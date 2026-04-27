@@ -1,0 +1,35 @@
+version: 2
+updates:
+  # Cargo dependencies (workspace + members).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    # Group patch + minor updates so we don't drown in PRs. Major
+    # bumps still come as individual PRs because they may need
+    # code changes.
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    labels:
+      - dependencies
+      - rust
+
+  # GitHub Actions versions used in workflows.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions

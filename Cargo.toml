@@ -1,0 +1,93 @@
+[workspace]
+resolver = "2"
+members = ["vela-server", "vela-core", "vela-store", "vela-api"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "Apache-2.0"
+description = "A Matrix homeserver written in Rust."
+readme = "README.md"
+rust-version = "1.85"
+
+# Workspace-level lint config — every member crate inherits via
+# `[lints] workspace = true`. The CI lint job runs with `-D warnings`,
+# so the levels here are the project's actual policy. Adjust here, not
+# per-file.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# Style preferences clippy is wrong about often enough to be net noise:
+too_many_arguments = "allow"
+type_complexity = "allow"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "query", "tokio", "tracing", "matched-path"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "catch-panic", "trace", "timeout", "limit"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+
+# Database
+rocksdb = { version = "0.22", default-features = false, features = ["multi-threaded-cf"] }
+dashmap = "6"
+
+# Config + CLI
+figment = { version = "0.10", features = ["env", "toml"] }
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
+
+# Distributed tracing (optional, gated by the `otel` feature)
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["tonic", "grpc-tonic"] }
+tracing-opentelemetry = "0.28"
+
+# Crypto
+argon2 = "0.5"
+rand = "0.9"
+base64 = "0.22"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+# Media
+uuid = { version = "1", features = ["v4"] }
+tokio-util = { version = "0.7", features = ["io"] }
+async-trait = "0.1"
+bytes = "1"
+# object_store gives us a unified abstraction over S3/GCS/Azure/local
+# that handles auth, multipart, retries, virtual-hosting nuances. It's
+# the standard cloud-storage abstraction in the Rust ecosystem (used by
+# arrow-rs, polars, datafusion).
+object_store = { version = "0.11", features = ["aws"] }
+futures = "0.3"
+
+# Utilities
+thiserror = "2"
+anyhow = "1"
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+wiremock = "0.6"
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime", "system-config"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+
+# Internal crates. Path-and-version: path wins for local builds, the
+# version anchor satisfies cargo-deny + works the day we ever publish.
+vela-core = { path = "vela-core", version = "0.1.0" }
+vela-store = { path = "vela-store", version = "0.1.0" }
+vela-api = { path = "vela-api", version = "0.1.0" }

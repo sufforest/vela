@@ -1,0 +1,134 @@
+# vela.toml — local smoketest config.
+#
+# Used by tools/testing/smoketest/docker-compose.yml. Defaults here
+# bias toward conservative behavior (closed registration is recommended
+# for any deployment with public reachability; encryption-by-default
+# for new private rooms; local-only user directory).
+#
+# For each section, the inline comments explain what the setting does.
+# Anything you don't set falls back to vela's built-in default — see
+# vela-server/src/main.rs for the authoritative defaults.
+
+[server]
+# How peers and clients address you. For a real deployment this is
+# a public hostname (`chat.example.org`); for the local smoketest
+# `localhost:8008` is fine. The value must match what your reverse
+# proxy / DNS uses, otherwise federated peers won't be able to verify
+# your signatures.
+name = "chat.example.org"
+bind = "0.0.0.0"
+port = 8008
+
+# Optional TLS listener (port 8448 is the federation default). When
+# present, vela serves HTTPS in addition to HTTP. For most small
+# deployments you'll terminate TLS at a reverse proxy (Caddy, nginx)
+# and leave this unset.
+# [server.tls]
+# port      = 8448
+# cert_file = "/etc/vela/tls.crt"
+# key_file  = "/etc/vela/tls.key"
+
+[database]
+# Where RocksDB stores everything. Mount this on persistent storage.
+path = "/var/lib/vela"
+
+[federation]
+# Federation lets your users talk to people on other Matrix servers.
+# Default true. Set false for fully private deployments — vela will
+# refuse all server-to-server traffic in both directions.
+enabled = true
+
+[registration]
+# Closed-signup is the right default for a friend-group server.
+# Without `enabled = false` OR a `token`, anyone who can reach the
+# server can sign up — that's almost always wrong.
+enabled = true
+
+# Distribute this token out-of-band; clients pass it via the
+# `m.login.registration_token` UIA stage. Generate with `openssl
+# rand -hex 16`. Keep secret.
+# token = "REPLACE_WITH_SECRET_TOKEN"
+
+[media]
+# Size cap for uploads. Default is 50MB; raise if your users send big
+# files often. Accepts "K", "M", "G" suffixes.
+max_upload_size = "100MB"
+
+# Default is filesystem (rooted at <database.path>/media). For
+# multi-instance / off-host durability, switch to S3-compatible
+# (MinIO, Cloudflare R2, Backblaze B2, AWS S3 itself).
+backend = "fs"
+# [media.s3]
+# bucket             = "vela-media"
+# region             = "us-east-1"
+# endpoint           = "https://s3.us-east-005.backblazeb2.com"
+# access_key_id      = "..."
+# secret_access_key  = "..."
+# prefix             = "media"     # optional namespace inside bucket
+# allow_http         = false        # true for MinIO dev mode
+
+[room_defaults]
+# Server-side encryption-by-default for new rooms. When the
+# `/createRoom` request doesn't include `m.room.encryption` in
+# `initial_state`, vela injects it for matching room types.
+#
+# Values:
+#   "off"          — never inject (let clients decide)
+#   "dm_only"      — only when the request body has is_direct: true
+#   "private_only" — for private_chat / trusted_private_chat (default
+#                    when private rooms should be E2EE)
+#   "all"          — every room except public_chat
+#
+# Public rooms are NEVER auto-encrypted regardless of this setting —
+# Megolm's per-member rekey costs make E2EE in megarooms impractical.
+encrypt_by_default = "private_only"
+
+[backup]
+# In-process backup scheduler. Off by default; enable + set a target.
+# enabled  = true
+# interval = "24h"
+# target   = "disk:/var/lib/vela/backups"
+# # Or off-host:
+# # target = "s3://your-backup-bucket/vela"
+# keep     = 7   # number of most-recent backups to retain
+# [backup.s3]
+# region            = "us-east-1"
+# access_key_id     = "..."
+# secret_access_key = "..."
+
+[retention]
+# Periodic media retention sweeper. Off by default; enable to expire
+# old uploads automatically.
+# enabled  = true
+# interval = "24h"
+# [retention.media]
+# # Local-uploaded media — when in doubt, "forever". Use "365d",
+# # "180d", etc. if storage cost matters.
+# local_lifetime  = "forever"
+# # Cached remote media (federated thumbnails etc.). 30d is
+# # reasonable; remote servers retain the originals.
+# remote_lifetime = "30d"
+
+[user_directory]
+# Off by default for privacy. Set true if you WANT users to be
+# discoverable by other users they don't share a room with —
+# appropriate for an open community, wrong for a friends-only server.
+search_all_users = false
+# Don't query remote servers when searching. Stranger DMs require
+# typing the full MXID — kills user-graph enumeration via federation.
+federate = false
+
+[directory]
+# Don't expose this server's room list to the federated graph.
+allow_public_rooms_over_federation = false
+
+[rate_limit]
+# Per-IP token-bucket rate limit on /register and /login. Defaults
+# are production-safe; flip to false for local Complement runs.
+enabled = true
+
+[tracing]
+# OpenTelemetry OTLP/gRPC endpoint, only consulted when vela is
+# built with `--features otel`. Empty/unset disables export
+# (spans still log via the fmt layer).
+# otlp_endpoint = "http://localhost:4317"

@@ -1,0 +1,57 @@
+[package]
+name = "vela-api"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Vela's HTTP API surface: client-server, server-server, application service routes and middleware."
+
+[features]
+# Distributed tracing context propagation across federation. Off by
+# default. When enabled, signed_request injects a W3C `traceparent`
+# header from the current tracing span, and the federation_auth
+# middleware extracts it and binds the request span as a child of the
+# remote-originated trace. Requires the binary to also enable the
+# matching `otel` feature on vela-server so the global propagator and
+# tracer provider are installed.
+otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
+
+[dependencies]
+vela-core = { workspace = true }
+vela-store = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# `metrics` is the facade (zero-cost when no recorder is installed).
+# Choice of exporter lives in the binary crate — vela-api stays
+# backend-agnostic.
+metrics = { workspace = true }
+dashmap = { workspace = true }
+rocksdb = { workspace = true }
+argon2 = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+uuid = { workspace = true }
+tokio-util = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+hickory-resolver = { workspace = true }
+form_urlencoded = "1"
+opentelemetry = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+wiremock = { workspace = true }
+serde_urlencoded = "0.7"
+# Integration tests need ServerSigningKey + canonical JSON for signing
+# federation requests from stub remote servers.
+base64 = { workspace = true }
+
+[lints]
+workspace = true

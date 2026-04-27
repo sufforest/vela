@@ -1,0 +1,7 @@
+# Pin the toolchain so contributors and CI compile with the same Rust.
+# `stable` follows the latest stable release; bump deliberately if a new
+# rust version surfaces lint regressions or breaks the build.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

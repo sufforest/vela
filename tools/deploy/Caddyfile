@@ -1,0 +1,52 @@
+# Caddy reverse proxy for vela.
+#
+# Replace `vela.example.com` below with your actual server_name.
+# Caddy auto-obtains a Let's Encrypt cert for it on first start.
+#
+# This config terminates TLS for BOTH:
+#   - Port 443: client API (`/_matrix/*`) + .well-known endpoints
+#   - Port 8448: federation traffic — proxied to vela's HTTP listener
+#
+# vela itself serves plain HTTP on port 8008. One cert pipeline,
+# auto-renewed.
+
+# --- Client API + .well-known on port 443 -----------------------------------
+
+vela.example.com {
+    encode gzip
+
+    # .well-known endpoints — pure JSON. Adjust if you split
+    # `server_name` from the host (e.g. server_name=example.com but
+    # vela lives at vela.example.com).
+    handle /.well-known/matrix/server {
+        header Content-Type application/json
+        respond `{"m.server": "vela.example.com:8448"}` 200
+    }
+    handle /.well-known/matrix/client {
+        header Content-Type application/json
+        respond `{"m.homeserver": {"base_url": "https://vela.example.com"}}` 200
+    }
+
+    # Client API + everything else → vela's plain HTTP listener.
+    # /_vela/metrics is intentionally NOT exposed here — Prometheus
+    # scrapes it directly inside the docker network.
+    handle /_matrix/* {
+        reverse_proxy vela:8008
+    }
+
+    # Optional: a tiny landing page so a browser hitting the bare
+    # domain doesn't see Caddy's default page.
+    handle / {
+        respond `vela Matrix homeserver. Use a Matrix client.` 200
+    }
+
+    handle {
+        respond 404
+    }
+}
+
+# --- Federation on port 8448 ------------------------------------------------
+
+vela.example.com:8448 {
+    reverse_proxy vela:8008
+}

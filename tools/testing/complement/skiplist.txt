@@ -1,0 +1,41 @@
+# Complement test skip list.
+#
+# Tests listed here are excluded from Complement runs via `go test -skip`.
+# Each line is a regex anchored against the Go test name. Empty lines
+# and `#` comments are ignored.
+#
+# Add a test here ONLY when:
+# 1. It's known to fail because of a feature gap or open bug, AND
+# 2. It's slow enough to consume meaningful wall time (>10s typical),
+#    so skipping reclaims iteration speed.
+#
+# Each entry should be paired with a one-line note about why. When the
+# underlying gap is closed, remove the line and re-run the suite.
+#
+# Re-evaluate the list on every Complement upgrade — the upstream test
+# names occasionally rename.
+
+# Application-service bridge endpoints out of scope for now. ~16s.
+^TestJoinFederatedRoomFromApplicationServiceBridgeUser$
+
+# Inbound invite preserves `is_direct` content field. We redact on
+# content-hash mismatch (spec-compliant), but Complement's stub event
+# builder doesn't always add a `hashes` field, so absent-hash triggers
+# redaction here. Needs a careful look at gomatrixserverlib parity
+# before changing redact semantics. ~11s.
+^TestIsDirectFlagFederation$
+
+# v10/v12 incompatibility: test asserts the room creator appears in
+# m.room.power_levels.users with PL > users_default. v12 (MSC4289)
+# REQUIRES creators to be absent from users — implicit power 100 via
+# the create event's sender + additional_creators field. Vela is
+# v12-only by design, so this test is structurally inapplicable.
+^TestPowerLevels$
+
+# Resolved by recent commits — re-include and verify next run:
+#   ^TestToDeviceMessagesOverFederation$  (m.direct_to_device EDU shipped)
+#   ^TestPushSync$                         (m.push_rules synth + sync wake)
+#   ^TestACLs$                             (server_acl enforcement)
+#   ^TestDeviceListUpdates$                (m.device_list_update EDU shipped)
+#   ^TestDeviceListsUpdateOverFederation$  (same)
+#   ^TestUserAppearsInChangedDeviceListOnJoinOverFederation$ (same)

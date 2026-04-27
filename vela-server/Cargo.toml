@@ -1,0 +1,64 @@
+[package]
+name = "vela-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Vela the Matrix homeserver binary: top-level orchestration, config, signing key, scheduled tasks."
+
+[[bin]]
+name = "vela"
+path = "src/main.rs"
+
+[[bin]]
+name = "vela-backup"
+path = "src/bin/backup.rs"
+
+[features]
+# Prometheus text-format exporter for /_vela/metrics. Default on — most
+# deployments will want it. Turn off (`--no-default-features`) to drop
+# the dependency when using an alternate observability stack; the
+# endpoint stays wired but returns 503 until a renderer is plumbed.
+default = ["prometheus"]
+prometheus = ["dep:metrics-exporter-prometheus"]
+# OpenTelemetry distributed tracing exporter. Off by default — only
+# install the OTLP/tonic dependency tree when an operator opts in.
+# When enabled, set [tracing.otlp_endpoint] in vela.toml to point at a
+# collector (e.g. http://localhost:4317). Spans from the regular
+# `tracing` macros bridge into OTLP automatically.
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "vela-api/otel",
+]
+
+[dependencies]
+vela-core = { workspace = true }
+vela-store = { workspace = true }
+vela-api = { workspace = true }
+tokio = { workspace = true }
+figment = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dashmap = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+axum-server = { workspace = true }
+rustls = { workspace = true }
+reqwest = { workspace = true }
+object_store = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+metrics-exporter-prometheus = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[lints]
+workspace = true

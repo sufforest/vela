@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Vela exposes metrics at GET /_vela/metrics (Prometheus text format).
+# Inside the docker network it's reachable at http://vela:8008/_vela/metrics.
+scrape_configs:
+  - job_name: vela
+    metrics_path: /_vela/metrics
+    static_configs:
+      - targets: ["vela:8008"]
+
+# Optional: load alert rules. Uncomment when you want operator-grade alerting.
+# rule_files:
+#   - /etc/prometheus/alerts.yml
+
+# Optional: send alerts to an Alertmanager. Wire this up after you've
+# decided on a notification destination (PagerDuty, Slack, email).
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]

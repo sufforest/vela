@@ -1,0 +1,56 @@
+# Operator-grade alert rules for Vela. Wire in via:
+#   prometheus.yml → rule_files: [ /etc/prometheus/alerts.yml ]
+#
+# Each rule is intentionally conservative: false-positives are worse
+# than late detection on a small homeserver. Tune to your traffic.
+
+groups:
+  - name: vela-availability
+    rules:
+      - alert: VelaUnreachable
+        expr: up{job="vela"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Vela is not responding to Prometheus scrapes
+          description: |
+            Prometheus has been unable to scrape Vela for over a minute.
+            Check `docker compose logs vela` and `docker compose ps`.
+
+  - name: vela-errors
+    rules:
+      - alert: VelaHigh5xxRate
+        expr: |
+          sum(rate(vela_http_requests_total{status=~"5.."}[5m]))
+          /
+          sum(rate(vela_http_requests_total[5m]))
+          > 0.02
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Vela is returning >2% 5xx for 5 minutes
+          description: |
+            Sustained server-error rate above 2%. Check logs for panics
+            or DB errors. The metric breaks down by `route`; in Grafana,
+            filter to find the offending endpoint.
+
+  - name: vela-latency
+    rules:
+      - alert: VelaSlowSync
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le) (rate(vela_http_request_duration_seconds_bucket{route=~".*sync.*"}[5m]))
+          ) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: /sync p99 latency above 5s for 10 minutes
+          description: |
+            Long-poll /sync calls are expected to wait, so this metric
+            includes some legitimate hold-time. Sustained spike above
+            5s suggests RocksDB pressure, GC stall, or a deadlock —
+            check CPU and disk IOPS.

@@ -1,0 +1,7 @@
+target/
+data/
+**/*.rs.bk
+*.profraw
+.git/
+.github/
+docs/

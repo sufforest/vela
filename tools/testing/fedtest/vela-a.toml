@@ -1,0 +1,15 @@
+[server]
+# server_name must match what the OTHER server writes in its X-Matrix
+# destination header. We use Docker service DNS so `vela-a:8008` and
+# `vela-b:8008` resolve inside the compose network.
+name = "vela-a:8008"
+bind = "0.0.0.0"
+port = 8008
+
+[database]
+path = "/data"
+
+[federation]
+# Plain-HTTP peering. Vela-a contacts vela-b directly over the Docker
+# bridge; skips TLS + SRV lookup entirely.
+http_peers = { "vela-b:8008" = "http://vela-b:8008" }

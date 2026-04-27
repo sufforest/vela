@@ -1,0 +1,85 @@
+# Production vela deployment via docker-compose.
+#
+# Default stack (minimum viable production):
+#   - vela     : homeserver, plain HTTP on 8008 (proxied)
+#   - caddy    : reverse proxy + Let's Encrypt for ports 443 (client
+#                API) and 8448 (federation)
+#
+# Optional observability stack (opt-in via `--profile observability`):
+#   - prom     : Prometheus, scrapes /_vela/metrics
+#   - grafana  : visualises the metrics — dashboard pre-loaded
+#
+# Bring-up (default — vela + caddy):
+#   1. Edit your domain in vela.toml + Caddyfile.
+#   2. DNS: see tools/deploy/README.md for the three scenarios.
+#   3. `docker compose up -d`
+#
+# With monitoring:
+#   docker compose --profile observability up -d
+#
+# Backup:
+#   docker compose exec vela vela-backup --db /data --out /data/backups/$(date +%F)
+#
+# Upgrade:
+#   docker compose pull vela && docker compose up -d vela
+#   (vela's schema-version stamp refuses to start on incompatible data;
+#    when that fires, run the matching migrator before retrying.)
+
+services:
+  vela:
+    build:
+      context: ../..
+    restart: unless-stopped
+    volumes:
+      - vela_data:/data
+      - ./vela.toml:/etc/vela/vela.toml:ro
+    expose:
+      - "8008"                                # plain HTTP — only Caddy reaches it
+    command: ["/usr/local/bin/vela", "--config", "/etc/vela/vela.toml"]
+    environment:
+      RUST_LOG: "info,vela=info"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [vela]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8448:8448"                           # federation — terminated here
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  prom:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    profiles: ["observability"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"                 # admin only — bind to localhost
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    profiles: ["observability"]
+    depends_on: [prom]
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_ADMIN_PASSWORD: "changeme"  # CHANGE THIS
+    ports:
+      - "127.0.0.1:3000:3000"                 # admin only — bind to localhost
+
+volumes:
+  vela_data:
+  caddy_data:
+  caddy_config:
+  prom_data:
+  grafana_data:

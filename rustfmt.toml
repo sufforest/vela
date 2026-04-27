@@ -1,0 +1,7 @@
+# rustfmt config. Stable rustfmt only honours a handful of options;
+# we keep this file minimal so `cargo fmt` runs warning-free on
+# stable. Most useful style options (import grouping, granularity)
+# remain nightly-only as of Rust 1.85.
+
+edition = "2024"
+max_width = 100

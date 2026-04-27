@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+#
+# Vela pre-commit hook.
+#
+# Runs the same fmt + clippy gates that CI enforces, but skips tests
+# (CI runs those — the hook stays fast). Opt in once per clone:
+#
+#   git config core.hooksPath .githooks
+#
+# To bypass for a one-off commit:
+#
+#   git commit --no-verify
+#
+# Bypass should be the exception, not the rule. If clippy is wrong about
+# your code, prefer a `#[allow(...)]` with a comment explaining why.
+
+set -euo pipefail
+
+# Only run on staged Rust changes — a docs- or yaml-only commit doesn't
+# need the full clippy spin.
+staged_rust=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.rs$' || true)
+if [ -z "$staged_rust" ]; then
+    exit 0
+fi
+
+echo "[pre-commit] cargo fmt --all -- --check"
+if ! cargo fmt --all -- --check; then
+    echo
+    echo "[pre-commit] formatting drift. Fix with: cargo fmt --all"
+    exit 1
+fi
+
+echo "[pre-commit] cargo clippy --workspace --all-targets -- -D warnings"
+if ! cargo clippy --workspace --all-targets -- -D warnings; then
+    echo
+    echo "[pre-commit] clippy errors. Fix the above before committing."
+    exit 1
+fi

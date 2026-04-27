@@ -1,0 +1,30 @@
+services:
+  vela-a:
+    build:
+      context: ../../..
+    command: ["--config", "/conf/vela.toml"]
+    volumes:
+      - ./vela-a.toml:/conf/vela.toml:ro
+      - vela_a_data:/data
+    ports:
+      - "127.0.0.1:8108:8008"
+    restart: unless-stopped
+    environment:
+      RUST_LOG: "info,vela_api=debug,tower_http=debug"
+
+  vela-b:
+    build:
+      context: ../../..
+    command: ["--config", "/conf/vela.toml"]
+    volumes:
+      - ./vela-b.toml:/conf/vela.toml:ro
+      - vela_b_data:/data
+    ports:
+      - "127.0.0.1:8118:8008"
+    restart: unless-stopped
+    environment:
+      RUST_LOG: "info,vela_api=debug,tower_http=debug"
+
+volumes:
+  vela_a_data:
+  vela_b_data:

@@ -1,0 +1,9 @@
+[server]
+# Element Web will call this server_name via the URL it resolves to. On
+# localhost that matches the bind address.
+name = "localhost:8008"
+bind = "0.0.0.0"
+port = 8008
+
+[database]
+path = "/data"

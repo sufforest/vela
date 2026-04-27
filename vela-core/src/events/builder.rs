@@ -1,0 +1,323 @@
+//! Event builder that constructs properly-formed Matrix events.
+//!
+//! Handles the full event lifecycle:
+//! 1. Build event JSON with correct fields
+//! 2. Add content hash
+//! 3. Sign the event
+//! 4. Compute event_id (reference hash)
+//!
+//! Auth events are selected per the auth events selection algorithm
+//! (server-server-api.md:528-554), respecting room version differences.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::{Map, Value, json};
+
+use crate::events::hash::{add_content_hash, compute_event_id};
+use crate::events::room_version::RoomVersion;
+use crate::events::sign::ServerSigningKey;
+use crate::identifiers::{EventId, RoomId};
+
+/// Build a complete, signed Matrix event.
+///
+/// Returns (event_json, event_id). The event_json includes hashes and signatures.
+pub fn build_event(
+    event_type: &str,
+    state_key: Option<&str>,
+    content: Value,
+    sender: &str,
+    room_id: Option<&RoomId>,
+    prev_events: &[EventId],
+    auth_events: &[EventId],
+    depth: u64,
+    signing_key: &ServerSigningKey,
+    server_name: &str,
+    _room_version: RoomVersion,
+) -> (Map<String, Value>, EventId) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let mut event = Map::new();
+    event.insert("type".to_string(), json!(event_type));
+    event.insert("sender".to_string(), json!(sender));
+    event.insert("origin_server_ts".to_string(), json!(now));
+    event.insert("content".to_string(), content);
+    event.insert("depth".to_string(), json!(depth));
+
+    if let Some(sk) = state_key {
+        event.insert("state_key".to_string(), json!(sk));
+    }
+
+    // room_id: required on all events EXCEPT m.room.create in v12
+    let is_create = event_type == "m.room.create";
+    if let Some(rid) = room_id
+        && !(is_create && _room_version.omit_room_id_from_create())
+    {
+        event.insert("room_id".to_string(), json!(rid.as_str()));
+    }
+
+    // prev_events and auth_events as string arrays
+    let prev: Vec<Value> = prev_events.iter().map(|e| json!(e.as_str())).collect();
+    let auth: Vec<Value> = auth_events.iter().map(|e| json!(e.as_str())).collect();
+    event.insert("prev_events".to_string(), Value::Array(prev));
+    event.insert("auth_events".to_string(), Value::Array(auth));
+
+    // Step 1: compute content hash and add to hashes field
+    add_content_hash(&mut event);
+
+    // Step 2: sign the event
+    signing_key.sign_event(&mut event, server_name);
+
+    // Step 3: compute event_id from reference hash
+    let event_id = compute_event_id(&event);
+
+    (event, event_id)
+}
+
+/// Sign a pre-built event template (e.g. the one returned by a remote
+/// server's `make_join` response). The template already has all logical
+/// fields populated (type, sender, state_key, content, prev_events,
+/// auth_events, depth, origin_server_ts). We add:
+///
+/// 1. The content hash (`hashes.sha256`).
+/// 2. Our signature under `signatures[server_name]`.
+///
+/// Returns the completed event + the computed `event_id`.
+pub fn sign_unsigned_template(
+    mut template: Map<String, Value>,
+    signing_key: &ServerSigningKey,
+    server_name: &str,
+) -> (Map<String, Value>, EventId) {
+    // Step 1: compute + insert content hash.
+    crate::events::hash::add_content_hash(&mut template);
+
+    // Step 2: sign.
+    signing_key.sign_event(&mut template, server_name);
+
+    // Step 3: compute event_id from reference hash.
+    let event_id = crate::events::hash::compute_event_id(&template);
+
+    (template, event_id)
+}
+
+/// Select auth_events for a new event based on current room state.
+///
+/// This is a pure function — it takes an explicit state map, NOT a database reference.
+/// Sprint 1: populate from DB's current room_state.
+/// Sprint 2 (federation): populate from incoming PDU's auth_events.
+///
+/// Per spec (server-server-api.md:528-554):
+/// - m.room.create: auth_events = []
+/// - All others (v12): power_levels + sender's member + (for m.room.member: target's member, join_rules)
+/// - v12: m.room.create MUST NOT be included
+pub fn select_auth_events(
+    event_type: &str,
+    sender: &str,
+    state_key: Option<&str>,
+    content: Option<&Value>,
+    room_version: RoomVersion,
+    current_state: &dyn Fn(&str, &str) -> Option<EventId>,
+) -> Vec<EventId> {
+    if event_type == "m.room.create" {
+        return vec![];
+    }
+
+    let mut auth = Vec::new();
+
+    // 1. m.room.create — NOT in v12
+    if room_version.include_create_in_auth_events()
+        && let Some(eid) = current_state("m.room.create", "")
+    {
+        auth.push(eid);
+    }
+
+    // 2. Current m.room.power_levels
+    if let Some(eid) = current_state("m.room.power_levels", "") {
+        auth.push(eid);
+    }
+
+    // 3. Sender's current m.room.member
+    if let Some(eid) = current_state("m.room.member", sender) {
+        auth.push(eid);
+    }
+
+    // 4. If type is m.room.member, additional events
+    if event_type == "m.room.member" {
+        let target = state_key.unwrap_or("");
+        let membership = content
+            .and_then(|c| c.get("membership"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+
+        // Target's current m.room.member (if different from sender)
+        if target != sender
+            && let Some(eid) = current_state("m.room.member", target)
+        {
+            auth.push(eid);
+        }
+
+        // join_rules for join/invite/knock
+        if matches!(membership, "join" | "invite" | "knock")
+            && let Some(eid) = current_state("m.room.join_rules", "")
+        {
+            auth.push(eid);
+        }
+
+        // Per server-server spec auth_events selection: when a join carries
+        // `join_authorised_via_users_server`, that user's current member
+        // event MUST be in auth_events so the rule engine can verify the
+        // authoriser is joined and powered to invite.
+        if membership == "join"
+            && let Some(authoriser) = content
+                .and_then(|c| c.get("join_authorised_via_users_server"))
+                .and_then(|v| v.as_str())
+            && authoriser != sender
+            && authoriser != target
+            && let Some(eid) = current_state("m.room.member", authoriser)
+        {
+            auth.push(eid);
+        }
+    }
+
+    auth
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::room_version::RoomVersion;
+    use std::collections::HashMap;
+
+    #[test]
+    fn create_event_has_empty_auth() {
+        let state = HashMap::<(String, String), EventId>::new();
+        let lookup = |t: &str, sk: &str| state.get(&(t.to_string(), sk.to_string())).cloned();
+
+        let auth = select_auth_events(
+            "m.room.create",
+            "@alice:example.com",
+            Some(""),
+            None,
+            RoomVersion::V12,
+            &lookup,
+        );
+        assert!(auth.is_empty());
+    }
+
+    #[test]
+    fn member_join_includes_power_levels_and_sender_member() {
+        let mut state = HashMap::<(String, String), EventId>::new();
+        let pl_eid = EventId::from_reference_hash("powerlevels");
+        let member_eid = EventId::from_reference_hash("member");
+        state.insert(("m.room.power_levels".into(), "".into()), pl_eid.clone());
+        state.insert(
+            ("m.room.member".into(), "@alice:example.com".into()),
+            member_eid.clone(),
+        );
+
+        let lookup = |t: &str, sk: &str| state.get(&(t.to_string(), sk.to_string())).cloned();
+
+        let content = serde_json::json!({"membership": "join"});
+        let auth = select_auth_events(
+            "m.room.member",
+            "@alice:example.com",
+            Some("@alice:example.com"),
+            Some(&content),
+            RoomVersion::V12,
+            &lookup,
+        );
+
+        // v12: no create, has power_levels and member, plus join_rules for join
+        assert!(auth.contains(&pl_eid));
+        assert!(auth.contains(&member_eid));
+        // No m.room.create in v12
+        assert!(!auth.iter().any(|e| e.as_str().contains("create")));
+    }
+
+    #[test]
+    fn v12_no_create_in_auth() {
+        let mut state = HashMap::<(String, String), EventId>::new();
+        let create_eid = EventId::from_reference_hash("create");
+        state.insert(("m.room.create".into(), "".into()), create_eid.clone());
+
+        let lookup = |t: &str, sk: &str| state.get(&(t.to_string(), sk.to_string())).cloned();
+
+        let auth = select_auth_events(
+            "m.room.power_levels",
+            "@alice:example.com",
+            Some(""),
+            None,
+            RoomVersion::V12,
+            &lookup,
+        );
+
+        // v12: create MUST NOT be in auth_events
+        assert!(!auth.contains(&create_eid));
+    }
+
+    #[test]
+    fn sign_unsigned_template_adds_hashes_signature_and_event_id() {
+        // Simulates receiving a template from a remote server's make_join,
+        // then signing it on our end for send_join submission.
+        let key = ServerSigningKey::generate();
+
+        let mut template = Map::new();
+        template.insert("type".into(), json!("m.room.member"));
+        template.insert("state_key".into(), json!("@us:our.example"));
+        template.insert("sender".into(), json!("@us:our.example"));
+        template.insert("room_id".into(), json!("!abc:remote.example"));
+        template.insert("origin".into(), json!("our.example"));
+        template.insert("origin_server_ts".into(), json!(1_700_000_000_000u64));
+        template.insert("depth".into(), json!(10));
+        template.insert("content".into(), json!({"membership": "join"}));
+        template.insert("prev_events".into(), json!(["$prev"]));
+        template.insert("auth_events".into(), json!(["$pl", "$cr"]));
+
+        let (signed, event_id) = sign_unsigned_template(template, &key, "our.example");
+
+        // Hashes + signatures added.
+        assert!(signed.contains_key("hashes"));
+        assert!(signed.contains_key("signatures"));
+        let sig = signed["signatures"]["our.example"][key.key_id()]
+            .as_str()
+            .expect("signature is a string");
+        assert!(!sig.is_empty());
+
+        // Event ID is reference-hash-derived and stable.
+        assert!(event_id.as_str().starts_with('$'));
+    }
+
+    #[test]
+    fn build_event_produces_valid_structure() {
+        let key = ServerSigningKey::generate();
+        let room_id = RoomId::parse("!test:example.com").unwrap();
+
+        let (event, event_id) = build_event(
+            "m.room.message",
+            None,
+            json!({"msgtype": "m.text", "body": "hello"}),
+            "@alice:example.com",
+            Some(&room_id),
+            &[],
+            &[],
+            1,
+            &key,
+            "example.com",
+            RoomVersion::V12,
+        );
+
+        assert!(event.contains_key("type"));
+        assert!(event.contains_key("sender"));
+        assert!(event.contains_key("origin_server_ts"));
+        assert!(event.contains_key("content"));
+        assert!(event.contains_key("depth"));
+        assert!(event.contains_key("hashes"));
+        assert!(event.contains_key("signatures"));
+        assert!(event.contains_key("prev_events"));
+        assert!(event.contains_key("auth_events"));
+        assert!(event.contains_key("room_id"));
+        assert!(event_id.as_str().starts_with('$'));
+    }
+}

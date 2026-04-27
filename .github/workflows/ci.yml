@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Default-deny token scopes; individual jobs override only what they
+# legitimately need (none of the current jobs need write).
+permissions:
+  contents: read
+
+# Cancel in-flight runs of the same workflow on the same ref when a
+# new push/PR-update arrives. Saves CI minutes during rapid iteration.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Build artefacts share a key across the whole workspace so
+          # incremental rebuilds reuse them.
+          shared-key: workspace
+
+      - name: cargo build --workspace
+        run: cargo build --workspace --all-targets --locked
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --all-targets --locked
+
+  msrv:
+    # Verifies the project still compiles under the declared minimum
+    # supported Rust version (rust-version in Cargo.toml). Drift here is
+    # silent without this job.
+    name: cargo check (MSRV 1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-msrv
+
+      - name: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --locked
+
+  lint:
+    name: cargo clippy + rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy --workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  docs:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    env:
+      # Treat broken intra-doc links as build failures.
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-doc
+
+      - name: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --locked
+
+  deny:
+    # Supply-chain check: RustSec advisories, license compatibility,
+    # banned/duplicate crates, registry sources. Config in deny.toml.
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  features:
+    name: cargo test --features otel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-otel
+
+      # The OTel feature pulls in a separate dependency tree
+      # (opentelemetry, tonic). Make sure it builds and tests pass.
+      - name: cargo test --features otel
+        run: cargo test -p vela-server --features otel --locked

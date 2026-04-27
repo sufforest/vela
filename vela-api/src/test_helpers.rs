@@ -1,0 +1,93 @@
+//! Shared test helpers for `vela-api`. Compiled only under `#[cfg(test)]`.
+//!
+//! Put helpers here when more than one test module needs them. Colocated
+//! helpers (only used by one module) should stay in that module's `tests`
+//! submodule.
+
+use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use dashmap::DashMap;
+use tempfile::TempDir;
+
+use crate::federation_client::{FederationClient, RemoteKeyCache};
+use crate::federation_resolver::FederationResolver;
+use crate::federation_sender::FederationSender;
+use crate::router::{AppState, ServerConfig};
+use vela_core::events::sign::ServerSigningKey;
+use vela_store::db::Database;
+use vela_store::media::{FilesystemMediaStore, MediaStore};
+
+/// Construct an `AppState` backed by a fresh RocksDB in a `TempDir`.
+///
+/// The caller must keep the returned `TempDir` alive for the duration of the
+/// test; dropping it unlinks the database directory.
+///
+/// Default server_name is `example.com`.
+pub fn build_test_state() -> (AppState, TempDir) {
+    build_test_state_with_name("example.com")
+}
+
+/// Variant with configurable server_name. Useful when a test needs to
+/// impersonate a specific destination.
+pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = Arc::new(Database::open(tmp.path()).expect("db open"));
+    let media = FilesystemMediaStore::new(&tmp.path().join("media")).expect("media");
+    let key = Arc::new(ServerSigningKey::generate());
+    let resolver = Arc::new(FederationResolver::new().expect("resolver"));
+    let client = Arc::new(FederationClient::new(
+        key.clone(),
+        server_name.to_string(),
+        resolver,
+        Vec::new(),
+    ));
+    let remote_keys = Arc::new(RemoteKeyCache::new(db.clone(), (*client).clone()));
+    let typing_stream = crate::edu::typing::TypingStream::new(db.clone(), server_name.to_string());
+    let federation_sender = Arc::new(FederationSender::new(
+        db.clone(),
+        client.clone(),
+        server_name.to_string(),
+        vec![
+            crate::edu::to_device::ToDeviceStream::new(),
+            crate::edu::device_list::DeviceListStream::new(),
+            typing_stream.clone(),
+        ],
+    ));
+    let state = AppState {
+        db,
+        config: Arc::new(ServerConfig {
+            server_name: server_name.to_string(),
+            bind_host: "127.0.0.1".to_string(),
+            bind_port: 0,
+            search_all_users: false,
+            federation_enabled: true,
+            registration_enabled: true,
+            registration_token: None,
+            max_upload_size: 50 * 1024 * 1024,
+            encrypt_by_default: crate::router::EncryptByDefault::Off,
+            allow_public_rooms_over_federation: false,
+            user_directory_federate: false,
+        }),
+        room_locks: Arc::new(DashMap::new()),
+        user_locks: Arc::new(DashMap::new()),
+        room_senders: Arc::new(DashMap::new()),
+        typing_state: Arc::new(DashMap::new()),
+        typing_stream,
+        media_store: Arc::new(media) as Arc<dyn MediaStore>,
+        signing_key: key,
+        remote_keys,
+        federation_sender,
+        federation_client: client,
+        uia_sessions: crate::uia::new_sessions(),
+        user_senders: Arc::new(DashMap::new()),
+        metrics_renderer: None,
+        rate_limiter: crate::rate_limit::RateLimiter::defaults(),
+        started_at: Arc::new(Instant::now()),
+        started_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    };
+    (state, tmp)
+}

@@ -1,0 +1,109 @@
+# vela homeserver — annotated production config.
+#
+# Copy this file to /etc/vela/vela.toml, edit `server.name`, and start
+# vela. Most fields have sensible defaults; the only one you MUST
+# change for a real deployment is `server.name`.
+#
+# This example assumes a reverse proxy (Caddy in tools/deploy/) handles
+# TLS on ports 443 and 8448; vela serves plain HTTP behind it. If you
+# want vela to terminate its own TLS, see the [server.tls] section
+# at the bottom.
+
+[server]
+# Public homeserver name. Appears in user IDs (`@alice:vela.example.com`)
+# and in X-Matrix headers peers see. Must match your DNS / .well-known.
+#
+# CHANGE THIS.
+name = "vela.example.com"
+
+# vela listens on this address; Caddy reaches it inside the docker
+# network. 127.0.0.1 keeps the listener local-only when not in Docker.
+bind = "127.0.0.1"
+port = 8008
+
+[database]
+# Persistent volume mount-point.
+path = "/var/lib/vela"
+
+[federation]
+# Federation lets users on this server talk to users on other Matrix
+# servers. Set false for a fully-private deployment — vela refuses all
+# server-to-server traffic in both directions when off.
+enabled = true
+
+[registration]
+# Closed-signup is the right default for most self-hosted servers.
+# Without `enabled = false` OR a `token`, anyone reaching the server
+# can sign up. Almost always wrong outside a public community.
+enabled = true
+
+# Distribute this token out-of-band; clients pass it via the
+# `m.login.registration_token` UIA stage. Generate with
+# `openssl rand -hex 16`.
+# token = "REPLACE_WITH_SECRET_TOKEN"
+
+[media]
+# Size cap for uploads. Default 50MB; raise for big-file workflows.
+max_upload_size = "50MB"
+
+# Default backend: filesystem (under <database.path>/media). Switch to
+# s3 for off-host durability or shared storage across restarts.
+backend = "fs"
+# [media.s3]
+# bucket             = "vela-media"
+# region             = "us-east-1"
+# endpoint           = "https://s3.us-east-005.backblazeb2.com"
+# access_key_id      = "..."
+# secret_access_key  = "..."
+# prefix             = "media"
+# allow_http         = false
+
+[room_defaults]
+# Server-side encryption-by-default for new rooms. When `/createRoom`
+# omits `m.room.encryption` in `initial_state`, vela injects it for
+# matching room types.
+#
+# Values: off | dm_only | private_only | all
+# Public rooms are NEVER auto-encrypted regardless of this setting.
+encrypt_by_default = "private_only"
+
+[user_directory]
+# Privacy-first: only return users sharing a room with the caller.
+# Set true on invite-only deployments wanting full-directory openness.
+search_all_users = false
+# Don't query remote servers — forces full MXID for cross-server DMs.
+federate = false
+
+[directory]
+# Don't expose published room list to the federated graph.
+allow_public_rooms_over_federation = false
+
+[backup]
+# In-process backup scheduler. Off by default; enable + set a target.
+# enabled  = true
+# interval = "24h"
+# target   = "disk:/var/lib/vela/backups"
+# # Or off-host:
+# # target = "s3://your-backup-bucket/vela"
+# keep     = 7
+# [backup.s3]
+# region            = "us-east-1"
+# access_key_id     = "..."
+# secret_access_key = "..."
+
+[retention]
+# Periodic media retention sweeper. Off by default.
+# enabled  = true
+# interval = "24h"
+# [retention.media]
+# local_lifetime  = "forever"
+# remote_lifetime = "30d"
+
+# --- vela-managed TLS (alternative to running Caddy in front) -------------
+# Uncomment if you'd rather vela terminate TLS directly instead of
+# putting a reverse proxy in front. You become responsible for cert
+# renewal in that case.
+# [server.tls]
+# port      = 8448
+# cert_file = "/etc/vela/tls/fullchain.pem"
+# key_file  = "/etc/vela/tls/privkey.pem"

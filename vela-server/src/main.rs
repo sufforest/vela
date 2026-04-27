@@ -1,0 +1,1208 @@
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use axum_server::tls_rustls::RustlsConfig;
+use clap::Parser;
+use dashmap::DashMap;
+use figment::Figment;
+use figment::providers::{Env, Format, Toml};
+use serde::Deserialize;
+use tracing::info;
+
+use vela_api::federation_client::{FederationClient, RemoteKeyCache};
+use vela_api::federation_resolver::FederationResolver;
+use vela_api::federation_sender::FederationSender;
+use vela_api::router::{AppState, ServerConfig};
+use vela_core::events::sign::ServerSigningKey;
+use vela_store::db::Database;
+
+mod backup;
+mod retention;
+
+#[derive(Parser)]
+#[command(name = "vela", version, about = "Vela Matrix Homeserver")]
+struct Cli {
+    /// Path to config file
+    #[arg(short, long, default_value = "vela.toml")]
+    config: PathBuf,
+    /// Parse and validate the config file, print a short summary, and
+    /// exit 0. Does not open the database, bind ports, or start any
+    /// background tasks. Intended for ops scripts that want to
+    /// pre-flight a new config before swapping binaries.
+    #[arg(long)]
+    validate_config: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Config {
+    #[serde(default)]
+    server: ServerSection,
+    #[serde(default)]
+    database: DatabaseSection,
+    #[serde(default)]
+    user_directory: UserDirectorySection,
+    #[serde(default)]
+    directory: DirectorySection,
+    #[serde(default)]
+    federation: FederationSection,
+    #[serde(default)]
+    registration: RegistrationSection,
+    #[serde(default)]
+    media: MediaSection,
+    #[serde(default)]
+    room_defaults: RoomDefaultsSection,
+    #[serde(default)]
+    backup: BackupSection,
+    #[serde(default)]
+    retention: RetentionSection,
+    #[serde(default)]
+    tracing: TracingSection,
+    #[serde(default)]
+    rate_limit: RateLimitSection,
+}
+
+/// `[retention]` section. Drives the periodic retention sweeper.
+/// Off by default — operators opt in by setting `enabled = true` and
+/// at least one media lifetime. Lifetime values use the same suffix
+/// syntax as backup intervals (`365d`, `30d`, `24h`); the literal
+/// `"forever"` (or empty string) means "keep forever."
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct RetentionSection {
+    enabled: bool,
+    /// E.g. `"24h"`. Default 24h.
+    interval: String,
+    media: RetentionMediaSection,
+}
+
+impl Default for RetentionSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: "24h".to_string(),
+            media: RetentionMediaSection::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct RetentionMediaSection {
+    /// Local-uploaded media — retain forever by default. Operators
+    /// who want cost-driven expiry set this to e.g. `"365d"`.
+    local_lifetime: String,
+    /// Cached remote media — short-by-default once we start fetching
+    /// remote blobs (today vela 404s on remote downloads, so the
+    /// field is forward-looking but harmless). 30 days is a sane
+    /// default for a fetch-and-cache layer.
+    remote_lifetime: String,
+}
+
+impl Default for RetentionMediaSection {
+    fn default() -> Self {
+        Self {
+            local_lifetime: "forever".to_string(),
+            remote_lifetime: "30d".to_string(),
+        }
+    }
+}
+
+/// `[room_defaults]` section. Server-side policies that tune what
+/// `/createRoom` produces when the client is silent. Client explicit
+/// `initial_state` always wins.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct RoomDefaultsSection {
+    /// `"off"` (default), `"dm_only"`, `"private_only"`, or `"all"`.
+    /// When set to anything other than `"off"`, vela injects
+    /// `m.room.encryption` (algorithm `m.megolm.v1.aes-sha2`) into
+    /// new rooms whose `/createRoom` request didn't include one.
+    /// Public rooms are never auto-encrypted regardless of policy.
+    /// Privacy-first deployments should set this to `"private_only"`.
+    encrypt_by_default: String,
+}
+
+impl Default for RoomDefaultsSection {
+    fn default() -> Self {
+        Self {
+            encrypt_by_default: "off".to_string(),
+        }
+    }
+}
+
+fn parse_encrypt_policy(s: &str) -> anyhow::Result<vela_api::router::EncryptByDefault> {
+    use vela_api::router::EncryptByDefault::*;
+    match s.trim().to_ascii_lowercase().as_str() {
+        "off" | "" => Ok(Off),
+        "dm_only" | "dm" => Ok(DmOnly),
+        "private_only" | "private" => Ok(PrivateOnly),
+        "all" => Ok(All),
+        other => anyhow::bail!(
+            "[room_defaults] encrypt_by_default: unknown {other:?} \
+             (expected off | dm_only | private_only | all)"
+        ),
+    }
+}
+
+/// `[backup]` section. Drives the in-process backup scheduler. Default
+/// is `enabled = false` — operators must opt in by setting a target.
+/// `interval` accepts the same human-readable duration syntax used in
+/// other parts of vela's config (`"24h"`, `"30m"`, `"15m"`, etc.).
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct BackupSection {
+    enabled: bool,
+    /// E.g. `"24h"`, `"6h"`. Default 24h.
+    interval: String,
+    /// `"disk:/path"` or `"s3://bucket/prefix"`.
+    target: String,
+    /// Number of most-recent backups to retain. 0 = keep forever.
+    keep: usize,
+    /// Optional S3 credentials when `target` is an `s3://` URL.
+    s3: Option<S3BackupSection>,
+}
+
+impl Default for BackupSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: "24h".to_string(),
+            target: String::new(),
+            keep: 7,
+            s3: None,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct S3BackupSection {
+    region: Option<String>,
+    endpoint: Option<String>,
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    allow_http: bool,
+}
+
+/// `[registration]` section. Controls signup admission. Default is
+/// open (`enabled = true`, no token) which is wrong for any
+/// internet-facing deploy — operators MUST flip these for production.
+/// Closed-signup deployments set `enabled = false` and either invite
+/// users out-of-band or distribute a `token`.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct RegistrationSection {
+    enabled: bool,
+    token: Option<String>,
+}
+
+impl Default for RegistrationSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            token: None,
+        }
+    }
+}
+
+/// `[media]` section. Holds the upload cap and the storage backend
+/// selection. Default backend is the local filesystem (rooted at
+/// `<database.path>/media`); S3-compatible storage is enabled by
+/// setting `backend = "s3"` and providing a `[media.s3]` block.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct MediaSection {
+    /// Human-readable size: "50MB", "1GB", "500K", or a bare byte
+    /// count ("1024"). Default 50MB.
+    max_upload_size: String,
+    /// `"fs"` (default) or `"s3"`. Determines which MediaStore impl
+    /// is wired into AppState.
+    backend: String,
+    /// S3 configuration. Only consulted when `backend = "s3"`.
+    s3: Option<S3MediaSection>,
+}
+
+impl Default for MediaSection {
+    fn default() -> Self {
+        Self {
+            max_upload_size: "50MB".to_string(),
+            backend: "fs".to_string(),
+            s3: None,
+        }
+    }
+}
+
+/// `[media.s3]` section. Mirrors `vela_store::media::S3Config`. Access
+/// keys may also be loaded from environment variables (AWS standard
+/// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) — leave the fields
+/// unset to let the SDK pick them up.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+#[derive(Default)]
+struct S3MediaSection {
+    bucket: String,
+    region: Option<String>,
+    /// Override for non-AWS S3-compatible (MinIO, Cloudflare R2,
+    /// Backblaze B2). Example: `"https://s3.eu-central-003.backblazeb2.com"`.
+    endpoint: Option<String>,
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    /// Optional key prefix; "" puts blobs at the bucket root.
+    prefix: String,
+    /// Allow plain-HTTP endpoints. Required for MinIO with a
+    /// dev-mode listener. Default false (production safety).
+    allow_http: bool,
+}
+
+#[cfg(test)]
+mod parse_encrypt_policy_tests {
+    use super::parse_encrypt_policy;
+    use vela_api::router::EncryptByDefault::*;
+
+    #[test]
+    fn known_values() {
+        assert_eq!(parse_encrypt_policy("off").unwrap(), Off);
+        assert_eq!(parse_encrypt_policy("").unwrap(), Off);
+        assert_eq!(parse_encrypt_policy("DM_ONLY").unwrap(), DmOnly);
+        assert_eq!(parse_encrypt_policy("dm").unwrap(), DmOnly);
+        assert_eq!(parse_encrypt_policy("private_only").unwrap(), PrivateOnly);
+        assert_eq!(parse_encrypt_policy("PRIVATE").unwrap(), PrivateOnly);
+        assert_eq!(parse_encrypt_policy("all").unwrap(), All);
+    }
+
+    #[test]
+    fn unknown_rejected() {
+        assert!(parse_encrypt_policy("encrypt_everything").is_err());
+        assert!(parse_encrypt_policy("yes").is_err());
+    }
+}
+
+#[cfg(test)]
+mod parse_size_tests {
+    use super::parse_size;
+
+    #[test]
+    fn bare_integer() {
+        assert_eq!(parse_size("1024").unwrap(), 1024);
+        assert_eq!(parse_size("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn k_m_g_suffixes() {
+        assert_eq!(parse_size("50MB").unwrap(), 50 * 1024 * 1024);
+        assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("500K").unwrap(), 500 * 1024);
+        assert_eq!(parse_size("2 KiB").unwrap(), 2048);
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert_eq!(parse_size("50mb").unwrap(), 50 * 1024 * 1024);
+        assert_eq!(parse_size("50Mb").unwrap(), 50 * 1024 * 1024);
+        assert_eq!(parse_size("50 GIB").unwrap(), 50u64 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn whitespace_tolerated() {
+        assert_eq!(parse_size(" 50MB ").unwrap(), 50 * 1024 * 1024);
+        assert_eq!(parse_size("50 MB").unwrap(), 50 * 1024 * 1024);
+    }
+
+    #[test]
+    fn malformed_rejected() {
+        assert!(parse_size("not_a_number").is_err());
+        assert!(parse_size("MB").is_err());
+        assert!(parse_size("").is_err());
+        assert!(parse_size("-5").is_err());
+    }
+}
+
+/// Parse a human-readable duration string ("24h", "30m", "15s",
+/// or a bare second count). Used for backup intervals.
+fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
+    let trimmed = s.trim();
+    let mult: u64 = if trimmed.ends_with('h') || trimmed.ends_with('H') {
+        3600
+    } else if trimmed.ends_with('m') || trimmed.ends_with('M') {
+        60
+    } else if trimmed.ends_with('s') || trimmed.ends_with('S') {
+        1
+    } else if trimmed.ends_with('d') || trimmed.ends_with('D') {
+        86400
+    } else {
+        1
+    };
+    let num_str = trimmed
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+        .trim();
+    let n: u64 = num_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid duration {s:?}: {e}"))?;
+    Ok(std::time::Duration::from_secs(n.saturating_mul(mult)))
+}
+
+#[cfg(test)]
+mod parse_duration_tests {
+    use super::parse_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn suffixes() {
+        assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86400));
+        assert_eq!(parse_duration("1d").unwrap(), Duration::from_secs(86400));
+        assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1800));
+        assert_eq!(parse_duration("15s").unwrap(), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn bare_integer_is_seconds() {
+        assert_eq!(parse_duration("60").unwrap(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse_duration("not_a_number").is_err());
+        assert!(parse_duration("").is_err());
+    }
+}
+
+/// Parse a human-readable size string into bytes. Accepts:
+/// - bare integer ("1024" → 1024)
+/// - K / KB / KiB suffix (1024 multiplier)
+/// - M / MB / MiB suffix (1024² multiplier)
+/// - G / GB / GiB suffix (1024³ multiplier)
+///
+/// Case-insensitive, whitespace tolerated.
+fn parse_size(s: &str) -> anyhow::Result<u64> {
+    let trimmed = s.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    let mult: u64 = if upper.ends_with("GIB") || upper.ends_with("GB") || upper.ends_with('G') {
+        1024 * 1024 * 1024
+    } else if upper.ends_with("MIB") || upper.ends_with("MB") || upper.ends_with('M') {
+        1024 * 1024
+    } else if upper.ends_with("KIB") || upper.ends_with("KB") || upper.ends_with('K') {
+        1024
+    } else {
+        1
+    };
+    let num_str = trimmed
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+        .trim();
+    let n: u64 = num_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid size string {s:?}: {e}"))?;
+    Ok(n.saturating_mul(mult))
+}
+
+/// `[rate_limit]` section. Controls the per-IP token-bucket limiter
+/// applied to abuse-prone unauthenticated POSTs (`/register`, `/login`).
+/// Default: enabled with production-safe thresholds (see
+/// `RateLimiter::defaults`). Set `enabled = false` in test or
+/// Complement deployments where many requests originate from a single
+/// IP and would cascade-fail unrelated assertions.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct RateLimitSection {
+    enabled: bool,
+}
+
+impl Default for RateLimitSection {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// `[tracing]` section. Distributed-tracing controls. Only meaningful
+/// when the `otel` feature is compiled in — in builds without it, this
+/// section is parsed but ignored.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct TracingSection {
+    /// OTLP/gRPC collector endpoint (e.g. "http://localhost:4317").
+    /// `None` (or empty string) disables export — spans still log via
+    /// the fmt layer.
+    otlp_endpoint: Option<String>,
+}
+
+/// `[federation]` section. `enabled` toggles federation in/out at
+/// the router and outbound-client level. `http_peers` carries
+/// plain-HTTP peer overrides — a map from a remote `server_name` to
+/// the base URL we should use to reach it, bypassing the normal
+/// resolve-+-HTTPS path. Intended for local dev / self-hosted
+/// clusters where two Vela instances need to talk without real TLS
+/// certs. Empty in production.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct FederationSection {
+    enabled: bool,
+    /// `"server_name" = "http://host:port"` pairs.
+    http_peers: std::collections::HashMap<String, String>,
+}
+
+impl Default for FederationSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            http_peers: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// `[user_directory]` section. Controls /user_directory/search behaviour.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct UserDirectorySection {
+    /// When false (default), search returns only users that share a room
+    /// with the caller. Set true on deployments where full-directory
+    /// search is desired.
+    search_all_users: bool,
+    /// When false (default), user_directory search does not query remote
+    /// servers — results are local-only. Privacy-first: forces full
+    /// MXID input for cross-server DMs to a stranger, no enumeration of
+    /// the federated user graph.
+    federate: bool,
+}
+
+/// `[directory]` section. Controls public-room directory exposure.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct DirectorySection {
+    /// When false (default), other servers cannot query our published
+    /// public-room directory via `/_matrix/federation/v1/publicRooms`.
+    /// Privacy-first; opt-in for community / open-server deployments.
+    allow_public_rooms_over_federation: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct ServerSection {
+    name: String,
+    bind: String,
+    port: u16,
+    /// Optional TLS listener. When present, Vela additionally serves HTTPS on
+    /// `tls.port` using the provided cert/key files. Absent → plain HTTP only
+    /// (development and unit-test default).
+    tls: Option<TlsSection>,
+    /// PEM files whose CAs to trust for OUTBOUND federation TLS, in addition
+    /// to system roots. Empty in production; used by Complement where both
+    /// servers' certs are signed by a CA mounted in the container.
+    extra_ca_certs: Vec<PathBuf>,
+}
+
+impl Default for ServerSection {
+    fn default() -> Self {
+        Self {
+            name: "localhost".to_string(),
+            bind: "0.0.0.0".to_string(),
+            port: 8008,
+            tls: None,
+            extra_ca_certs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+struct TlsSection {
+    /// HTTPS port. Matrix federation defaults to 8448.
+    port: u16,
+    /// PEM-encoded certificate file.
+    cert_file: PathBuf,
+    /// PEM-encoded private key file.
+    key_file: PathBuf,
+}
+
+impl Default for TlsSection {
+    fn default() -> Self {
+        Self {
+            port: 8448,
+            cert_file: PathBuf::from("/conf/server.tls.crt"),
+            key_file: PathBuf::from("/conf/server.tls.key"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct DatabaseSection {
+    path: String,
+}
+
+impl Default for DatabaseSection {
+    fn default() -> Self {
+        Self {
+            path: "./data".to_string(),
+        }
+    }
+}
+
+fn load_extra_ca_certs(paths: &[PathBuf]) -> anyhow::Result<Vec<reqwest::Certificate>> {
+    let mut out = Vec::new();
+    for path in paths {
+        let bytes = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("failed to read CA cert {}: {e}", path.display()))?;
+        // from_pem_bundle handles files containing one or more concatenated certs.
+        let certs = reqwest::Certificate::from_pem_bundle(&bytes)
+            .map_err(|e| anyhow::anyhow!("failed to parse CA cert {}: {e}", path.display()))?;
+        info!(path = %path.display(), count = certs.len(), "loaded extra CA cert(s)");
+        out.extend(certs);
+    }
+    Ok(out)
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // --validate-config short-circuits before any side-effects: no
+    // crypto provider install, no tracing init, no DB open, no listener
+    // bind. Print a one-line "OK" plus the parsed summary, exit 0. If
+    // validation fails, the anyhow error bubbles up and clap/anyhow
+    // print the message and exit non-zero — exactly what an ops script
+    // wants for pre-flight.
+    if cli.validate_config {
+        let config = load_config(&cli.config);
+        validate_config(&config)?;
+        // Also exercise the field-level parsers (size, duration,
+        // retention lifetime). These are the ones operators most often
+        // typo and the cheapest to surface here.
+        validate_runtime_parsable(&config)?;
+        print_config_summary(&cli.config, &config);
+        return Ok(());
+    }
+
+    // rustls 0.23 requires the process-level crypto provider to be explicitly
+    // installed before any TLS operation. We use aws-lc-rs (also what reqwest
+    // pulls via `rustls-tls`). This is a no-op if already set (e.g. tests).
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    // Load config: file -> env vars (VELA_ prefix)
+    let config = load_config(&cli.config);
+
+    // Initialize tracing — fmt layer + (optionally) an OTLP exporter
+    // when the `otel` feature is enabled and a collector endpoint is
+    // configured. The returned guard, if any, MUST live until shutdown
+    // so in-flight spans flush.
+    let _otel_guard = init_tracing(&config.tracing);
+
+    // Validate config at startup — fail loudly with a human-readable
+    // message now rather than letting a malformed setting surface as
+    // an opaque runtime error later.
+    validate_config(&config)?;
+
+    info!(server_name = %config.server.name, "starting vela");
+
+    // Install a metrics recorder if one's enabled at compile time.
+    // Feature-gated so alternate deployments can `--no-default-features`
+    // and bring their own exporter.
+    let metrics_renderer = install_metrics_recorder();
+
+    // Build tokio runtime
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(async move {
+        // Open database
+        let db_path = PathBuf::from(&config.database.path);
+        let db = Database::open(&db_path)
+            .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
+
+        info!(path = %config.database.path, "database opened");
+
+        // Initialize media store. Filesystem is the single-pod default;
+        // S3 (or any S3-compatible: MinIO, Cloudflare R2, B2) is for
+        // multi-pod deploys and off-host blob durability.
+        let media_store: Arc<dyn vela_store::media::MediaStore> = match config
+            .media
+            .backend
+            .as_str()
+        {
+            "fs" => {
+                let media_path = PathBuf::from(&config.database.path).join("media");
+                Arc::new(
+                    vela_store::media::FilesystemMediaStore::new(&media_path)
+                        .map_err(|e| anyhow::anyhow!("failed to initialize fs media store: {e}"))?,
+                )
+            }
+            "s3" => {
+                let s3 = config.media.s3.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("[media] backend = \"s3\" requires a [media.s3] block")
+                })?;
+                if s3.bucket.is_empty() {
+                    anyhow::bail!("[media.s3] bucket must be set");
+                }
+                let store_cfg = vela_store::media::S3Config {
+                    bucket: s3.bucket.clone(),
+                    region: s3.region.clone(),
+                    endpoint: s3.endpoint.clone(),
+                    access_key_id: s3.access_key_id.clone(),
+                    secret_access_key: s3.secret_access_key.clone(),
+                    prefix: s3.prefix.clone(),
+                    allow_http: s3.allow_http,
+                };
+                Arc::new(
+                    vela_store::media::S3MediaStore::new(&store_cfg)
+                        .map_err(|e| anyhow::anyhow!("failed to init S3 media store: {e}"))?,
+                )
+            }
+            other => anyhow::bail!("unknown [media] backend {other:?}: must be \"fs\" or \"s3\""),
+        };
+        info!(backend = %config.media.backend, "media store initialised");
+
+        // Load or generate server signing key
+        let signing_key = match db
+            .load_signing_key()
+            .map_err(|e| anyhow::anyhow!("failed to load signing key: {e}"))?
+        {
+            Some((key_id, secret)) => {
+                info!(key_id = %key_id, "loaded existing signing key");
+                ServerSigningKey::from_bytes(key_id, &secret)
+            }
+            None => {
+                let key = ServerSigningKey::generate();
+                db.store_signing_key(key.key_id(), key.secret_bytes())
+                    .map_err(|e| anyhow::anyhow!("failed to store signing key: {e}"))?;
+                info!(key_id = %key.key_id(), "generated new signing key");
+                key
+            }
+        };
+
+        let signing_key = Arc::new(signing_key);
+        let db = Arc::new(db);
+
+        let resolver = Arc::new(
+            FederationResolver::new()
+                .map_err(|e| anyhow::anyhow!("failed to init DNS resolver: {e}"))?,
+        );
+        let extra_ca_certs = load_extra_ca_certs(&config.server.extra_ca_certs)?;
+        let federation_client = Arc::new(FederationClient::new_with_enabled(
+            signing_key.clone(),
+            config.server.name.clone(),
+            resolver,
+            extra_ca_certs,
+            config.federation.enabled,
+        ));
+        // Plain-HTTP peer overrides: bypasses the resolve-+-HTTPS path for
+        // configured server_names. Used by local dev / self-hosted clusters
+        // where real TLS certs aren't practical. Empty in production.
+        for (peer, url) in &config.federation.http_peers {
+            federation_client.set_base_url_override(peer, url);
+        }
+        if !config.federation.http_peers.is_empty() {
+            tracing::info!(
+                peers = ?config.federation.http_peers.keys().collect::<Vec<_>>(),
+                "federation: plain-HTTP peer overrides installed"
+            );
+        }
+        let remote_keys = Arc::new(RemoteKeyCache::new(
+            db.clone(),
+            (*federation_client).clone(),
+        ));
+        let typing_stream =
+            vela_api::edu::typing::TypingStream::new(db.clone(), config.server.name.clone());
+        let edu_streams: vela_api::edu::EduStreams = vec![
+            vela_api::edu::receipts::ReceiptStream::new(config.server.name.clone()),
+            vela_api::edu::presence::PresenceStream::new(config.server.name.clone()),
+            vela_api::edu::to_device::ToDeviceStream::new(),
+            vela_api::edu::device_list::DeviceListStream::new(),
+            typing_stream.clone(),
+        ];
+        let federation_sender = Arc::new(FederationSender::new_with_enabled(
+            db.clone(),
+            federation_client.clone(),
+            config.server.name.clone(),
+            edu_streams,
+            config.federation.enabled,
+        ));
+
+        let state = AppState {
+            db: db.clone(),
+            config: Arc::new(ServerConfig {
+                server_name: config.server.name.clone(),
+                bind_host: config.server.bind.clone(),
+                bind_port: config.server.port,
+                search_all_users: config.user_directory.search_all_users,
+                federation_enabled: config.federation.enabled,
+                registration_enabled: config.registration.enabled,
+                registration_token: config.registration.token.clone(),
+                max_upload_size: parse_size(&config.media.max_upload_size)?,
+                encrypt_by_default: parse_encrypt_policy(&config.room_defaults.encrypt_by_default)?,
+                allow_public_rooms_over_federation: config
+                    .directory
+                    .allow_public_rooms_over_federation,
+                user_directory_federate: config.user_directory.federate,
+            }),
+            room_locks: Arc::new(DashMap::new()),
+            user_locks: Arc::new(DashMap::new()),
+            room_senders: Arc::new(DashMap::new()),
+            typing_state: Arc::new(DashMap::new()),
+            typing_stream,
+            media_store: media_store.clone(),
+            signing_key,
+            remote_keys,
+            federation_sender,
+            federation_client,
+            uia_sessions: vela_api::uia::new_sessions(),
+            user_senders: Arc::new(DashMap::new()),
+            metrics_renderer: metrics_renderer.clone(),
+            rate_limiter: if config.rate_limit.enabled {
+                vela_api::rate_limit::RateLimiter::defaults()
+            } else {
+                info!("rate_limit: disabled by config");
+                vela_api::rate_limit::RateLimiter::disabled()
+            },
+            // Captured before listeners bind so the /_health endpoint
+            // reports "process up since" rather than "first request
+            // received at." Both fields share the same instant.
+            started_at: Arc::new(Instant::now()),
+            started_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        };
+
+        let app = vela_api::router::build_router(state);
+
+        // Periodic backup task. No-op when [backup] enabled = false.
+        // The handle is intentionally dropped: we don't need a clean
+        // shutdown for the backup loop — if a backup is mid-upload
+        // when SIGTERM arrives, the in-progress one is abandoned and
+        // the next process picks up at the next interval. No harm
+        // beyond a single missed cycle.
+        if config.backup.enabled {
+            let backup_cfg = backup::BackupConfig {
+                enabled: true,
+                interval: parse_duration(&config.backup.interval)?,
+                target: config.backup.target.clone(),
+                keep: config.backup.keep,
+                s3: config.backup.s3.as_ref().map(|s| backup::S3BackupConfig {
+                    region: s.region.clone(),
+                    endpoint: s.endpoint.clone(),
+                    access_key_id: s.access_key_id.clone(),
+                    secret_access_key: s.secret_access_key.clone(),
+                    allow_http: s.allow_http,
+                }),
+            };
+            let _backup_handle = backup::spawn_backup_task(db.clone(), backup_cfg);
+        }
+
+        // Retention sweeper. Same shape as the backup task: in-process
+        // tokio loop, interval-driven, off by default.
+        if config.retention.enabled {
+            let retention_cfg = retention::RetentionConfig {
+                enabled: true,
+                interval: parse_duration(&config.retention.interval)?,
+                local_media_lifetime: retention::parse_lifetime(
+                    &config.retention.media.local_lifetime,
+                )?,
+                remote_media_lifetime: retention::parse_lifetime(
+                    &config.retention.media.remote_lifetime,
+                )?,
+                server_name: config.server.name.clone(),
+            };
+            let _retention_handle =
+                retention::spawn_retention_task(db.clone(), media_store.clone(), retention_cfg);
+        }
+
+        // Plain HTTP listener (CS-API, and federation fallback when TLS is disabled)
+        let http_addr: SocketAddr = format!("{}:{}", config.server.bind, config.server.port)
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid bind address: {e}"))?;
+        let http_listener = tokio::net::TcpListener::bind(&http_addr).await?;
+        info!(addr = %http_addr, "listening plain HTTP");
+
+        // Optional TLS listener (federation — spec-required). Holds an
+        // `axum_server::Handle` so we can ask it to drain in-flight
+        // connections on signal.
+        let (tls_handle, tls_task) = if let Some(tls_cfg) = &config.server.tls {
+            let tls_addr: SocketAddr =
+                format!("{}:{}", config.server.bind, tls_cfg.port)
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid TLS bind address: {e}"))?;
+            info!(
+                addr = %tls_addr,
+                cert = ?tls_cfg.cert_file,
+                "listening HTTPS"
+            );
+            let rustls_cfg = RustlsConfig::from_pem_file(&tls_cfg.cert_file, &tls_cfg.key_file)
+                .await
+                .map_err(|e| anyhow::anyhow!("TLS cert/key load failed: {e}"))?;
+            let handle = axum_server::Handle::new();
+            let app_tls = app.clone();
+            let handle_for_task = handle.clone();
+            let task = tokio::spawn(async move {
+                axum_server::bind_rustls(tls_addr, rustls_cfg)
+                    .handle(handle_for_task)
+                    .serve(app_tls.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+            });
+            (Some(handle), Some(task))
+        } else {
+            (None, None)
+        };
+
+        // axum's `with_graceful_shutdown` takes a future that resolves
+        // when shutdown should start. We wait for the signal here, then
+        // also tell the TLS server to drain (its own future is bound to
+        // an internal channel, not ours).
+        let tls_handle_for_signal = tls_handle.clone();
+        let http_done = axum::serve(
+            http_listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            if let Some(h) = tls_handle_for_signal {
+                h.graceful_shutdown(Some(Duration::from_secs(30)));
+            }
+        });
+
+        http_done.await?;
+
+        if let Some(task) = tls_task {
+            // graceful_shutdown was already requested above. Await with
+            // a hard cap so a stuck connection can't keep us up forever.
+            let _ = tokio::time::timeout(Duration::from_secs(35), task).await;
+        }
+
+        info!("shutdown complete");
+        Ok::<(), anyhow::Error>(())
+    })
+}
+
+/// Wait for either SIGINT (Ctrl+C, dev) or SIGTERM (Docker / k8s /
+/// systemd, production). Both are graceful-stop signals; we treat them
+/// identically. SIGKILL bypasses this entirely — the OS terminates the
+/// process and RocksDB recovers from its WAL on next start.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => info!("received SIGINT, shutting down"),
+        _ = term.recv() => info!("received SIGTERM, shutting down"),
+    }
+}
+
+/// Install the compile-time-selected metrics exporter, if any. Returns
+/// the renderer closure the `/_vela/metrics` HTTP handler will call.
+/// `None` means "no exporter compiled in"; `/_vela/metrics` will return
+/// 503 and `metrics::` macros across the codebase stay no-ops.
+/// Stand-in for the OTLP shutdown handle when the feature isn't
+/// compiled in. Holding a value of this type is a no-op; the binding
+/// in `main` exists only so the code paths look identical with and
+/// without `--features otel`.
+#[cfg(not(feature = "otel"))]
+struct OtelGuard;
+
+/// Initialise the global tracing subscriber. Always wires the `fmt`
+/// layer (matching today's stderr-formatted output). When the `otel`
+/// feature is enabled AND `[tracing] otlp_endpoint` is set, also
+/// bridges spans into an OpenTelemetry tracer that exports via OTLP
+/// over gRPC. Returns a guard whose Drop flushes pending spans — bind
+/// it in `main` for the program lifetime, drop on shutdown.
+#[cfg(feature = "otel")]
+fn init_tracing(cfg: &TracingSection) -> Option<OtelShutdownGuard> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,vela=debug".parse().unwrap());
+    let fmt_layer = tracing_subscriber::fmt::layer();
+
+    let endpoint = cfg
+        .otlp_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let Some(endpoint) = endpoint else {
+        // otel compiled in but operator didn't set an endpoint —
+        // fall back to fmt-only.
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .init();
+        info!("tracing: otel feature on, no otlp_endpoint configured (fmt only)");
+        return None;
+    };
+
+    use opentelemetry_otlp::WithExportConfig;
+
+    // Install the W3C trace-context propagator globally so vela-api's
+    // inject/extract helpers (used in signed_request and the federation
+    // auth middleware) round-trip the `traceparent` header.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()
+        .expect("OTLP exporter builds");
+    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+        .with_resource(opentelemetry_sdk::Resource::new(vec![
+            opentelemetry::KeyValue::new("service.name", "vela"),
+        ]))
+        .build();
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "vela");
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
+        .with(otel_layer)
+        .init();
+    info!(%endpoint, "tracing: OTLP exporter installed");
+
+    Some(OtelShutdownGuard { provider })
+}
+
+#[cfg(not(feature = "otel"))]
+fn init_tracing(_cfg: &TracingSection) -> Option<OtelGuard> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,vela=debug".parse().unwrap()),
+        )
+        .init();
+    None
+}
+
+/// Held in `main` while the program runs; on Drop, flushes the OTLP
+/// batch exporter so spans queued at shutdown make it to the
+/// collector.
+#[cfg(feature = "otel")]
+struct OtelShutdownGuard {
+    provider: opentelemetry_sdk::trace::TracerProvider,
+}
+
+#[cfg(feature = "otel")]
+impl Drop for OtelShutdownGuard {
+    fn drop(&mut self) {
+        // Best-effort: shutdown returns Result but there's nothing
+        // useful we can do about a flush failure on process exit.
+        let _ = self.provider.shutdown();
+    }
+}
+
+#[cfg(feature = "prometheus")]
+fn install_metrics_recorder() -> Option<vela_api::metrics::MetricsRenderer> {
+    use std::sync::Arc;
+    let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("prometheus recorder installed");
+    info!("metrics: prometheus recorder installed");
+    Some(Arc::new(move || handle.render()))
+}
+
+#[cfg(not(feature = "prometheus"))]
+fn install_metrics_recorder() -> Option<vela_api::metrics::MetricsRenderer> {
+    info!("metrics: no exporter compiled in (use --features prometheus to enable)");
+    None
+}
+
+/// Load the TOML config file plus `VELA_` environment overrides. A
+/// missing or malformed file produces `Config::default()` — same
+/// behaviour the binary has had since day one. Extracted so
+/// `--validate-config` can call it without copy-pasting the figment
+/// chain.
+fn load_config(path: &std::path::Path) -> Config {
+    Figment::new()
+        .merge(Toml::file(path))
+        .merge(Env::prefixed("VELA_").split("_"))
+        .extract()
+        .unwrap_or_default()
+}
+
+/// Run the field-level parsers (size, duration, retention lifetime)
+/// against the parsed config so syntax errors get caught at validation
+/// time rather than at startup. `validate_config` only checks
+/// inter-field invariants; this function exercises the parsers we use
+/// later in `main` so a bad `"50MBz"` or `"24hh"` is surfaced now.
+fn validate_runtime_parsable(config: &Config) -> anyhow::Result<()> {
+    parse_size(&config.media.max_upload_size)
+        .map_err(|e| anyhow::anyhow!("[media] max_upload_size: {e}"))?;
+    if config.backup.enabled {
+        parse_duration(&config.backup.interval)
+            .map_err(|e| anyhow::anyhow!("[backup] interval: {e}"))?;
+    }
+    if config.retention.enabled {
+        parse_duration(&config.retention.interval)
+            .map_err(|e| anyhow::anyhow!("[retention] interval: {e}"))?;
+        retention::parse_lifetime(&config.retention.media.local_lifetime)
+            .map_err(|e| anyhow::anyhow!("[retention.media] local_lifetime: {e}"))?;
+        retention::parse_lifetime(&config.retention.media.remote_lifetime)
+            .map_err(|e| anyhow::anyhow!("[retention.media] remote_lifetime: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Operator-facing summary printed when `--validate-config` succeeds.
+/// Stays small and stable so ops scripts can grep it. We deliberately
+/// don't print secrets (registration token, S3 keys) — the field is
+/// either present or absent, not its value.
+fn print_config_summary(path: &std::path::Path, config: &Config) {
+    println!("config OK: {}", path.display());
+    println!("  server.name             = {}", config.server.name);
+    println!(
+        "  server.bind             = {}:{}",
+        config.server.bind, config.server.port
+    );
+    if let Some(tls) = &config.server.tls {
+        println!(
+            "  server.tls              = port {} cert {}",
+            tls.port,
+            tls.cert_file.display()
+        );
+    } else {
+        println!("  server.tls              = disabled");
+    }
+    println!("  database.path           = {}", config.database.path);
+    println!("  federation.enabled      = {}", config.federation.enabled);
+    println!(
+        "  registration.enabled    = {} (token: {})",
+        config.registration.enabled,
+        if config.registration.token.is_some() {
+            "set"
+        } else {
+            "unset"
+        }
+    );
+    println!("  media.backend           = {}", config.media.backend);
+    println!(
+        "  media.max_upload_size   = {} ({} bytes)",
+        config.media.max_upload_size,
+        parse_size(&config.media.max_upload_size).unwrap_or(0)
+    );
+    println!("  backup.enabled          = {}", config.backup.enabled);
+    println!("  retention.enabled       = {}", config.retention.enabled);
+    println!("  rate_limit.enabled      = {}", config.rate_limit.enabled);
+}
+
+/// Validate config before we touch the database. Failures here return
+/// early with a human-readable error so operators see the problem in
+/// systemd/journalctl without having to grep stack traces. Only checks
+/// things we can cheaply verify up front — the DB open itself catches
+/// permission / path errors.
+fn validate_config(config: &Config) -> anyhow::Result<()> {
+    // server.name: non-empty, no whitespace. Matrix's formal grammar
+    // is stricter but we don't need to re-implement it here — this
+    // catches the common fat-finger cases.
+    let name = &config.server.name;
+    if name.is_empty() {
+        anyhow::bail!("config: [server] name must be set");
+    }
+    if name.chars().any(|c| c.is_whitespace()) {
+        anyhow::bail!("config: [server] name contains whitespace: {name:?}");
+    }
+    // TLS: if declared, cert and key files must actually exist on
+    // disk. Loading them happens later under tokio; early-fail gives a
+    // clearer signal.
+    if let Some(tls) = &config.server.tls {
+        if !tls.cert_file.exists() {
+            anyhow::bail!(
+                "config: [server.tls] cert_file does not exist: {}",
+                tls.cert_file.display()
+            );
+        }
+        if !tls.key_file.exists() {
+            anyhow::bail!(
+                "config: [server.tls] key_file does not exist: {}",
+                tls.key_file.display()
+            );
+        }
+    }
+    // Extra CA certs: same early-existence check, same reasoning.
+    for path in &config.server.extra_ca_certs {
+        if !path.exists() {
+            anyhow::bail!(
+                "config: [server] extra_ca_certs entry does not exist: {}",
+                path.display()
+            );
+        }
+    }
+    // Federation http_peers: each URL must parse as http(s)://. This
+    // is a config-level typo catcher; the actual request will still
+    // fail loudly at federation time if the remote is unreachable.
+    for (peer, url) in &config.federation.http_peers {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            anyhow::bail!(
+                "config: [federation] http_peers[{peer}] must start with http:// or https:// (got {url:?})"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod validate_config_tests {
+    use super::*;
+
+    /// `validate_runtime_parsable` accepts a default config (the same
+    /// shape `Config::default()` produces — `"50MB"`, `"24h"`, etc.).
+    /// This is the smoke-test path `vela --validate-config` exercises
+    /// against a freshly-stamped TOML.
+    #[test]
+    fn default_config_passes_runtime_parsers() {
+        let cfg = Config::default();
+        validate_runtime_parsable(&cfg).expect("default must parse");
+    }
+
+    /// A garbage `max_upload_size` is the canonical "operator typo"
+    /// case — it's parsed cheaply but only at startup, not at TOML
+    /// parse time. `--validate-config` should surface it now, with a
+    /// human-readable error pointing at the field.
+    #[test]
+    fn rejects_malformed_max_upload_size() {
+        let mut cfg = Config::default();
+        cfg.media.max_upload_size = "not-a-size".to_string();
+        let err = validate_runtime_parsable(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("max_upload_size"),
+            "error should name the offending field: {err}"
+        );
+    }
+
+    /// Retention parsers are skipped when `retention.enabled = false`
+    /// (consistent with how `main` only calls them under the same
+    /// gate). A malformed lifetime in a disabled section is fine: an
+    /// operator who flips the gate on later will see the error then.
+    #[test]
+    fn skips_disabled_retention_parsers() {
+        let mut cfg = Config::default();
+        cfg.retention.enabled = false;
+        cfg.retention.media.local_lifetime = "garbage".to_string();
+        validate_runtime_parsable(&cfg).expect("disabled retention shouldn't parse lifetimes");
+    }
+
+    /// Conversely, a malformed lifetime IS caught when retention is
+    /// enabled. Mirrors the gate `main` uses to actually call the
+    /// parsers.
+    #[test]
+    fn rejects_malformed_lifetime_when_retention_enabled() {
+        let mut cfg = Config::default();
+        cfg.retention.enabled = true;
+        cfg.retention.media.local_lifetime = "garbage".to_string();
+        let err = validate_runtime_parsable(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("local_lifetime"),
+            "error should name the offending field: {err}"
+        );
+    }
+
+    /// `validate_config` is the inter-field invariant check. Empty
+    /// server.name is the canonical fat-finger that `Config::default()`
+    /// avoids but a stripped-down operator TOML can hit.
+    #[test]
+    fn validate_config_rejects_empty_server_name() {
+        let mut cfg = Config::default();
+        cfg.server.name = String::new();
+        assert!(validate_config(&cfg).is_err());
+    }
+}

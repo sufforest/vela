@@ -1,0 +1,26 @@
+services:
+  vela:
+    build:
+      context: ../../..
+    command: ["--config", "/conf/vela.toml"]
+    volumes:
+      - ./vela.toml:/conf/vela.toml:ro
+      - vela_data:/data
+    ports:
+      - "127.0.0.1:8008:8008"
+    restart: unless-stopped
+    environment:
+      RUST_LOG: "info,vela_api=debug,tower_http=debug"
+
+  element:
+    image: vectorim/element-web:latest
+    depends_on:
+      - vela
+    volumes:
+      - ./element-config.json:/app/config.json:ro
+    ports:
+      - "127.0.0.1:8009:80"
+    restart: unless-stopped
+
+volumes:
+  vela_data:

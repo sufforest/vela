@@ -1,0 +1,19 @@
+[package]
+name = "vela-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Vela's Matrix protocol primitives: events, state resolution, auth rules, federation crypto."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
