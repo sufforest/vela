@@ -364,9 +364,12 @@ fn err(code: StatusCode, errcode: &str, msg: &str) -> (StatusCode, Json<Value>) 
 }
 
 fn db_err<E: std::fmt::Display>(e: E) -> (StatusCode, Json<Value>) {
+    // Log the underlying error operator-side; respond generically to the
+    // federating peer so DB internals don't leak.
+    tracing::error!(error = %e, "federation leave: db error");
     err(
         StatusCode::INTERNAL_SERVER_ERROR,
         "M_UNKNOWN",
-        &format!("db: {e}"),
+        "internal error",
     )
 }

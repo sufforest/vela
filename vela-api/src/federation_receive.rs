@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use serde_json::{Map, Value};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use vela_core::auth_rules::{AuthError, check_auth};
 use vela_core::canonical::canonical_json_object;
@@ -135,7 +135,10 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
             return (pdu.event_id, PduOutcome::Rejected("unknown room".into()));
         }
         Err(e) => {
-            return (pdu.event_id, PduOutcome::Rejected(format!("db error: {e}")));
+            // Log the actual error operator-side; don't leak DB internals
+            // to the federating peer.
+            error!(event_id = %pdu.event_id, error = %e, "db error resolving room_id");
+            return (pdu.event_id, PduOutcome::Rejected("internal error".into()));
         }
     };
 
@@ -358,7 +361,17 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
             );
         }
         Err(reason) => {
-            return (effective_pdu.event_id.clone(), PduOutcome::Rejected(reason));
+            // Log the detailed reason (may include internal DB error text or
+            // NID values) operator-side; don't ship it to the federating peer.
+            error!(
+                event_id = %effective_pdu.event_id,
+                error = %reason,
+                "state-at-event resolution failed"
+            );
+            return (
+                effective_pdu.event_id.clone(),
+                PduOutcome::Rejected("state-at-event resolution failed".into()),
+            );
         }
     }
 
@@ -366,9 +379,14 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
     let current_state = match build_current_state(state, room_nid) {
         Ok(s) => s,
         Err(e) => {
+            error!(
+                event_id = %effective_pdu.event_id,
+                error = %e,
+                "db error reading current state"
+            );
             return (
                 effective_pdu.event_id.clone(),
-                PduOutcome::Rejected(format!("db error reading current state: {e}")),
+                PduOutcome::Rejected("internal error".into()),
             );
         }
     };
