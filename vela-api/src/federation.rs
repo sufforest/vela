@@ -381,4 +381,106 @@ mod tests {
         let parsed = parse_x_matrix_auth(h).unwrap();
         assert!(parsed.destination.is_none());
     }
+
+    // --- Adversarial inputs ----------------------------------------------
+    //
+    // Federation peers can send any bytes they want in the Authorization
+    // header. The parser must reject malformed input deterministically
+    // without panicking, looping, or allocating unbounded memory.
+
+    #[test]
+    fn parse_empty_input() {
+        assert!(parse_x_matrix_auth("").is_none());
+    }
+
+    #[test]
+    fn parse_only_scheme() {
+        assert!(parse_x_matrix_auth("X-Matrix").is_none());
+        assert!(parse_x_matrix_auth("X-Matrix ").is_none());
+    }
+
+    #[test]
+    fn parse_unterminated_quoted_value() {
+        // Missing closing quote — must not loop or panic.
+        let h = r#"X-Matrix origin="o.com,key="ed25519:x",sig="S""#;
+        assert!(parse_x_matrix_auth(h).is_none());
+    }
+
+    #[test]
+    fn parse_trailing_backslash_in_quoted_value() {
+        // Backslash with nothing after — escape escape consumes nothing.
+        let h = r#"X-Matrix origin="o.com",key="ed25519:x",sig="S\"#;
+        let _ = parse_x_matrix_auth(h);
+        // Must not panic. Whether it succeeds or fails is an
+        // implementation detail; we only assert it terminates.
+    }
+
+    #[test]
+    fn parse_value_with_null_byte() {
+        // Null byte inside a value — must not crash.
+        let h = "X-Matrix origin=\"o.com\",key=\"ed25519:x\",sig=\"\0SIG\"";
+        let _ = parse_x_matrix_auth(h);
+    }
+
+    #[test]
+    fn parse_extremely_long_input() {
+        // 1 MiB of `a=b,` repeated — should terminate without panicking
+        // or eating huge memory. Whether it parses successfully is fine
+        // either way; we only care it terminates.
+        let big = "a=b,".repeat(250_000);
+        let h = format!("X-Matrix {big}origin=\"o.com\",key=\"ed25519:x\",sig=\"S\"");
+        let _ = parse_x_matrix_auth(&h);
+    }
+
+    #[test]
+    fn parse_value_with_internal_equals() {
+        // Quoted value containing `=` — should be accepted as part of the
+        // value (e.g. base64-encoded sig with padding).
+        let h = r#"X-Matrix origin="o.com",key="ed25519:x",sig="abcd==""#;
+        let parsed = parse_x_matrix_auth(h).unwrap();
+        assert_eq!(parsed.sig, "abcd==");
+    }
+
+    #[test]
+    fn parse_only_commas() {
+        // Pathological: just commas. Must not loop.
+        assert!(parse_x_matrix_auth("X-Matrix ,,,,,,,,").is_none());
+    }
+
+    #[test]
+    fn parse_param_without_equals() {
+        // No `=` separator between name and value.
+        assert!(parse_x_matrix_auth("X-Matrix origin").is_none());
+    }
+
+    #[test]
+    fn parse_lots_of_unknown_params() {
+        // 1000 unknown params — should still find the required ones.
+        let mut h = String::from("X-Matrix ");
+        for i in 0..1000 {
+            h.push_str(&format!("p{i}=\"v\","));
+        }
+        h.push_str(r#"origin="o.com",key="ed25519:x",sig="S""#);
+        let parsed = parse_x_matrix_auth(&h).unwrap();
+        assert_eq!(parsed.origin, "o.com");
+    }
+
+    #[test]
+    fn parse_unicode_in_values() {
+        // Non-ASCII bytes in a quoted value. Spec doesn't say either way
+        // explicitly; we accept since the values just get fed back to the
+        // signature verifier which will reject mismatches.
+        let h = "X-Matrix origin=\"o.com\",key=\"ed25519:x\",sig=\"sig with 🎉\"";
+        let parsed = parse_x_matrix_auth(h).unwrap();
+        assert!(parsed.sig.contains("🎉"));
+    }
+
+    #[test]
+    fn parse_repeated_required_param() {
+        // Two `origin=` entries — last one wins (no spec guidance, just
+        // must terminate deterministically).
+        let h = r#"X-Matrix origin="first.com",origin="second.com",key="ed25519:x",sig="S""#;
+        let parsed = parse_x_matrix_auth(h).unwrap();
+        assert_eq!(parsed.origin, "second.com");
+    }
 }
