@@ -167,7 +167,7 @@ pub async fn sliding_sync(
                 membership: "join".to_string(),
             });
         }
-        room_infos.sort_by(|a, b| b.bump_ts.cmp(&a.bump_ts));
+        room_infos.sort_by_key(|r| std::cmp::Reverse(r.bump_ts));
 
         let mut lists_response: Map<String, Value> = Map::new();
         let mut rooms_response: Map<String, Value> = Map::new();

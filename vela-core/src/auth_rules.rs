@@ -698,21 +698,17 @@ fn check_power_levels(event: &Pdu, state: StateFn<'_>, create: &Pdu) -> AuthResu
         for (k, cur_val) in current_map.iter() {
             let cur = as_i64_loose(cur_val).unwrap_or(0);
             match new_map.get(k) {
-                None => {
-                    // removed
-                    if cur > sender_power {
-                        return Err(AuthError::reject(format!(
-                            "power_levels.{field}.{k} removed, current {cur} > sender power {sender_power}"
-                        )));
-                    }
+                // removed
+                None if cur > sender_power => {
+                    return Err(AuthError::reject(format!(
+                        "power_levels.{field}.{k} removed, current {cur} > sender power {sender_power}"
+                    )));
                 }
-                Some(new_val) if new_val != cur_val => {
-                    // changed
-                    if cur > sender_power {
-                        return Err(AuthError::reject(format!(
-                            "power_levels.{field}.{k} changed, current {cur} > sender power {sender_power}"
-                        )));
-                    }
+                // changed
+                Some(new_val) if new_val != cur_val && cur > sender_power => {
+                    return Err(AuthError::reject(format!(
+                        "power_levels.{field}.{k} changed, current {cur} > sender power {sender_power}"
+                    )));
                 }
                 _ => {}
             }
@@ -721,21 +717,17 @@ fn check_power_levels(event: &Pdu, state: StateFn<'_>, create: &Pdu) -> AuthResu
         for (k, new_val) in new_map.iter() {
             let new_i = as_i64_loose(new_val).unwrap_or(0);
             match current_map.get(k) {
-                None => {
-                    // added
-                    if new_i > sender_power {
-                        return Err(AuthError::reject(format!(
-                            "power_levels.{field}.{k} added, new {new_i} > sender power {sender_power}"
-                        )));
-                    }
+                // added
+                None if new_i > sender_power => {
+                    return Err(AuthError::reject(format!(
+                        "power_levels.{field}.{k} added, new {new_i} > sender power {sender_power}"
+                    )));
                 }
-                Some(cur_val) if cur_val != new_val => {
-                    // changed
-                    if new_i > sender_power {
-                        return Err(AuthError::reject(format!(
-                            "power_levels.{field}.{k} changed, new {new_i} > sender power {sender_power}"
-                        )));
-                    }
+                // changed
+                Some(cur_val) if cur_val != new_val && new_i > sender_power => {
+                    return Err(AuthError::reject(format!(
+                        "power_levels.{field}.{k} changed, new {new_i} > sender power {sender_power}"
+                    )));
                 }
                 _ => {}
             }
@@ -790,21 +782,17 @@ fn check_power_levels(event: &Pdu, state: StateFn<'_>, create: &Pdu) -> AuthResu
     for (user, new_val) in new_users.iter() {
         let new_i = as_i64_loose(new_val).unwrap_or(0);
         match current_users.get(user) {
-            None => {
-                // added
-                if new_i > sender_power {
-                    return Err(AuthError::reject(format!(
-                        "power_levels.users.{user} added, new {new_i} > sender power {sender_power}"
-                    )));
-                }
+            // added
+            None if new_i > sender_power => {
+                return Err(AuthError::reject(format!(
+                    "power_levels.users.{user} added, new {new_i} > sender power {sender_power}"
+                )));
             }
-            Some(cur_val) if cur_val != new_val => {
-                // changed
-                if new_i > sender_power {
-                    return Err(AuthError::reject(format!(
-                        "power_levels.users.{user} changed, new {new_i} > sender power {sender_power}"
-                    )));
-                }
+            // changed
+            Some(cur_val) if cur_val != new_val && new_i > sender_power => {
+                return Err(AuthError::reject(format!(
+                    "power_levels.users.{user} changed, new {new_i} > sender power {sender_power}"
+                )));
             }
             _ => {}
         }
