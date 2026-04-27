@@ -52,22 +52,23 @@ jobs:
   msrv:
     # Verifies the project still compiles under the declared minimum
     # supported Rust version (rust-version in Cargo.toml). Drift here is
-    # silent without this job.
-    name: cargo check (MSRV 1.85)
+    # silent without this job. Uses `cargo build` (not `check`) so codegen
+    # errors surface, not just type errors.
+    name: cargo build (MSRV 1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.85
-        uses: dtolnay/rust-toolchain@1.85
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-msrv
 
-      - name: cargo check --workspace --all-targets
-        run: cargo check --workspace --all-targets --locked
+      - name: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --locked
 
   lint:
     name: cargo clippy + rustfmt
