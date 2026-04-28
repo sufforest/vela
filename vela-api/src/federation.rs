@@ -60,6 +60,36 @@ pub async fn get_server_keys(State(state): State<AppState>) -> Json<Value> {
     Json(Value::Object(response))
 }
 
+/// GET /_matrix/federation/v1/version
+///
+/// Unauthenticated. Reports the implementation name + version so peers
+/// can log deployment heterogeneity.
+pub async fn version() -> Json<Value> {
+    Json(json!({
+        "server": {
+            "name": "vela",
+            "version": env!("CARGO_PKG_VERSION"),
+        }
+    }))
+}
+
+/// GET /_matrix/key/v2/query/{serverName}
+///
+/// Notary single-server key query. vela doesn't act as a notary —
+/// returns an empty `server_keys` array so peers know the route
+/// exists but get no notarised data.
+pub async fn query_keys_single() -> Json<Value> {
+    Json(json!({ "server_keys": [] }))
+}
+
+/// POST /_matrix/key/v2/query
+///
+/// Notary batch key query. Same stance as the single variant — empty
+/// results, well-formed shape.
+pub async fn query_keys_batch() -> Json<Value> {
+    Json(json!({ "server_keys": [] }))
+}
+
 /// Parsed X-Matrix Authorization header parameters.
 #[derive(Debug)]
 pub struct XMatrixAuth {
