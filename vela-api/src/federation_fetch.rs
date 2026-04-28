@@ -133,12 +133,25 @@ pub async fn get_state_ids(
 /// GET /_matrix/federation/v1/event_auth/{roomId}/{eventId}
 pub async fn get_event_auth(
     State(state): State<AppState>,
-    Path((_room_id, event_id)): Path<(String, String)>,
+    Path((room_id, event_id)): Path<(String, String)>,
     axum::extract::Extension(origin): axum::extract::Extension<XMatrixOrigin>,
 ) -> Result<Json<Value>, StatusCode> {
     debug!(%event_id, origin = %origin.0, "federation /event_auth request");
 
-    let chain = auth_chain_pdu_json(&state.db, &event_id).map_err(|_| StatusCode::NOT_FOUND)?;
+    let mut chain = auth_chain_pdu_json(&state.db, &event_id).map_err(|_| StatusCode::NOT_FOUND)?;
+
+    // v12 (MSC4291) strips `m.room.create` from every event's
+    // `auth_events`, so a chain walk via auth_events alone never
+    // surfaces it. Peers querying /event_auth still expect the create
+    // event in the response — derive its event_id from the room_id
+    // (sigil swap `!` → `$`) and prepend.
+    if let Some(rest) = room_id.strip_prefix('!') {
+        let create_eid = format!("${rest}");
+        if let Some(create_json) = load_event_json_by_event_id(&state.db, &create_eid) {
+            chain.insert(0, create_json);
+        }
+    }
+
     Ok(Json(json!({ "auth_chain": chain })))
 }
 
@@ -312,4 +325,60 @@ pub async fn query_directory(
         "room_id": room_id,
         "servers": [state.config.server_name],
     })))
+}
+
+#[derive(Deserialize)]
+pub struct ProfileQuery {
+    pub user_id: String,
+    /// Optional restriction to a single field (`displayname` or
+    /// `avatar_url`). When absent, both fields are returned.
+    #[serde(default)]
+    pub field: Option<String>,
+}
+
+/// GET /_matrix/federation/v1/query/profile?user_id=...&field=...
+///
+/// Returns the requested user's profile fields. Spec allows either
+/// field to be missing if unset; we return them as-is.
+pub async fn query_profile(
+    State(state): State<AppState>,
+    Query(q): Query<ProfileQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let user_nid = state
+        .db
+        .get_nid(&q.user_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let record = state
+        .db
+        .get_user(user_nid)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let displayname = record.get("displayname").cloned();
+    let avatar_url = record.get("avatar_url").cloned();
+
+    let mut out = serde_json::Map::new();
+    match q.field.as_deref() {
+        Some("displayname") => {
+            if let Some(v) = displayname {
+                out.insert("displayname".into(), v);
+            }
+        }
+        Some("avatar_url") => {
+            if let Some(v) = avatar_url {
+                out.insert("avatar_url".into(), v);
+            }
+        }
+        _ => {
+            if let Some(v) = displayname {
+                out.insert("displayname".into(), v);
+            }
+            if let Some(v) = avatar_url {
+                out.insert("avatar_url".into(), v);
+            }
+        }
+    }
+
+    Ok(Json(Value::Object(out)))
 }

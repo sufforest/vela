@@ -765,6 +765,10 @@ fn federation_authed_routes(state: AppState) -> Router<AppState> {
             "/_matrix/federation/v1/query/directory",
             get(federation_fetch::query_directory),
         )
+        .route(
+            "/_matrix/federation/v1/query/profile",
+            get(federation_fetch::query_profile),
+        )
         // Inbound join
         .route(
             "/_matrix/federation/v1/make_join/{room_id}/{user_id}",
