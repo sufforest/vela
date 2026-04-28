@@ -541,7 +541,21 @@ pub fn build_router(state: AppState) -> Router {
         // with federation disabled, this is harmless — peers that
         // happen to query us get the public keys but inbound traffic
         // is rejected below.
-        .route("/_matrix/key/v2/server", get(federation::get_server_keys));
+        .route("/_matrix/key/v2/server", get(federation::get_server_keys))
+        // Notary key-query endpoints (unauthenticated per spec). vela
+        // doesn't operate as a notary; the stubs return an empty
+        // server_keys array so peers learn the route exists but get
+        // no notarised data — the spec-compliant "I'm not a notary"
+        // response.
+        .route(
+            "/_matrix/key/v2/query/{server_name}",
+            get(federation::query_keys_single),
+        )
+        .route("/_matrix/key/v2/query", post(federation::query_keys_batch))
+        // Server-version endpoint, unauthenticated per spec. Reports
+        // the implementation name + version so other servers can
+        // observe deployment heterogeneity.
+        .route("/_matrix/federation/v1/version", get(federation::version));
     // Federation authenticated routes — require X-Matrix header
     // verification. Skipped entirely when federation is disabled in
     // config: the routes are not mounted, so unrelated middleware
@@ -558,6 +572,10 @@ pub fn build_router(state: AppState) -> Router {
         // M_UNRECOGNIZED rather than the misleading 401 from federation
         // auth on an endpoint we just don't implement.
         .fallback(unrecognized_endpoint)
+        // Wrong-method on a known route returns 405; spec wants the same
+        // M_UNRECOGNIZED JSON body shape as the 404 case (Complement's
+        // TestUnknownEndpoints checks for this).
+        .method_not_allowed_fallback(method_not_allowed)
         // Middleware (applied bottom-up — TimeoutLayer wraps innermost,
         // CatchPanicLayer outermost). RequestBodyLimit caps inbound at
         // 50 MiB; media uploads have their own limit and run on the
@@ -688,6 +706,24 @@ async fn unrecognized_endpoint(uri: axum::http::Uri) -> impl axum::response::Int
         Json(serde_json::json!({
             "errcode": "M_UNRECOGNIZED",
             "error": format!("unrecognized endpoint: {}", uri.path()),
+        })),
+    )
+}
+
+/// 405 fallback: a known route exists but the request used an
+/// unsupported method. Spec wants the same JSON shape as 404
+/// M_UNRECOGNIZED — without it, axum returns an empty body and
+/// Complement's TestUnknownEndpoints rejects the response.
+async fn method_not_allowed(
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+) -> impl axum::response::IntoResponse {
+    use axum::Json;
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        Json(serde_json::json!({
+            "errcode": "M_UNRECOGNIZED",
+            "error": format!("method {} not allowed on {}", method, uri.path()),
         })),
     )
 }

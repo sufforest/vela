@@ -114,9 +114,11 @@ pub async fn register(
     if username.is_empty() || username.len() > 255 {
         return Err(VelaError::InvalidUsername.into());
     }
+    // Allowed-character set per Matrix identifier grammar:
+    //   `[0-9a-z-._=/+]` (lowercase only — we already lowercased above)
     if !username
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "._-=".contains(c))
+        .all(|c| c.is_ascii_alphanumeric() || "._-=/+".contains(c))
     {
         return Err(VelaError::InvalidUsername.into());
     }
@@ -222,9 +224,11 @@ pub async fn available(
     if username.is_empty() || username.len() > 255 {
         return Err(VelaError::InvalidUsername.into());
     }
+    // Allowed-character set per Matrix identifier grammar:
+    //   `[0-9a-z-._=/+]` (lowercase only — we already lowercased above)
     if !username
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "._-=".contains(c))
+        .all(|c| c.is_ascii_alphanumeric() || "._-=/+".contains(c))
     {
         return Err(VelaError::InvalidUsername.into());
     }
