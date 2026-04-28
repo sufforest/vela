@@ -33,3 +33,6 @@ updates:
     labels:
       - dependencies
       - github-actions
+    ignore:
+      # The tag is the Rust version to install (e.g. `@1.88` = Rust 1.88).
+      - dependency-name: "dtolnay/rust-toolchain"
