@@ -81,8 +81,17 @@ fn select_auth_from_created(
 pub async fn create_room(
     State(state): State<AppState>,
     user: AuthenticatedUser,
-    Json(body): Json<CreateRoomRequest>,
+    body_bytes: axum::body::Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    // Parse the body manually so deserialization errors (e.g. a
+    // numeric `room_version` instead of a string) surface as
+    // 400 M_BAD_JSON rather than axum's default 422 Unprocessable Entity.
+    let body: CreateRoomRequest = if body_bytes.is_empty() {
+        serde_json::from_slice(b"{}").map_err(|e| ApiError(VelaError::BadJson(e.to_string())))?
+    } else {
+        serde_json::from_slice(&body_bytes)
+            .map_err(|e| ApiError(VelaError::BadJson(e.to_string())))?
+    };
     let room_version = match body.room_version.as_deref() {
         Some(v) => RoomVersion::parse(v)
             .ok_or_else(|| ApiError(VelaError::UnsupportedRoomVersion(v.to_string())))?,
