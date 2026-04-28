@@ -21,9 +21,9 @@ use crate::federation_sender::FederationSender;
 use crate::middleware::federation_auth::federation_auth;
 use crate::{
     account, account_data, capabilities, devices, directory, discovery, federation, filters,
-    key_backup, keys, login, media, membership, messages, presence, profile, pushers, pushrules,
-    receipts, redaction, refresh, register, relations, room_upgrade, rooms, search, send,
-    sliding_sync, state, sync, to_device, typing, whoami,
+    key_backup, keys, login, logout, media, membership, messages, presence, profile, pushers,
+    pushrules, receipts, redaction, refresh, register, relations, room_upgrade, rooms, search,
+    send, sliding_sync, state, sync, to_device, typing, whoami,
 };
 
 #[derive(Clone)]
@@ -163,6 +163,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/_matrix/client/v3/refresh", post(refresh::refresh))
         .route("/_matrix/client/r0/refresh", post(refresh::refresh))
+        .route("/_matrix/client/v3/logout", post(logout::logout))
+        .route("/_matrix/client/v3/logout/all", post(logout::logout_all))
+        .route("/_matrix/client/r0/logout", post(logout::logout))
+        .route("/_matrix/client/r0/logout/all", post(logout::logout_all))
         // r0 aliases — legacy clients (Sytest converters, older SDKs).
         // Spec says servers MAY continue to accept r0 paths indefinitely; we
         // alias the handful Complement's legacy tests still hit.

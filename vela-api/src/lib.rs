@@ -27,6 +27,7 @@ pub mod federation;
 pub mod health;
 mod keys;
 mod login;
+mod logout;
 mod media;
 mod membership;
 pub mod messages;
