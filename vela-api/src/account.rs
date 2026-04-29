@@ -52,6 +52,12 @@ pub async fn change_password(
             .db
             .delete_user_tokens(user.user_nid, Some(&user.device_id))
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        // Spec: pushers tied to the access tokens we just revoked also
+        // disappear. The caller's pushers (same device_id) survive.
+        state
+            .db
+            .delete_user_pushers_except(user.user_nid, &user.device_id)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     }
 
     Ok(Json(json!({})))

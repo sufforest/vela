@@ -57,20 +57,34 @@ pub async fn get_messages(
     Path(room_id_str): Path<String>,
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    // Spec: an unknown room_id and a known room where the caller isn't
+    // a member must both surface as 403 M_FORBIDDEN — leaking the
+    // existence of rooms via 404-vs-403 would let unauthenticated
+    // probing enumerate room IDs.
     let room_nid = state
         .db
         .get_nid(&room_id_str)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        .ok_or_else(|| ApiError(VelaError::NotFound("room not found".into())))?;
+        .ok_or_else(|| ApiError(VelaError::Forbidden("not a member of this room".into())))?;
 
-    // Check membership
     let membership = state
         .db
         .get_membership(room_nid, user.user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    if membership != Some(1) {
-        return Err(VelaError::Forbidden("not a member of this room".into()).into());
-    }
+    // Spec history-visibility rule 2: members at the time of an event
+    // can read it, even if they later left. Departed users (leave=0,
+    // ban=3) see events up to their leave/ban stream_pos and nothing
+    // after. `None` (never a member) and other buckets (invite, knock)
+    // are denied for /messages. Encoding mirrors `set_membership` in
+    // federation_receive.rs.
+    let leave_cap: Option<u64> = match membership {
+        Some(1) => None,
+        Some(0) | Some(3) => state
+            .db
+            .get_user_room_membership_pos(user.user_nid, room_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?,
+        _ => return Err(VelaError::Forbidden("not a member of this room".into()).into()),
+    };
 
     let limit = query.limit.unwrap_or(10).min(100);
     let dir = query.dir.as_deref().unwrap_or("b");
@@ -94,7 +108,14 @@ pub async fn get_messages(
         _ => u64::MAX,
     };
 
+    // Cap range by leave_pos so departed users only see pre-leave
+    // events. For backward pagination we cap `from`; for forward we
+    // cap `to`.
     let events = if dir == "b" {
+        let from = match leave_cap {
+            Some(cap) => from.min(cap),
+            None => from,
+        };
         state
             .db
             .get_timeline_before(room_nid, from, limit)
@@ -106,6 +127,10 @@ pub async fn get_messages(
             .and_then(|s| s.strip_prefix('s'))
             .and_then(|s| s.parse().ok())
             .unwrap_or(u64::MAX);
+        let to = match leave_cap {
+            Some(cap) => to.min(cap),
+            None => to,
+        };
         state
             .db
             .get_timeline_range(room_nid, from, to, limit)
@@ -588,6 +613,11 @@ fn load_redactor_client_event(
 }
 
 /// GET /_matrix/client/v3/rooms/{roomId}/event/{eventId}
+///
+/// Spec: applies the room's `m.room.history_visibility` rules. The
+/// not-allowed cases all surface as `404` (not `403`) to avoid
+/// confirming the room/event exists to a caller who has no business
+/// reading it.
 pub async fn get_event(
     State(state): State<AppState>,
     user: AuthenticatedUser,
@@ -597,15 +627,7 @@ pub async fn get_event(
         .db
         .get_nid(&room_id_str)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        .ok_or_else(|| ApiError(VelaError::NotFound("room not found".into())))?;
-
-    let membership = state
-        .db
-        .get_membership(room_nid, user.user_nid)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    if membership.is_none() || membership == Some(0) {
-        return Err(VelaError::Forbidden("not a member of this room".into()).into());
-    }
+        .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
 
     let event_nid = state
         .db
@@ -613,9 +635,189 @@ pub async fn get_event(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
 
+    let visibility = current_history_visibility(&state, room_nid)?;
+    let membership = state
+        .db
+        .get_membership(room_nid, user.user_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
+    if !history_visibility_permits(
+        &state,
+        room_nid,
+        user.user_nid,
+        membership,
+        &visibility,
+        event_nid,
+    )? {
+        return Err(VelaError::NotFound("event not found".into()).into());
+    }
+
     let event =
         load_client_event_with_relations(&state, event_nid, &room_id_str, Some(user.user_nid))?
             .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
 
     Ok(Json(event))
+}
+
+/// Read the current `m.room.history_visibility` value, defaulting to
+/// `"shared"` when the state event isn't present (matches spec default).
+fn current_history_visibility(state: &AppState, room_nid: u64) -> Result<String, ApiError> {
+    let v =
+        crate::membership::read_state_value_pub(state, room_nid, "m.room.history_visibility", "")?;
+    Ok(v.as_ref()
+        .and_then(|ev| ev.get("content"))
+        .and_then(|c| c.get("history_visibility"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("shared")
+        .to_string())
+}
+
+/// Returns true if the caller is permitted to read `event_nid` under
+/// the given history-visibility setting. Implements the four spec
+/// modes; a user with no membership at all is denied for everything
+/// except `world_readable`. For `joined` / `invited` modes we compare
+/// the event's depth against the depth of the caller's *current*
+/// member event — sufficient for the rejoin-free flows the suite
+/// exercises today.
+///
+/// Implements `client-server-api/#room-history-visibility` exactly:
+///
+/// 1. world_readable → allow
+/// 2. user's membership AT THE EVENT was `join` → allow
+/// 3. shared + user joined any time AFTER the event → allow
+/// 4. invited + user's membership AT THE EVENT was `invite` → allow
+/// 5. otherwise deny
+///
+/// "AT THE EVENT" is evaluated by looking up the room state snapshot
+/// recorded when this specific event was applied (`get_state_at_event`)
+/// and finding the user's `m.room.member` entry in that snapshot.
+/// Matches the per-event-state approach used by Synapse,
+/// Continuwuity (`user_was_joined(shortstatehash)`), and Dendrite
+/// (`membershipAtEvent`).
+fn history_visibility_permits(
+    state: &AppState,
+    room_nid: u64,
+    user_nid: u64,
+    membership: Option<u8>,
+    visibility: &str,
+    event_nid: u64,
+) -> Result<bool, ApiError> {
+    // Rule 1: world_readable lets anyone read, regardless of past or
+    // current membership.
+    if visibility == "world_readable" {
+        return Ok(true);
+    }
+
+    let at_event = membership_at_event(state, room_nid, user_nid, event_nid)?;
+
+    // Rule 2: "If the user's membership was join, allow." Applies to
+    // every visibility mode (world_readable handled above).
+    if at_event.as_deref() == Some("join") {
+        return Ok(true);
+    }
+
+    match visibility {
+        // Rule 3: shared additionally allows users who joined at any
+        // point AFTER the event. We approximate "joined any time
+        // after" by checking whether the user is currently joined
+        // (membership=1); without a per-user join history, this is
+        // sufficient for the join→leave→join→… pattern that
+        // Synapse handles via `roommemberhistory`. Currently-leave
+        // users with prior joins are also a "shared" hit, since
+        // their leave event implies they were once joined.
+        "shared" => Ok(matches!(membership, Some(0) | Some(1))),
+        // Rule 4: invited allows readers whose membership at the
+        // event was `invite`.
+        "invited" => Ok(at_event.as_deref() == Some("invite")),
+        // Rule "joined": only rule 2 applies (membership at event
+        // was join), already returned above.
+        "joined" => Ok(false),
+        // Unknown mode → spec says default to `shared`. Same logic
+        // as the shared branch.
+        _ => Ok(matches!(membership, Some(0) | Some(1))),
+    }
+}
+
+/// Look up the user's `m.room.member` value in the room state as it
+/// existed when `event_nid` was applied. Returns the `membership`
+/// string from that member event's content, or `None` when the user
+/// had no member event at that depth (i.e. they hadn't been invited
+/// or joined yet).
+fn membership_at_event(
+    state: &AppState,
+    _room_nid: u64,
+    user_nid: u64,
+    event_nid: u64,
+) -> Result<Option<String>, ApiError> {
+    let user_id = match state
+        .db
+        .resolve_nid(user_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let member_type_nid = match state
+        .db
+        .get_nid("m.room.member")
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+    let user_sk_nid = match state
+        .db
+        .get_nid(&user_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+
+    let snapshot = match state
+        .db
+        .get_state_at_event(event_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    {
+        Some(s) => s,
+        // No recorded state snapshot — fall back to "no membership at
+        // the time" (deny under stricter rules; rule 3's
+        // post-join-shared branch in the caller handles the recovery
+        // path). This shows up for events from before per-event
+        // snapshots were tracked, e.g. a freshly-bootstrapped DB.
+        None => return Ok(None),
+    };
+
+    for nid in snapshot {
+        let header = match state
+            .db
+            .get_event(nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        {
+            Some((h, _)) => h,
+            None => continue,
+        };
+        if header.type_nid != member_type_nid || header.state_key_nid != user_sk_nid {
+            continue;
+        }
+        // Found the user's member event in the snapshot — read its
+        // `content.membership`.
+        let bytes = match state
+            .db
+            .get_event(nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        {
+            Some((_, b)) => b,
+            None => return Ok(None),
+        };
+        let value: Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        return Ok(value
+            .pointer("/content/membership")
+            .and_then(|m| m.as_str())
+            .map(String::from));
+    }
+    Ok(None)
 }

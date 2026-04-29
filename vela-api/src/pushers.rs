@@ -70,10 +70,15 @@ pub async fn set_pusher(
         return Ok(Json(json!({})));
     }
 
+    // Record the device_id of the access token that registered this
+    // pusher. /account/password (logout_devices=true) deletes tokens
+    // for every device except the caller's; the spec also requires
+    // those devices' pushers to disappear, so we need a back-pointer.
     let mut record = json!({
         "app_id": body.app_id,
         "pushkey": body.pushkey,
         "kind": body.kind,
+        "device_id": user.device_id,
     });
     let obj = record.as_object_mut().unwrap();
     if let Some(v) = body.app_display_name {

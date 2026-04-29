@@ -14,7 +14,6 @@ pub struct RegisterRequest {
     pub username: Option<String>,
     pub password: Option<String>,
     pub device_id: Option<String>,
-    #[allow(dead_code)]
     pub initial_device_display_name: Option<String>,
     #[serde(default)]
     pub inhibit_login: bool,
@@ -54,22 +53,30 @@ pub async fn register(
             refresh_token: false,
         }
     } else {
-        serde_json::from_slice(&body_bytes).map_err(|e| {
+        // Reject invalid UTF-8 explicitly. JSON requires strings be UTF-8;
+        // serde_json's slice deserializer ignores fields not present in
+        // the target struct, so a non-UTF-8 byte sequence inside an
+        // ignored field would otherwise sneak past as a valid parse and
+        // we'd return 401 instead of the spec-mandated 400 M_NOT_JSON.
+        let body_str = std::str::from_utf8(&body_bytes).map_err(|e| {
+            ApiError(VelaError::NotJson(format!(
+                "request body is not valid UTF-8: {e}"
+            )))
+        })?;
+        serde_json::from_str(body_str).map_err(|e| {
             ApiError(VelaError::NotJson(format!(
                 "request body is not valid JSON: {e}"
             )))
         })?
     };
 
-    // Empty body or missing both `username` and `auth` → return a UIA
-    // challenge rather than 400. Spec says register MUST use UIA. We accept
-    // `m.login.dummy` (no real challenge) when present, so this handler
-    // serves both the discover-flows step and the actual create-user step.
-    // Token-gated registration: when configured, require a UIA flow
-    // that includes `m.login.registration_token` (MSC3231-style). The
-    // discovery branch (empty body) advertises both flows so clients
-    // know which to provide; subsequent submissions must carry the
-    // matching token in `auth.token`.
+    // Spec: register MUST use UIA. Any submission without `auth` gets a
+    // 401 + flows challenge, regardless of whether username/password are
+    // already present — clients are expected to repeat the request with
+    // the same body plus an `auth` block. Token-gated registration:
+    // when configured, advertise `m.login.registration_token`
+    // (MSC3231-style); subsequent submissions must carry the matching
+    // token in `auth.token`.
     let token_required = state.config.registration_token.as_deref();
     let flows = if token_required.is_some() {
         json!([{"stages": ["m.login.registration_token"]}])
@@ -77,9 +84,7 @@ pub async fn register(
         json!([{"stages": ["m.login.dummy"]}])
     };
 
-    let has_username = body.username.is_some();
-    let has_auth = body.auth.is_some();
-    if !has_username && !has_auth {
+    if body.auth.is_none() {
         let uia_body = json!({
             "flows": flows,
             "params": {},
@@ -165,6 +170,15 @@ pub async fn register(
         .db
         .create_device(user_nid, device_id.as_str())
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
+    if let Some(display_name) = body.initial_device_display_name.as_deref()
+        && !display_name.is_empty()
+    {
+        state
+            .db
+            .update_device_display_name(user_nid, device_id.as_str(), display_name)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    }
 
     let mut response = json!({
         "user_id": user_id.as_str(),

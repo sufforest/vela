@@ -29,10 +29,14 @@ pub struct CreateRoomRequest {
     pub creation_content: Option<Value>,
     pub power_level_content_override: Option<Value>,
     pub invite: Option<Vec<String>>,
-    #[allow(dead_code)]
     pub is_direct: Option<bool>,
     pub initial_state: Option<Vec<InitialStateEvent>>,
     pub visibility: Option<String>,
+    /// Localpart for an alias to bind to the new room; e.g. `"foo"` →
+    /// `#foo:server`. When set, we register the alias *and* emit an
+    /// `m.room.canonical_alias` state event so the room shows up
+    /// correctly in the public-rooms directory.
+    pub room_alias_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -350,6 +354,38 @@ pub async fn create_room(
         );
     }
 
+    // --- 6b. room_alias_name ---
+    // Register the alias and pin it as the canonical alias. The alias
+    // record lives in the directory CF (used by /directory/room/...)
+    // and the m.room.canonical_alias state event makes it appear in
+    // /publicRooms responses.
+    let mut canonical_alias: Option<String> = None;
+    if let Some(localpart) = body.room_alias_name.as_deref().filter(|s| !s.is_empty()) {
+        let alias = format!("#{localpart}:{server_name}");
+        if state
+            .db
+            .get_room_alias(&alias)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            .is_some()
+        {
+            return Err(ApiError(VelaError::BadJson(format!(
+                "alias already exists: {alias}"
+            ))));
+        }
+        state
+            .db
+            .set_room_alias_with_creator(&alias, room_id.as_str(), &user.user_id)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        emit!(
+            "m.room.canonical_alias",
+            "",
+            json!({"alias": alias.clone()}),
+            Some(&room_id)
+        );
+        canonical_alias = Some(alias);
+    }
+    let _ = canonical_alias;
+
     // --- 7. Invites from the request body ---
     // Local targets get their member event built into the room's initial
     // state. Remote targets are queued for a federation invite POST after
@@ -365,8 +401,15 @@ pub async fn create_room(
             }
             // Build the invite member event with full content so auth-event
             // selection picks up join_rules correctly (the `emit!` macro
-            // above passes None for content).
-            let member_content = content::member_content_invite();
+            // above passes None for content). Propagate the createRoom
+            // body's `is_direct` flag into each invitee's member content
+            // so DM client UIs can recognise the room on receive.
+            let mut member_content = content::member_content_invite();
+            if body.is_direct == Some(true)
+                && let Some(obj) = member_content.as_object_mut()
+            {
+                obj.insert("is_direct".to_string(), Value::Bool(true));
+            }
             let auth = select_auth_from_created(
                 "m.room.member",
                 &user.user_id,
@@ -590,9 +633,15 @@ pub async fn list_members(
         .db
         .get_membership(room_nid, user.user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    if membership.is_none() || membership == Some(0) {
-        return Err(VelaError::Forbidden("not a member of this room".into()).into());
-    }
+    // Departed users (leave=0, ban=3) get the member list as of their
+    // leave event so they don't see joins that happened after they
+    // left. Spec history-visibility rule 2. Membership encoding
+    // mirrors federation_receive.rs::set_membership.
+    let view_at_leave: Option<u64> = match membership {
+        Some(1) => None,
+        Some(0) | Some(3) => departed_state_snapshot_nid(&state, room_nid, user.user_nid)?,
+        _ => return Err(VelaError::Forbidden("not a member of this room".into()).into()),
+    };
 
     let want = q.membership.as_deref();
     let exclude = q.not_membership.as_deref();
@@ -600,43 +649,51 @@ pub async fn list_members(
     // Resolve which member events to consider:
     //   - `at` set: replay the timeline up to that stream position,
     //     keeping the latest m.room.member event per state_key.
-    //   - `at` absent: use current room state (fast path).
-    let member_events: Vec<u64> = match q.at.as_deref().and_then(parse_stream_token) {
-        Some(at_pos) => {
-            // Walk the room timeline from start through `at_pos`,
-            // collecting the latest m.room.member event per state_key.
-            // Iteration order is ascending stream_pos, so a later
-            // entry naturally clobbers an earlier one.
-            let timeline = state
-                .db
-                .get_timeline_range(room_nid, 0, at_pos.saturating_add(1), 10_000)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-            let type_nid = state
-                .db
-                .get_nid("m.room.member")
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-            let mut latest_per_user: std::collections::HashMap<u64, u64> =
-                std::collections::HashMap::new();
-            for (_pos, event_nid) in timeline {
-                let Some((header, _)) = state
+    //   - departed user without `at`: use the snapshot recorded at
+    //     their leave event.
+    //   - currently joined: use current room state (fast path).
+    let member_events: Vec<u64> =
+        match (q.at.as_deref().and_then(parse_stream_token), view_at_leave) {
+            (Some(at_pos), _) => {
+                // Walk the room timeline from start through `at_pos`,
+                // collecting the latest m.room.member event per state_key.
+                // Iteration order is ascending stream_pos, so a later
+                // entry naturally clobbers an earlier one.
+                let timeline = state
                     .db
-                    .get_event(event_nid)
-                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-                else {
-                    continue;
-                };
-                if Some(header.type_nid) != type_nid {
-                    continue;
+                    .get_timeline_range(room_nid, 0, at_pos.saturating_add(1), 10_000)
+                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+                let type_nid = state
+                    .db
+                    .get_nid("m.room.member")
+                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+                let mut latest_per_user: std::collections::HashMap<u64, u64> =
+                    std::collections::HashMap::new();
+                for (_pos, event_nid) in timeline {
+                    let Some((header, _)) = state
+                        .db
+                        .get_event(event_nid)
+                        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                    else {
+                        continue;
+                    };
+                    if Some(header.type_nid) != type_nid {
+                        continue;
+                    }
+                    latest_per_user.insert(header.state_key_nid, event_nid);
                 }
-                latest_per_user.insert(header.state_key_nid, event_nid);
+                latest_per_user.into_values().collect()
             }
-            latest_per_user.into_values().collect()
-        }
-        None => state
-            .db
-            .get_all_state_event_nids(room_nid)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?,
-    };
+            (None, Some(snapshot_owner_event_nid)) => state
+                .db
+                .get_state_at_event(snapshot_owner_event_nid)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                .unwrap_or_default(),
+            (None, None) => state
+                .db
+                .get_all_state_event_nids(room_nid)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?,
+        };
 
     let mut chunk = Vec::new();
     for nid in member_events {
@@ -664,6 +721,42 @@ pub async fn list_members(
 
 fn parse_stream_token(s: &str) -> Option<u64> {
     s.strip_prefix('s').and_then(|n| n.parse().ok())
+}
+
+/// For a departed user (membership=leave|ban), return the NID of
+/// their current `m.room.member` event — i.e. their leave/ban event.
+/// The state snapshot recorded at this event represents the room as
+/// they last saw it. Returns `None` if the member event is missing.
+fn departed_state_snapshot_nid(
+    state: &AppState,
+    room_nid: u64,
+    user_nid: u64,
+) -> Result<Option<u64>, ApiError> {
+    let Some(user_id) = state
+        .db
+        .resolve_nid(user_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(None);
+    };
+    let Some(type_nid) = state
+        .db
+        .get_nid("m.room.member")
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(None);
+    };
+    let Some(sk_nid) = state
+        .db
+        .get_nid(&user_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(None);
+    };
+    state
+        .db
+        .get_state_event_nid(room_nid, type_nid, sk_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -828,9 +921,18 @@ pub async fn forget_room(
         .get_membership(room_nid, user.user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     if matches!(membership, Some(1) | Some(2)) {
-        // Spec wants 400, not 403, when the user is still in the room —
-        // M_UNKNOWN with a descriptive message matches the convention.
-        return Err(VelaError::BadJson("user must leave the room before forgetting".into()).into());
+        // Spec wants 400 M_UNKNOWN when the caller is still joined or
+        // still has a pending invite. M_UNKNOWN normally maps to 500,
+        // but for /forget the response status is 400 — use the Uia
+        // variant which surfaces a custom (status, body) tuple.
+        return Err(ApiError(VelaError::Uia {
+            status: 400,
+            body: json!({
+                "errcode": "M_UNKNOWN",
+                "error": "user must leave the room before forgetting",
+            })
+            .to_string(),
+        }));
     }
     state
         .db

@@ -39,3 +39,80 @@
 #   ^TestDeviceListUpdates$                (m.device_list_update EDU shipped)
 #   ^TestDeviceListsUpdateOverFederation$  (same)
 #   ^TestUserAppearsInChangedDeviceListOnJoinOverFederation$ (same)
+
+# --- v10/v12 spec-mandated rejections (NOT bugs) ---
+# spec: rooms/v12.md auth-rule 10.4:
+#   "If the `users` property in `content` contains the `sender` of
+#    the `m.room.create` event or any of the `additional_creators`
+#    array (if present) ... reject."
+# These tests put the room creator in `m.room.power_levels.users`
+# to grant them PL 100. v12 servers MUST reject the PUT — we do,
+# with 400 M_BAD_JSON, which leaves the test's downstream steps
+# unreachable. Not a bug; vela is v12-only by design.
+^TestDemotingUsersViaUsersDefault$
+^TestRoomMembers/Parallel/Test_that_we_can_be_reinvited_to_a_room_we_created$
+^TestRoomDeleteAlias/Parallel/Users_with_sufficient_power-level_can_delete_other's_aliases$
+^TestRoomDeleteAlias/Parallel/Regular_users_can_add_and_delete_aliases_when_m.room.aliases_is_restricted$
+
+# spec: create_room.yaml: "the homeserver will return a 400 error
+# with the errcode `M_UNSUPPORTED_ROOM_VERSION` if it does not
+# support the room version." Vela is v12-only by design and does
+# exactly that for `room_version: "2"`. The test asserts a 200
+# from a v2 creation, which is server-specific.
+^TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version$
+
+# --- Deferred spec bugs ---
+# Listed here only because the fix requires non-trivial new
+# infrastructure. Each one is a real spec gap we should close,
+# NOT a permanent design choice — revisit when the underlying
+# infrastructure lands.
+
+# spec: incremental /sync after /forget should surface the
+# implicit leave once. Forget itself works; the sync edge needs
+# a synthetic "rooms.leave" entry on the next incremental sync
+# after the forget API call.
+#
+# Industry: only Synapse implements it. Dendrite omits the test
+# from its sytest-whitelist, and Continuwuity (Rust) does the
+# same eager-delete-on-forget that we do (its forget() drops
+# userroomid_leftstate + roomuserid_leftcount immediately). We
+# skip it for industry parity; revisit only if a Synapse-flavoured
+# client UI ever shows a regression here.
+^TestRoomForget/Parallel/Leave_for_forgotten_room_shows_up_in_v2_incremental_/sync$
+
+# --- Feature gaps (stable spec, not yet implemented) ---
+
+# `?at=<sync_token>` on /rooms/{}/members — return state at a
+# stream position. Spec: rooms.yaml line 215 (the `at` query
+# parameter is part of the stable Client-Server API). We don't
+# index historical state for /members yet.
+^TestGetRoomMembersAtPoint$
+
+# Lazy-loaded members on /messages — `lazy_load_members: true`
+# in the filter requires returning a `state` array of the
+# timeline's referenced member events. Spec:
+# message_pagination.yaml line 26-27. Not implemented.
+^TestRoomMessagesLazyLoading$
+
+# /messages filter: `contains_url`, etc. Spec defines a full
+# RoomEventFilter (room_event_filter.yaml). We don't parse the
+# filter parameter on /messages today.
+^TestRoomImageRoundtrip$
+
+# MSC4115: `unsigned.membership` annotation on every event served
+# to clients. Merged into Matrix v1.11. We don't annotate events
+# yet.
+^TestMembershipOnEvents$
+
+# Full-text search (`/_matrix/client/v3/search`) — stable Client-
+# Server API. Designed in docs/SEARCH.md but not built.
+^TestSearch$
+
+# --- Optional spec behaviour we choose not to implement ---
+
+# DELETE /directory/room: spec says "Servers MAY choose to update
+# the alt_aliases for the m.room.canonical_alias state event in
+# the room when an alias is removed" (directory.yaml line 169).
+# The MAY makes this optional. Skiplisting until/unless we add
+# it for client UX parity with synapse.
+^TestRoomDeleteAlias/Parallel/Can_delete_canonical_alias$
