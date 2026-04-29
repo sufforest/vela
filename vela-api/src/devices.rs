@@ -3,6 +3,7 @@
 //! Spec: `references/matrix-spec/data/api/client-server/device_management.yaml`.
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use serde_json::{Value, json};
 
@@ -77,17 +78,49 @@ pub async fn rename_device(
 
 /// `DELETE /_matrix/client/v3/devices/{deviceId}`
 ///
-/// Spec requires UIA. First call (no auth in body) returns 401 with a
-/// challenge; subsequent call with valid `m.login.password` proceeds.
-/// After UIA, the target device must belong to the caller — otherwise
-/// 403, regardless of whether the UIA-supplied password was correct.
+/// Spec requires UIA. First call (no body or no `auth`) returns 401
+/// with a challenge; subsequent call with valid `m.login.password`
+/// proceeds. After UIA, the auth-supplied identifier must match the
+/// caller AND the target device must belong to the caller — otherwise
+/// 403. (If we only checked device ownership, alice could supply
+/// bob's password to delete alice's device, which the spec forbids:
+/// "the user must complete UIA *as themselves*".)
 pub async fn delete_device(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(device_id): Path<String>,
-    Json(body): Json<Value>,
+    body_bytes: Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    // Empty body → kick UIA. Json<Value> on empty bytes returns 400
+    // M_BAD_JSON before we ever see it; the spec says the bare delete
+    // request gets a 401 challenge.
+    let body: Value = if body_bytes.is_empty() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_slice(&body_bytes).map_err(|e| {
+            ApiError(VelaError::NotJson(format!(
+                "request body is not valid JSON: {e}"
+            )))
+        })?
+    };
+
     uia::require_password_auth(&state, &body)?;
+
+    let auth_user = body
+        .pointer("/auth/identifier/user")
+        .and_then(|v| v.as_str())
+        .or_else(|| body.pointer("/auth/user").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let auth_user_id = if auth_user.starts_with('@') {
+        auth_user.to_lowercase()
+    } else {
+        format!("@{}:{}", auth_user.to_lowercase(), state.config.server_name)
+    };
+    if auth_user_id != user.user_id {
+        return Err(ApiError(VelaError::Forbidden(
+            "UIA identifier does not match the caller".into(),
+        )));
+    }
 
     if state
         .db

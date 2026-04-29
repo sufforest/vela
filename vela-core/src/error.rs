@@ -25,6 +25,16 @@ pub enum VelaError {
     UserDeactivated,
     #[error("bad alias: {0}")]
     BadAlias(String),
+    /// Spec: `M_INVALID_PARAM` (status 400). A request parameter is
+    /// well-formed JSON but fails domain validation (e.g. an alias string
+    /// that doesn't match the `#localpart:server` grammar).
+    #[error("invalid param: {0}")]
+    InvalidParam(String),
+    /// Spec: status 413 (`M_TOO_LARGE`) when a built event's canonical
+    /// JSON exceeds the 65,536-byte limit. Surfaced from send paths
+    /// after the event is fully assembled.
+    #[error("event too large: {0}")]
+    EventTooLarge(String),
     #[error("unsupported room version: {0}")]
     UnsupportedRoomVersion(String),
     #[error("store error: {0}")]
@@ -50,6 +60,8 @@ impl VelaError {
             Self::MissingToken => "M_MISSING_TOKEN",
             Self::UserDeactivated => "M_USER_DEACTIVATED",
             Self::BadAlias(_) => "M_BAD_ALIAS",
+            Self::InvalidParam(_) => "M_INVALID_PARAM",
+            Self::EventTooLarge(_) => "M_TOO_LARGE",
             Self::UnsupportedRoomVersion(_) => "M_UNSUPPORTED_ROOM_VERSION",
             Self::Store(_) => "M_UNKNOWN",
             Self::Uia { .. } => "M_FORBIDDEN",
@@ -60,13 +72,16 @@ impl VelaError {
         match self {
             Self::Forbidden(_) => 403,
             Self::NotFound(_) => 404,
+            Self::EventTooLarge(_) => 413,
             Self::UnknownToken | Self::MissingToken => 401,
             Self::UserInUse
             | Self::InvalidUsername
             | Self::BadJson(_)
             | Self::NotJson(_)
             | Self::BadAlias(_)
+            | Self::InvalidParam(_)
             | Self::UnsupportedRoomVersion(_) => 400,
+            // Note: EventTooLarge is handled above (413).
             Self::UserDeactivated => 403,
             Self::Uia { status, .. } => *status,
             Self::Unknown(_) | Self::Store(_) => 500,

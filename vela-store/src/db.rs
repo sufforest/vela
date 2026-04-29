@@ -1070,6 +1070,46 @@ impl Database {
         Ok(out)
     }
 
+    /// Delete every pusher belonging to `user_nid` whose stored
+    /// `device_id` does not match `keep_device`. Used by
+    /// `/account/password` with `logout_devices=true`: the spec
+    /// requires that pushers for devices being logged out are
+    /// removed alongside their access tokens.
+    pub fn delete_user_pushers_except(
+        &self,
+        user_nid: u64,
+        keep_device: &str,
+    ) -> Result<usize, rocksdb::Error> {
+        let cf = self.db.cf_handle("user_pushers").unwrap();
+        let prefix = keys::encode_u64(user_nid);
+        let iter = self.db.prefix_iterator_cf(&cf, prefix);
+        let mut batch = WriteBatch::default();
+        let mut removed = 0usize;
+        for item in iter {
+            let (key, val) = item?;
+            if key.len() < 8 || key[..8] != prefix[..] {
+                break;
+            }
+            let device_id = serde_json::from_slice::<Value>(&val)
+                .ok()
+                .and_then(|v| {
+                    v.get("device_id")
+                        .and_then(|d| d.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_default();
+            if device_id == keep_device {
+                continue;
+            }
+            batch.delete_cf(&cf, &key);
+            removed += 1;
+        }
+        if removed > 0 {
+            self.db.write(batch)?;
+        }
+        Ok(removed)
+    }
+
     /// Delete every pusher belonging to `user_nid`. Used on account
     /// deactivation so the user stops receiving push notifications.
     /// Returns the number of pushers removed.

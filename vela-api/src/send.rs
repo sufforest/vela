@@ -147,6 +147,7 @@ pub async fn send_message(
     // Persist
     let event_nid = state.db.next_nid();
     let json_bytes = canonical_json_object(&event);
+    enforce_event_size(&json_bytes)?;
     let type_nid = state
         .db
         .get_or_create_nid(&event_type)
@@ -342,6 +343,7 @@ async fn send_state_inner(
 
     let event_nid = state.db.next_nid();
     let json_bytes = canonical_json_object(&event);
+    enforce_event_size(&json_bytes)?;
     let type_nid = state
         .db
         .get_or_create_nid(&event_type)
@@ -389,6 +391,24 @@ async fn send_state_inner(
     }
 
     Ok(Json(json!({"event_id": event_id.as_str()})))
+}
+
+/// Per-spec maximum size of a single PDU's canonical JSON encoding.
+/// Source: `client-server-api/#size-limits` (and identically in
+/// `server-server-api`). Events that hash to anything larger MUST
+/// be rejected with HTTP 413.
+const MAX_EVENT_BYTES: usize = 65_536;
+
+fn enforce_event_size(canonical: &[u8]) -> Result<(), ApiError> {
+    if canonical.len() > MAX_EVENT_BYTES {
+        return Err(VelaError::EventTooLarge(format!(
+            "canonical event JSON is {} bytes, exceeds {} limit",
+            canonical.len(),
+            MAX_EVENT_BYTES
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// Resolve event NIDs to event IDs via reverse lookup (no recomputation).
@@ -470,8 +490,10 @@ fn record_relation_if_present(
 }
 
 /// Validate an `m.room.canonical_alias` content. Both `alias` (singular)
-/// and any `alt_aliases` entry must resolve to this room via local
-/// alias storage. Spec: `client-server-api/#mroomcanonical_alias`.
+/// and any `alt_aliases` entry must (a) match the `#localpart:server`
+/// grammar and (b) resolve to this room via local alias storage. Spec:
+/// `client-server-api/#mroomcanonical_alias`. Format violations surface
+/// as `M_INVALID_PARAM`; resolution failures as `M_BAD_ALIAS`.
 fn validate_canonical_alias(
     state: &AppState,
     expected_room_id: &str,
@@ -490,6 +512,13 @@ fn validate_canonical_alias(
             {
                 to_check.push(a);
             }
+        }
+    }
+    for alias in &to_check {
+        if !is_valid_alias_format(alias) {
+            return Err(
+                VelaError::InvalidParam(format!("alias is not well-formed: {alias}")).into(),
+            );
         }
     }
     for alias in to_check {
@@ -511,6 +540,22 @@ fn validate_canonical_alias(
         }
     }
     Ok(())
+}
+
+/// Matrix room alias grammar: `#localpart:server`. We're lenient on
+/// what counts as a server (any non-empty suffix after the first `:`)
+/// since the resolution step will reject mismatches anyway. The point
+/// here is to catch obvious malformed strings — leading sigil missing,
+/// no colon — which the spec marks as `M_INVALID_PARAM` rather than
+/// `M_BAD_ALIAS`.
+fn is_valid_alias_format(alias: &str) -> bool {
+    let Some(rest) = alias.strip_prefix('#') else {
+        return false;
+    };
+    let Some((localpart, server)) = rest.split_once(':') else {
+        return false;
+    };
+    !localpart.is_empty() && !server.is_empty()
 }
 
 /// Reject a power_levels send whose `users` map contains any room creator.
@@ -643,4 +688,81 @@ const SAFE_INT_MIN: i64 = -(1i64 << 53) + 1;
 
 fn is_safe_int(i: i64) -> bool {
     (SAFE_INT_MIN..=SAFE_INT_MAX).contains(&i)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alias_format_accepts_well_formed_aliases() {
+        assert!(is_valid_alias_format("#room:hs1"));
+        assert!(is_valid_alias_format("#with-dashes:server.example.com"));
+        assert!(is_valid_alias_format("#unicode-老虎:hs1"));
+        // Server portion is anything non-empty — we're lenient by design.
+        assert!(is_valid_alias_format("#x:y"));
+    }
+
+    #[test]
+    fn alias_format_rejects_malformed_aliases() {
+        // Missing leading `#`.
+        assert!(!is_valid_alias_format("%percent:hs1"));
+        assert!(!is_valid_alias_format("nosigil:hs1"));
+        // Missing `:` separator.
+        assert!(!is_valid_alias_format("#noseparator"));
+        // Empty localpart or server.
+        assert!(!is_valid_alias_format("#:server"));
+        assert!(!is_valid_alias_format("#localpart:"));
+        // Bare sigil.
+        assert!(!is_valid_alias_format("#"));
+        assert!(!is_valid_alias_format(""));
+    }
+
+    #[test]
+    fn enforce_event_size_passes_under_limit() {
+        let small = vec![b'a'; 1024];
+        assert!(enforce_event_size(&small).is_ok());
+
+        let exactly_at_limit = vec![b'a'; MAX_EVENT_BYTES];
+        assert!(
+            enforce_event_size(&exactly_at_limit).is_ok(),
+            "the limit itself is allowed; only strictly larger is rejected"
+        );
+    }
+
+    #[test]
+    fn enforce_event_size_rejects_oversize_with_too_large_errcode() {
+        let oversize = vec![b'a'; MAX_EVENT_BYTES + 1];
+        let err = enforce_event_size(&oversize).expect_err("must reject oversize");
+        // Surface as M_TOO_LARGE / 413.
+        assert_eq!(err.0.errcode(), "M_TOO_LARGE");
+        assert_eq!(err.0.status_code(), 413);
+    }
+
+    #[test]
+    fn find_invalid_number_flags_unsafe_integer() {
+        // 2^53 is just above the JS-safe-integer ceiling.
+        let v: Value = serde_json::from_str(r#"{"n": 9007199254740993}"#).unwrap();
+        assert_eq!(find_invalid_number(&v), Some("n".to_string()));
+    }
+
+    #[test]
+    fn find_invalid_number_flags_fractional_value() {
+        let v: Value = serde_json::from_str(r#"{"f": 1.5}"#).unwrap();
+        assert_eq!(find_invalid_number(&v), Some("f".to_string()));
+    }
+
+    #[test]
+    fn find_invalid_number_flags_nested_path() {
+        let v: Value = serde_json::from_str(r#"{"outer": {"inner": 1.5}}"#).unwrap();
+        // Nested paths join with `.`; first failure short-circuits.
+        assert_eq!(find_invalid_number(&v), Some("outer.inner".to_string()));
+    }
+
+    #[test]
+    fn find_invalid_number_passes_safe_values() {
+        let v: Value =
+            serde_json::from_str(r#"{"a": 1, "b": -42, "c": 9007199254740991}"#).unwrap();
+        assert_eq!(find_invalid_number(&v), None);
+    }
 }

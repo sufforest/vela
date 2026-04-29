@@ -26,7 +26,6 @@ pub struct LoginRequest {
     pub user: Option<String>,
     pub password: Option<String>,
     pub device_id: Option<String>,
-    #[allow(dead_code)]
     pub initial_device_display_name: Option<String>,
     /// MSC2918 / spec v1.3+: client opts in to refresh tokens by setting
     /// this to `true`. When unset or false we keep the legacy non-expiring
@@ -115,6 +114,15 @@ pub async fn login(
         .db
         .create_device(user_nid, device_id.as_str())
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
+    if let Some(display_name) = body.initial_device_display_name.as_deref()
+        && !display_name.is_empty()
+    {
+        state
+            .db
+            .update_device_display_name(user_nid, device_id.as_str(), display_name)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    }
 
     let mut response = json!({
         "user_id": user_id.as_str(),

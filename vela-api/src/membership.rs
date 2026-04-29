@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -43,22 +44,47 @@ pub(crate) fn parse_query_values(raw: Option<&str>, key: &str) -> Vec<String> {
 }
 
 /// POST /_matrix/client/v3/join/{roomIdOrAlias}
+///
+/// Body is optional; when present, non-`membership` fields are merged
+/// into the emitted `m.room.member` content (spec: clients can attach
+/// arbitrary metadata, e.g. a custom `reason` or third-party data).
 pub async fn join_by_id_or_alias(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(room_id_or_alias): Path<String>,
     RawQuery(raw_query): RawQuery,
+    body_bytes: Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    let extra_content = parse_optional_body(&body_bytes)?;
     let hints = parse_query_values(raw_query.as_deref(), "server_name");
     if room_id_or_alias.starts_with('#') {
         let alias = room_id_or_alias.clone();
         let (room_id, mut servers) = resolve_alias(&state, &alias).await?;
         servers.extend(hints);
-        return do_join(state, user, room_id, servers).await;
+        return do_join(state, user, room_id, servers, extra_content).await;
     }
     let room_id = RoomId::parse(&room_id_or_alias)
         .map_err(|_| ApiError(VelaError::NotFound("room not found".into())))?;
-    do_join(state, user, room_id, hints).await
+    do_join(state, user, room_id, hints, extra_content).await
+}
+
+/// Parse an optional JSON-object body. Empty body → `None`. Any
+/// non-empty body must parse as a JSON object.
+fn parse_optional_body(bytes: &Bytes) -> Result<Option<Value>, ApiError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let v: Value = serde_json::from_slice(bytes).map_err(|e| {
+        ApiError(VelaError::NotJson(format!(
+            "request body is not valid JSON: {e}"
+        )))
+    })?;
+    if !v.is_object() {
+        return Err(ApiError(VelaError::BadJson(
+            "body must be a JSON object".into(),
+        )));
+    }
+    Ok(Some(v))
 }
 
 async fn resolve_alias(state: &AppState, alias: &str) -> Result<(RoomId, Vec<String>), ApiError> {
@@ -115,11 +141,13 @@ pub async fn join_room(
     user: AuthenticatedUser,
     Path(room_id_str): Path<String>,
     RawQuery(raw_query): RawQuery,
+    body_bytes: Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    let extra_content = parse_optional_body(&body_bytes)?;
     let room_id = RoomId::parse(&room_id_str)
         .map_err(|_| ApiError(VelaError::NotFound("room not found".into())))?;
     let hints = parse_query_values(raw_query.as_deref(), "server_name");
-    do_join(state, user, room_id, hints).await
+    do_join(state, user, room_id, hints, extra_content).await
 }
 
 async fn do_join(
@@ -127,6 +155,7 @@ async fn do_join(
     user: AuthenticatedUser,
     room_id: RoomId,
     server_hints: Vec<String>,
+    extra_content: Option<Value>,
 ) -> Result<Json<Value>, ApiError> {
     // If the room is known locally, run the regular local join flow.
     // Otherwise, if the client supplied server_name hints, dispatch to the
@@ -224,7 +253,15 @@ async fn do_join(
         _ => return Err(VelaError::Forbidden("cannot join this room".into()).into()),
     }
 
-    emit_join_event(&state, &user, room_nid, &room_id, authoriser.as_deref()).await?;
+    emit_join_event(
+        &state,
+        &user,
+        room_nid,
+        &room_id,
+        authoriser.as_deref(),
+        extra_content.as_ref(),
+    )
+    .await?;
 
     Ok(Json(json!({"room_id": room_id.as_str()})))
 }
@@ -504,7 +541,7 @@ pub async fn leave_room(
         return Ok(Json(json!({})));
     }
 
-    emit_membership_event(&state, &user, room_nid, &room_id, "leave").await?;
+    emit_membership_event(&state, &user, room_nid, &room_id, "leave", None).await?;
 
     Ok(Json(json!({})))
 }
@@ -675,8 +712,16 @@ pub async fn invite_user(
 
     check_sender_joined(&state, room_nid, user.user_nid)?;
 
-    emit_membership_event_for_target(&state, &user, room_nid, &room_id, &body.user_id, "invite")
-        .await?;
+    emit_membership_event_for_target(
+        &state,
+        &user,
+        room_nid,
+        &room_id,
+        &body.user_id,
+        "invite",
+        None,
+    )
+    .await?;
 
     Ok(Json(json!({})))
 }
@@ -692,8 +737,16 @@ pub async fn invite_user_internal(
     room_id: RoomId,
     target_user_id: String,
 ) -> Result<(), ApiError> {
-    emit_membership_event_for_target(&state, &user, room_nid, &room_id, &target_user_id, "invite")
-        .await
+    emit_membership_event_for_target(
+        &state,
+        &user,
+        room_nid,
+        &room_id,
+        &target_user_id,
+        "invite",
+        None,
+    )
+    .await
 }
 
 /// POST /_matrix/client/v3/rooms/{roomId}/kick
@@ -723,8 +776,16 @@ pub async fn kick_user(
         return Err(VelaError::Forbidden("target is not in the room".into()).into());
     }
 
-    emit_membership_event_for_target(&state, &user, room_nid, &room_id, &body.user_id, "leave")
-        .await?;
+    emit_membership_event_for_target(
+        &state,
+        &user,
+        room_nid,
+        &room_id,
+        &body.user_id,
+        "leave",
+        None,
+    )
+    .await?;
 
     Ok(Json(json!({})))
 }
@@ -746,8 +807,16 @@ pub async fn ban_user(
 
     check_sender_joined(&state, room_nid, user.user_nid)?;
 
-    emit_membership_event_for_target(&state, &user, room_nid, &room_id, &body.user_id, "ban")
-        .await?;
+    emit_membership_event_for_target(
+        &state,
+        &user,
+        room_nid,
+        &room_id,
+        &body.user_id,
+        "ban",
+        None,
+    )
+    .await?;
 
     Ok(Json(json!({})))
 }
@@ -769,8 +838,16 @@ pub async fn unban_user(
 
     check_sender_joined(&state, room_nid, user.user_nid)?;
 
-    emit_membership_event_for_target(&state, &user, room_nid, &room_id, &body.user_id, "leave")
-        .await?;
+    emit_membership_event_for_target(
+        &state,
+        &user,
+        room_nid,
+        &room_id,
+        &body.user_id,
+        "leave",
+        None,
+    )
+    .await?;
 
     Ok(Json(json!({})))
 }
@@ -1018,9 +1095,39 @@ async fn emit_membership_event(
     room_nid: u64,
     room_id: &RoomId,
     membership: &str,
+    extra_content: Option<&Value>,
 ) -> Result<(), ApiError> {
-    emit_membership_event_for_target(state, user, room_nid, room_id, &user.user_id, membership)
-        .await
+    emit_membership_event_for_target(
+        state,
+        user,
+        room_nid,
+        room_id,
+        &user.user_id,
+        membership,
+        extra_content,
+    )
+    .await
+}
+
+/// Merge non-protected fields from `extra` into `target`. The
+/// `membership` and `join_authorised_via_users_server` keys are always
+/// owned by the server — clients can't override them via custom join
+/// content. All other keys are copied verbatim, overwriting on conflict.
+fn merge_extra_content(target: &mut Value, extra: Option<&Value>) {
+    let Some(extra) = extra else { return };
+    let Some(extra_obj) = extra.as_object() else {
+        return;
+    };
+    let target_obj = match target.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+    for (k, v) in extra_obj {
+        if k == "membership" || k == "join_authorised_via_users_server" {
+            continue;
+        }
+        target_obj.insert(k.clone(), v.clone());
+    }
 }
 
 /// Emit a join membership event for the calling user. When `authoriser`
@@ -1032,10 +1139,14 @@ async fn emit_join_event(
     room_nid: u64,
     room_id: &RoomId,
     authoriser: Option<&str>,
+    extra_content: Option<&Value>,
 ) -> Result<(), ApiError> {
     let authoriser = match authoriser {
         Some(a) => a,
-        None => return emit_membership_event(state, user, room_nid, room_id, "join").await,
+        None => {
+            return emit_membership_event(state, user, room_nid, room_id, "join", extra_content)
+                .await;
+        }
     };
 
     // Inline the build path so we can attach join_authorised_via_users_server
@@ -1056,6 +1167,7 @@ async fn emit_join_event(
         "join_authorised_via_users_server".to_string(),
         Value::String(authoriser.to_string()),
     );
+    merge_extra_content(&mut member_content, extra_content);
 
     let extremity_nids = state
         .db
@@ -1340,6 +1452,7 @@ async fn emit_membership_event_for_target(
     room_id: &RoomId,
     target_user_id: &str,
     membership: &str,
+    extra_content: Option<&Value>,
 ) -> Result<(), ApiError> {
     let signing_key = get_or_create_signing_key(state)?;
     let server_name = &state.config.server_name;
@@ -1353,13 +1466,14 @@ async fn emit_membership_event_for_target(
     let _guard = lock.lock().await;
 
     // Build content
-    let member_content = match membership {
+    let mut member_content = match membership {
         "join" => content::member_content_join(None, None),
         "invite" => content::member_content_invite(),
         "ban" => json!({"membership": "ban"}),
         "knock" => content::member_content_knock(None),
         _ => content::member_content_leave(),
     };
+    merge_extra_content(&mut member_content, extra_content);
 
     // Get prev_events from extremities
     let extremity_nids = state
@@ -2366,6 +2480,7 @@ mod tests {
             user(bob_nid, "@bob:example.com"),
             Path(room_id.clone()),
             RawQuery(None),
+            Bytes::new(),
         )
         .await
         .expect("restricted join allowed");
@@ -2403,6 +2518,7 @@ mod tests {
             user(charlie_nid, "@charlie:example.com"),
             Path(room_id),
             RawQuery(None),
+            Bytes::new(),
         )
         .await
         .expect_err("not a member of any allowed room");

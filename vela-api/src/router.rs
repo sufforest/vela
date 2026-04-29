@@ -177,6 +177,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/_matrix/client/r0/register", post(register::register))
         .route("/_matrix/client/r0/sync", get(sync::sync))
         .route(
+            "/_matrix/client/r0/rooms/{room_id}/joined_members",
+            get(rooms::joined_members),
+        )
+        .route(
             "/_matrix/client/r0/rooms/{room_id}/messages",
             get(messages::get_messages),
         )
