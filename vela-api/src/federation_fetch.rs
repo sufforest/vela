@@ -339,11 +339,22 @@ pub struct ProfileQuery {
 /// GET /_matrix/federation/v1/query/profile?user_id=...&field=...
 ///
 /// Returns the requested user's profile fields. Spec allows either
-/// field to be missing if unset; we return them as-is.
+/// field to be missing if unset; we return them as-is. Validates the
+/// `user_id`'s server portion against the appendix grammar — a
+/// non-numeric port (e.g. `localhost:http`) is a 400 per spec.
 pub async fn query_profile(
     State(state): State<AppState>,
     Query(q): Query<ProfileQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    let server_part = q
+        .user_id
+        .strip_prefix('@')
+        .and_then(|s| s.split_once(':'))
+        .map(|(_, s)| s);
+    if !server_part.map(is_valid_server_name).unwrap_or(false) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let user_nid = state
         .db
         .get_nid(&q.user_id)
@@ -381,4 +392,100 @@ pub async fn query_profile(
     }
 
     Ok(Json(Value::Object(out)))
+}
+
+/// Validate a server-name string against the appendix grammar:
+///
+/// ```text
+/// server_name = hostname [ ":" port ]
+/// port        = 1*5DIGIT
+/// hostname    = IPv4address / "[" IPv6address "]" / dns-name
+/// dns-char    = DIGIT / ALPHA / "-" / "."
+/// ```
+///
+/// Used for inbound-federation parameter validation. We're permissive
+/// on the hostname character set (any byte that survives the
+/// dns-char / IPv4 / IPv6 union) because the wire format guarantees
+/// the value is already a UTF-8 string; the spec-critical bit is the
+/// **port**: it MUST be 1-5 decimal digits when present, and a
+/// non-numeric port (e.g. `localhost:http`) MUST be rejected with 400.
+fn is_valid_server_name(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let (host, port) = if s.starts_with('[') {
+        // IPv6 literal: [..]:port. Find the closing bracket.
+        match s.find(']') {
+            Some(i) => {
+                let host = &s[..=i];
+                let rest = &s[i + 1..];
+                if rest.is_empty() {
+                    (host, None)
+                } else if let Some(p) = rest.strip_prefix(':') {
+                    (host, Some(p))
+                } else {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    } else {
+        // Hostname or IPv4. Optional `:port` suffix.
+        match s.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (s, None),
+        }
+    };
+    if host.is_empty() {
+        return false;
+    }
+    if let Some(p) = port
+        && (p.is_empty() || p.len() > 5 || !p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_server_name;
+
+    #[test]
+    fn server_name_accepts_well_formed() {
+        assert!(is_valid_server_name("matrix.org"));
+        assert!(is_valid_server_name("matrix.org:8888"));
+        assert!(is_valid_server_name("1.2.3.4"));
+        assert!(is_valid_server_name("1.2.3.4:1234"));
+        assert!(is_valid_server_name("[1234:5678::abcd]"));
+        assert!(is_valid_server_name("[1234:5678::abcd]:5678"));
+        assert!(is_valid_server_name("localhost"));
+        assert!(is_valid_server_name("localhost:8008"));
+        // Five-digit port — boundary case.
+        assert!(is_valid_server_name("host:65535"));
+    }
+
+    #[test]
+    fn server_name_rejects_non_numeric_port() {
+        // The case Complement asserts: `localhost:http` MUST 400.
+        assert!(!is_valid_server_name("localhost:http"));
+        assert!(!is_valid_server_name("hs1:abc"));
+        assert!(!is_valid_server_name("hs1:80a"));
+    }
+
+    #[test]
+    fn server_name_rejects_other_malformed() {
+        // Empty string.
+        assert!(!is_valid_server_name(""));
+        // Empty port after colon.
+        assert!(!is_valid_server_name("hs1:"));
+        // Empty host before colon.
+        assert!(!is_valid_server_name(":8008"));
+        // Port with 6+ digits exceeds the 1*5DIGIT grammar.
+        assert!(!is_valid_server_name("hs1:123456"));
+        // Unclosed IPv6 bracket.
+        assert!(!is_valid_server_name("[1234:5678::abcd"));
+        // Garbage after IPv6 closing bracket without colon prefix.
+        assert!(!is_valid_server_name("[1234::abcd]xyz"));
+    }
 }

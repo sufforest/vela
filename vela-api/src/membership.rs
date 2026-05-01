@@ -1610,10 +1610,22 @@ async fn emit_membership_event_for_target(
 
     // Federated-invite hook: when we invite a user on another server, we also
     // PUT the signed event to their `/_matrix/federation/v2/invite/{room}/{event}`.
-    // The remote server validates and may add their signature; we keep the
-    // local copy regardless (we already authorised + persisted). On failure
-    // we log and continue — the remote can still receive the event via a
-    // future backfill once they have a member in the room.
+    // The remote validates and may add their signature.
+    //
+    // Awaited inline (not spawned). Spec / industry behaviour: clients
+    // expect synchronous /invite — both Synapse and Continuwuity block
+    // the C2S response until the remote ACKs. Fire-and-forget races
+    // tests like TestFederationRejectInvite where the invitee's
+    // server gets a /leave call immediately after the C2S /invite
+    // returns 200; if the federation POST hasn't landed, the remote
+    // hasn't created the room/membership and the leave 404s.
+    //
+    // On federation failure we still log and return 200 to the
+    // client: the local invite event is already authorised +
+    // persisted, and the remote can pick it up later via backfill
+    // once they have a member in the room. Keeping the C2S call
+    // succeeding matches synapse's "best-effort" semantics — the
+    // client sees the invite locally even when federation flaps.
     if membership == "invite" {
         let server = &state.config.server_name;
         if !is_local_user(target_user_id, server) {
@@ -1627,22 +1639,18 @@ async fn emit_membership_event_for_target(
                 "room_version": room_version.as_str(),
                 "invite_room_state": invite_room_state,
             });
-            let client = state.federation_client.clone();
-            let room_id_owned = room_id.as_str().to_string();
-            let event_id_owned = event_id.as_str().to_string();
-            tokio::spawn(async move {
-                if let Err(e) = client
-                    .send_invite_v2(&target_server, &room_id_owned, &event_id_owned, body)
-                    .await
-                {
-                    tracing::warn!(
-                        target = %target_server,
-                        event = %event_id_owned,
-                        error = %e,
-                        "federated invite POST failed"
-                    );
-                }
-            });
+            if let Err(e) = state
+                .federation_client
+                .send_invite_v2(&target_server, room_id.as_str(), event_id.as_str(), body)
+                .await
+            {
+                tracing::warn!(
+                    target = %target_server,
+                    event = %event_id.as_str(),
+                    error = %e,
+                    "federated invite POST failed; remote can backfill later"
+                );
+            }
         }
     }
 

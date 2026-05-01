@@ -913,7 +913,10 @@ fn fetch_auth_chain<'a>(
                 warn!("budget exhausted during auth_chain ingestion");
                 break;
             }
-            if let Err(e) = persist_fetched_event(state, ev_json, origin, budget.clone()).await {
+            if let Err(e) =
+                persist_fetched_event(state, ev_json, origin, budget.clone(), FetchKind::AuthChain)
+                    .await
+            {
                 debug!(error = %e, "skipping fetched event");
                 continue;
             }
@@ -988,7 +991,15 @@ async fn fetch_missing_events(
             warn!("budget exhausted during get_missing_events ingestion");
             break;
         }
-        if let Err(e) = persist_fetched_event(state, ev_json, origin, budget.clone()).await {
+        if let Err(e) = persist_fetched_event(
+            state,
+            ev_json,
+            origin,
+            budget.clone(),
+            FetchKind::MissingTimeline,
+        )
+        .await
+        {
             debug!(error = %e, "skipping fetched missing event");
             continue;
         }
@@ -996,6 +1007,24 @@ async fn fetch_missing_events(
     }
     debug!(accepted, latest_event_id, "missing events fetched");
     Ok(())
+}
+
+/// Where the fetched event is being ingested from. The two paths fetch
+/// different shapes of "missing" event and persist them differently.
+#[derive(Clone, Copy, Debug)]
+enum FetchKind {
+    /// `/event_auth` auth-chain ingestion. The events here predate live
+    /// state and exist only as auth context for validating a downstream
+    /// event. They MUST NOT join the timeline (no stream_pos), become a
+    /// forward extremity, or update current state.
+    AuthChain,
+    /// `/get_missing_events` gap-fill ingestion. The events DO belong on
+    /// the timeline — they're the messages between our last extremity
+    /// and the trigger event we're processing. They get a stream_pos
+    /// and surface in /sync. They momentarily become forward
+    /// extremities, then the trigger event supersedes them via its own
+    /// prev_events chain.
+    MissingTimeline,
 }
 
 /// Validate and persist a single fetched event.
@@ -1014,9 +1043,10 @@ fn persist_fetched_event<'a>(
     event_json: &'a Value,
     origin: &'a str,
     budget: FetchBudget,
+    kind: FetchKind,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
     Box::pin(persist_fetched_event_inner(
-        state, event_json, origin, budget,
+        state, event_json, origin, budget, kind,
     ))
 }
 
@@ -1025,6 +1055,7 @@ async fn persist_fetched_event_inner(
     event_json: &Value,
     origin: &str,
     budget: FetchBudget,
+    kind: FetchKind,
 ) -> Result<(), String> {
     use vela_core::canonical::canonical_json_object;
     use vela_core::events::hash::{compute_content_hash, compute_event_id};
@@ -1192,6 +1223,15 @@ async fn persist_fetched_event_inner(
     let event_nid = state.db.next_nid();
     let json_bytes = canonical_json_object(&event_obj_to_persist);
 
+    // suppress_current_state semantics:
+    //   AuthChain      → true  (historical auth context, never on timeline)
+    //   MissingTimeline → false (real timeline events that fill a gap;
+    //                            they need a stream_pos and to surface
+    //                            via /sync. The downstream trigger
+    //                            event will supersede them as the
+    //                            forward extremity once we move on.)
+    let suppress_current_state = matches!(kind, FetchKind::AuthChain);
+
     state
         .db
         .persist_event(
@@ -1207,10 +1247,7 @@ async fn persist_fetched_event_inner(
             &prev_nids,
             &auth_nids,
             target_pdu.state_key.is_some(),
-            // suppress_current_state: fetched events are historical context for
-            // auth validation — they predate our current state and must not
-            // rewrite it, nor become our forward extremities.
-            true,
+            suppress_current_state,
         )
         .map_err(|e| format!("persist_event: {e}"))?;
 

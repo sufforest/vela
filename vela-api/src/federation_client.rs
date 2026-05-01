@@ -127,6 +127,26 @@ fn build_reqwest_client(
     builder.build()
 }
 
+/// Percent-encode every byte of `s` that isn't an URL-unreserved
+/// character (`A-Za-z0-9 - _ . ~`). Used when constructing
+/// federation URL paths and query parameters: we sign the URL we're
+/// about to send, so the encoded form we put on the wire MUST match
+/// the encoded form fed into the signing canonical-string. Naive
+/// `replace('#', "%23")`-style encoding leaks raw multibyte UTF-8
+/// (e.g. unicode aliases) into the URL, which reqwest then re-encodes
+/// before sending — breaking the X-Matrix signature at the receiver.
+fn url_query_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 impl FederationClient {
     pub fn new(
         signing_key: Arc<ServerSigningKey>,
@@ -475,8 +495,36 @@ impl FederationClient {
         destination: &str,
         room_alias: &str,
     ) -> Result<Value, FederationClientError> {
-        let encoded = room_alias.replace('#', "%23").replace(':', "%3A");
+        // Percent-encode every non-unreserved byte. Aliases like
+        // `#老虎Â£я🤨👉ඞ:hs1` carry multibyte UTF-8; we sign the URL
+        // and reqwest sends it verbatim, so the encoded form we sign
+        // MUST match the encoded form on the wire — otherwise the
+        // X-Matrix signature breaks at the receiver.
+        let encoded = url_query_encode(room_alias);
         let path = format!("/_matrix/federation/v1/query/directory?room_alias={encoded}");
+        self.signed_request(reqwest::Method::GET, destination, &path, None)
+            .await
+    }
+
+    /// `GET /_matrix/federation/v1/query/profile?user_id=...&field=...`
+    ///
+    /// Used by client-API profile handlers when the target user lives on
+    /// another server. `field` is `"displayname"`, `"avatar_url"`, or
+    /// `None` for both. Response shape mirrors the spec: a JSON object
+    /// containing whichever fields are set on the remote.
+    pub async fn query_profile(
+        &self,
+        destination: &str,
+        user_id: &str,
+        field: Option<&str>,
+    ) -> Result<Value, FederationClientError> {
+        let encoded_user = url_query_encode(user_id);
+        let path = match field {
+            Some(f) => {
+                format!("/_matrix/federation/v1/query/profile?user_id={encoded_user}&field={f}")
+            }
+            None => format!("/_matrix/federation/v1/query/profile?user_id={encoded_user}"),
+        };
         self.signed_request(reqwest::Method::GET, destination, &path, None)
             .await
     }
@@ -807,6 +855,45 @@ impl RemoteKeyCache {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn url_query_encode_preserves_unreserved() {
+        // RFC 3986 unreserved set: ALPHA / DIGIT / - . _ ~
+        assert_eq!(
+            url_query_encode("Abc-123_xyz.~"),
+            "Abc-123_xyz.~",
+            "unreserved chars must NOT be percent-encoded"
+        );
+    }
+
+    #[test]
+    fn url_query_encode_percent_encodes_reserved() {
+        // Reserved + sub-delims must encode.
+        assert_eq!(url_query_encode("#alias:host"), "%23alias%3Ahost");
+        assert_eq!(url_query_encode("@user:host"), "%40user%3Ahost");
+        // Space, slash, query.
+        assert_eq!(url_query_encode("a b/c?d"), "a%20b%2Fc%3Fd");
+    }
+
+    #[test]
+    fn url_query_encode_percent_encodes_multibyte_utf8() {
+        // The TestRemoteAliasRequestsUnderstandUnicode case: every UTF-8
+        // byte gets percent-encoded so the wire URL matches what we
+        // signed.
+        let alias = "#老虎:hs1";
+        let encoded = url_query_encode(alias);
+        // No raw multibyte bytes survive.
+        assert!(
+            encoded.is_ascii(),
+            "encoded form must be pure ASCII: {encoded}"
+        );
+        // Sigil + colon present.
+        assert!(encoded.starts_with("%23"));
+        assert!(encoded.contains("%3A"));
+        // Unicode bytes encoded — `老` (U+8001) is 3 bytes in UTF-8:
+        // E8 80 81. Verify those appear in order.
+        assert!(encoded.contains("%E8%80%81"));
+    }
 
     fn now_ms_fixed() -> u64 {
         1_700_000_000_000
