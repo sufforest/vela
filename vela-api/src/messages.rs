@@ -529,6 +529,10 @@ pub fn load_client_event(
 /// `unsigned.m.relations.m.thread` aggregation if it is a thread root.
 /// Pass `Some(user_nid)` to populate `current_user_participated`; pass
 /// `None` (sync timeline doesn't always carry caller context) to omit it.
+///
+/// MSC4115: when `user_nid` is `Some`, also annotate
+/// `unsigned.membership` with the user's `m.room.member` value at the
+/// time of this event. The default (no member event) is `"leave"`.
 pub fn load_client_event_with_relations(
     state: &AppState,
     event_nid: u64,
@@ -554,6 +558,19 @@ pub fn load_client_event_with_relations(
             .as_object_mut()
             .unwrap()
             .insert("m.thread".to_string(), agg);
+    }
+    if let Some(uid) = user_nid {
+        let membership =
+            membership_at_event(state, 0, uid, event_nid)?.unwrap_or_else(|| "leave".to_string());
+        let unsigned = ev
+            .as_object_mut()
+            .unwrap()
+            .entry("unsigned".to_string())
+            .or_insert_with(|| json!({}));
+        unsigned
+            .as_object_mut()
+            .unwrap()
+            .insert("membership".to_string(), json!(membership));
     }
     Ok(Some(ev))
 }
@@ -796,7 +813,7 @@ fn history_visibility_permits(
 /// string from that member event's content, or `None` when the user
 /// had no member event at that depth (i.e. they hadn't been invited
 /// or joined yet).
-fn membership_at_event(
+pub(crate) fn membership_at_event(
     state: &AppState,
     _room_nid: u64,
     user_nid: u64,

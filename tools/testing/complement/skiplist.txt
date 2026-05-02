@@ -104,11 +104,6 @@
 # message_pagination.yaml line 26-27. Not implemented.
 ^TestRoomMessagesLazyLoading$
 
-# MSC4115: `unsigned.membership` annotation on every event served
-# to clients. Merged into Matrix v1.11. We don't annotate events
-# yet.
-^TestMembershipOnEvents$
-
 # Full-text search (`/_matrix/client/v3/search`) — stable Client-
 # Server API. Designed in docs/SEARCH.md but not built.
 ^TestSearch$

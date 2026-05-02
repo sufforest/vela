@@ -471,6 +471,33 @@ pub(crate) fn build_sync_response_with_filter(
     }))
 }
 
+/// MSC4115: annotate `unsigned.membership` on `ev` with the requesting
+/// user's `m.room.member` value as it stood at `event_nid`. Default
+/// `"leave"` when the user had no member event yet. No-op when
+/// `user_nid` is `None`.
+fn attach_membership_for_user(
+    state: &AppState,
+    ev: &mut Value,
+    user_nid: Option<u64>,
+    event_nid: u64,
+) {
+    let Some(uid) = user_nid else { return };
+    let membership = crate::messages::membership_at_event(state, 0, uid, event_nid)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "leave".to_string());
+    let Some(obj) = ev.as_object_mut() else {
+        return;
+    };
+    let unsigned = obj
+        .entry("unsigned".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(unsigned_obj) = unsigned.as_object_mut() else {
+        return;
+    };
+    unsigned_obj.insert("membership".to_string(), json!(membership));
+}
+
 fn build_room_sync_for_user(
     state: &AppState,
     room_nid: u64,
@@ -488,7 +515,8 @@ fn build_room_sync_for_user(
 
             let mut state_events = Vec::new();
             for nid in &state_nids {
-                if let Some(ev) = load_client_event(state, *nid, room_id)? {
+                if let Some(mut ev) = load_client_event(state, *nid, room_id)? {
+                    attach_membership_for_user(state, &mut ev, user_nid, *nid);
                     state_events.push(ev);
                 }
             }
@@ -504,7 +532,8 @@ fn build_room_sync_for_user(
                 if first_pos.is_none() {
                     first_pos = Some(*pos);
                 }
-                if let Some(ev) = load_client_event(state, *enid, room_id)? {
+                if let Some(mut ev) = load_client_event(state, *enid, room_id)? {
+                    attach_membership_for_user(state, &mut ev, user_nid, *enid);
                     timeline_events.push(ev);
                 }
             }
