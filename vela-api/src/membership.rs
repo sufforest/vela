@@ -953,14 +953,19 @@ pub async fn knock_room(
     RawQuery(raw_query): RawQuery,
     Json(body): Json<KnockBody>,
 ) -> Result<Json<Value>, ApiError> {
-    // TODO: alias resolution (#room:server) — for now require a room id.
-    if !room_id_or_alias.starts_with('!') {
-        return Err(
-            VelaError::NotFound("alias-based knock not yet supported; use room id".into()).into(),
-        );
-    }
-    let room_id = RoomId::parse(&room_id_or_alias)
-        .map_err(|_| ApiError(VelaError::NotFound("room not found".into())))?;
+    // Spec: /knock takes a roomId OR a roomAlias. For alias-form,
+    // resolve through the directory (local first, then federation
+    // /query/directory). Use the returned `servers` array as
+    // automatic hints for the federated make_knock path so the
+    // caller doesn't have to also supply `?server_name=`.
+    let (room_id, alias_hints) = if room_id_or_alias.starts_with('#') {
+        let (room_id, hints) = resolve_alias(&state, &room_id_or_alias).await?;
+        (room_id, hints)
+    } else {
+        let room_id = RoomId::parse(&room_id_or_alias)
+            .map_err(|_| ApiError(VelaError::NotFound("room not found".into())))?;
+        (room_id, Vec::new())
+    };
 
     // Unknown room → assume remote; use `?server_name=` hints to locate a
     // resident server and run the federated make_knock/send_knock flow.
@@ -971,7 +976,13 @@ pub async fn knock_room(
     {
         Some(n) => n,
         None => {
-            let hints = parse_query_values(raw_query.as_deref(), "server_name");
+            // Server hints: prefer explicit `?server_name=` from the
+            // client; fall back to the directory-resolved server list
+            // when the room came in as an alias.
+            let mut hints = parse_query_values(raw_query.as_deref(), "server_name");
+            if hints.is_empty() {
+                hints = alias_hints;
+            }
             crate::federation_outbound_knock::do_remote_knock(
                 &state,
                 &user.user_id,
