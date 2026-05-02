@@ -641,3 +641,96 @@ fn federate_device_list_update(
         state.federation_sender.notify_destination(&dest);
     }
 }
+
+/// Push `m.device_list_update` EDUs for every device the local user
+/// owns to every remote server in the room they just joined. Spec:
+///
+/// > Servers must send m.device_list_update EDUs to all the servers
+/// > who share a room with a given local user … when that user joins
+/// > a room which contains servers which are not already receiving
+/// > updates for that user's device list.
+///
+/// Without this, a remote server has no record of the joiner's
+/// devices until the user uploads keys again — clients on the remote
+/// won't see the joiner appear in `device_lists.changed` after a
+/// federation join.
+pub fn federate_device_lists_on_join(
+    state: &AppState,
+    user_nid: u64,
+    user_id: &str,
+    room_nid: u64,
+) {
+    let destinations = match state
+        .db
+        .get_remote_servers_in_room(room_nid, &state.config.server_name)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "device_list join-federate: room scan failed");
+            return;
+        }
+    };
+    if destinations.is_empty() {
+        return;
+    }
+
+    let devices = match state.db.list_devices(user_nid) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "device_list join-federate: list_devices failed");
+            return;
+        }
+    };
+    if devices.is_empty() {
+        return;
+    }
+
+    for device in &devices {
+        let Some(device_id) = device.get("device_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        let device_keys = state.db.get_device_keys(user_nid, device_id).ok().flatten();
+
+        let stream_id = match state.db.bump_user_device_list_stream(user_nid) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "device_list join-federate: stream bump failed");
+                return;
+            }
+        };
+
+        let display_name = device_keys
+            .as_ref()
+            .and_then(|v| v.get("device_display_name"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| {
+                device
+                    .get("display_name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
+
+        let mut content = serde_json::Map::new();
+        content.insert("user_id".into(), json!(user_id));
+        content.insert("device_id".into(), json!(device_id));
+        content.insert("stream_id".into(), json!(stream_id));
+        content.insert("deleted".into(), json!(false));
+        if let Some(name) = display_name {
+            content.insert("device_display_name".into(), json!(name));
+        }
+        if let Some(keys) = device_keys {
+            content.insert("keys".into(), keys);
+        }
+        let content_value = Value::Object(content);
+
+        for dest in &destinations {
+            if let Err(e) = state.db.enqueue_device_list_outbound(dest, &content_value) {
+                tracing::warn!(target = %dest, error = %e, "device_list enqueue (join) failed");
+                continue;
+            }
+            state.federation_sender.notify_destination(dest);
+        }
+    }
+}

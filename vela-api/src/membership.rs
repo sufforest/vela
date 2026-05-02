@@ -177,6 +177,17 @@ async fn do_join(
                 &server_hints,
             )
             .await?;
+            // After the remote join the room exists locally; resolve
+            // its nid and federate device lists to the new co-resident
+            // servers.
+            if let Ok(Some(rn)) = state.db.get_nid(room_id.as_str()) {
+                crate::keys::federate_device_lists_on_join(
+                    &state,
+                    user.user_nid,
+                    &user.user_id,
+                    rn,
+                );
+            }
             return Ok(Json(json!({"room_id": room_id.as_str()})));
         }
     };
@@ -208,6 +219,7 @@ async fn do_join(
             server_hints
         };
         do_remote_join(&state, &user.user_id, user.user_nid, &room_id, &hints).await?;
+        crate::keys::federate_device_lists_on_join(&state, user.user_nid, &user.user_id, room_nid);
         return Ok(Json(json!({"room_id": room_id.as_str()})));
     }
 
@@ -262,6 +274,8 @@ async fn do_join(
         extra_content.as_ref(),
     )
     .await?;
+
+    crate::keys::federate_device_lists_on_join(&state, user.user_nid, &user.user_id, room_nid);
 
     Ok(Json(json!({"room_id": room_id.as_str()})))
 }
