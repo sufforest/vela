@@ -453,16 +453,15 @@ pub async fn upload_signing_keys(
     let _ = state.db.record_device_key_change(user.user_nid);
     crate::router::notify_user(&state, user.user_nid);
 
-    // Federate the change. We piggyback on `m.device_list_update`
-    // rather than `m.signing_key_update`: the receiver's response to
-    // either is the same — re-query `/keys/query` for the user, at
-    // which point our federated /keys/query handler returns the new
-    // master/self-signing keys. The piggyback avoids a second EDU
-    // queue and stream while staying spec-correct (peers MUST handle
-    // any unknown EDU silently, and they MUST re-query on
-    // device_list_update). Use the uploader's own device for the
-    // device_id slot — it always exists since the upload was
-    // authenticated against it.
+    // Federate the change. We send BOTH:
+    //   * `m.device_list_update` — peers without `m.signing_key_update`
+    //     support fall through to a `/keys/query` re-fetch and pick up
+    //     the new master/self-signing keys via our federated
+    //     `/keys/query` handler.
+    //   * `m.signing_key_update` (proper EDU) — peers with the spec
+    //     handler persist the new keys directly without the round-trip.
+    // Belt-and-suspenders for compatibility with any peer in the
+    // federation.
     let device_keys = state
         .db
         .get_device_keys(user.user_nid, &user.device_id)
@@ -471,7 +470,73 @@ pub async fn upload_signing_keys(
         .unwrap_or_else(|| Value::Object(Map::new()));
     federate_device_list_update(&state, &user, device_keys, /* deleted */ false);
 
+    let stored = state
+        .db
+        .get_cross_signing_keys(user.user_nid)
+        .unwrap_or_default();
+    federate_signing_key_update(&state, &user, &stored);
+
     Ok(Json(json!({})))
+}
+
+/// Enqueue an `m.signing_key_update` EDU for every remote server
+/// that shares a room with the user. Content carries the user's
+/// current `master_key` and `self_signing_key`; `user_signing_key`
+/// is intentionally NOT federated (it's the user's private key for
+/// signing trust assertions about other users — only the local
+/// server needs it).
+fn federate_signing_key_update(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    cross_signing: &std::collections::HashMap<String, Value>,
+) {
+    use std::collections::HashSet;
+
+    let rooms = match state.db.get_user_joined_rooms(user.user_nid) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "signing_key federate: get_user_joined_rooms failed");
+            return;
+        }
+    };
+    let mut destinations: HashSet<String> = HashSet::new();
+    for room_nid in rooms {
+        match state
+            .db
+            .get_remote_servers_in_room(room_nid, &state.config.server_name)
+        {
+            Ok(servers) => destinations.extend(servers),
+            Err(e) => tracing::warn!(error = %e, "signing_key federate: room scan failed"),
+        }
+    }
+    if destinations.is_empty() {
+        return;
+    }
+
+    let mut content = serde_json::Map::new();
+    content.insert("user_id".into(), json!(user.user_id));
+    if let Some(master) = cross_signing.get("master_key") {
+        content.insert("master_key".into(), master.clone());
+    }
+    if let Some(ssk) = cross_signing.get("self_signing_key") {
+        content.insert("self_signing_key".into(), ssk.clone());
+    }
+    // No keys to share → nothing for peers to act on; skip the EDU.
+    if !content.contains_key("master_key") && !content.contains_key("self_signing_key") {
+        return;
+    }
+    let content_value = Value::Object(content);
+
+    for dest in destinations {
+        if let Err(e) = state
+            .db
+            .enqueue_signing_key_update_outbound(&dest, &content_value)
+        {
+            tracing::warn!(target = %dest, error = %e, "signing_key_update enqueue failed");
+            continue;
+        }
+        state.federation_sender.notify_destination(&dest);
+    }
 }
 
 // --- Signatures Upload ---

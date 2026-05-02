@@ -58,5 +58,10 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     "to_device_outbound",
     "to_device_seen_message_ids",
     "device_list_outbound",
+    // Per-(destination, position) buffer of m.signing_key_update EDU
+    // payloads. Drained by `SigningKeyUpdateStream` and shipped via
+    // the federation sender. Same value/key shape as
+    // `device_list_outbound`.
+    "signing_key_update_outbound",
     "room_directory",
 ];

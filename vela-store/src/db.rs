@@ -928,6 +928,96 @@ impl Database {
         Ok((out, new_cursor))
     }
 
+    /// Append an `m.signing_key_update` EDU content for delivery to
+    /// `destination`. Mirrors `enqueue_device_list_outbound` —
+    /// same per-destination cursor counter, separate CF.
+    pub fn enqueue_signing_key_update_outbound(
+        &self,
+        destination: &str,
+        content_json: &Value,
+    ) -> Result<u64, rocksdb::Error> {
+        let cf = self.db.cf_handle("signing_key_update_outbound").unwrap();
+        let pos = self
+            .to_device_outbound_counter
+            .fetch_add(1, Ordering::Relaxed);
+        let key = to_device_outbound_key(destination, pos);
+        self.db
+            .put_cf(&cf, &key, content_json.to_string().as_bytes())?;
+        Ok(pos)
+    }
+
+    /// Drain the signing-key-update outbound queue strictly after
+    /// `cursor`. Mirrors `scan_device_list_outbound`'s shape.
+    pub fn scan_signing_key_update_outbound(
+        &self,
+        destination: &str,
+        cursor: u64,
+        limit: usize,
+    ) -> Result<(Vec<(u64, Value)>, u64), rocksdb::Error> {
+        let cf = self.db.cf_handle("signing_key_update_outbound").unwrap();
+        let prefix = to_device_outbound_prefix(destination);
+
+        if cursor > 0 {
+            let mut to_delete: Vec<Vec<u8>> = Vec::new();
+            let iter = self.db.prefix_iterator_cf(&cf, &prefix);
+            for item in iter {
+                let (key, _) = item?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                if key.len() < prefix.len() + 8 {
+                    continue;
+                }
+                let pos_bytes = &key[prefix.len()..prefix.len() + 8];
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(pos_bytes);
+                let pos = u64::from_be_bytes(buf);
+                if pos <= cursor {
+                    to_delete.push(key.to_vec());
+                } else {
+                    break;
+                }
+            }
+            if !to_delete.is_empty() {
+                let mut batch = WriteBatch::default();
+                for k in &to_delete {
+                    batch.delete_cf(&cf, k);
+                }
+                self.db.write(batch)?;
+            }
+        }
+
+        let mut new_cursor = cursor;
+        let mut out = Vec::new();
+        let iter = self.db.prefix_iterator_cf(&cf, &prefix);
+        for item in iter {
+            let (key, val) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if key.len() < prefix.len() + 8 {
+                continue;
+            }
+            let pos_bytes = &key[prefix.len()..prefix.len() + 8];
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(pos_bytes);
+            let pos = u64::from_be_bytes(buf);
+            if pos <= cursor {
+                continue;
+            }
+            let content: Value = match serde_json::from_slice(&val) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            out.push((pos, content));
+            new_cursor = pos;
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok((out, new_cursor))
+    }
+
     /// Set whether `room_nid` is published in the public-rooms
     /// directory. Independent of join rules — a public-join room can
     /// be private-in-directory and vice versa, per the c2s spec on
