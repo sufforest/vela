@@ -642,6 +642,44 @@ fn federate_device_list_update(
     }
 }
 
+/// Bookkeeping run when a local user joins (or is joined to) a room.
+/// Two effects, both required for `device_lists.changed` to behave
+/// correctly per spec:
+///
+/// 1. Record `record_device_key_change(joiner)` so all observers — the
+///    joiner's other devices and existing room-mates across all rooms —
+///    see the joiner in their next `/sync` `device_lists.changed`.
+///    Existing room-mates' clients re-`/keys/query` and discover any
+///    new device.
+/// 2. Record `notify_device_key_change(member, [joiner], pos)` for
+///    every other current member of the new room, so the joiner's own
+///    next `/sync` surfaces those members in `device_lists.changed`.
+///    The joiner is a "fresh" observer of those users — their device
+///    state is new information from the joiner's perspective.
+///
+/// Federation: the outbound `m.device_list_update` EDUs are emitted
+/// by `federate_device_lists_on_join`; this helper is local-only.
+pub fn record_device_changes_on_join(state: &AppState, user_nid: u64, room_nid: u64) {
+    if let Err(e) = state.db.record_device_key_change(user_nid) {
+        tracing::warn!(error = %e, "record_device_key_change on join failed");
+    }
+    let stream_pos = state.db.next_stream_position().as_u64();
+    if let Ok(members) = state.db.get_room_members(room_nid) {
+        for member_nid in members {
+            if member_nid == user_nid {
+                continue;
+            }
+            if let Err(e) = state
+                .db
+                .notify_device_key_change(member_nid, &[user_nid], stream_pos)
+            {
+                tracing::warn!(error = %e, "notify_device_key_change on join failed");
+            }
+        }
+    }
+    crate::router::notify_user(state, user_nid);
+}
+
 /// Push `m.device_list_update` EDUs for every device the local user
 /// owns to every remote server in the room they just joined. Spec:
 ///

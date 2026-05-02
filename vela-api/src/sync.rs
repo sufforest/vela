@@ -430,7 +430,13 @@ pub(crate) fn build_sync_response_with_filter(
     // decide when to re-query /keys/query; without it, self-signature
     // uploads don't surface and the device stays "unverified".
     let device_lists_changed: Vec<String> = {
-        let from = since.unwrap_or(0);
+        // `since` is the highest position already returned to the
+        // client (next_batch from the prior /sync). The rest of sync
+        // treats it as exclusive — strictly newer events. Match that
+        // here by starting one position past `since`, otherwise the
+        // long-poll re-serves a change that was already in the prior
+        // response.
+        let from = since.map(|s| s.saturating_add(1)).unwrap_or(0);
         let nids = state
             .db
             .get_device_key_changes(user.user_nid, from, current_pos + 1)
