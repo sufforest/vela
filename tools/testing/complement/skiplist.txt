@@ -104,11 +104,6 @@
 # message_pagination.yaml line 26-27. Not implemented.
 ^TestRoomMessagesLazyLoading$
 
-# /messages filter: `contains_url`, etc. Spec defines a full
-# RoomEventFilter (room_event_filter.yaml). We don't parse the
-# filter parameter on /messages today.
-^TestRoomImageRoundtrip$
-
 # MSC4115: `unsigned.membership` annotation on every event served
 # to clients. Merged into Matrix v1.11. We don't annotate events
 # yet.

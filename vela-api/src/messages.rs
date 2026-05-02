@@ -199,6 +199,23 @@ pub async fn get_messages(
         }
     }
 
+    // Apply the `contains_url` content filter, if present in the query
+    // filter. Spec `RoomEventFilter`: `true` keeps only events whose
+    // content includes a `url` field, `false` keeps only those that
+    // don't, omitted = no filter. Server-side filtering keeps clients
+    // from having to walk through entire timelines to find media
+    // (TestRoomImageRoundtrip relies on this).
+    if let Some(want_url) = filter_contains_url(query.filter.as_deref()) {
+        chunk.retain(|ev| {
+            let has_url = ev
+                .get("content")
+                .and_then(|c| c.get("url"))
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            has_url == want_url
+        });
+    }
+
     let mut response = json!({
         "chunk": chunk,
         "start": start_token,
@@ -219,6 +236,23 @@ pub async fn get_messages(
     }
 
     Ok(Json(response))
+}
+
+/// Inline filter: `room.timeline.contains_url` (RoomEventFilter).
+/// `Some(true)` keeps only events whose `content.url` is present;
+/// `Some(false)` keeps only events without a url; `None` = filter
+/// absent or malformed (apply no filter).
+fn filter_contains_url(filter_str: Option<&str>) -> Option<bool> {
+    let s = filter_str?;
+    let v: Value = serde_json::from_str(s).ok()?;
+    // Spec keeps `contains_url` under either `room.timeline` (the
+    // /messages-applicable subfilter) or directly at the top level
+    // when the filter is already a RoomEventFilter. Accept both.
+    let nested = v
+        .pointer("/room/timeline/contains_url")
+        .and_then(|x| x.as_bool());
+    let top = v.get("contains_url").and_then(|x| x.as_bool());
+    nested.or(top)
 }
 
 /// Returns true if the inline JSON filter requests lazy loading of
