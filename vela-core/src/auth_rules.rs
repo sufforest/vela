@@ -886,6 +886,15 @@ pub fn can_apply_redaction(
     if user_server(sender) == user_server(target_sender) {
         return true;
     }
+    has_redact_power(sender, state, create)
+}
+
+/// Just the power-level half of the redaction permission check. Used
+/// when the target event isn't available locally (e.g. redacting a
+/// federated event whose original we never received) — we can't
+/// compare server domains, so the only remaining path is "user has
+/// redact-level power".
+pub fn has_redact_power(sender: &str, state: StateFn<'_>, create: &Pdu) -> bool {
     let redact_level = power_level_field(state, "redact", 50);
     user_power_level(state, sender, create) >= redact_level
 }

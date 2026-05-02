@@ -41,6 +41,7 @@ tokio-util = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 hickory-resolver = { workspace = true }
+futures = { workspace = true }
 form_urlencoded = "1"
 opentelemetry = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }

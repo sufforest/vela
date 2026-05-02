@@ -63,72 +63,73 @@ pub struct KeysQueryRequest {
 }
 
 /// POST /_matrix/client/v3/keys/query
+///
+/// Spec: clients call this on their own server to discover device +
+/// cross-signing keys for any user, local OR remote. We split the
+/// request into local users (DB lookup) and remote users (one
+/// federation `/user/keys/query` per destination server, batched per
+/// remote), then merge the four top-level keys
+/// (device_keys/master_keys/self_signing_keys/user_signing_keys)
+/// from each branch.
 pub async fn query_keys(
     State(state): State<AppState>,
     _user: AuthenticatedUser,
     Json(body): Json<KeysQueryRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let mut device_keys_response: Map<String, Value> = Map::new();
-
-    for (user_id, device_ids) in &body.device_keys {
-        let user_nid = match state
-            .db
-            .get_nid(user_id)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        {
-            Some(nid) => nid,
-            None => continue,
-        };
-
-        let mut user_devices: Map<String, Value> = Map::new();
-
-        if device_ids.is_empty() {
-            // Empty list = return all devices
-            let all_keys = state
-                .db
-                .get_all_device_keys(user_nid)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-            for (device_id, keys) in all_keys {
-                user_devices.insert(device_id, keys);
-            }
-        } else {
-            for device_id in device_ids {
-                if let Some(keys) = state
-                    .db
-                    .get_device_keys(user_nid, device_id)
-                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-                {
-                    user_devices.insert(device_id.clone(), keys);
-                }
-            }
-        }
-
-        device_keys_response.insert(user_id.clone(), Value::Object(user_devices));
-    }
-
-    // Include cross-signing keys
     let mut master_keys: Map<String, Value> = Map::new();
     let mut self_signing_keys: Map<String, Value> = Map::new();
     let mut user_signing_keys: Map<String, Value> = Map::new();
 
-    for user_id in body.device_keys.keys() {
-        if let Some(user_nid) = state
-            .db
-            .get_nid(user_id)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        {
-            let cs_keys = state
-                .db
-                .get_cross_signing_keys(user_nid)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-            if let Some(k) = cs_keys.get("master_key") {
-                master_keys.insert(user_id.clone(), k.clone());
+    // Partition users by home server.
+    let our_server = &state.config.server_name;
+    let mut by_remote: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+    for (user_id, device_ids) in &body.device_keys {
+        match user_server(user_id) {
+            Some(server) if server == our_server => {
+                fold_local_user_keys(
+                    &state,
+                    user_id,
+                    device_ids,
+                    &mut device_keys_response,
+                    &mut master_keys,
+                    &mut self_signing_keys,
+                    &mut user_signing_keys,
+                )?;
             }
-            if let Some(k) = cs_keys.get("self_signing_key") {
-                self_signing_keys.insert(user_id.clone(), k.clone());
+            Some(server) => {
+                by_remote
+                    .entry(server.to_string())
+                    .or_default()
+                    .insert(user_id.clone(), device_ids.clone());
             }
-            if let Some(k) = cs_keys.get("user_signing_key") {
-                user_signing_keys.insert(user_id.clone(), k.clone());
+            None => {} // malformed user_id — skip silently
+        }
+    }
+
+    // One federation call per remote server, fan out concurrently.
+    if !by_remote.is_empty() {
+        let mut futures = Vec::with_capacity(by_remote.len());
+        for (server, device_keys_for_server) in by_remote {
+            let body = json!({"device_keys": device_keys_for_server});
+            let client = state.federation_client.clone();
+            futures.push(async move {
+                let resp = client.query_user_keys(&server, body).await;
+                (server, resp)
+            });
+        }
+        for (server, resp) in futures::future::join_all(futures).await {
+            match resp {
+                Ok(v) => merge_remote_keys_response(
+                    v,
+                    &mut device_keys_response,
+                    &mut master_keys,
+                    &mut self_signing_keys,
+                    &mut user_signing_keys,
+                ),
+                Err(e) => {
+                    tracing::debug!(remote = %server, error = %e, "remote /keys/query failed");
+                }
             }
         }
     }
@@ -141,6 +142,102 @@ pub async fn query_keys(
     })))
 }
 
+/// Resolve `user_id`'s server portion (`@local:server` → `server`).
+/// Returns `None` for malformed IDs so callers can skip them.
+fn user_server(user_id: &str) -> Option<&str> {
+    user_id.strip_prefix('@')?.split_once(':').map(|(_, s)| s)
+}
+
+/// Read a local user's device + cross-signing keys into the four
+/// per-user maps that build up the /keys/query response.
+fn fold_local_user_keys(
+    state: &AppState,
+    user_id: &str,
+    device_ids: &[String],
+    device_keys_response: &mut Map<String, Value>,
+    master_keys: &mut Map<String, Value>,
+    self_signing_keys: &mut Map<String, Value>,
+    user_signing_keys: &mut Map<String, Value>,
+) -> Result<(), ApiError> {
+    let Some(user_nid) = state
+        .db
+        .get_nid(user_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(());
+    };
+    let mut user_devices: Map<String, Value> = Map::new();
+    if device_ids.is_empty() {
+        let all_keys = state
+            .db
+            .get_all_device_keys(user_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        for (device_id, keys) in all_keys {
+            user_devices.insert(device_id, keys);
+        }
+    } else {
+        for device_id in device_ids {
+            if let Some(keys) = state
+                .db
+                .get_device_keys(user_nid, device_id)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            {
+                user_devices.insert(device_id.clone(), keys);
+            }
+        }
+    }
+    device_keys_response.insert(user_id.to_string(), Value::Object(user_devices));
+
+    let cs_keys = state
+        .db
+        .get_cross_signing_keys(user_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if let Some(k) = cs_keys.get("master_key") {
+        master_keys.insert(user_id.to_string(), k.clone());
+    }
+    if let Some(k) = cs_keys.get("self_signing_key") {
+        self_signing_keys.insert(user_id.to_string(), k.clone());
+    }
+    if let Some(k) = cs_keys.get("user_signing_key") {
+        user_signing_keys.insert(user_id.to_string(), k.clone());
+    }
+    Ok(())
+}
+
+/// Fold a remote `/user/keys/query` response into the per-user maps
+/// that make up our C2S /keys/query response.
+fn merge_remote_keys_response(
+    response: Value,
+    device_keys_response: &mut Map<String, Value>,
+    master_keys: &mut Map<String, Value>,
+    self_signing_keys: &mut Map<String, Value>,
+    user_signing_keys: &mut Map<String, Value>,
+) {
+    let Some(obj) = response.as_object() else {
+        return;
+    };
+    if let Some(remote_devs) = obj.get("device_keys").and_then(|v| v.as_object()) {
+        for (uid, keys) in remote_devs {
+            device_keys_response.insert(uid.clone(), keys.clone());
+        }
+    }
+    if let Some(mk) = obj.get("master_keys").and_then(|v| v.as_object()) {
+        for (uid, k) in mk {
+            master_keys.insert(uid.clone(), k.clone());
+        }
+    }
+    if let Some(sk) = obj.get("self_signing_keys").and_then(|v| v.as_object()) {
+        for (uid, k) in sk {
+            self_signing_keys.insert(uid.clone(), k.clone());
+        }
+    }
+    if let Some(uk) = obj.get("user_signing_keys").and_then(|v| v.as_object()) {
+        for (uid, k) in uk {
+            user_signing_keys.insert(uid.clone(), k.clone());
+        }
+    }
+}
+
 // --- Keys Claim ---
 
 #[derive(Deserialize)]
@@ -149,6 +246,12 @@ pub struct KeysClaimRequest {
 }
 
 /// POST /_matrix/client/v3/keys/claim
+///
+/// Spec: clients call this on their own server; the server is
+/// responsible for federating to each owning home server. We split
+/// the request into local users (DB claim under the per-user lock)
+/// and remote users (one federation `/user/keys/claim` per
+/// destination), then merge the per-user maps into a single response.
 pub async fn claim_keys(
     State(state): State<AppState>,
     _user: AuthenticatedUser,
@@ -156,42 +259,100 @@ pub async fn claim_keys(
 ) -> Result<Json<Value>, ApiError> {
     let mut result: Map<String, Value> = Map::new();
 
+    // Partition users by home server.
+    let our_server = &state.config.server_name;
+    let mut by_remote: HashMap<String, HashMap<String, HashMap<String, String>>> = HashMap::new();
     for (user_id, devices) in &body.one_time_keys {
-        let user_nid = match state
-            .db
-            .get_nid(user_id)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        {
-            Some(nid) => nid,
-            None => continue,
-        };
+        match user_server(user_id) {
+            Some(server) if server == our_server => {
+                claim_local_user_otks(&state, user_id, devices, &mut result).await?;
+            }
+            Some(server) => {
+                by_remote
+                    .entry(server.to_string())
+                    .or_default()
+                    .insert(user_id.clone(), devices.clone());
+            }
+            None => {} // malformed user_id — skip silently
+        }
+    }
 
-        // Per-user lock prevents two concurrent claims from reading the same OTK
-        let lock = state
-            .user_locks
-            .entry(user_nid)
-            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
-        let _guard = lock.lock().await;
-
-        let mut user_keys: Map<String, Value> = Map::new();
-
-        for (device_id, algorithm) in devices {
-            if let Some((key_id, key_data)) = state
-                .db
-                .claim_one_time_key(user_nid, device_id, algorithm)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-            {
-                let mut device_map = Map::new();
-                device_map.insert(key_id, key_data);
-                user_keys.insert(device_id.clone(), Value::Object(device_map));
+    // One federation call per remote server, fan out concurrently.
+    if !by_remote.is_empty() {
+        let mut futures = Vec::with_capacity(by_remote.len());
+        for (server, otks_for_server) in by_remote {
+            let body = json!({"one_time_keys": otks_for_server});
+            let client = state.federation_client.clone();
+            futures.push(async move {
+                let resp = client.claim_user_keys(&server, body).await;
+                (server, resp)
+            });
+        }
+        for (server, resp) in futures::future::join_all(futures).await {
+            match resp {
+                Ok(v) => merge_remote_claim_response(v, &mut result),
+                Err(e) => {
+                    tracing::debug!(remote = %server, error = %e, "remote /keys/claim failed");
+                }
             }
         }
-
-        result.insert(user_id.clone(), Value::Object(user_keys));
     }
 
     Ok(Json(json!({"one_time_keys": result})))
+}
+
+/// Claim one-time keys for a local user under the per-user lock and
+/// fold the result into the per-user response map.
+async fn claim_local_user_otks(
+    state: &AppState,
+    user_id: &str,
+    devices: &HashMap<String, String>,
+    result: &mut Map<String, Value>,
+) -> Result<(), ApiError> {
+    let Some(user_nid) = state
+        .db
+        .get_nid(user_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(());
+    };
+
+    // Per-user lock prevents two concurrent claims from reading the same OTK
+    let lock = state
+        .user_locks
+        .entry(user_nid)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _guard = lock.lock().await;
+
+    let mut user_keys: Map<String, Value> = Map::new();
+    for (device_id, algorithm) in devices {
+        if let Some((key_id, key_data)) = state
+            .db
+            .claim_one_time_key(user_nid, device_id, algorithm)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        {
+            let mut device_map = Map::new();
+            device_map.insert(key_id, key_data);
+            user_keys.insert(device_id.clone(), Value::Object(device_map));
+        }
+    }
+    result.insert(user_id.to_string(), Value::Object(user_keys));
+    Ok(())
+}
+
+/// Fold a remote `/user/keys/claim` response into the per-user map
+/// that makes up our C2S /keys/claim response.
+fn merge_remote_claim_response(response: Value, result: &mut Map<String, Value>) {
+    let Some(obj) = response.as_object() else {
+        return;
+    };
+    let Some(remote) = obj.get("one_time_keys").and_then(|v| v.as_object()) else {
+        return;
+    };
+    for (uid, devices) in remote {
+        result.insert(uid.clone(), devices.clone());
+    }
 }
 
 // --- Key Changes ---
@@ -478,5 +639,136 @@ fn federate_device_list_update(
             continue;
         }
         state.federation_sender.notify_destination(&dest);
+    }
+}
+
+/// Bookkeeping run when a local user joins (or is joined to) a room.
+/// Two effects, both required for `device_lists.changed` to behave
+/// correctly per spec:
+///
+/// 1. Record `record_device_key_change(joiner)` so all observers — the
+///    joiner's other devices and existing room-mates across all rooms —
+///    see the joiner in their next `/sync` `device_lists.changed`.
+///    Existing room-mates' clients re-`/keys/query` and discover any
+///    new device.
+/// 2. Record `notify_device_key_change(member, [joiner], pos)` for
+///    every other current member of the new room, so the joiner's own
+///    next `/sync` surfaces those members in `device_lists.changed`.
+///    The joiner is a "fresh" observer of those users — their device
+///    state is new information from the joiner's perspective.
+///
+/// Federation: the outbound `m.device_list_update` EDUs are emitted
+/// by `federate_device_lists_on_join`; this helper is local-only.
+pub fn record_device_changes_on_join(state: &AppState, user_nid: u64, room_nid: u64) {
+    if let Err(e) = state.db.record_device_key_change(user_nid) {
+        tracing::warn!(error = %e, "record_device_key_change on join failed");
+    }
+    let stream_pos = state.db.next_stream_position().as_u64();
+    if let Ok(members) = state.db.get_room_members(room_nid) {
+        for member_nid in members {
+            if member_nid == user_nid {
+                continue;
+            }
+            if let Err(e) = state
+                .db
+                .notify_device_key_change(member_nid, &[user_nid], stream_pos)
+            {
+                tracing::warn!(error = %e, "notify_device_key_change on join failed");
+            }
+        }
+    }
+    crate::router::notify_user(state, user_nid);
+}
+
+/// Push `m.device_list_update` EDUs for every device the local user
+/// owns to every remote server in the room they just joined. Spec:
+///
+/// > Servers must send m.device_list_update EDUs to all the servers
+/// > who share a room with a given local user … when that user joins
+/// > a room which contains servers which are not already receiving
+/// > updates for that user's device list.
+///
+/// Without this, a remote server has no record of the joiner's
+/// devices until the user uploads keys again — clients on the remote
+/// won't see the joiner appear in `device_lists.changed` after a
+/// federation join.
+pub fn federate_device_lists_on_join(
+    state: &AppState,
+    user_nid: u64,
+    user_id: &str,
+    room_nid: u64,
+) {
+    let destinations = match state
+        .db
+        .get_remote_servers_in_room(room_nid, &state.config.server_name)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "device_list join-federate: room scan failed");
+            return;
+        }
+    };
+    if destinations.is_empty() {
+        return;
+    }
+
+    let devices = match state.db.list_devices(user_nid) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "device_list join-federate: list_devices failed");
+            return;
+        }
+    };
+    if devices.is_empty() {
+        return;
+    }
+
+    for device in &devices {
+        let Some(device_id) = device.get("device_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        let device_keys = state.db.get_device_keys(user_nid, device_id).ok().flatten();
+
+        let stream_id = match state.db.bump_user_device_list_stream(user_nid) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "device_list join-federate: stream bump failed");
+                return;
+            }
+        };
+
+        let display_name = device_keys
+            .as_ref()
+            .and_then(|v| v.get("device_display_name"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| {
+                device
+                    .get("display_name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
+
+        let mut content = serde_json::Map::new();
+        content.insert("user_id".into(), json!(user_id));
+        content.insert("device_id".into(), json!(device_id));
+        content.insert("stream_id".into(), json!(stream_id));
+        content.insert("deleted".into(), json!(false));
+        if let Some(name) = display_name {
+            content.insert("device_display_name".into(), json!(name));
+        }
+        if let Some(keys) = device_keys {
+            content.insert("keys".into(), keys);
+        }
+        let content_value = Value::Object(content);
+
+        for dest in &destinations {
+            if let Err(e) = state.db.enqueue_device_list_outbound(dest, &content_value) {
+                tracing::warn!(target = %dest, error = %e, "device_list enqueue (join) failed");
+                continue;
+            }
+            state.federation_sender.notify_destination(dest);
+        }
     }
 }

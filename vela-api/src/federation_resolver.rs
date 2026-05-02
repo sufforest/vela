@@ -23,8 +23,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use reqwest::Client;
 use serde::Deserialize;
 use thiserror::Error;
@@ -102,14 +103,21 @@ struct CachedWellKnown {
 
 /// Federation server name resolver.
 pub struct FederationResolver {
-    dns: Arc<TokioAsyncResolver>,
+    dns: Arc<TokioResolver>,
     well_known: DashMap<String, CachedWellKnown>,
     http: Client,
 }
 
 impl FederationResolver {
     pub fn new() -> Result<Self, ResolveError> {
-        let dns = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+        let mut builder = TokioResolver::builder_with_config(
+            ResolverConfig::default(),
+            TokioRuntimeProvider::default(),
+        );
+        *builder.options_mut() = ResolverOpts::default();
+        let dns = builder
+            .build()
+            .map_err(|e| ResolveError::WellKnownFailure(format!("dns resolver build: {e}")))?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .user_agent(concat!("vela/", env!("CARGO_PKG_VERSION")))
@@ -287,21 +295,27 @@ impl FederationResolver {
 
     async fn lookup_srv(&self, name: &str) -> Option<(String, u16)> {
         match self.dns.srv_lookup(name).await {
-            Ok(records) => {
-                // Pick the first record after sorting by priority ascending, then
-                // weight descending. RFC 2782 calls for weighted random selection
-                // within a priority; for 3b we take the top-priority record.
-                let mut recs: Vec<_> = records.iter().collect();
-                recs.sort_by(|a, b| {
-                    a.priority()
-                        .cmp(&b.priority())
-                        .then(b.weight().cmp(&a.weight()))
-                });
+            Ok(lookup) => {
+                use hickory_resolver::proto::rr::RData;
+                // hickory v0.26 returns generic Records via `Lookup::answers()`;
+                // pull out the SRV-typed records ourselves. Sort by priority
+                // ascending then weight descending (RFC 2782 — weighted
+                // random selection within a priority is overkill for a
+                // single-pick resolver, take top-priority).
+                let mut recs: Vec<_> = lookup
+                    .answers()
+                    .iter()
+                    .filter_map(|r| match &r.data {
+                        RData::SRV(srv) => Some(srv.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                recs.sort_by(|a, b| a.priority.cmp(&b.priority).then(b.weight.cmp(&a.weight)));
                 recs.first().map(|r| {
-                    let target = r.target().to_utf8();
+                    let target = r.target.to_utf8();
                     // hickory appends a trailing "." to FQDNs; strip it.
                     let target = target.trim_end_matches('.').to_string();
-                    (target, r.port())
+                    (target, r.port)
                 })
             }
             Err(_) => None,

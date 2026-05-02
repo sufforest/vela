@@ -547,6 +547,26 @@ pub async fn send_join_v2(
         .clone();
     let _guard = lock.lock().await;
 
+    // Banned users MUST NOT be able to /send_join, even if their forged
+    // event references stale auth_events from BEFORE the ban. The event's
+    // claimed auth_events are an attacker-controlled choice — auth-rule
+    // check 5.3 ("if state_key's current membership is `ban`, reject")
+    // would let it through here because the attacker omitted the ban
+    // event from auth_events. Independently consult our current room
+    // state and reject up front. Spec: server-server-api §Auth chain
+    // — receivers MAY apply additional state-resolution-based checks
+    // beyond the bare auth-events check.
+    if let Some(current_member) =
+        crate::federation_state::load_state_pdu(&state.db, room_nid, "m.room.member", state_key)
+        && current_member.membership() == Some("ban")
+    {
+        return Err(err_response(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "user is banned from this room",
+        ));
+    }
+
     // Check auth against the event's claimed auth_events.
     let mut auth_state: std::collections::HashMap<(String, String), Pdu> =
         std::collections::HashMap::new();
@@ -627,6 +647,43 @@ pub async fn send_join_v2(
             "M_UNKNOWN",
             &format!("persist failed: {reason}"),
         ));
+    }
+
+    // Surface the remote joiner in our local users' next /sync
+    // `device_lists.changed`. The standalone `m.device_list_update`
+    // EDU may follow later; without this bookkeeping our local
+    // users only learn about the new co-resident's keys when they
+    // happen to /keys/query for them. Spec: device-list updates
+    // SHOULD reflect all newly-shared peers immediately on join.
+    if let Ok(remote_user_nid) = state.db.get_or_create_nid(state_key) {
+        let our_server = state.config.server_name.as_str();
+        let stream_pos = state.db.next_stream_position().as_u64();
+        if let Ok(members) = state.db.get_room_members(room_nid) {
+            let mut local_observers: Vec<u64> = Vec::new();
+            for m in members {
+                if m == remote_user_nid {
+                    continue;
+                }
+                if let Ok(Some(uid)) = state.db.resolve_nid(m)
+                    && uid
+                        .split_once(':')
+                        .map(|(_, d)| d == our_server)
+                        .unwrap_or(false)
+                {
+                    local_observers.push(m);
+                }
+            }
+            if !local_observers.is_empty() {
+                let _ = state.db.notify_device_key_change(
+                    remote_user_nid,
+                    &local_observers,
+                    stream_pos,
+                );
+                for &nid in &local_observers {
+                    crate::router::notify_user(&state, nid);
+                }
+            }
+        }
     }
 
     Ok(Json(json!({
