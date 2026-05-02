@@ -4,7 +4,7 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use vela_core::canonical::canonical_json_object;
 use vela_core::error::VelaError;
 use vela_core::events::builder::{build_event, select_auth_events};
@@ -1692,6 +1692,10 @@ fn is_local_user(user_id: &str, server: &str) -> bool {
 /// events giving them just enough context to render the room invite. Spec:
 /// `client-server-api/#invite_state` (mirrors what we send in CS-API sync's
 /// `rooms.invite.{id}.invite_state`).
+///
+/// MSC4311 (room version 12): the `m.room.create` event MUST appear in
+/// full — recipients need it to verify the room_id, which v12 derives
+/// from a hash of the create event.
 fn build_invite_stripped_state(
     state: &AppState,
     room_nid: u64,
@@ -1725,13 +1729,30 @@ fn build_invite_stripped_state(
         if !STRIPPED_TYPES.contains(&etype) {
             continue;
         }
-        out.push(json!({
-            "type": ev.get("type"),
-            "state_key": ev.get("state_key"),
-            "sender": ev.get("sender"),
-            "content": ev.get("content"),
-            "room_id": room_id,
-        }));
+        if etype == "m.room.create" {
+            // MSC4311: emit the full create event. Re-derive event_id
+            // (v3+ events on the wire don't carry event_id) and ensure
+            // room_id is present so receivers can verify the v12 hash
+            // matches.
+            let event_id =
+                vela_core::events::hash::compute_event_id(ev.as_object().unwrap_or(&Map::new()));
+            let mut full = ev;
+            if let Some(obj) = full.as_object_mut() {
+                obj.insert("event_id".to_string(), json!(event_id.as_str()));
+                if !obj.contains_key("room_id") {
+                    obj.insert("room_id".to_string(), json!(room_id));
+                }
+            }
+            out.push(full);
+        } else {
+            out.push(json!({
+                "type": ev.get("type"),
+                "state_key": ev.get("state_key"),
+                "sender": ev.get("sender"),
+                "content": ev.get("content"),
+                "room_id": room_id,
+            }));
+        }
     }
     Ok(out)
 }

@@ -98,22 +98,6 @@
 # index historical state for /members yet.
 ^TestGetRoomMembersAtPoint$
 
-# Lazy-loaded members on /messages — `lazy_load_members: true`
-# in the filter requires returning a `state` array of the
-# timeline's referenced member events. Spec:
-# message_pagination.yaml line 26-27. Not implemented.
-^TestRoomMessagesLazyLoading$
-
-# /messages filter: `contains_url`, etc. Spec defines a full
-# RoomEventFilter (room_event_filter.yaml). We don't parse the
-# filter parameter on /messages today.
-^TestRoomImageRoundtrip$
-
-# MSC4115: `unsigned.membership` annotation on every event served
-# to clients. Merged into Matrix v1.11. We don't annotate events
-# yet.
-^TestMembershipOnEvents$
-
 # Full-text search (`/_matrix/client/v3/search`) — stable Client-
 # Server API. Designed in docs/SEARCH.md but not built.
 ^TestSearch$

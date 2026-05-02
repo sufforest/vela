@@ -471,6 +471,33 @@ pub(crate) fn build_sync_response_with_filter(
     }))
 }
 
+/// MSC4115: annotate `unsigned.membership` on `ev` with the requesting
+/// user's `m.room.member` value as it stood at `event_nid`. Default
+/// `"leave"` when the user had no member event yet. No-op when
+/// `user_nid` is `None`.
+fn attach_membership_for_user(
+    state: &AppState,
+    ev: &mut Value,
+    user_nid: Option<u64>,
+    event_nid: u64,
+) {
+    let Some(uid) = user_nid else { return };
+    let membership = crate::messages::membership_at_event(state, 0, uid, event_nid)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "leave".to_string());
+    let Some(obj) = ev.as_object_mut() else {
+        return;
+    };
+    let unsigned = obj
+        .entry("unsigned".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(unsigned_obj) = unsigned.as_object_mut() else {
+        return;
+    };
+    unsigned_obj.insert("membership".to_string(), json!(membership));
+}
+
 fn build_room_sync_for_user(
     state: &AppState,
     room_nid: u64,
@@ -488,7 +515,8 @@ fn build_room_sync_for_user(
 
             let mut state_events = Vec::new();
             for nid in &state_nids {
-                if let Some(ev) = load_client_event(state, *nid, room_id)? {
+                if let Some(mut ev) = load_client_event(state, *nid, room_id)? {
+                    attach_membership_for_user(state, &mut ev, user_nid, *nid);
                     state_events.push(ev);
                 }
             }
@@ -504,7 +532,8 @@ fn build_room_sync_for_user(
                 if first_pos.is_none() {
                     first_pos = Some(*pos);
                 }
-                if let Some(ev) = load_client_event(state, *enid, room_id)? {
+                if let Some(mut ev) = load_client_event(state, *enid, room_id)? {
+                    attach_membership_for_user(state, &mut ev, user_nid, *enid);
                     timeline_events.push(ev);
                 }
             }
@@ -872,38 +901,9 @@ fn membership_changed_since(
 
 /// Build the `rooms.invite.{room_id}` payload with stripped state events.
 fn build_invite_sync(state: &AppState, room_nid: u64, room_id: &str) -> Result<Value, ApiError> {
-    static STRIPPED_TYPES: &[&str] = &[
-        "m.room.create",
-        "m.room.name",
-        "m.room.avatar",
-        "m.room.canonical_alias",
-        "m.room.join_rules",
-        "m.room.member",
-    ];
-
-    let state_nids = state
-        .db
-        .get_all_state_event_nids(room_nid)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-
-    let mut stripped = Vec::new();
-    for nid in state_nids {
-        if let Some(ev) = load_client_event(state, nid, room_id)? {
-            let etype = ev.event_type().unwrap_or("");
-            if STRIPPED_TYPES.contains(&etype) {
-                stripped.push(json!({
-                    "type": ev.get("type"),
-                    "state_key": ev.get("state_key"),
-                    "sender": ev.get("sender"),
-                    "content": ev.get("content"),
-                }));
-            }
-        }
-    }
-
     Ok(json!({
         "invite_state": {
-            "events": stripped,
+            "events": collect_invite_or_knock_stripped(state, room_nid, room_id)?,
         },
     }))
 }
@@ -911,6 +911,24 @@ fn build_invite_sync(state: &AppState, room_nid: u64, room_id: &str) -> Result<V
 /// Build the `rooms.knock.{room_id}` payload with stripped state events.
 /// Spec: `rooms.knock.{roomId}.knock_state.events` mirrors `invite_state`.
 fn build_knock_sync(state: &AppState, room_nid: u64, room_id: &str) -> Result<Value, ApiError> {
+    Ok(json!({
+        "knock_state": {
+            "events": collect_invite_or_knock_stripped(state, room_nid, room_id)?,
+        },
+    }))
+}
+
+/// Stripped state events that go into `invite_state` / `knock_state`.
+///
+/// Per MSC4311 (room version 12), the `m.room.create` event MUST be
+/// included in full — it carries the data needed to verify the
+/// room_id (which v12 derives from a hash of the create event). All
+/// other state events are stripped to `type/state_key/sender/content`.
+fn collect_invite_or_knock_stripped(
+    state: &AppState,
+    room_nid: u64,
+    room_id: &str,
+) -> Result<Vec<Value>, ApiError> {
     static STRIPPED_TYPES: &[&str] = &[
         "m.room.create",
         "m.room.name",
@@ -925,24 +943,28 @@ fn build_knock_sync(state: &AppState, room_nid: u64, room_id: &str) -> Result<Va
         .get_all_state_event_nids(room_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
-    let mut stripped = Vec::new();
+    let mut out = Vec::new();
     for nid in state_nids {
-        if let Some(ev) = load_client_event(state, nid, room_id)? {
-            let etype = ev.event_type().unwrap_or("");
-            if STRIPPED_TYPES.contains(&etype) {
-                stripped.push(json!({
-                    "type": ev.get("type"),
-                    "state_key": ev.get("state_key"),
-                    "sender": ev.get("sender"),
-                    "content": ev.get("content"),
-                }));
-            }
+        let Some(ev) = load_client_event(state, nid, room_id)? else {
+            continue;
+        };
+        let etype = ev.event_type().unwrap_or("");
+        if !STRIPPED_TYPES.contains(&etype) {
+            continue;
+        }
+        if etype == "m.room.create" {
+            // MSC4311: full create event, not stripped.
+            out.push(ev);
+        } else {
+            out.push(json!({
+                "type": ev.get("type"),
+                "state_key": ev.get("state_key"),
+                "sender": ev.get("sender"),
+                "content": ev.get("content"),
+            }));
         }
     }
-
-    Ok(json!({
-        "knock_state": {"events": stripped},
-    }))
+    Ok(out)
 }
 
 /// Build the `rooms.leave.{room_id}` payload.
