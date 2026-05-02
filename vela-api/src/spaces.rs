@@ -88,17 +88,17 @@ pub async fn hierarchy(
         if depth + 1 > max_depth {
             continue;
         }
-        for (child_id, _order, _suggested) in &children {
+        for child in &children {
             // Only recurse into children we know locally. Unknown (remote)
             // children already appear in the parent's `children_state`
             // array so clients can render them stub-style.
             if let Some(child_nid) = state
                 .db
-                .get_nid(child_id)
+                .get_nid(&child.child_id)
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
                 && !visited.contains(&child_nid)
             {
-                queue.push_back((child_nid, child_id.clone(), depth + 1));
+                queue.push_back((child_nid, child.child_id.clone(), depth + 1));
             }
         }
     }
@@ -140,15 +140,29 @@ fn can_peek(state: &AppState, room_nid: u64, user_nid: u64) -> Result<bool, ApiE
     Ok(hv == "world_readable")
 }
 
+/// One m.space.child entry retained for hierarchy emission.
+struct ChildEvent {
+    /// Child room ID (state_key).
+    child_id: String,
+    /// Original `m.space.child` event JSON, preserved as-is so the
+    /// hierarchy response carries the spec-required fields (sender,
+    /// origin_server_ts, content.via).
+    raw: Value,
+    /// Cached lexicographic sort key from `content.order`.
+    order: Option<String>,
+    /// Cached origin_server_ts for tie-break sort.
+    origin_ts: u64,
+}
+
 /// Fetch child room declarations from the space's `m.space.child` state
-/// events. Returns `(child_room_id, order, suggested)` for each child
-/// whose content has non-empty `via`. When `suggested_only=true`,
-/// children missing `suggested: true` are filtered out.
+/// events. Returns one `ChildEvent` per child whose content has
+/// non-empty `via`. When `suggested_only=true`, children missing
+/// `suggested: true` are filtered out.
 fn collect_children(
     state: &AppState,
     space_nid: u64,
     suggested_only: bool,
-) -> Result<Vec<(String, Option<String>, bool)>, ApiError> {
+) -> Result<Vec<ChildEvent>, ApiError> {
     let nids = state
         .db
         .get_all_state_event_nids(space_nid)
@@ -178,7 +192,7 @@ fn collect_children(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let state_key = v.state_key().unwrap_or("");
+        let state_key = v.state_key().unwrap_or("").to_string();
         if state_key.is_empty() {
             continue;
         }
@@ -207,12 +221,25 @@ fn collect_children(
             .get("order")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        out.push((state_key.to_string(), order, suggested));
+        let origin_ts = v
+            .get("origin_server_ts")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        out.push(ChildEvent {
+            child_id: state_key,
+            raw: v,
+            order,
+            origin_ts,
+        });
     }
-    // Spec ordering: by `order` (lexicographic) then by child origin_server_ts.
-    // We only have `order` readily; falling back to insertion order is fine
-    // for the first cut.
-    out.sort_by(|a, b| a.1.cmp(&b.1));
+    // Spec ordering: by `order` (lexicographic, missing/null last) then
+    // by child origin_server_ts ascending as the tie-break.
+    out.sort_by(|a, b| match (&a.order, &b.order) {
+        (Some(ao), Some(bo)) => ao.cmp(bo).then(a.origin_ts.cmp(&b.origin_ts)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.origin_ts.cmp(&b.origin_ts),
+    });
     Ok(out)
 }
 
@@ -221,7 +248,7 @@ fn summarize_room(
     state: &AppState,
     room_nid: u64,
     room_id: &str,
-    children: &[(String, Option<String>, bool)],
+    children: &[ChildEvent],
 ) -> Result<Value, ApiError> {
     let create = read_content(state, room_nid, "m.room.create", "").unwrap_or(json!({}));
     let room_version = create
@@ -282,24 +309,25 @@ fn summarize_room(
         .map(|m| m.len() as u64)
         .unwrap_or(0);
 
-    // `children_state` expects stripped m.space.child events. Rebuild from
-    // the walked list so we don't re-read the CF a second time.
+    // `children_state` carries the actual stripped m.space.child events so
+    // clients can render via/order/suggested without re-querying. Spec:
+    // type, state_key, content, sender, origin_server_ts (per the
+    // `StrippedStateEvent` schema referenced from the hierarchy response).
     let mut children_state = Vec::with_capacity(children.len());
-    for (child_id, order, suggested) in children {
-        let mut content = serde_json::Map::new();
-        content.insert("via".into(), json!([])); // placeholder; clients don't strictly need it
-        if let Some(o) = order {
-            content.insert("order".into(), json!(o));
-        }
-        if *suggested {
-            content.insert("suggested".into(), json!(true));
-        }
+    for child in children {
+        let raw = child.raw.as_object();
+        let content = raw
+            .and_then(|o| o.get("content").cloned())
+            .unwrap_or_else(|| json!({}));
+        let sender = raw
+            .and_then(|o| o.get("sender").cloned())
+            .unwrap_or_else(|| json!(""));
         children_state.push(json!({
             "type": "m.space.child",
-            "state_key": child_id,
-            "sender": "",
-            "content": Value::Object(content),
-            "origin_server_ts": 0,
+            "state_key": child.child_id,
+            "sender": sender,
+            "content": content,
+            "origin_server_ts": child.origin_ts,
         }));
     }
 
