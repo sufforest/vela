@@ -453,6 +453,24 @@ pub async fn upload_signing_keys(
     let _ = state.db.record_device_key_change(user.user_nid);
     crate::router::notify_user(&state, user.user_nid);
 
+    // Federate the change. We piggyback on `m.device_list_update`
+    // rather than `m.signing_key_update`: the receiver's response to
+    // either is the same — re-query `/keys/query` for the user, at
+    // which point our federated /keys/query handler returns the new
+    // master/self-signing keys. The piggyback avoids a second EDU
+    // queue and stream while staying spec-correct (peers MUST handle
+    // any unknown EDU silently, and they MUST re-query on
+    // device_list_update). Use the uploader's own device for the
+    // device_id slot — it always exists since the upload was
+    // authenticated against it.
+    let device_keys = state
+        .db
+        .get_device_keys(user.user_nid, &user.device_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    federate_device_list_update(&state, &user, device_keys, /* deleted */ false);
+
     Ok(Json(json!({})))
 }
 
