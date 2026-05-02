@@ -857,7 +857,7 @@ fn load_current_state_pdu(
 /// arbitrarily-deep ancestor chains.
 pub type FetchBudget = std::sync::Arc<std::sync::atomic::AtomicUsize>;
 
-fn new_fetch_budget() -> FetchBudget {
+pub(crate) fn new_fetch_budget() -> FetchBudget {
     std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
         MAX_MISSING_FETCH_PER_PDU,
     ))
@@ -1031,7 +1031,7 @@ async fn fetch_missing_events(
 /// Where the fetched event is being ingested from. The two paths fetch
 /// different shapes of "missing" event and persist them differently.
 #[derive(Clone, Copy, Debug)]
-enum FetchKind {
+pub(crate) enum FetchKind {
     /// `/event_auth` auth-chain ingestion. The events here predate live
     /// state and exist only as auth context for validating a downstream
     /// event. They MUST NOT join the timeline (no stream_pos), become a
@@ -1057,7 +1057,7 @@ enum FetchKind {
 /// NOT run on fetched events: they're historical context for auth validation,
 /// not new live events. Running check 5 would require resolving state from
 /// ancestors that may themselves be missing, multiplying the fetch cost.
-fn persist_fetched_event<'a>(
+pub(crate) fn persist_fetched_event<'a>(
     state: &'a AppState,
     event_json: &'a Value,
     origin: &'a str,

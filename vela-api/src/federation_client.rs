@@ -529,6 +529,28 @@ impl FederationClient {
             .await
     }
 
+    /// `GET /_matrix/federation/v1/event/{eventId}` — fetch a single
+    /// PDU we don't have locally. Response is a transaction-shaped
+    /// object (`{origin, origin_server_ts, pdus: [event]}`); we
+    /// return just the PDU value, leaving validation / persistence
+    /// to the caller via `persist_fetched_event`.
+    pub async fn fetch_event_pdu(
+        &self,
+        destination: &str,
+        event_id: &str,
+    ) -> Result<Value, FederationClientError> {
+        let encoded = url_query_encode(event_id);
+        let path = format!("/_matrix/federation/v1/event/{encoded}");
+        let resp = self
+            .signed_request(reqwest::Method::GET, destination, &path, None)
+            .await?;
+        resp.get("pdus")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .cloned()
+            .ok_or_else(|| FederationClientError::BadJson("response missing pdus[0]".into()))
+    }
+
     /// `POST /_matrix/federation/v1/user/keys/query` — fetch device +
     /// cross-signing keys for users on a remote server. Body shape
     /// matches the C2S /keys/query: `{device_keys: {user_id:
