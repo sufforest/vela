@@ -264,10 +264,15 @@ pub async fn get_missing_events(
     // walk discovers events latest-first; the response is then sorted
     // by depth ascending so the caller receives them in topological
     // (oldest-first) order — what receivers need to fill a DAG gap.
+    //
+    // Spec: events listed in `earliest_events` AND `latest_events` are
+    // excluded from the response — the caller already has both ends
+    // and only needs the gap between them.
     let earliest: HashSet<String> = req.earliest_events.into_iter().collect();
+    let latest: HashSet<String> = req.latest_events.iter().cloned().collect();
     let mut seen: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<String> = req.latest_events.into_iter().collect();
-    let mut out: Vec<Value> = Vec::new();
+    let mut out: Vec<(u64, Value)> = Vec::new();
 
     while let Some(eid) = queue.pop_front() {
         if out.len() >= limit {
@@ -281,10 +286,14 @@ pub async fn get_missing_events(
         let Some(nid) = state.db.get_event_nid_by_id(&eid).ok().flatten() else {
             continue;
         };
-        let Some(json) = load_event_json_by_event_id(&state.db, &eid) else {
-            continue;
-        };
-        out.push(json);
+
+        // Latest_events are walk seeds, not output.
+        if !latest.contains(&eid) {
+            let Some(json) = load_event_json_by_event_id(&state.db, &eid) else {
+                continue;
+            };
+            out.push((nid, json));
+        }
 
         // Enqueue its prev_events for further BFS.
         if let Ok(prev) = state.db.get_prev_events(nid) {
@@ -299,9 +308,120 @@ pub async fn get_missing_events(
         }
     }
 
-    out.sort_by_key(|ev| ev.get("depth").and_then(|d| d.as_u64()).unwrap_or(u64::MAX));
+    // History-visibility filter: when the requesting server's users
+    // wouldn't have been able to see an event under the room's
+    // visibility policy at that event, return a redacted copy. The
+    // policy is per-event, so we look up the state snapshot recorded
+    // for each event and inspect both `m.room.history_visibility`
+    // and the requesting origin's member events at that point.
+    let final_out: Vec<Value> = out
+        .into_iter()
+        .map(|(nid, json)| {
+            if should_redact_for_origin(&state, nid, &origin.0) {
+                let obj = json.as_object().cloned().unwrap_or_default();
+                Value::Object(vela_core::events::redact::redact_event(&obj))
+            } else {
+                json
+            }
+        })
+        .collect();
 
-    Ok(Json(json!({ "events": out })))
+    let mut final_out = final_out;
+    final_out.sort_by_key(|ev| ev.get("depth").and_then(|d| d.as_u64()).unwrap_or(u64::MAX));
+
+    Ok(Json(json!({ "events": final_out })))
+}
+
+/// True when the requesting server's users could not see the event
+/// under the room's history-visibility policy as it stood at that
+/// event. Falls back to "do not redact" on missing snapshots — better
+/// to over-share than to silently hide events from a peer that has a
+/// legitimate need for the chain.
+fn should_redact_for_origin(state: &AppState, event_nid: u64, origin: &str) -> bool {
+    let Ok(Some(state_nids)) = state.db.get_state_at_event(event_nid) else {
+        return false;
+    };
+    let visibility = find_history_visibility_in_state(state, &state_nids);
+    match visibility.as_str() {
+        "world_readable" | "shared" => false,
+        "joined" => !origin_has_member_with_membership(state, &state_nids, origin, &["join"]),
+        "invited" => {
+            !origin_has_member_with_membership(state, &state_nids, origin, &["join", "invite"])
+        }
+        // Unknown/missing → spec default "shared".
+        _ => false,
+    }
+}
+
+/// Read `m.room.history_visibility/""` from a state snapshot. Returns
+/// the spec default `"shared"` when the event is missing or malformed.
+fn find_history_visibility_in_state(state: &AppState, state_nids: &[u64]) -> String {
+    let Ok(Some(type_nid)) = state.db.get_nid("m.room.history_visibility") else {
+        return "shared".to_string();
+    };
+    for &nid in state_nids {
+        let Ok(Some((header, bytes))) = state.db.get_event(nid) else {
+            continue;
+        };
+        if header.type_nid != type_nid {
+            continue;
+        }
+        let Ok(ev) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if let Some(v) = ev
+            .get("content")
+            .and_then(|c| c.get("history_visibility"))
+            .and_then(|v| v.as_str())
+        {
+            return v.to_string();
+        }
+        return "shared".to_string();
+    }
+    "shared".to_string()
+}
+
+/// True when at least one user from `origin` has an `m.room.member`
+/// state event in `state_nids` whose `membership` is one of `wanted`.
+fn origin_has_member_with_membership(
+    state: &AppState,
+    state_nids: &[u64],
+    origin: &str,
+    wanted: &[&str],
+) -> bool {
+    let Ok(Some(member_type_nid)) = state.db.get_nid("m.room.member") else {
+        return false;
+    };
+    for &nid in state_nids {
+        let Ok(Some((header, bytes))) = state.db.get_event(nid) else {
+            continue;
+        };
+        if header.type_nid != member_type_nid {
+            continue;
+        }
+        let Ok(ev) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let Some(state_key) = ev.get("state_key").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // state_key is a user_id `@local:server`.
+        let Some((_, server)) = state_key.split_once(':') else {
+            continue;
+        };
+        if server != origin {
+            continue;
+        }
+        let membership = ev
+            .get("content")
+            .and_then(|c| c.get("membership"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if wanted.contains(&membership) {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Deserialize)]
