@@ -138,7 +138,7 @@ impl FederationSender {
         if !self.enabled {
             return;
         }
-        let destinations = match self
+        let mut destinations = match self
             .db
             .get_remote_servers_in_room(room_nid, &self.our_server_name)
         {
@@ -148,6 +148,19 @@ impl FederationSender {
                 return;
             }
         };
+
+        // m.room.member events that change a remote user's membership
+        // (typically ban / kick / leave) need to reach the target's
+        // server even if the target is no longer joined post-event.
+        // `get_remote_servers_in_room` only walks currently-joined
+        // members, so a ban event would otherwise never be federated
+        // to the banned user's home server. Read the event's
+        // state_key, derive the server, and union it in.
+        if let Some(extra) = self.target_server_for_member_event(event_nid)
+            && !destinations.iter().any(|s| s == &extra)
+        {
+            destinations.push(extra);
+        }
 
         if destinations.is_empty() {
             return;
@@ -250,6 +263,30 @@ impl FederationSender {
             let notify = self.ensure_destination(&server_name);
             notify.notify_one();
         }
+    }
+
+    /// If `event_nid` refers to an `m.room.member` state event whose
+    /// target lives on a remote server, return that server. Used in
+    /// `broadcast` to ensure ban / kick / leave events reach the
+    /// affected user's home server even when the user has just been
+    /// stripped from the joined-members destination list.
+    ///
+    /// Returns `None` for non-member events, locally-hosted targets,
+    /// malformed state_keys, or DB read failures (we'd rather under-
+    /// federate than crash the broadcast path).
+    fn target_server_for_member_event(&self, event_nid: u64) -> Option<String> {
+        let (header, bytes) = self.db.get_event(event_nid).ok().flatten()?;
+        let m_room_member_nid = self.db.get_nid("m.room.member").ok().flatten()?;
+        if header.type_nid != m_room_member_nid {
+            return None;
+        }
+        let event: Value = serde_json::from_slice(&bytes).ok()?;
+        let state_key = event.get("state_key")?.as_str()?;
+        let (_, server) = state_key.split_once(':')?;
+        if server.is_empty() || server == self.our_server_name {
+            return None;
+        }
+        Some(server.to_string())
     }
 
     fn ensure_destination(&self, server_name: &str) -> Arc<Notify> {

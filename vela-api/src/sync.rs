@@ -258,8 +258,24 @@ pub(crate) fn build_sync_response_with_filter(
             continue;
         }
 
-        let mut room_data =
-            build_room_sync_for_user(state, room_nid, &room_id, since, Some(user.user_nid))?;
+        // Honour the filter's timeline.limit at DB query time so
+        // prev_batch is computed from the trimmed batch (not the
+        // pre-trim one — that breaks /messages backward pagination).
+        // Cap at DEFAULT_TIMELINE_LIMIT to match the spec-suggested
+        // ceiling.
+        let timeline_limit = timeline_filter
+            .and_then(|tf| tf.get("limit"))
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).min(DEFAULT_TIMELINE_LIMIT))
+            .unwrap_or(DEFAULT_TIMELINE_LIMIT);
+        let mut room_data = build_room_sync_for_user(
+            state,
+            room_nid,
+            &room_id,
+            since,
+            Some(user.user_nid),
+            timeline_limit,
+        )?;
         if !ignored.is_empty() {
             filter_room_timeline_by_ignored(&mut room_data, &ignored);
         }
@@ -455,6 +471,7 @@ fn build_room_sync_for_user(
     room_id: &str,
     since: Option<u64>,
     user_nid: Option<u64>,
+    timeline_limit: usize,
 ) -> Result<Value, ApiError> {
     let (state_events, timeline_events, limited, prev_batch) = match since {
         None => {
@@ -472,7 +489,7 @@ fn build_room_sync_for_user(
 
             let timeline_entries = state
                 .db
-                .get_timeline_latest(room_nid, DEFAULT_TIMELINE_LIMIT)
+                .get_timeline_latest(room_nid, timeline_limit)
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
             let mut timeline_events = Vec::new();
@@ -521,7 +538,7 @@ fn build_room_sync_for_user(
                 }
                 let timeline_entries = state
                     .db
-                    .get_timeline_latest(room_nid, DEFAULT_TIMELINE_LIMIT)
+                    .get_timeline_latest(room_nid, timeline_limit)
                     .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
                 let mut timeline_events = Vec::new();
                 let mut first_pos = None;
@@ -538,10 +555,29 @@ fn build_room_sync_for_user(
             } else {
                 let timeline_entries = state
                     .db
-                    .get_timeline_range(room_nid, since_pos + 1, u64::MAX, DEFAULT_TIMELINE_LIMIT)
+                    // Spec on /sync timeline filter limit: when the
+                    // client supplies one, we must use it both to bound
+                    // the events returned AND to compute prev_batch
+                    // accurately. Loading 30 events then trimming in a
+                    // post-filter pass leaves prev_batch pointing at
+                    // the pre-trim batch start, which makes
+                    // /messages?from=prev_batch walk past the events
+                    // the client already saw and into older state.
+                    // get_timeline_range walks ascending — to honour
+                    // "most recent N events since `since`", we instead
+                    // walk *backwards* from now to the first
+                    // `timeline_limit` events strictly newer than
+                    // since.
+                    .get_timeline_before(room_nid, u64::MAX, timeline_limit.max(1))
                     .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
-                let limited = timeline_entries.len() >= DEFAULT_TIMELINE_LIMIT;
+                // Drop entries at or before `since_pos`; those are
+                // already on the client.
+                let timeline_entries: Vec<(u64, u64)> = timeline_entries
+                    .into_iter()
+                    .filter(|(p, _)| *p > since_pos)
+                    .collect();
+                let limited = timeline_entries.len() >= timeline_limit;
 
                 let mut timeline_events = Vec::new();
                 let mut first_pos = None;

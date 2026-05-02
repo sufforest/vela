@@ -61,6 +61,16 @@
 # from a v2 creation, which is server-specific.
 ^TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version$
 
+# Tests that hard-code older room versions vela doesn't support.
+# `TestCorruptedAuthChain` creates a v10 room; we reject with
+# M_UNSUPPORTED_ROOM_VERSION per spec. The test is also marked
+# SkipIf(Dendrite) upstream — meant for synapse-specific bugfix
+# coverage.
+^TestCorruptedAuthChain$
+# v6-specific test — same v12-only design rationale.
+^TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6$
+
+
 # --- Deferred spec bugs ---
 # Listed here only because the fix requires non-trivial new
 # infrastructure. Each one is a real spec gap we should close,

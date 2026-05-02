@@ -137,6 +137,25 @@ pub async fn get_messages(
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
     };
 
+    // /messages chunk ordering is direction-aware per spec:
+    //
+    // - `dir=f`: chronological (oldest → newest). `start` is the
+    //   token at the first chunk event, `end` is the token at the
+    //   last (= newest reached on this page).
+    // - `dir=b`: reverse-chronological (newest → oldest). `start`
+    //   is the newest event's token, `end` is the oldest reached
+    //   (= where the client paginates further back from).
+    //
+    // `get_timeline_before` returns chronological order; reverse it
+    // for backward pagination so callers see newest-first chunks.
+    let events: Vec<(u64, u64)> = if dir == "b" {
+        let mut e = events;
+        e.reverse();
+        e
+    } else {
+        events
+    };
+
     let mut chunk = Vec::new();
     let mut start_token = String::new();
     let mut end_token = String::new();
