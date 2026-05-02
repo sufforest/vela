@@ -644,19 +644,24 @@ impl FederationClient {
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
+            .unwrap_or("application/octet-stream")
             .to_string();
-        let boundary = parse_multipart_boundary(&response_ct).ok_or_else(|| {
-            FederationClientError::BadJson(format!("not multipart/mixed: {response_ct}"))
-        })?;
-
         let body = resp
             .bytes()
             .await
             .map_err(|e| FederationClientError::Http(format!("read body: {e}")))?;
 
-        parse_multipart_media(&body, &boundary)
-            .map_err(|e| FederationClientError::BadJson(format!("multipart: {e}")))
+        // Spec-compliant peers reply with multipart/mixed (MSC3916).
+        // Compatibility carve-out: some servers and Complement mocks
+        // return the file directly with its native Content-Type even
+        // at this endpoint. When the response isn't multipart/mixed,
+        // pass the body through verbatim instead of failing.
+        if let Some(boundary) = parse_multipart_boundary(&response_ct) {
+            parse_multipart_media(&body, &boundary)
+                .map_err(|e| FederationClientError::BadJson(format!("multipart: {e}")))
+        } else {
+            Ok((response_ct, body.to_vec()))
+        }
     }
 }
 
