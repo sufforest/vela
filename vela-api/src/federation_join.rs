@@ -547,6 +547,26 @@ pub async fn send_join_v2(
         .clone();
     let _guard = lock.lock().await;
 
+    // Banned users MUST NOT be able to /send_join, even if their forged
+    // event references stale auth_events from BEFORE the ban. The event's
+    // claimed auth_events are an attacker-controlled choice — auth-rule
+    // check 5.3 ("if state_key's current membership is `ban`, reject")
+    // would let it through here because the attacker omitted the ban
+    // event from auth_events. Independently consult our current room
+    // state and reject up front. Spec: server-server-api §Auth chain
+    // — receivers MAY apply additional state-resolution-based checks
+    // beyond the bare auth-events check.
+    if let Some(current_member) =
+        crate::federation_state::load_state_pdu(&state.db, room_nid, "m.room.member", state_key)
+        && current_member.membership() == Some("ban")
+    {
+        return Err(err_response(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "user is banned from this room",
+        ));
+    }
+
     // Check auth against the event's claimed auth_events.
     let mut auth_state: std::collections::HashMap<(String, String), Pdu> =
         std::collections::HashMap::new();

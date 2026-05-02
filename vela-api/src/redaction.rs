@@ -71,9 +71,18 @@ pub async fn redact_event(
         return Ok(Json(json!({"event_id": existing_event_id})));
     }
 
-    // Target must exist and belong to this room.
-    let (target_nid, target_pdu) = load_target(&state, &target_event_id)?;
-    if target_pdu.room_id != room_id.as_str() {
+    // Target may or may not exist locally — the spec explicitly allows
+    // redacting an event we don't have (e.g. it lived only on a remote
+    // server before we federated in, or we missed it during a network
+    // partition). When we DO have it, validate that it belongs to this
+    // room and use its sender for the same-server permission check.
+    // When we don't, fall back to the redact-power-level check alone:
+    // the redaction is sent over federation and the receiver applies
+    // its own permission gate per spec §Handling redactions.
+    let target = load_target(&state, &target_event_id).ok();
+    if let Some((_, target_pdu)) = &target
+        && target_pdu.room_id != room_id.as_str()
+    {
         return Err(VelaError::NotFound("event not found in this room".into()).into());
     }
 
@@ -90,7 +99,15 @@ pub async fn redact_event(
             _ => None,
         }
     };
-    if !can_apply_redaction(&user.user_id, &target_pdu.sender, &state_fn, &create_pdu) {
+    let permission_ok = match &target {
+        Some((_, target_pdu)) => {
+            can_apply_redaction(&user.user_id, &target_pdu.sender, &state_fn, &create_pdu)
+        }
+        // Target unknown — sender must have the redact power level
+        // (we can't compare servers without the target's sender).
+        None => vela_core::auth_rules::has_redact_power(&user.user_id, &state_fn, &create_pdu),
+    };
+    if !permission_ok {
         return Err(
             VelaError::Forbidden("insufficient power level to redact this event".into()).into(),
         );
@@ -205,11 +222,17 @@ pub async fn redact_event(
         )
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
-    // Apply the redaction: mark the target so client renders strip content.
-    state
-        .db
-        .mark_redacted_by(target_nid, event_nid)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    // Apply the redaction locally if we have the target — marks the
+    // event so subsequent reads strip content. If we don't have the
+    // target (federated room where the event preceded our join), the
+    // redaction is still federated to remote servers; they apply
+    // their own copy.
+    if let Some((target_nid, _)) = &target {
+        state
+            .db
+            .mark_redacted_by(*target_nid, event_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    }
 
     state.federation_sender.broadcast(room_nid, event_nid);
 
@@ -661,21 +684,28 @@ mod tests {
         }
     }
 
+    /// Spec `federation/v1/redaction` allows redacting an event we
+    /// don't have locally — e.g. a federated event that preceded our
+    /// join. The redaction is built and broadcast over federation;
+    /// receivers apply their local copy. Used by Complement
+    /// `TestFederationRedactSendsWithoutEvent`.
     #[tokio::test]
-    async fn missing_target_event_is_404() {
+    async fn missing_target_event_redacts_when_user_has_redact_power() {
         let (state, _tmp, _room_nid, _msg_nid, _msg_eid) = setup_room().await;
 
-        let err = redact_event(
+        let result = redact_event(
             State(state.clone()),
             alice_user(&state),
             Path(("!room12".into(), "$does_not_exist".into(), "txn_m".into())),
             Json(RedactBody::default()),
         )
         .await
-        .expect_err("target missing");
+        .expect("redaction with missing target should succeed when caller has power");
+        // Returned event_id should be the redaction we just emitted.
         assert!(
-            matches!(err, ApiError(VelaError::NotFound(_))),
-            "got {err:?}"
+            result.0.get("event_id").and_then(|v| v.as_str()).is_some(),
+            "expected event_id in response: {:?}",
+            result.0
         );
     }
 }

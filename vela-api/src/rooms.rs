@@ -296,12 +296,21 @@ pub async fn create_room(
         content::history_visibility_content(history_vis),
         Some(&room_id)
     );
-    emit!(
-        "m.room.guest_access",
-        "",
-        content::guest_access_content(guest_access),
-        Some(&room_id)
-    );
+    // Only emit `m.room.guest_access` when the preset diverges from
+    // the spec default of `forbidden` — synapse and continuwuity skip
+    // the no-op event for public_chat / preset-default rooms. Emitting
+    // it anyway pads the room's prev_events chain with an event that
+    // breaks tests counting initial-state events
+    // (e.g. TestInboundCanReturnMissingEvents) and is purely
+    // redundant with the spec default.
+    if guest_access != "forbidden" {
+        emit!(
+            "m.room.guest_access",
+            "",
+            content::guest_access_content(guest_access),
+            Some(&room_id)
+        );
+    }
 
     // --- 5. initial_state ---
     let client_supplied_encryption = body
