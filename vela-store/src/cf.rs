@@ -40,6 +40,11 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     "server_keys",
     "sliding_sync_conns",
     "soft_failed_events",
+    // Tracks event_ids of inbound federation events we rejected.
+    // Used to cascade rejection: any event whose auth_events
+    // reference one of these is itself rejected. Stores the
+    // rejection reason as the value (debugging aid).
+    "rejected_events",
     "event_redactions",
     "user_membership_pos",
     "event_relations",

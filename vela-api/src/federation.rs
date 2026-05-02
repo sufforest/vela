@@ -277,6 +277,17 @@ pub async fn receive_transaction(
             }
             crate::federation_receive::PduOutcome::Rejected(reason) => {
                 warn!(%txn_id, %event_id, %reason, "pdu rejected");
+                // Persist the rejection so descendant events that
+                // reference this one in `auth_events` can cascade-
+                // reject without needing to re-derive WHY the
+                // ancestor was rejected. Best-effort; a write
+                // failure here just means we lose cascade for this
+                // particular ancestor on this run.
+                if !event_id.is_empty()
+                    && let Err(e) = state.db.mark_event_rejected(&event_id, reason)
+                {
+                    warn!(%txn_id, %event_id, error = %e, "mark_event_rejected failed");
+                }
             }
         }
         results.insert(event_id, outcome.to_json());

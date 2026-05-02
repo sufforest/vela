@@ -3197,6 +3197,24 @@ impl Database {
         Ok(self.db.get_cf(&cf, event_nid.to_be_bytes())?.is_some())
     }
 
+    // --- Rejected event tracking ---
+
+    /// Persist an event_id as "rejected" so future events whose
+    /// auth_events reference it cascade-reject (Synapse issue 9595,
+    /// MSC TestInboundFederationRejectsEventsWithRejectedAuthEvents).
+    /// Stores `reason` as the value for debugging; the key alone
+    /// would suffice for the rejection check itself.
+    pub fn mark_event_rejected(&self, event_id: &str, reason: &str) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("rejected_events").unwrap();
+        self.db.put_cf(&cf, event_id.as_bytes(), reason.as_bytes())
+    }
+
+    /// True iff `mark_event_rejected` was called for this event_id.
+    pub fn is_event_rejected(&self, event_id: &str) -> Result<bool, rocksdb::Error> {
+        let cf = self.db.cf_handle("rejected_events").unwrap();
+        Ok(self.db.get_cf(&cf, event_id.as_bytes())?.is_some())
+    }
+
     // --- Federation EDU cursors ---
     //
     // Per-(destination, stream_name) cursor tracking how far this server
