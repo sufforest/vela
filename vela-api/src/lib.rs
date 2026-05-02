@@ -11,6 +11,7 @@ pub mod federation_invite;
 pub mod federation_join;
 pub mod federation_knock;
 pub mod federation_leave;
+pub mod federation_media;
 pub mod federation_outbound_join;
 pub mod federation_outbound_knock;
 pub mod federation_receive;
