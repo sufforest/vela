@@ -785,6 +785,16 @@ fn federation_authed_routes(state: AppState) -> Router<AppState> {
             "/_matrix/federation/v1/user/devices/{user_id}",
             get(federation_devices::get_user_devices),
         )
+        // Public-rooms federation directory. Always mounted; the
+        // handler returns 404 when
+        // `allow_public_rooms_over_federation` is false (default),
+        // matching the response a peer would get from a server that
+        // doesn't run this endpoint at all.
+        .route(
+            "/_matrix/federation/v1/publicRooms",
+            get(federation_fetch::get_federation_public_rooms)
+                .post(federation_fetch::post_federation_public_rooms),
+        )
         .route(
             "/_matrix/federation/v1/media/download/{media_id}",
             get(federation_media::federation_download),

@@ -567,6 +567,89 @@ fn is_valid_server_name(s: &str) -> bool {
     true
 }
 
+/// Common query/body shape for both GET and POST `/publicRooms`.
+#[derive(Default, Deserialize)]
+pub struct FederationPublicRoomsRequest {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub include_all_networks: Option<bool>,
+    #[serde(default)]
+    pub third_party_instance_id: Option<String>,
+    #[serde(default)]
+    pub generic_search_term: Option<String>,
+    /// POST-only nested filter object — same as the C2S body.
+    #[serde(default)]
+    pub filter: Option<FederationPublicRoomsFilter>,
+}
+
+#[derive(Deserialize)]
+pub struct FederationPublicRoomsFilter {
+    #[serde(default)]
+    pub generic_search_term: Option<String>,
+}
+
+/// GET /_matrix/federation/v1/publicRooms
+///
+/// Spec-optional federation directory. Gated by
+/// `[server] allow_public_rooms_over_federation` (default false) so
+/// privacy-first deployments don't expose the local room list to
+/// the federation graph by default. When disabled, peers see a 404
+/// — the same response they'd get from a server that simply doesn't
+/// run this endpoint.
+pub async fn get_federation_public_rooms(
+    State(state): State<AppState>,
+    Query(q): Query<FederationPublicRoomsRequest>,
+    axum::extract::Extension(_origin): axum::extract::Extension<XMatrixOrigin>,
+) -> Result<Json<Value>, StatusCode> {
+    serve_federation_public_rooms(&state, &q)
+}
+
+/// POST /_matrix/federation/v1/publicRooms
+pub async fn post_federation_public_rooms(
+    State(state): State<AppState>,
+    axum::extract::Extension(_origin): axum::extract::Extension<XMatrixOrigin>,
+    axum::extract::Extension(VerifiedBody(body)): axum::extract::Extension<VerifiedBody>,
+) -> Result<Json<Value>, StatusCode> {
+    let req: FederationPublicRoomsRequest = match body {
+        Some(b) => serde_json::from_value(b).map_err(|_| StatusCode::BAD_REQUEST)?,
+        None => FederationPublicRoomsRequest::default(),
+    };
+    serve_federation_public_rooms(&state, &req)
+}
+
+fn serve_federation_public_rooms(
+    state: &AppState,
+    req: &FederationPublicRoomsRequest,
+) -> Result<Json<Value>, StatusCode> {
+    if !state.config.allow_public_rooms_over_federation {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // generic_search_term can come either at the top level (GET /
+    // legacy) or nested under `filter` (POST /publicRooms-style).
+    let search_term = req
+        .generic_search_term
+        .as_deref()
+        .or_else(|| {
+            req.filter
+                .as_ref()
+                .and_then(|f| f.generic_search_term.as_deref())
+        })
+        .map(|s| s.to_lowercase());
+
+    let chunk = crate::directory::collect_public_rooms(state, search_term.as_deref())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let total = chunk.len() as u64;
+
+    Ok(Json(json!({
+        "chunk": chunk,
+        "total_room_count_estimate": total,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_valid_server_name;

@@ -333,7 +333,10 @@ pub async fn search_public_rooms(
     })))
 }
 
-fn collect_public_rooms(state: &AppState, search: Option<&str>) -> Result<Vec<Value>, ApiError> {
+pub(crate) fn collect_public_rooms(
+    state: &AppState,
+    search: Option<&str>,
+) -> Result<Vec<Value>, ApiError> {
     let rooms = state.db.list_room_ids().unwrap_or_default();
     let mut chunk = Vec::new();
     for room_id in rooms {
