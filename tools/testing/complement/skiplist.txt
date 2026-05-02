@@ -98,12 +98,6 @@
 # index historical state for /members yet.
 ^TestGetRoomMembersAtPoint$
 
-# Lazy-loaded members on /messages — `lazy_load_members: true`
-# in the filter requires returning a `state` array of the
-# timeline's referenced member events. Spec:
-# message_pagination.yaml line 26-27. Not implemented.
-^TestRoomMessagesLazyLoading$
-
 # Full-text search (`/_matrix/client/v3/search`) — stable Client-
 # Server API. Designed in docs/SEARCH.md but not built.
 ^TestSearch$
