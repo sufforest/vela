@@ -95,7 +95,7 @@ async fn download_inner(
     Path((server_name, media_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     if server_name != state.config.server_name {
-        return Err(VelaError::NotFound("remote media not supported".into()).into());
+        return download_remote(&state, &server_name, &media_id).await;
     }
 
     let metadata = state
@@ -179,4 +179,33 @@ pub async fn config(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "m.upload.size": state.config.max_upload_size,
     }))
+}
+
+/// Federate a media download to the home server that owns the
+/// `mxc://` namespace. Spec: MSC3916 authenticated multipart download
+/// at `/_matrix/federation/v1/media/download/{mediaId}`. We surface
+/// the file content with the original `Content-Type`. Failures
+/// surface as 404 to clients — there's nothing actionable they can
+/// do besides retry, and a leak of upstream errors would be noisy.
+async fn download_remote(
+    state: &AppState,
+    server_name: &str,
+    media_id: &str,
+) -> Result<Response, ApiError> {
+    let (content_type, bytes) = state
+        .federation_client
+        .fetch_media(server_name, media_id)
+        .await
+        .map_err(|e| {
+            tracing::debug!(remote = %server_name, %media_id, error = %e, "federation media fetch failed");
+            ApiError(VelaError::NotFound("remote media unavailable".into()))
+        })?;
+
+    let len = bytes.len();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, len.to_string())
+        .body(Body::from(bytes))
+        .map_err(|e| ApiError(VelaError::Unknown(e.to_string())))
 }
