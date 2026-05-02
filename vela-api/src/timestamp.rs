@@ -19,10 +19,13 @@ use axum::extract::{Path, Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use axum::http::StatusCode;
+
 use vela_core::error::VelaError;
 
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::error::ApiError;
+use crate::middleware::federation_auth::XMatrixOrigin;
 use crate::router::AppState;
 
 #[derive(Deserialize)]
@@ -129,6 +132,82 @@ pub async fn timestamp_to_event(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         .ok_or_else(|| ApiError(VelaError::NotFound("no event matches timestamp".into())))?;
 
+    Ok(Json(json!({
+        "event_id": event_id,
+        "origin_server_ts": event_ts,
+    })))
+}
+
+/// GET /_matrix/federation/v1/timestamp_to_event/{roomId}?ts=…&dir=…
+///
+/// Federation companion to the C2S handler. Peers send this when
+/// their own search yields nothing and they think we may have the
+/// event. Same lookup logic as the C2S path, with two differences:
+/// (1) authentication is X-Matrix (handled by the federation_auth
+/// middleware, hence the `XMatrixOrigin` extractor) — no member
+/// check, since signed peers are authoritative for their own users;
+/// (2) errors are returned as bare HTTP statuses so we don't leak
+/// our internal `M_*` error codes onto the federation surface.
+pub async fn federation_timestamp_to_event(
+    State(state): State<AppState>,
+    axum::extract::Extension(_origin): axum::extract::Extension<XMatrixOrigin>,
+    Path(room_id_str): Path<String>,
+    Query(q): Query<TimestampQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    if q.dir != "f" && q.dir != "b" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let room_nid = state
+        .db
+        .get_nid(&room_id_str)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let entries = state
+        .db
+        .get_timeline_range(room_nid, 0, u64::MAX, MAX_TIMESTAMP_SCAN)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let want_forward = q.dir == "f";
+    let mut best: Option<(u64, u64, u64)> = None;
+    for (stream_pos, event_nid) in entries {
+        let header = match state
+            .db
+            .get_event(event_nid)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        {
+            Some((h, _)) => h,
+            None => continue,
+        };
+        let event_ts = header.origin_server_ts;
+        let qualifies = if want_forward {
+            event_ts >= q.ts
+        } else {
+            event_ts <= q.ts
+        };
+        if !qualifies {
+            continue;
+        }
+        let candidate = (event_ts, stream_pos, event_nid);
+        best = Some(match best {
+            None => candidate,
+            Some(cur) => {
+                let prefer_candidate = if want_forward {
+                    (candidate.0, candidate.1) < (cur.0, cur.1)
+                } else {
+                    (candidate.0, candidate.1) > (cur.0, cur.1)
+                };
+                if prefer_candidate { candidate } else { cur }
+            }
+        });
+    }
+
+    let (event_ts, _, event_nid) = best.ok_or(StatusCode::NOT_FOUND)?;
+    let event_id = state
+        .db
+        .get_event_id_by_nid(event_nid)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(json!({
         "event_id": event_id,
         "origin_server_ts": event_ts,

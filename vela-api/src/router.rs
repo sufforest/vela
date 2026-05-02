@@ -776,6 +776,11 @@ fn federation_authed_routes(state: AppState) -> Router<AppState> {
             "/_matrix/federation/v1/backfill/{room_id}",
             get(federation_fetch::get_backfill),
         )
+        // MSC3030 federation companion to the C2S timestamp_to_event.
+        .route(
+            "/_matrix/federation/v1/timestamp_to_event/{room_id}",
+            get(crate::timestamp::federation_timestamp_to_event),
+        )
         .route(
             "/_matrix/federation/v1/media/download/{media_id}",
             get(federation_media::federation_download),
