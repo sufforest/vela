@@ -6,6 +6,7 @@ mod devices;
 pub mod edu;
 pub mod federation_backfill;
 pub mod federation_client;
+pub mod federation_devices;
 pub mod federation_fetch;
 pub mod federation_invite;
 pub mod federation_join;

@@ -799,6 +799,26 @@ impl Database {
     /// caller's session, and the resulting duplicate ID would only
     /// cause receivers to refetch keys (the conservative response to
     /// any gap).
+    /// Read the current device-list stream id for `user_nid` without
+    /// bumping it. Used by handlers that need to report the current
+    /// generation (e.g. federation `/user/devices/{userId}`).
+    /// Returns 0 if the user has never had a device-list emit.
+    pub fn current_user_device_list_stream(&self, user_nid: u64) -> Result<u64, rocksdb::Error> {
+        let cf = self.db.cf_handle("meta").unwrap();
+        let key = format!("device_list_stream:{user_nid}");
+        Ok(self
+            .db
+            .get_cf(&cf, key.as_bytes())?
+            .and_then(|b| {
+                if b.len() == 8 {
+                    Some(keys::decode_u64(&b))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0))
+    }
+
     pub fn bump_user_device_list_stream(&self, user_nid: u64) -> Result<u64, rocksdb::Error> {
         let cf = self.db.cf_handle("meta").unwrap();
         let key = format!("device_list_stream:{user_nid}");

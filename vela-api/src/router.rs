@@ -745,7 +745,7 @@ async fn method_not_allowed(
 
 /// Build the sub-router for federation endpoints that require X-Matrix auth.
 fn federation_authed_routes(state: AppState) -> Router<AppState> {
-    use crate::{federation_fetch, federation_media};
+    use crate::{federation_devices, federation_fetch, federation_media};
     Router::new()
         .route(
             "/_matrix/federation/v1/send/{txn_id}",
@@ -780,6 +780,10 @@ fn federation_authed_routes(state: AppState) -> Router<AppState> {
         .route(
             "/_matrix/federation/v1/timestamp_to_event/{room_id}",
             get(crate::timestamp::federation_timestamp_to_event),
+        )
+        .route(
+            "/_matrix/federation/v1/user/devices/{user_id}",
+            get(federation_devices::get_user_devices),
         )
         .route(
             "/_matrix/federation/v1/media/download/{media_id}",
