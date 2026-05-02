@@ -3313,6 +3313,7 @@ dependencies = [
  "dashmap",
  "ed25519-dalek",
  "form_urlencoded",
+ "futures",
  "hickory-resolver",
  "metrics",
  "opentelemetry",

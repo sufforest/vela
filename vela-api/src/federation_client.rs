@@ -529,6 +529,41 @@ impl FederationClient {
             .await
     }
 
+    /// `POST /_matrix/federation/v1/user/keys/query` — fetch device +
+    /// cross-signing keys for users on a remote server. Body shape
+    /// matches the C2S /keys/query: `{device_keys: {user_id:
+    /// [device_id, ...]}}`.
+    pub async fn query_user_keys(
+        &self,
+        destination: &str,
+        body: Value,
+    ) -> Result<Value, FederationClientError> {
+        self.signed_request(
+            reqwest::Method::POST,
+            destination,
+            "/_matrix/federation/v1/user/keys/query",
+            Some(body),
+        )
+        .await
+    }
+
+    /// `POST /_matrix/federation/v1/user/keys/claim` — claim one-time
+    /// keys for users on a remote server. Body shape matches the C2S
+    /// /keys/claim: `{one_time_keys: {user_id: {device_id: algorithm}}}`.
+    pub async fn claim_user_keys(
+        &self,
+        destination: &str,
+        body: Value,
+    ) -> Result<Value, FederationClientError> {
+        self.signed_request(
+            reqwest::Method::POST,
+            destination,
+            "/_matrix/federation/v1/user/keys/claim",
+            Some(body),
+        )
+        .await
+    }
+
     /// `GET /_matrix/federation/v1/backfill/{roomId}?v=...&limit=N`
     ///
     /// Sliding-window history fetch. Caller provides the event IDs to start
