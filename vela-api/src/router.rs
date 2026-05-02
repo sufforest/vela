@@ -522,6 +522,13 @@ pub fn build_router(state: AppState) -> Router {
             "/_matrix/media/v3/download/{server_name}/{media_id}",
             get(media::download_legacy),
         )
+        // Spec variant with a filename override in the path. The
+        // filename overrides any name we recorded at upload time, so
+        // clients can serve the same blob under different filenames.
+        .route(
+            "/_matrix/media/v3/download/{server_name}/{media_id}/{filename}",
+            get(media::download_legacy_with_filename),
+        )
         .route(
             "/_matrix/media/v3/thumbnail/{server_name}/{media_id}",
             get(media::thumbnail_legacy),
@@ -529,6 +536,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/_matrix/client/v1/media/download/{server_name}/{media_id}",
             get(media::download),
+        )
+        .route(
+            "/_matrix/client/v1/media/download/{server_name}/{media_id}/{filename}",
+            get(media::download_with_filename),
         )
         .route(
             "/_matrix/client/v1/media/thumbnail/{server_name}/{media_id}",
