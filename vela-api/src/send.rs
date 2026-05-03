@@ -201,6 +201,13 @@ pub async fn send_message(
         )
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
+    // Record the txn_id alongside the event so reads from the
+    // originating device get `unsigned.transaction_id` attached.
+    state
+        .db
+        .set_event_txn_id(event_nid, user.user_nid, &user.device_id, &txn_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
     // Update room bump (messages are bump events)
     state
         .db

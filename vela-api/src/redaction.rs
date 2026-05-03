@@ -253,6 +253,11 @@ pub async fn redact_event(
 
     state
         .db
+        .set_event_txn_id(event_nid, user.user_nid, &user.device_id, &txn_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
+    state
+        .db
         .update_room_bump(room_nid, origin_ts, event_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 

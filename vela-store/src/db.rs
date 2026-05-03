@@ -3334,6 +3334,61 @@ impl Database {
         Ok(self.db.get_cf(&cf, event_id.as_bytes())?.is_some())
     }
 
+    /// Record the transaction id used to mint `event_nid`, scoped to
+    /// the originating `(user_nid, device_id)`. Read back via
+    /// `get_event_txn_id_for_user` to attach `unsigned.transaction_id`
+    /// on the local-echo path.
+    pub fn set_event_txn_id(
+        &self,
+        event_nid: u64,
+        user_nid: u64,
+        device_id: &str,
+        txn_id: &str,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("event_txn_ids").unwrap();
+        let mut value = Vec::with_capacity(8 + device_id.len() + 1 + txn_id.len());
+        value.extend_from_slice(&keys::encode_u64(user_nid));
+        value.extend_from_slice(device_id.as_bytes());
+        value.push(0xff);
+        value.extend_from_slice(txn_id.as_bytes());
+        self.db.put_cf(&cf, keys::encode_u64(event_nid), value)
+    }
+
+    /// Look up the txn_id for `event_nid` if it was sent by
+    /// `(user_nid, device_id)`. Returns `None` when the event has no
+    /// recorded txn (e.g. it came in over federation, or via
+    /// /createRoom which doesn't carry one) or when the requester
+    /// isn't the original sender — local-echo MUST NOT leak txn ids
+    /// across users.
+    pub fn get_event_txn_id_for_user(
+        &self,
+        event_nid: u64,
+        user_nid: u64,
+        device_id: &str,
+    ) -> Result<Option<String>, rocksdb::Error> {
+        let cf = self.db.cf_handle("event_txn_ids").unwrap();
+        let Some(value) = self.db.get_cf(&cf, keys::encode_u64(event_nid))? else {
+            return Ok(None);
+        };
+        if value.len() < 8 {
+            return Ok(None);
+        }
+        let stored_user_nid = keys::decode_u64(&value[..8]);
+        if stored_user_nid != user_nid {
+            return Ok(None);
+        }
+        let rest = &value[8..];
+        let Some(sep) = rest.iter().position(|b| *b == 0xff) else {
+            return Ok(None);
+        };
+        let stored_device = &rest[..sep];
+        if stored_device != device_id.as_bytes() {
+            return Ok(None);
+        }
+        let txn = &rest[sep + 1..];
+        Ok(Some(String::from_utf8_lossy(txn).into_owned()))
+    }
+
     // --- OpenID tokens ---
 
     /// Persist an OpenID access token. Value layout: 8 BE bytes of

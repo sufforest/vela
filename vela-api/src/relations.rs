@@ -267,7 +267,7 @@ pub async fn threads_list(
             &state,
             *enid,
             &room_id,
-            Some(user.user_nid),
+            Some((user.user_nid, &user.device_id)),
         )? {
             chunk.push(ev);
             last_pos = Some(*sp);
