@@ -529,6 +529,22 @@ impl FederationClient {
             .await
     }
 
+    /// `GET /_matrix/federation/v1/hierarchy/{roomId}` — fetch a
+    /// remote space's single-level summary (MSC2946). Caller is
+    /// responsible for further recursion across servers.
+    pub async fn fetch_hierarchy(
+        &self,
+        destination: &str,
+        room_id: &str,
+    ) -> Result<Value, FederationClientError> {
+        let path = format!(
+            "/_matrix/federation/v1/hierarchy/{}",
+            url_query_encode(room_id)
+        );
+        self.signed_request(reqwest::Method::GET, destination, &path, None)
+            .await
+    }
+
     /// `GET /_matrix/federation/v1/event/{eventId}` — fetch a single
     /// PDU we don't have locally. Response is a transaction-shaped
     /// object (`{origin, origin_server_ts, pdus: [event]}`); we
