@@ -174,13 +174,10 @@ async fn handle(
     let mut resp = serde_json::Map::new();
     resp.insert("chunk".to_string(), Value::Array(chunk));
     if let Some(pos) = last_pos {
-        // For backwards iteration, next page starts BEFORE the last position.
-        let token = format!("s{pos}");
-        if dir_backwards {
-            resp.insert("next_batch".to_string(), Value::String(token));
-        } else {
-            resp.insert("prev_batch".to_string(), Value::String(token));
-        }
+        // `next_batch` means "continue paginating in the SAME direction" — for both
+        // dir=b (older) and dir=f (newer), the token is the last seen stream_pos,
+        // which list_relations treats as exclusive on both ends.
+        resp.insert("next_batch".to_string(), Value::String(format!("s{pos}")));
     }
     Ok(Json(Value::Object(resp)))
 }
@@ -234,28 +231,25 @@ pub async fn threads_list(
         None => return Ok(Json(json!({"chunk": []}))),
     };
 
-    // Walk timeline backwards from `from`, looking for events that have
-    // m.thread children. We over-scan to find `limit` roots.
+    // Walk a window of recent room events looking for thread roots, then sort
+    // by latest m.thread child activity (newest first) — this is the spec's
+    // "thread order", not timeline order. `from` paginates by latest-activity,
+    // so we always scan from the newest end and filter the page afterwards.
     let scan_window = limit * 50; // heuristic; bounded to keep latency low.
     let entries = state
         .db
-        .get_timeline_before(room_nid, from, scan_window)
+        .get_timeline_before(room_nid, u64::MAX, scan_window)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
-    let mut chunk = Vec::with_capacity(limit);
-    let mut last_pos = None;
-    for (sp, enid) in entries.iter().rev() {
-        if chunk.len() >= limit {
-            break;
-        }
-        // Cheap thread-root check: does this event have any m.thread child?
+    let mut candidates: Vec<(u64, u64)> = Vec::new(); // (latest_child_sp, root_nid)
+    for (_, enid) in entries.iter() {
         let children = state
             .db
             .list_relations(*enid, Some(thread_nid), None, u64::MAX, true, 1)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-        if children.is_empty() {
+        let Some(&(latest_sp, _, _, _)) = children.first() else {
             continue;
-        }
+        };
         if participated_only {
             let participated =
                 root_or_replied_user(state.db.as_ref(), *enid, user.user_nid, thread_nid)?;
@@ -263,14 +257,23 @@ pub async fn threads_list(
                 continue;
             }
         }
+        candidates.push((latest_sp, *enid));
+    }
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
+    candidates.retain(|&(sp, _)| sp < from);
+    candidates.truncate(limit);
+
+    let mut chunk = Vec::with_capacity(candidates.len());
+    let mut last_pos = None;
+    for (latest_sp, root_nid) in candidates {
         if let Some(ev) = crate::messages::load_client_event_with_relations(
             &state,
-            *enid,
+            root_nid,
             &room_id,
             Some((user.user_nid, &user.device_id)),
         )? {
             chunk.push(ev);
-            last_pos = Some(*sp);
+            last_pos = Some(latest_sp);
         }
     }
 
@@ -680,6 +683,74 @@ mod tests {
             .collect();
         assert_eq!(ids2, vec!["$c2"]);
         let _ = (p1, p2);
+    }
+
+    #[tokio::test]
+    async fn relations_forward_pagination_uses_next_batch() {
+        let (state, _tmp, room_id, room_nid, alice_nid, parent_eid) = setup_room();
+        for (nid, eid) in [(300u64, "$c1"), (301, "$c2"), (302, "$c3")] {
+            persist_child(
+                &state,
+                &room_id,
+                room_nid,
+                alice_nid,
+                "@alice:example.com",
+                nid,
+                eid,
+                "m.thread",
+                &parent_eid,
+            );
+        }
+
+        // dir=f, limit=1 → first child by ASC, next_batch present.
+        let res = relations_with_query(
+            State(state.clone()),
+            alice_user(&state),
+            Path((room_id.clone(), parent_eid.clone())),
+            Query(RelationsQuery {
+                dir: Some("f".into()),
+                limit: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let chunk = res.0.get("chunk").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            chunk[0].get("event_id").and_then(|v| v.as_str()),
+            Some("$c1")
+        );
+        let next = res
+            .0
+            .get("next_batch")
+            .and_then(|v| v.as_str())
+            .expect("next_batch must be present for dir=f");
+        assert!(res.0.get("prev_batch").is_none());
+
+        // Continue paginating forward.
+        let res2 = relations_with_query(
+            State(state.clone()),
+            alice_user(&state),
+            Path((room_id.clone(), parent_eid.clone())),
+            Query(RelationsQuery {
+                dir: Some("f".into()),
+                from: Some(next.to_string()),
+                limit: Some(1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let ids: Vec<&str> = res2
+            .0
+            .get("chunk")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.get("event_id").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(ids, vec!["$c2"]);
     }
 
     #[tokio::test]
