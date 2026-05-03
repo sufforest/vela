@@ -111,6 +111,14 @@ pub async fn get_messages(
     // Cap range by leave_pos so departed users only see pre-leave
     // events. For backward pagination we cap `from`; for forward we
     // cap `to`.
+    //
+    // Matrix token semantics: a sync `next_batch` is the highest
+    // delivered position — clients re-feed it as `since`/`from`
+    // expecting events strictly after, and as `to` expecting events
+    // up to and including. Our `get_timeline_range(from, to)` is
+    // half-open `[from, to)`, so for `dir=f` we shift `from = n+1`
+    // (exclusive) and `to = n+1` (inclusive of the supplied
+    // afterToken).
     let events = if dir == "b" {
         let from = match leave_cap {
             Some(cap) => from.min(cap),
@@ -121,14 +129,19 @@ pub async fn get_messages(
             .get_timeline_before(room_nid, from, limit)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
     } else {
+        let from = match cursor {
+            Some(Cursor::Stream(n)) => n.saturating_add(1),
+            _ => 0,
+        };
         let to = query
             .to
             .as_deref()
             .and_then(|s| s.strip_prefix('s'))
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|n| n.saturating_add(1))
             .unwrap_or(u64::MAX);
         let to = match leave_cap {
-            Some(cap) => to.min(cap),
+            Some(cap) => to.min(cap.saturating_add(1)),
             None => to,
         };
         state
