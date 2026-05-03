@@ -147,19 +147,17 @@ pub async fn sync(
         full_state,
     )?;
 
+    // A joined room appears in `rooms.join` only when it has new
+    // content (timeline / state / ephemeral / account_data) per the
+    // unchanged-room rule. So "any joined room is present" is itself
+    // the signal that there's new data to deliver — no need to crack
+    // open the timeline. This catches typing/receipt-only changes
+    // that previously left long-polls hanging until timeout.
     let has_events = response
         .get("rooms")
         .and_then(|r| r.get("join"))
         .and_then(|j| j.as_object())
-        .map(|rooms| {
-            rooms.values().any(|room| {
-                room.get("timeline")
-                    .and_then(|t| t.get("events"))
-                    .and_then(|e| e.as_array())
-                    .is_some_and(|a| !a.is_empty())
-            })
-        })
-        .unwrap_or(false);
+        .is_some_and(|rooms| !rooms.is_empty());
     let has_invites = response
         .get("rooms")
         .and_then(|r| r.get("invite"))
@@ -711,9 +709,24 @@ fn build_room_sync_for_user(
     // Ephemeral: typing + receipts
     let mut ephemeral_events = Vec::new();
 
-    // Typing
-    let typing_user_nids = get_typing_users(state, room_nid);
-    if !typing_user_nids.is_empty() {
+    // Typing.
+    //
+    // m.typing is current-state-style: clients want the latest list of
+    // typers, not a stream of deltas. But emitting it on every /sync
+    // would conflict with the "skip unchanged room" rule (every room
+    // would always look "changed") and flood clients with redundant
+    // events. Compromise: emit on initial sync, then on incremental
+    // sync only when the typing set transitioned (start or stop) at
+    // a stream position newer than `since`. The transition pos is
+    // bumped by the /typing handler.
+    let last_typing_change = state.typing_change_pos.get(&room_nid).map(|v| *v);
+    let typing_changed_since = match (since, last_typing_change) {
+        (None, _) => true,           // initial sync — always carry the snapshot
+        (Some(_), None) => false,    // never transitioned in this process
+        (Some(s), Some(p)) => p > s, // a transition happened since the last sync
+    };
+    if typing_changed_since {
+        let typing_user_nids = get_typing_users(state, room_nid);
         let mut user_ids = Vec::new();
         for nid in &typing_user_nids {
             if let Some(uid) = state
@@ -724,6 +737,9 @@ fn build_room_sync_for_user(
                 user_ids.push(Value::String(uid));
             }
         }
+        // Even an empty user_ids list is meaningful — it tells clients
+        // "no one is typing right now" after a stop transition, which
+        // is what TestTyping/Typing_can_be_explicitly_stopped checks.
         ephemeral_events.push(json!({
             "type": "m.typing",
             "content": {"user_ids": user_ids}

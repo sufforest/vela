@@ -739,6 +739,7 @@ fn main() -> anyhow::Result<()> {
             user_locks: Arc::new(DashMap::new()),
             room_senders: Arc::new(DashMap::new()),
             typing_state: Arc::new(DashMap::new()),
+            typing_change_pos: Arc::new(DashMap::new()),
             typing_stream,
             media_store: media_store.clone(),
             signing_key,
