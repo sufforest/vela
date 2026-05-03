@@ -150,7 +150,7 @@ fn user_server(user_id: &str) -> Option<&str> {
 
 /// Read a local user's device + cross-signing keys into the four
 /// per-user maps that build up the /keys/query response.
-fn fold_local_user_keys(
+pub(crate) fn fold_local_user_keys(
     state: &AppState,
     user_id: &str,
     device_ids: &[String],
@@ -303,7 +303,7 @@ pub async fn claim_keys(
 
 /// Claim one-time keys for a local user under the per-user lock and
 /// fold the result into the per-user response map.
-async fn claim_local_user_otks(
+pub(crate) async fn claim_local_user_otks(
     state: &AppState,
     user_id: &str,
     devices: &HashMap<String, String>,
@@ -337,7 +337,14 @@ async fn claim_local_user_otks(
             user_keys.insert(device_id.clone(), Value::Object(device_map));
         }
     }
-    result.insert(user_id.to_string(), Value::Object(user_keys));
+    // Spec: omit users for whom no keys could be claimed. The test
+    // `TestFederationKeyUploadQuery/Can_claim_remote_one_time_key_using_POST`
+    // pings /keys/claim a second time after exhausting the OTK and
+    // asserts the user_id is *missing* from the response — an
+    // empty-but-present map fails that match.
+    if !user_keys.is_empty() {
+        result.insert(user_id.to_string(), Value::Object(user_keys));
+    }
     Ok(())
 }
 
@@ -453,7 +460,90 @@ pub async fn upload_signing_keys(
     let _ = state.db.record_device_key_change(user.user_nid);
     crate::router::notify_user(&state, user.user_nid);
 
+    // Federate the change. We send BOTH:
+    //   * `m.device_list_update` — peers without `m.signing_key_update`
+    //     support fall through to a `/keys/query` re-fetch and pick up
+    //     the new master/self-signing keys via our federated
+    //     `/keys/query` handler.
+    //   * `m.signing_key_update` (proper EDU) — peers with the spec
+    //     handler persist the new keys directly without the round-trip.
+    // Belt-and-suspenders for compatibility with any peer in the
+    // federation.
+    let device_keys = state
+        .db
+        .get_device_keys(user.user_nid, &user.device_id)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    federate_device_list_update(&state, &user, device_keys, /* deleted */ false);
+
+    let stored = state
+        .db
+        .get_cross_signing_keys(user.user_nid)
+        .unwrap_or_default();
+    federate_signing_key_update(&state, &user, &stored);
+
     Ok(Json(json!({})))
+}
+
+/// Enqueue an `m.signing_key_update` EDU for every remote server
+/// that shares a room with the user. Content carries the user's
+/// current `master_key` and `self_signing_key`; `user_signing_key`
+/// is intentionally NOT federated (it's the user's private key for
+/// signing trust assertions about other users — only the local
+/// server needs it).
+fn federate_signing_key_update(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    cross_signing: &std::collections::HashMap<String, Value>,
+) {
+    use std::collections::HashSet;
+
+    let rooms = match state.db.get_user_joined_rooms(user.user_nid) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "signing_key federate: get_user_joined_rooms failed");
+            return;
+        }
+    };
+    let mut destinations: HashSet<String> = HashSet::new();
+    for room_nid in rooms {
+        match state
+            .db
+            .get_remote_servers_in_room(room_nid, &state.config.server_name)
+        {
+            Ok(servers) => destinations.extend(servers),
+            Err(e) => tracing::warn!(error = %e, "signing_key federate: room scan failed"),
+        }
+    }
+    if destinations.is_empty() {
+        return;
+    }
+
+    let mut content = serde_json::Map::new();
+    content.insert("user_id".into(), json!(user.user_id));
+    if let Some(master) = cross_signing.get("master_key") {
+        content.insert("master_key".into(), master.clone());
+    }
+    if let Some(ssk) = cross_signing.get("self_signing_key") {
+        content.insert("self_signing_key".into(), ssk.clone());
+    }
+    // No keys to share → nothing for peers to act on; skip the EDU.
+    if !content.contains_key("master_key") && !content.contains_key("self_signing_key") {
+        return;
+    }
+    let content_value = Value::Object(content);
+
+    for dest in destinations {
+        if let Err(e) = state
+            .db
+            .enqueue_signing_key_update_outbound(&dest, &content_value)
+        {
+            tracing::warn!(target = %dest, error = %e, "signing_key_update enqueue failed");
+            continue;
+        }
+        state.federation_sender.notify_destination(&dest);
+    }
 }
 
 // --- Signatures Upload ---
@@ -771,4 +861,87 @@ pub fn federate_device_lists_on_join(
             state.federation_sender.notify_destination(dest);
         }
     }
+}
+
+// --- Federation key endpoints ---
+
+/// POST /_matrix/federation/v1/user/keys/query
+///
+/// Federation companion to the C2S `/keys/query`. Same body shape:
+/// `{device_keys: {user_id: [device_id, ...]}}`. We respond ONLY
+/// for users on our own server — peers serve their own users.
+///
+/// Spec response omits `user_signing_keys` (private to the user's
+/// home server); we discard the map populated by
+/// `fold_local_user_keys` rather than maintain a separate
+/// federation-only helper.
+pub async fn federation_query_keys(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Extension(_origin): axum::extract::Extension<
+        crate::middleware::federation_auth::XMatrixOrigin,
+    >,
+    axum::extract::Extension(crate::middleware::federation_auth::VerifiedBody(body)): axum::extract::Extension<crate::middleware::federation_auth::VerifiedBody>,
+) -> Result<Json<Value>, axum::http::StatusCode> {
+    let body = body.ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    let req: KeysQueryRequest =
+        serde_json::from_value(body).map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+
+    let mut device_keys_response: Map<String, Value> = Map::new();
+    let mut master_keys: Map<String, Value> = Map::new();
+    let mut self_signing_keys: Map<String, Value> = Map::new();
+    let mut user_signing_keys_discard: Map<String, Value> = Map::new();
+
+    let our_server = state.config.server_name.as_str();
+    for (user_id, device_ids) in &req.device_keys {
+        if user_server(user_id) != Some(our_server) {
+            continue;
+        }
+        fold_local_user_keys(
+            &state,
+            user_id,
+            device_ids,
+            &mut device_keys_response,
+            &mut master_keys,
+            &mut self_signing_keys,
+            &mut user_signing_keys_discard,
+        )
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    Ok(Json(json!({
+        "device_keys": device_keys_response,
+        "master_keys": master_keys,
+        "self_signing_keys": self_signing_keys,
+    })))
+}
+
+/// POST /_matrix/federation/v1/user/keys/claim
+///
+/// Federation companion to the C2S `/keys/claim`. Body:
+/// `{one_time_keys: {user_id: {device_id: algorithm}}}`. Claims
+/// happen under the per-user lock so two concurrent peers don't
+/// both win the same one-time key.
+pub async fn federation_claim_keys(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Extension(_origin): axum::extract::Extension<
+        crate::middleware::federation_auth::XMatrixOrigin,
+    >,
+    axum::extract::Extension(crate::middleware::federation_auth::VerifiedBody(body)): axum::extract::Extension<crate::middleware::federation_auth::VerifiedBody>,
+) -> Result<Json<Value>, axum::http::StatusCode> {
+    let body = body.ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    let req: KeysClaimRequest =
+        serde_json::from_value(body).map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+
+    let mut result: Map<String, Value> = Map::new();
+    let our_server = state.config.server_name.as_str();
+    for (user_id, devices) in &req.one_time_keys {
+        if user_server(user_id) != Some(our_server) {
+            continue;
+        }
+        claim_local_user_otks(&state, user_id, devices, &mut result)
+            .await
+            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    Ok(Json(json!({ "one_time_keys": result })))
 }

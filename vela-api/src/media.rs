@@ -74,7 +74,17 @@ pub async fn download(
     _user: AuthenticatedUser,
     path: Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    download_inner(state, path).await
+    let Path((server, media)) = path;
+    download_inner(state, Path((server, media, None))).await
+}
+
+/// GET /_matrix/client/v1/media/download/{serverName}/{mediaId}/{filename}
+pub async fn download_with_filename(
+    state: State<AppState>,
+    _user: AuthenticatedUser,
+    Path((server, media, filename)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    download_inner(state, Path((server, media, Some(filename)))).await
 }
 
 /// GET /_matrix/media/v3/download/{serverName}/{mediaId}
@@ -87,15 +97,26 @@ pub async fn download_legacy(
     state: State<AppState>,
     path: Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    download_inner(state, path).await
+    let Path((server, media)) = path;
+    download_inner(state, Path((server, media, None))).await
+}
+
+/// GET /_matrix/media/v3/download/{serverName}/{mediaId}/{filename}
+///
+/// Legacy unauthenticated variant with filename override.
+pub async fn download_legacy_with_filename(
+    state: State<AppState>,
+    Path((server, media, filename)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    download_inner(state, Path((server, media, Some(filename)))).await
 }
 
 async fn download_inner(
     State(state): State<AppState>,
-    Path((server_name, media_id)): Path<(String, String)>,
+    Path((server_name, media_id, filename_override)): Path<(String, String, Option<String>)>,
 ) -> Result<Response, ApiError> {
     if server_name != state.config.server_name {
-        return Err(VelaError::NotFound("remote media not supported".into()).into());
+        return download_remote(&state, &server_name, &media_id).await;
     }
 
     let metadata = state
@@ -121,10 +142,15 @@ async fn download_inner(
         .and_then(|v| v.as_str())
         .unwrap_or("application/octet-stream");
 
-    let filename = metadata
-        .get("filename")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    // Spec: a `{filename}` segment in the URL overrides the stored
+    // filename. Otherwise fall back to whatever was provided at upload.
+    let filename: &str = match filename_override.as_deref() {
+        Some(f) => f,
+        None => metadata
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    };
 
     let size = state.media_store.size(&media_id).await.ok().flatten();
 
@@ -136,14 +162,9 @@ async fn download_inner(
     }
 
     if !filename.is_empty() {
-        // Sanitize filename — remove control chars and quotes to prevent header injection
-        let safe_name: String = filename
-            .chars()
-            .filter(|c| !c.is_control() && *c != '"' && *c != '\\')
-            .collect();
         builder = builder.header(
             header::CONTENT_DISPOSITION,
-            format!("inline; filename=\"{safe_name}\""),
+            format_content_disposition(filename),
         );
     }
 
@@ -156,11 +177,11 @@ async fn download_inner(
 pub async fn thumbnail(
     state: State<AppState>,
     _user: AuthenticatedUser,
-    path: Path<(String, String)>,
+    Path((server, media)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     // For now, return the original file. Proper thumbnail generation
     // requires the `image` crate — defer to a future iteration.
-    download_inner(state, path).await
+    download_inner(state, Path((server, media, None))).await
 }
 
 /// GET /_matrix/media/v3/thumbnail/{serverName}/{mediaId}
@@ -169,9 +190,9 @@ pub async fn thumbnail(
 /// rationale as `download_legacy`.
 pub async fn thumbnail_legacy(
     state: State<AppState>,
-    path: Path<(String, String)>,
+    Path((server, media)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    download_inner(state, path).await
+    download_inner(state, Path((server, media, None))).await
 }
 
 /// GET /_matrix/media/v3/config
@@ -179,4 +200,73 @@ pub async fn config(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "m.upload.size": state.config.max_upload_size,
     }))
+}
+
+/// Build a `Content-Disposition` value for a media download.
+///
+/// Always uses `inline` disposition (we don't force file save). When
+/// the filename is pure ASCII we emit only the `filename=` parameter.
+/// When it contains non-ASCII bytes, we additionally emit
+/// `filename*=UTF-8''<percent-encoded>` per RFC 5987 so HTTP clients
+/// preserve the original Unicode rather than mangling it. The plain
+/// `filename=` is kept for legacy clients but with non-ASCII bytes
+/// stripped — anything else risks header-injection or invalid
+/// header bytes that proxies will reject.
+fn format_content_disposition(filename: &str) -> String {
+    // Strip control chars and the literals that would break the
+    // header value (`"`, `\\`, CR, LF, NUL, etc.).
+    fn safe_char(c: char) -> bool {
+        !c.is_control() && c != '"' && c != '\\'
+    }
+    let safe: String = filename.chars().filter(|c| safe_char(*c)).collect();
+    let ascii_safe: String = safe
+        .chars()
+        .filter(|c| c.is_ascii() && safe_char(*c))
+        .collect();
+
+    if safe.is_ascii() {
+        return format!("inline; filename=\"{safe}\"");
+    }
+
+    // RFC 5987 percent-encoding: only unreserved characters are kept
+    // verbatim; everything else (including all multibyte UTF-8) gets
+    // %HH-encoded.
+    let mut encoded = String::with_capacity(safe.len() * 3);
+    for byte in safe.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("inline; filename=\"{ascii_safe}\"; filename*=UTF-8''{encoded}")
+}
+
+/// Federate a media download to the home server that owns the
+/// `mxc://` namespace. Spec: MSC3916 authenticated multipart download
+/// at `/_matrix/federation/v1/media/download/{mediaId}`. We surface
+/// the file content with the original `Content-Type`. Failures
+/// surface as 404 to clients — there's nothing actionable they can
+/// do besides retry, and a leak of upstream errors would be noisy.
+async fn download_remote(
+    state: &AppState,
+    server_name: &str,
+    media_id: &str,
+) -> Result<Response, ApiError> {
+    let (content_type, bytes) = state
+        .federation_client
+        .fetch_media(server_name, media_id)
+        .await
+        .map_err(|e| {
+            tracing::debug!(remote = %server_name, %media_id, error = %e, "federation media fetch failed");
+            ApiError(VelaError::NotFound("remote media unavailable".into()))
+        })?;
+
+    let len = bytes.len();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, len.to_string())
+        .body(Body::from(bytes))
+        .map_err(|e| ApiError(VelaError::Unknown(e.to_string())))
 }

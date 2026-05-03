@@ -67,5 +67,6 @@ pub mod device_list;
 pub mod inbound;
 pub mod presence;
 pub mod receipts;
+pub mod signing_key;
 pub mod to_device;
 pub mod typing;

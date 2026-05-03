@@ -799,6 +799,26 @@ impl Database {
     /// caller's session, and the resulting duplicate ID would only
     /// cause receivers to refetch keys (the conservative response to
     /// any gap).
+    /// Read the current device-list stream id for `user_nid` without
+    /// bumping it. Used by handlers that need to report the current
+    /// generation (e.g. federation `/user/devices/{userId}`).
+    /// Returns 0 if the user has never had a device-list emit.
+    pub fn current_user_device_list_stream(&self, user_nid: u64) -> Result<u64, rocksdb::Error> {
+        let cf = self.db.cf_handle("meta").unwrap();
+        let key = format!("device_list_stream:{user_nid}");
+        Ok(self
+            .db
+            .get_cf(&cf, key.as_bytes())?
+            .and_then(|b| {
+                if b.len() == 8 {
+                    Some(keys::decode_u64(&b))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0))
+    }
+
     pub fn bump_user_device_list_stream(&self, user_nid: u64) -> Result<u64, rocksdb::Error> {
         let cf = self.db.cf_handle("meta").unwrap();
         let key = format!("device_list_stream:{user_nid}");
@@ -845,6 +865,96 @@ impl Database {
         limit: usize,
     ) -> Result<(Vec<(u64, Value)>, u64), rocksdb::Error> {
         let cf = self.db.cf_handle("device_list_outbound").unwrap();
+        let prefix = to_device_outbound_prefix(destination);
+
+        if cursor > 0 {
+            let mut to_delete: Vec<Vec<u8>> = Vec::new();
+            let iter = self.db.prefix_iterator_cf(&cf, &prefix);
+            for item in iter {
+                let (key, _) = item?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                if key.len() < prefix.len() + 8 {
+                    continue;
+                }
+                let pos_bytes = &key[prefix.len()..prefix.len() + 8];
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(pos_bytes);
+                let pos = u64::from_be_bytes(buf);
+                if pos <= cursor {
+                    to_delete.push(key.to_vec());
+                } else {
+                    break;
+                }
+            }
+            if !to_delete.is_empty() {
+                let mut batch = WriteBatch::default();
+                for k in &to_delete {
+                    batch.delete_cf(&cf, k);
+                }
+                self.db.write(batch)?;
+            }
+        }
+
+        let mut new_cursor = cursor;
+        let mut out = Vec::new();
+        let iter = self.db.prefix_iterator_cf(&cf, &prefix);
+        for item in iter {
+            let (key, val) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if key.len() < prefix.len() + 8 {
+                continue;
+            }
+            let pos_bytes = &key[prefix.len()..prefix.len() + 8];
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(pos_bytes);
+            let pos = u64::from_be_bytes(buf);
+            if pos <= cursor {
+                continue;
+            }
+            let content: Value = match serde_json::from_slice(&val) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            out.push((pos, content));
+            new_cursor = pos;
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok((out, new_cursor))
+    }
+
+    /// Append an `m.signing_key_update` EDU content for delivery to
+    /// `destination`. Mirrors `enqueue_device_list_outbound` —
+    /// same per-destination cursor counter, separate CF.
+    pub fn enqueue_signing_key_update_outbound(
+        &self,
+        destination: &str,
+        content_json: &Value,
+    ) -> Result<u64, rocksdb::Error> {
+        let cf = self.db.cf_handle("signing_key_update_outbound").unwrap();
+        let pos = self
+            .to_device_outbound_counter
+            .fetch_add(1, Ordering::Relaxed);
+        let key = to_device_outbound_key(destination, pos);
+        self.db
+            .put_cf(&cf, &key, content_json.to_string().as_bytes())?;
+        Ok(pos)
+    }
+
+    /// Drain the signing-key-update outbound queue strictly after
+    /// `cursor`. Mirrors `scan_device_list_outbound`'s shape.
+    pub fn scan_signing_key_update_outbound(
+        &self,
+        destination: &str,
+        cursor: u64,
+        limit: usize,
+    ) -> Result<(Vec<(u64, Value)>, u64), rocksdb::Error> {
+        let cf = self.db.cf_handle("signing_key_update_outbound").unwrap();
         let prefix = to_device_outbound_prefix(destination);
 
         if cursor > 0 {
@@ -3197,6 +3307,71 @@ impl Database {
         Ok(self.db.get_cf(&cf, event_nid.to_be_bytes())?.is_some())
     }
 
+    // --- Rejected event tracking ---
+
+    /// Persist an event_id as "rejected" so future events whose
+    /// auth_events reference it cascade-reject (Synapse issue 9595,
+    /// MSC TestInboundFederationRejectsEventsWithRejectedAuthEvents).
+    /// Stores `reason` as the value for debugging; the key alone
+    /// would suffice for the rejection check itself.
+    pub fn mark_event_rejected(&self, event_id: &str, reason: &str) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("rejected_events").unwrap();
+        self.db.put_cf(&cf, event_id.as_bytes(), reason.as_bytes())
+    }
+
+    /// True iff `mark_event_rejected` was called for this event_id.
+    pub fn is_event_rejected(&self, event_id: &str) -> Result<bool, rocksdb::Error> {
+        let cf = self.db.cf_handle("rejected_events").unwrap();
+        Ok(self.db.get_cf(&cf, event_id.as_bytes())?.is_some())
+    }
+
+    // --- OpenID tokens ---
+
+    /// Persist an OpenID access token. Value layout: 8 BE bytes of
+    /// `expires_at_ms` followed by the UTF-8 user_id. Lookups use
+    /// `lookup_openid_token` which checks the timestamp and returns
+    /// the user_id when still valid.
+    pub fn store_openid_token(
+        &self,
+        token: &str,
+        user_id: &str,
+        expires_at_ms: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("openid_tokens").unwrap();
+        let mut value = Vec::with_capacity(8 + user_id.len());
+        value.extend_from_slice(&expires_at_ms.to_be_bytes());
+        value.extend_from_slice(user_id.as_bytes());
+        self.db.put_cf(&cf, token.as_bytes(), value)
+    }
+
+    /// Look up an OpenID token. Returns `Some(user_id)` when the
+    /// token exists and `now_ms` is before its expiry, `None`
+    /// otherwise. Expired or unknown tokens look the same to the
+    /// caller — federation peers should get a 401 either way.
+    pub fn lookup_openid_token(
+        &self,
+        token: &str,
+        now_ms: u64,
+    ) -> Result<Option<String>, rocksdb::Error> {
+        let cf = self.db.cf_handle("openid_tokens").unwrap();
+        let Some(value) = self.db.get_cf(&cf, token.as_bytes())? else {
+            return Ok(None);
+        };
+        if value.len() < 8 {
+            return Ok(None);
+        }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&value[..8]);
+        let expires_at_ms = u64::from_be_bytes(buf);
+        if expires_at_ms <= now_ms {
+            // Best-effort cleanup; ignore the error so a parallel
+            // delete doesn't surface to the caller.
+            let _ = self.db.delete_cf(&cf, token.as_bytes());
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf8_lossy(&value[8..]).into_owned()))
+    }
+
     // --- Federation EDU cursors ---
     //
     // Per-(destination, stream_name) cursor tracking how far this server
@@ -3539,5 +3714,33 @@ mod stream_recovery_tests {
         let p2 = db.next_stream_position().as_u64();
         let p3 = db.next_stream_position().as_u64();
         assert!(p1 < p2 && p2 < p3, "monotonic: {p1} < {p2} < {p3}");
+    }
+
+    /// Mark/lookup roundtrip on `rejected_events`. The cascade
+    /// rejection in process_pdu reads is_event_rejected on every
+    /// auth_event of an inbound PDU; this verifies the underlying
+    /// store contract before that wiring depends on it.
+    #[test]
+    fn rejected_events_marker_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+
+        let event_id = "$rejected:example.com";
+        assert!(
+            !db.is_event_rejected(event_id).unwrap(),
+            "fresh DB has no rejection marker"
+        );
+
+        db.mark_event_rejected(event_id, "auth_events check failed")
+            .unwrap();
+        assert!(
+            db.is_event_rejected(event_id).unwrap(),
+            "marked event_id is detected"
+        );
+        // Adjacent event_ids stay unmarked — the lookup must be exact.
+        assert!(
+            !db.is_event_rejected("$other:example.com").unwrap(),
+            "non-marked event_id stays clean"
+        );
     }
 }

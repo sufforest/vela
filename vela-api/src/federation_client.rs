@@ -529,6 +529,44 @@ impl FederationClient {
             .await
     }
 
+    /// `GET /_matrix/federation/v1/hierarchy/{roomId}` — fetch a
+    /// remote space's single-level summary (MSC2946). Caller is
+    /// responsible for further recursion across servers.
+    pub async fn fetch_hierarchy(
+        &self,
+        destination: &str,
+        room_id: &str,
+    ) -> Result<Value, FederationClientError> {
+        let path = format!(
+            "/_matrix/federation/v1/hierarchy/{}",
+            url_query_encode(room_id)
+        );
+        self.signed_request(reqwest::Method::GET, destination, &path, None)
+            .await
+    }
+
+    /// `GET /_matrix/federation/v1/event/{eventId}` — fetch a single
+    /// PDU we don't have locally. Response is a transaction-shaped
+    /// object (`{origin, origin_server_ts, pdus: [event]}`); we
+    /// return just the PDU value, leaving validation / persistence
+    /// to the caller via `persist_fetched_event`.
+    pub async fn fetch_event_pdu(
+        &self,
+        destination: &str,
+        event_id: &str,
+    ) -> Result<Value, FederationClientError> {
+        let encoded = url_query_encode(event_id);
+        let path = format!("/_matrix/federation/v1/event/{encoded}");
+        let resp = self
+            .signed_request(reqwest::Method::GET, destination, &path, None)
+            .await?;
+        resp.get("pdus")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .cloned()
+            .ok_or_else(|| FederationClientError::BadJson("response missing pdus[0]".into()))
+    }
+
     /// `POST /_matrix/federation/v1/user/keys/query` — fetch device +
     /// cross-signing keys for users on a remote server. Body shape
     /// matches the C2S /keys/query: `{device_keys: {user_id:
@@ -581,6 +619,203 @@ impl FederationClient {
         let path = format!("/_matrix/federation/v1/backfill/{room_id}?{query}");
         self.signed_request(reqwest::Method::GET, destination, &path, None)
             .await
+    }
+
+    /// Fetch a remote media object via authenticated federation
+    /// download (MSC3916). The peer responds with `multipart/mixed`
+    /// containing two parts: a JSON metadata block (currently empty)
+    /// and the file content with its original `Content-Type`. We
+    /// return the file content as `(content_type, bytes)` — the JSON
+    /// metadata block is reserved for future spec extensions and is
+    /// dropped today.
+    pub async fn fetch_media(
+        &self,
+        destination: &str,
+        media_id: &str,
+    ) -> Result<(String, Vec<u8>), FederationClientError> {
+        if !self.enabled {
+            return Err(FederationClientError::FederationDisabled);
+        }
+        let path = format!("/_matrix/federation/v1/media/download/{media_id}");
+
+        let (url, host_header, client) =
+            if let Some(base) = self.base_url_overrides.get(destination) {
+                (
+                    format!("{}{path}", base.value()),
+                    destination.to_string(),
+                    self.default_http.clone(),
+                )
+            } else {
+                let resolved = self
+                    .resolver
+                    .resolve(destination)
+                    .await
+                    .map_err(|e| FederationClientError::Http(format!("resolve: {e}")))?;
+                (
+                    format!("{}{}", resolved.base_url(), path),
+                    resolved.host_header.clone(),
+                    self.client_for(&resolved),
+                )
+            };
+        let auth_header =
+            self.sign_federation_request(reqwest::Method::GET.as_str(), &path, destination, None);
+
+        let mut req = client
+            .request(reqwest::Method::GET, &url)
+            .header("host", &host_header)
+            .header("authorization", auth_header);
+        req = crate::trace_context::inject_into_request(req);
+
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| FederationClientError::Http(e.to_string()))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(FederationClientError::Http(format!(
+                "media: status {status}"
+            )));
+        }
+
+        let response_ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| FederationClientError::Http(format!("read body: {e}")))?;
+
+        // Spec-compliant peers reply with multipart/mixed (MSC3916).
+        // Compatibility carve-out: some servers and Complement mocks
+        // return the file directly with its native Content-Type even
+        // at this endpoint. When the response isn't multipart/mixed,
+        // pass the body through verbatim instead of failing.
+        if let Some(boundary) = parse_multipart_boundary(&response_ct) {
+            parse_multipart_media(&body, &boundary)
+                .map_err(|e| FederationClientError::BadJson(format!("multipart: {e}")))
+        } else {
+            Ok((response_ct, body.to_vec()))
+        }
+    }
+}
+
+/// Pull `boundary=...` out of a `Content-Type: multipart/mixed; boundary=...`
+/// header value. Accepts both quoted and unquoted boundary parameters,
+/// case-insensitive on the parameter name.
+fn parse_multipart_boundary(content_type: &str) -> Option<String> {
+    for param in content_type.split(';').skip(1) {
+        let param = param.trim();
+        let (name, value) = param.split_once('=')?;
+        if !name.eq_ignore_ascii_case("boundary") {
+            continue;
+        }
+        let v = value.trim();
+        // Strip surrounding quotes if present.
+        let v = v
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(v);
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Parse a `multipart/mixed` body and return the media part —
+/// `(content_type, bytes)` — assuming the spec-defined two-part
+/// layout (JSON metadata first, file content second). Returns an
+/// error string on any structural mismatch.
+fn parse_multipart_media(body: &[u8], boundary: &str) -> Result<(String, Vec<u8>), String> {
+    let marker = format!("--{boundary}");
+    let marker_b = marker.as_bytes();
+    let positions: Vec<usize> = (0..body.len())
+        .filter(|&i| body[i..].starts_with(marker_b))
+        .collect();
+    // We need at least three boundary markers: opening before the
+    // JSON part, between JSON and file, and closing.
+    if positions.len() < 3 {
+        return Err(format!(
+            "expected at least 3 boundary markers, got {}",
+            positions.len()
+        ));
+    }
+    // The file content is between positions[1] and positions[2].
+    let part_start = positions[1] + marker_b.len();
+    let part_end = positions[2];
+    let mut p = part_start;
+    // Optional CRLF after boundary.
+    if body.get(p..p + 2) == Some(b"\r\n") {
+        p += 2;
+    }
+    // Find header/body terminator (CRLFCRLF).
+    let header_terminator = body[p..part_end]
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "missing header terminator in media part".to_string())?;
+    let headers_bytes = &body[p..p + header_terminator];
+    let content_start = p + header_terminator + 4;
+    // Drop the trailing CRLF before the next boundary if present.
+    let mut content_end = part_end;
+    if content_end >= 2 && &body[content_end - 2..content_end] == b"\r\n" {
+        content_end -= 2;
+    }
+
+    let headers_str =
+        std::str::from_utf8(headers_bytes).map_err(|e| format!("non-UTF-8 part headers: {e}"))?;
+    let content_type = headers_str
+        .split("\r\n")
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-type") {
+                Some(value.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    Ok((content_type, body[content_start..content_end].to_vec()))
+}
+
+#[cfg(test)]
+mod multipart_tests {
+    use super::{parse_multipart_boundary, parse_multipart_media};
+
+    #[test]
+    fn boundary_parsing_handles_quotes_and_case() {
+        assert_eq!(
+            parse_multipart_boundary("multipart/mixed; boundary=abc").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            parse_multipart_boundary("multipart/mixed; BOUNDARY=\"x-y-z\"").as_deref(),
+            Some("x-y-z")
+        );
+        assert_eq!(parse_multipart_boundary("multipart/mixed"), None);
+    }
+
+    #[test]
+    fn multipart_extracts_media_part_round_trip() {
+        let boundary = "vela-test-boundary";
+        let body_inner = b"hello world".to_vec();
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Type: application/json\r\n\r\n");
+        body.extend_from_slice(b"{}\r\n");
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Type: text/plain; charset=utf-8\r\n\r\n");
+        body.extend_from_slice(&body_inner);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let (ct, bytes) = parse_multipart_media(&body, boundary).unwrap();
+        assert_eq!(ct, "text/plain; charset=utf-8");
+        assert_eq!(bytes, body_inner);
     }
 }
 

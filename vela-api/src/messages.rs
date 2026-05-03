@@ -699,11 +699,26 @@ pub async fn get_event(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
 
-    let event_nid = state
+    // First try the local store. If the event isn't here yet but
+    // the user belongs to a room with remote members, fetch from a
+    // peer — historical events on a federated timeline aren't
+    // automatically replicated to us, so a 404 on first access
+    // would force the client into a backfill loop.
+    let event_nid = match state
         .db
         .get_event_nid_by_id(&event_id)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
+    {
+        Some(n) => n,
+        None => {
+            try_fetch_event_from_federation(&state, room_nid, user.user_nid, &event_id).await?;
+            state
+                .db
+                .get_event_nid_by_id(&event_id)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?
+        }
+    };
 
     let visibility = current_history_visibility(&state, room_nid)?;
     let membership = state
@@ -727,6 +742,72 @@ pub async fn get_event(
             .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
 
     Ok(Json(event))
+}
+
+/// Best-effort fetch of a missing event from a remote member of the
+/// room. Spec lets a server fall back to a peer's `/event/{eventId}`
+/// when the client asks for an event we haven't seen yet (e.g. an
+/// older message in a federated room we joined recently).
+///
+/// Errors here surface as 404 to the client — there's nothing
+/// actionable beyond retry, and operators can find the underlying
+/// failure in the trace via `tracing::debug!`.
+async fn try_fetch_event_from_federation(
+    state: &AppState,
+    room_nid: u64,
+    user_nid: u64,
+    event_id: &str,
+) -> Result<(), ApiError> {
+    let membership = state
+        .db
+        .get_membership(room_nid, user_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    // Only members can trigger a federated fetch — parity with the
+    // membership check we'll repeat below for visibility, but here
+    // it doubles as a denial-of-service shield against unauthenticated
+    // probes for arbitrary event IDs.
+    if !matches!(membership, Some(0) | Some(1) | Some(3)) {
+        return Err(VelaError::NotFound("event not found".into()).into());
+    }
+
+    let our_server = state.config.server_name.as_str();
+    let peers = state
+        .db
+        .get_remote_servers_in_room(room_nid, our_server)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if peers.is_empty() {
+        // Local-only room — no peer can have this event.
+        return Err(VelaError::NotFound("event not found".into()).into());
+    }
+
+    let budget = crate::federation_receive::new_fetch_budget();
+    for peer in &peers {
+        let pdu = match state
+            .federation_client
+            .fetch_event_pdu(peer, event_id)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(remote = %peer, %event_id, error = %e, "fetch_event_pdu failed");
+                continue;
+            }
+        };
+        if let Err(e) = crate::federation_receive::persist_fetched_event(
+            state,
+            &pdu,
+            peer,
+            budget.clone(),
+            crate::federation_receive::FetchKind::AuthChain,
+        )
+        .await
+        {
+            tracing::debug!(remote = %peer, %event_id, error = %e, "persist fetched event failed");
+            continue;
+        }
+        return Ok(());
+    }
+    Err(VelaError::NotFound("event not found".into()).into())
 }
 
 /// Read the current `m.room.history_visibility` value, defaulting to

@@ -213,6 +213,33 @@ async fn do_join(
     // the outbound federated-join flow. Distinguish by checking whether
     // the creator of the room is on our server.
     if !room_is_locally_hosted(&state, room_nid)? {
+        // Restricted-room local-authoriser fast path: if we already
+        // hold the room state and have a local member with invite
+        // power who satisfies the allow list, mint the join event
+        // locally and broadcast. Avoids a remote round-trip and
+        // ensures `join_authorised_via_users_server` points at our
+        // local user (regression check in
+        // TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12).
+        if let Some(authoriser) = local_authoriser_for_restricted(&state, room_nid, &user)? {
+            emit_join_event(
+                &state,
+                &user,
+                room_nid,
+                &room_id,
+                Some(&authoriser),
+                extra_content.as_ref(),
+            )
+            .await?;
+            crate::keys::record_device_changes_on_join(&state, user.user_nid, room_nid);
+            crate::keys::federate_device_lists_on_join(
+                &state,
+                user.user_nid,
+                &user.user_id,
+                room_nid,
+            );
+            return Ok(Json(json!({"room_id": room_id.as_str()})));
+        }
+
         let hints = if server_hints.is_empty() {
             // Fall back to the inviter's server if the client didn't hint.
             invite_sender_server(&state, room_nid, user.user_nid)?
@@ -283,6 +310,43 @@ async fn do_join(
     crate::keys::federate_device_lists_on_join(&state, user.user_nid, &user.user_id, room_nid);
 
     Ok(Json(json!({"room_id": room_id.as_str()})))
+}
+
+/// For a non-locally-hosted restricted/knock_restricted room we
+/// already have state for, decide whether we can mint the join event
+/// ourselves. Returns the local authoriser's user_id when:
+///   1. join_rule is restricted or knock_restricted,
+///   2. the joining user qualifies via the allow-list, AND
+///   3. some local member has both invite power and is currently joined.
+///
+/// Returns `None` for any other join_rule, when the user doesn't
+/// qualify, or when no local authoriser is available. Callers fall
+/// back to a remote `make_join` / `send_join` round-trip in those
+/// cases.
+fn local_authoriser_for_restricted(
+    state: &AppState,
+    room_nid: u64,
+    user: &AuthenticatedUser,
+) -> Result<Option<String>, ApiError> {
+    let jr_content = get_join_rule_content(state, room_nid)?;
+    let join_rule = jr_content
+        .get("join_rule")
+        .and_then(|v| v.as_str())
+        .unwrap_or("invite");
+    if !matches!(join_rule, "restricted" | "knock_restricted") {
+        return Ok(None);
+    }
+
+    let allow = jr_content
+        .get("allow")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if !user_qualifies_via_allow_list(state, user.user_nid, &allow)? {
+        return Ok(None);
+    }
+
+    pick_local_authoriser(state, room_nid)
 }
 
 /// True if the room's `m.room.create` event was authored by a user on
@@ -889,14 +953,19 @@ pub async fn knock_room(
     RawQuery(raw_query): RawQuery,
     Json(body): Json<KnockBody>,
 ) -> Result<Json<Value>, ApiError> {
-    // TODO: alias resolution (#room:server) — for now require a room id.
-    if !room_id_or_alias.starts_with('!') {
-        return Err(
-            VelaError::NotFound("alias-based knock not yet supported; use room id".into()).into(),
-        );
-    }
-    let room_id = RoomId::parse(&room_id_or_alias)
-        .map_err(|_| ApiError(VelaError::NotFound("room not found".into())))?;
+    // Spec: /knock takes a roomId OR a roomAlias. For alias-form,
+    // resolve through the directory (local first, then federation
+    // /query/directory). Use the returned `servers` array as
+    // automatic hints for the federated make_knock path so the
+    // caller doesn't have to also supply `?server_name=`.
+    let (room_id, alias_hints) = if room_id_or_alias.starts_with('#') {
+        let (room_id, hints) = resolve_alias(&state, &room_id_or_alias).await?;
+        (room_id, hints)
+    } else {
+        let room_id = RoomId::parse(&room_id_or_alias)
+            .map_err(|_| ApiError(VelaError::NotFound("room not found".into())))?;
+        (room_id, Vec::new())
+    };
 
     // Unknown room → assume remote; use `?server_name=` hints to locate a
     // resident server and run the federated make_knock/send_knock flow.
@@ -907,7 +976,13 @@ pub async fn knock_room(
     {
         Some(n) => n,
         None => {
-            let hints = parse_query_values(raw_query.as_deref(), "server_name");
+            // Server hints: prefer explicit `?server_name=` from the
+            // client; fall back to the directory-resolved server list
+            // when the room came in as an alias.
+            let mut hints = parse_query_values(raw_query.as_deref(), "server_name");
+            if hints.is_empty() {
+                hints = alias_hints;
+            }
             crate::federation_outbound_knock::do_remote_knock(
                 &state,
                 &user.user_id,

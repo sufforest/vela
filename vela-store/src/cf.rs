@@ -40,6 +40,11 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     "server_keys",
     "sliding_sync_conns",
     "soft_failed_events",
+    // Tracks event_ids of inbound federation events we rejected.
+    // Used to cascade rejection: any event whose auth_events
+    // reference one of these is itself rejected. Stores the
+    // rejection reason as the value (debugging aid).
+    "rejected_events",
     "event_redactions",
     "user_membership_pos",
     "event_relations",
@@ -53,5 +58,15 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     "to_device_outbound",
     "to_device_seen_message_ids",
     "device_list_outbound",
+    // Per-(destination, position) buffer of m.signing_key_update EDU
+    // payloads. Drained by `SigningKeyUpdateStream` and shipped via
+    // the federation sender. Same value/key shape as
+    // `device_list_outbound`.
+    "signing_key_update_outbound",
+    // Short-lived OpenID tokens issued via /_matrix/client/v3/user/
+    // {userId}/openid/request_token and validated by remote servers
+    // hitting /_matrix/federation/v1/openid/userinfo. Value: 8 BE
+    // bytes of `expires_at_ms` followed by the user_id string.
+    "openid_tokens",
     "room_directory",
 ];

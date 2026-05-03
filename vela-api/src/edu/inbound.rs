@@ -34,6 +34,7 @@ pub async fn dispatch_edu(state: &AppState, origin: &str, edu: &Value) {
         "m.typing" => handle_typing(state, origin, content).await,
         "m.direct_to_device" => handle_direct_to_device(state, origin, content).await,
         "m.device_list_update" => handle_device_list_update(state, origin, content).await,
+        "m.signing_key_update" => handle_signing_key_update(state, origin, content).await,
         // Unknown types are accepted silently per spec.
         _ => debug!(%edu_type, "EDU type not handled (silently accepted)"),
     }
@@ -111,6 +112,99 @@ async fn handle_device_list_update(state: &AppState, origin: &str, content: &Val
     }
     // Wake observers' /sync long-polls so they pick up the change
     // without waiting for the 30s timeout.
+    for &observer_nid in &observer_nids {
+        crate::router::notify_user(state, observer_nid);
+    }
+}
+
+/// `m.signing_key_update` EDU.
+///
+/// Per spec, sent when a remote user's cross-signing keys change.
+/// Content shape:
+/// ```json
+/// {
+///   "user_id":          "@alice:example.com",
+///   "master_key":       { ... },
+///   "self_signing_key": { ... }
+/// }
+/// ```
+///
+/// We persist the keys via `set_cross_signing_keys` so subsequent
+/// `/keys/query` calls return the fresh values directly. Same
+/// observer-notification flow as `m.device_list_update` so local
+/// users sharing a room with the remote see the change in
+/// `device_lists.changed` and re-query.
+async fn handle_signing_key_update(state: &AppState, origin: &str, content: &Value) {
+    let Some(obj) = content.as_object() else {
+        return;
+    };
+    let Some(user_id) = obj.get("user_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    if !user_belongs_to_origin(user_id, origin) {
+        debug!(%origin, %user_id, "dropping m.signing_key_update: user not from sending server");
+        return;
+    }
+
+    let user_nid = match state.db.get_or_create_nid(user_id) {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(%user_id, error = %e, "nid alloc failed for inbound signing_key_update");
+            return;
+        }
+    };
+
+    if let Some(master) = obj.get("master_key").filter(|v| !v.is_null())
+        && let Err(e) = state
+            .db
+            .set_cross_signing_keys(user_nid, "master_key", master)
+    {
+        warn!(error = %e, "set_cross_signing_keys (master) failed");
+    }
+    if let Some(sk) = obj.get("self_signing_key").filter(|v| !v.is_null())
+        && let Err(e) = state
+            .db
+            .set_cross_signing_keys(user_nid, "self_signing_key", sk)
+    {
+        warn!(error = %e, "set_cross_signing_keys (self_signing) failed");
+    }
+
+    // Same observer notification path as device_list_update — local
+    // users sharing a room get the user surfaced in their
+    // device_lists.changed so clients re-query.
+    let remote_user_rooms = match state.db.get_user_joined_rooms(user_nid) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut observer_nids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for room_nid in remote_user_rooms {
+        let members = match state.db.get_room_members(room_nid) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        for m in members {
+            if let Ok(Some(uid)) = state.db.resolve_nid(m)
+                && uid
+                    .split_once(':')
+                    .map(|(_, d)| d == state.config.server_name)
+                    .unwrap_or(false)
+            {
+                observer_nids.insert(m);
+            }
+        }
+    }
+    if observer_nids.is_empty() {
+        return;
+    }
+    let stream_pos = state.db.next_stream_position();
+    let observer_vec: Vec<u64> = observer_nids.iter().copied().collect();
+    if let Err(e) = state
+        .db
+        .notify_device_key_change(user_nid, &observer_vec, stream_pos.as_u64())
+    {
+        warn!(error = %e, "notify_device_key_change (inbound signing_key_update) failed");
+        return;
+    }
     for &observer_nid in &observer_nids {
         crate::router::notify_user(state, observer_nid);
     }

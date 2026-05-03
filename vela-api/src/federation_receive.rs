@@ -244,6 +244,21 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
     // --- Check 4: auth rules against auth_events ---
     // Build a state view from the event's auth_events. On a missing auth event,
     // attempt a bounded fetch from the sender's server via /event_auth.
+    //
+    // Rejection cascade (regression test for synapse#9595): if any
+    // declared auth_event is on our `rejected_events` list, the
+    // current event MUST be rejected too — irrespective of what
+    // auth_events it actually selected. The wrapper at the txn
+    // result layer marks `event_id` as rejected on every Rejected
+    // outcome, so we don't repeat that here on each early return.
+    for aev_id in &effective_pdu.auth_events {
+        if state.db.is_event_rejected(aev_id).unwrap_or(false) {
+            return (
+                effective_pdu.event_id.clone(),
+                PduOutcome::Rejected(format!("auth_event {aev_id} is rejected")),
+            );
+        }
+    }
     let mut auth_state: HashMap<(String, String), Pdu> = HashMap::new();
     let fetch_budget = new_fetch_budget();
     for aev_id in &effective_pdu.auth_events {
@@ -266,12 +281,16 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
                     Ok(()) => match load_pdu_by_event_id(state, aev_id) {
                         Some(p) => p,
                         None => {
-                            return (
-                                effective_pdu.event_id.clone(),
-                                PduOutcome::Rejected(format!(
-                                    "auth event {aev_id} still missing after fetch"
-                                )),
-                            );
+                            // The fetch may have surfaced a chain
+                            // that included a rejected ancestor; in
+                            // that case `aev_id` is now in
+                            // `rejected_events`. Cascade.
+                            let reason = if state.db.is_event_rejected(aev_id).unwrap_or(false) {
+                                format!("auth_event {aev_id} is rejected")
+                            } else {
+                                format!("auth event {aev_id} still missing after fetch")
+                            };
+                            return (effective_pdu.event_id.clone(), PduOutcome::Rejected(reason));
                         }
                     },
                     Err(e) => {
@@ -838,7 +857,7 @@ fn load_current_state_pdu(
 /// arbitrarily-deep ancestor chains.
 pub type FetchBudget = std::sync::Arc<std::sync::atomic::AtomicUsize>;
 
-fn new_fetch_budget() -> FetchBudget {
+pub(crate) fn new_fetch_budget() -> FetchBudget {
     std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
         MAX_MISSING_FETCH_PER_PDU,
     ))
@@ -1012,7 +1031,7 @@ async fn fetch_missing_events(
 /// Where the fetched event is being ingested from. The two paths fetch
 /// different shapes of "missing" event and persist them differently.
 #[derive(Clone, Copy, Debug)]
-enum FetchKind {
+pub(crate) enum FetchKind {
     /// `/event_auth` auth-chain ingestion. The events here predate live
     /// state and exist only as auth context for validating a downstream
     /// event. They MUST NOT join the timeline (no stream_pos), become a
@@ -1038,7 +1057,7 @@ enum FetchKind {
 /// NOT run on fetched events: they're historical context for auth validation,
 /// not new live events. Running check 5 would require resolving state from
 /// ancestors that may themselves be missing, multiplying the fetch cost.
-fn persist_fetched_event<'a>(
+pub(crate) fn persist_fetched_event<'a>(
     state: &'a AppState,
     event_json: &'a Value,
     origin: &'a str,
@@ -1163,6 +1182,17 @@ async fn persist_fetched_event_inner(
         0
     };
 
+    // Cascade rejection: bail before any work if the fetched event
+    // declares a previously-rejected auth_event. Same logic as the
+    // top-level process_pdu path.
+    for aev_id in &target_pdu.auth_events {
+        if state.db.is_event_rejected(aev_id).unwrap_or(false) {
+            let reason = format!("auth_event {aev_id} is rejected");
+            let _ = state.db.mark_event_rejected(&target_pdu.event_id, &reason);
+            return Err(reason);
+        }
+    }
+
     // Check 4 (auth rules against the event's own auth_events). If any
     // referenced auth event is missing from our DB, recursively fetch it.
     // This is what closes the 3b single-level-fetch gap: a fetched event
@@ -1179,14 +1209,26 @@ async fn persist_fetched_event_inner(
                     fetch_auth_chain(state, origin, &target_pdu.room_id, aev_id, budget.clone())
                         .await
                 {
-                    return Err(format!("recursive fetch of auth {aev_id} failed: {e}"));
+                    let reason = format!("recursive fetch of auth {aev_id} failed: {e}");
+                    let _ = state.db.mark_event_rejected(&target_pdu.event_id, &reason);
+                    return Err(reason);
                 }
                 match load_pdu_by_event_id(state, aev_id) {
                     Some(p) => p,
                     None => {
-                        return Err(format!(
-                            "auth event {aev_id} still missing after recursive fetch"
-                        ));
+                        // Same cascade as the top-level path: a
+                        // recursive fetch can land an auth chain
+                        // including a rejected event, leaving
+                        // `aev_id` unloadable but recorded as
+                        // rejected. Reflect that in our reason
+                        // string and propagate.
+                        let reason = if state.db.is_event_rejected(aev_id).unwrap_or(false) {
+                            format!("auth_event {aev_id} is rejected")
+                        } else {
+                            format!("auth event {aev_id} still missing after recursive fetch")
+                        };
+                        let _ = state.db.mark_event_rejected(&target_pdu.event_id, &reason);
+                        return Err(reason);
                     }
                 }
             }
@@ -1201,10 +1243,12 @@ async fn persist_fetched_event_inner(
     if let Err(vela_core::auth_rules::AuthError::Rejected(reason)) =
         vela_core::auth_rules::check_auth(&target_pdu, &auth_fn)
     {
-        return Err(format!(
+        let full = format!(
             "fetched event {} failed check 4: {reason}",
             target_pdu.event_id
-        ));
+        );
+        let _ = state.db.mark_event_rejected(&target_pdu.event_id, &full);
+        return Err(full);
     }
 
     let mut prev_nids: Vec<u64> = Vec::new();

@@ -707,6 +707,7 @@ fn main() -> anyhow::Result<()> {
             vela_api::edu::presence::PresenceStream::new(config.server.name.clone()),
             vela_api::edu::to_device::ToDeviceStream::new(),
             vela_api::edu::device_list::DeviceListStream::new(),
+            vela_api::edu::signing_key::SigningKeyUpdateStream::new(),
             typing_stream.clone(),
         ];
         let federation_sender = Arc::new(FederationSender::new_with_enabled(

@@ -21,9 +21,9 @@ use crate::federation_sender::FederationSender;
 use crate::middleware::federation_auth::federation_auth;
 use crate::{
     account, account_data, capabilities, devices, directory, discovery, federation, filters,
-    key_backup, keys, login, logout, media, membership, messages, presence, profile, pushers,
-    pushrules, receipts, redaction, refresh, register, relations, room_upgrade, rooms, search,
-    send, sliding_sync, state, sync, to_device, typing, whoami,
+    key_backup, keys, login, logout, media, membership, messages, openid, presence, profile,
+    pushers, pushrules, receipts, redaction, refresh, register, relations, room_upgrade, rooms,
+    search, send, sliding_sync, state, sync, to_device, typing, whoami,
 };
 
 #[derive(Clone)]
@@ -414,6 +414,12 @@ pub fn build_router(state: AppState) -> Router {
             "/_matrix/client/v3/user/{userId}/filter/{filterId}",
             get(filters::get_filter),
         )
+        // OpenID — short-lived tokens for SSO into Matrix-aware
+        // third-party services. Path userId must match the caller.
+        .route(
+            "/_matrix/client/v3/user/{userId}/openid/request_token",
+            post(openid::request_token),
+        )
         // Device management
         .route("/_matrix/client/v3/devices", get(devices::list_devices))
         .route(
@@ -522,6 +528,13 @@ pub fn build_router(state: AppState) -> Router {
             "/_matrix/media/v3/download/{server_name}/{media_id}",
             get(media::download_legacy),
         )
+        // Spec variant with a filename override in the path. The
+        // filename overrides any name we recorded at upload time, so
+        // clients can serve the same blob under different filenames.
+        .route(
+            "/_matrix/media/v3/download/{server_name}/{media_id}/{filename}",
+            get(media::download_legacy_with_filename),
+        )
         .route(
             "/_matrix/media/v3/thumbnail/{server_name}/{media_id}",
             get(media::thumbnail_legacy),
@@ -529,6 +542,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/_matrix/client/v1/media/download/{server_name}/{media_id}",
             get(media::download),
+        )
+        .route(
+            "/_matrix/client/v1/media/download/{server_name}/{media_id}/{filename}",
+            get(media::download_with_filename),
         )
         .route(
             "/_matrix/client/v1/media/thumbnail/{server_name}/{media_id}",
@@ -559,7 +576,13 @@ pub fn build_router(state: AppState) -> Router {
         // Server-version endpoint, unauthenticated per spec. Reports
         // the implementation name + version so other servers can
         // observe deployment heterogeneity.
-        .route("/_matrix/federation/v1/version", get(federation::version));
+        .route("/_matrix/federation/v1/version", get(federation::version))
+        // OpenID userinfo. Spec marks this unauthenticated — the
+        // access_token in the query string is the bearer.
+        .route(
+            "/_matrix/federation/v1/openid/userinfo",
+            get(openid::federation_userinfo),
+        );
     // Federation authenticated routes — require X-Matrix header
     // verification. Skipped entirely when federation is disabled in
     // config: the routes are not mounted, so unrelated middleware
@@ -734,7 +757,7 @@ async fn method_not_allowed(
 
 /// Build the sub-router for federation endpoints that require X-Matrix auth.
 fn federation_authed_routes(state: AppState) -> Router<AppState> {
-    use crate::federation_fetch;
+    use crate::{federation_devices, federation_fetch, federation_media};
     Router::new()
         .route(
             "/_matrix/federation/v1/send/{txn_id}",
@@ -764,6 +787,50 @@ fn federation_authed_routes(state: AppState) -> Router<AppState> {
         .route(
             "/_matrix/federation/v1/backfill/{room_id}",
             get(federation_fetch::get_backfill),
+        )
+        // MSC3030 federation companion to the C2S timestamp_to_event.
+        .route(
+            "/_matrix/federation/v1/timestamp_to_event/{room_id}",
+            get(crate::timestamp::federation_timestamp_to_event),
+        )
+        .route(
+            "/_matrix/federation/v1/user/devices/{user_id}",
+            get(federation_devices::get_user_devices),
+        )
+        // Federation key endpoints — peers query these for our local
+        // users' device + cross-signing keys, and to claim their
+        // one-time keys when starting an Olm session.
+        .route(
+            "/_matrix/federation/v1/user/keys/query",
+            post(keys::federation_query_keys),
+        )
+        .route(
+            "/_matrix/federation/v1/user/keys/claim",
+            post(keys::federation_claim_keys),
+        )
+        // Public-rooms federation directory. Always mounted; the
+        // handler returns 404 when
+        // `allow_public_rooms_over_federation` is false (default),
+        // matching the response a peer would get from a server that
+        // doesn't run this endpoint at all.
+        .route(
+            "/_matrix/federation/v1/publicRooms",
+            get(federation_fetch::get_federation_public_rooms)
+                .post(federation_fetch::post_federation_public_rooms),
+        )
+        // MSC2946 spaces hierarchy — single-level summary. Caller
+        // recurses across servers themselves.
+        .route(
+            "/_matrix/federation/v1/hierarchy/{room_id}",
+            get(crate::spaces::federation_hierarchy),
+        )
+        .route(
+            "/_matrix/federation/v1/media/download/{media_id}",
+            get(federation_media::federation_download),
+        )
+        .route(
+            "/_matrix/federation/v1/media/thumbnail/{media_id}",
+            get(federation_media::federation_thumbnail),
         )
         .route(
             "/_matrix/federation/v1/query/directory",

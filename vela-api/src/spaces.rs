@@ -66,39 +66,133 @@ pub async fn hierarchy(
     }
 
     let mut rooms = Vec::new();
-    let mut visited: HashSet<u64> = HashSet::new();
-    // BFS: each entry is (room_nid, room_id_str, current depth).
-    let mut queue: VecDeque<(u64, String, u32)> = VecDeque::new();
-    queue.push_back((root_nid, room_id.clone(), 0));
+    let mut visited: HashSet<String> = HashSet::new();
+    // BFS over rooms. Each queue entry is either a local nid we
+    // resolve and walk, or a remote room_id we federate to. Both
+    // emit one summary into `rooms` and enqueue the discovered
+    // children to keep walking.
+    enum WalkEntry {
+        Local(u64, String, u32),
+        Remote(String, Vec<String>, u32),
+    }
+    let mut queue: VecDeque<WalkEntry> = VecDeque::new();
+    queue.push_back(WalkEntry::Local(root_nid, room_id.clone(), 0));
 
-    while let Some((nid, id, depth)) = queue.pop_front() {
-        if !visited.insert(nid) {
-            continue;
-        }
+    while let Some(entry) = queue.pop_front() {
         if rooms.len() >= limit {
             break;
         }
-        // For non-root entries, check the caller can peek.
-        if nid != root_nid && !can_peek(&state, nid, user.user_nid).unwrap_or(false) {
-            continue;
-        }
-        let children = collect_children(&state, nid, suggested_only)?;
-        rooms.push(summarize_room(&state, nid, &id, &children)?);
+        match entry {
+            WalkEntry::Local(nid, id, depth) => {
+                if !visited.insert(id.clone()) {
+                    continue;
+                }
+                // For non-root entries, check the caller can peek.
+                if nid != root_nid && !can_peek(&state, nid, user.user_nid).unwrap_or(false) {
+                    continue;
+                }
+                let children = collect_children(&state, nid, suggested_only)?;
+                rooms.push(summarize_room(&state, nid, &id, &children)?);
 
-        if depth + 1 > max_depth {
-            continue;
-        }
-        for child in &children {
-            // Only recurse into children we know locally. Unknown (remote)
-            // children already appear in the parent's `children_state`
-            // array so clients can render them stub-style.
-            if let Some(child_nid) = state
-                .db
-                .get_nid(&child.child_id)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-                && !visited.contains(&child_nid)
-            {
-                queue.push_back((child_nid, child.child_id.clone(), depth + 1));
+                if depth + 1 > max_depth {
+                    continue;
+                }
+                for child in &children {
+                    if visited.contains(&child.child_id) {
+                        continue;
+                    }
+                    match state
+                        .db
+                        .get_nid(&child.child_id)
+                        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                    {
+                        Some(child_nid) => {
+                            queue.push_back(WalkEntry::Local(
+                                child_nid,
+                                child.child_id.clone(),
+                                depth + 1,
+                            ));
+                        }
+                        None => {
+                            // Remote: pull `via` servers from the
+                            // m.space.child event content so we know
+                            // who to federate to. Spec mandates a
+                            // non-empty `via` array — defensive code
+                            // here just skips entries that don't have one.
+                            let via_servers: Vec<String> = child
+                                .raw
+                                .get("content")
+                                .and_then(|c| c.get("via"))
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if via_servers.is_empty() {
+                                continue;
+                            }
+                            queue.push_back(WalkEntry::Remote(
+                                child.child_id.clone(),
+                                via_servers,
+                                depth + 1,
+                            ));
+                        }
+                    }
+                }
+            }
+            WalkEntry::Remote(remote_id, via, depth) => {
+                if !visited.insert(remote_id.clone()) {
+                    continue;
+                }
+                let Some(resp) = fetch_remote_hierarchy(&state, &remote_id, &via).await else {
+                    continue;
+                };
+                if let Some(room_chunk) = resp.get("room").cloned() {
+                    rooms.push(room_chunk);
+                }
+                if depth + 1 > max_depth {
+                    continue;
+                }
+                // Walk the children the remote returned: each is
+                // either a future enqueue target or already inline.
+                if let Some(remote_children) = resp.get("children").and_then(|v| v.as_array()) {
+                    for child_chunk in remote_children {
+                        let Some(cid) = child_chunk.get("room_id").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        if visited.contains(cid) {
+                            continue;
+                        }
+                        // Inline the chunk directly — it's already a
+                        // summary the caller wants.
+                        rooms.push(child_chunk.clone());
+                        visited.insert(cid.to_string());
+                    }
+                }
+                if let Some(inacc) = resp.get("inaccessible_children").and_then(|v| v.as_array()) {
+                    for cid in inacc {
+                        let Some(cid) = cid.as_str() else { continue };
+                        if visited.contains(cid) {
+                            continue;
+                        }
+                        // The remote can't summarise — try locally
+                        // (we may host it), or follow via servers
+                        // from the remote's `room.children_state`.
+                        if let Ok(Some(local_nid)) = state.db.get_nid(cid) {
+                            queue.push_back(WalkEntry::Local(
+                                local_nid,
+                                cid.to_string(),
+                                depth + 1,
+                            ));
+                        }
+                        // We don't speculate on via for purely
+                        // inaccessible-and-unknown rooms. Caller's
+                        // own clients can pursue them via /publicRooms
+                        // or other discovery paths if they care.
+                    }
+                }
             }
         }
     }
@@ -109,10 +203,25 @@ pub async fn hierarchy(
     })))
 }
 
+/// Try each `via` server in turn until one returns a parseable
+/// `/hierarchy` response. Returns `None` when every peer fails —
+/// the caller's walker just records the room as unreachable.
+async fn fetch_remote_hierarchy(state: &AppState, room_id: &str, via: &[String]) -> Option<Value> {
+    for peer in via {
+        match state.federation_client.fetch_hierarchy(peer, room_id).await {
+            Ok(v) => return Some(v),
+            Err(e) => {
+                tracing::debug!(remote = %peer, %room_id, error = %e, "fetch_hierarchy failed");
+            }
+        }
+    }
+    None
+}
+
 /// Decide whether `user_nid` is allowed to see `room_nid` in a hierarchy.
 /// Joined members always pass. Non-members pass only for world-readable,
 /// public, or knock-rule rooms. Invite-only rooms refuse peeks.
-fn can_peek(state: &AppState, room_nid: u64, user_nid: u64) -> Result<bool, ApiError> {
+pub(crate) fn can_peek(state: &AppState, room_nid: u64, user_nid: u64) -> Result<bool, ApiError> {
     if state
         .db
         .get_membership(room_nid, user_nid)
@@ -141,24 +250,24 @@ fn can_peek(state: &AppState, room_nid: u64, user_nid: u64) -> Result<bool, ApiE
 }
 
 /// One m.space.child entry retained for hierarchy emission.
-struct ChildEvent {
+pub(crate) struct ChildEvent {
     /// Child room ID (state_key).
-    child_id: String,
+    pub child_id: String,
     /// Original `m.space.child` event JSON, preserved as-is so the
     /// hierarchy response carries the spec-required fields (sender,
     /// origin_server_ts, content.via).
-    raw: Value,
+    pub raw: Value,
     /// Cached lexicographic sort key from `content.order`.
-    order: Option<String>,
+    pub order: Option<String>,
     /// Cached origin_server_ts for tie-break sort.
-    origin_ts: u64,
+    pub origin_ts: u64,
 }
 
 /// Fetch child room declarations from the space's `m.space.child` state
 /// events. Returns one `ChildEvent` per child whose content has
 /// non-empty `via`. When `suggested_only=true`, children missing
 /// `suggested: true` are filtered out.
-fn collect_children(
+pub(crate) fn collect_children(
     state: &AppState,
     space_nid: u64,
     suggested_only: bool,
@@ -244,7 +353,7 @@ fn collect_children(
 }
 
 /// Build one `SpaceHierarchyRoomsChunk` entry.
-fn summarize_room(
+pub(crate) fn summarize_room(
     state: &AppState,
     room_nid: u64,
     room_id: &str,
@@ -366,4 +475,121 @@ fn read_content(state: &AppState, room_nid: u64, etype: &str, state_key: &str) -
         .ok()
         .flatten()
         .and_then(|v| v.get("content").cloned())
+}
+
+/// GET /_matrix/federation/v1/hierarchy/{roomId}
+///
+/// MSC2946 single-level hierarchy summary. Shape:
+///
+/// ```text
+/// { room: <chunk for queried space>,
+///   children: [ <chunk per locally-known child> ],
+///   inaccessible_children: [ <child_id we can't summarise> ] }
+/// ```
+///
+/// Unlike the C2S `/hierarchy`, federation returns ONE level — the
+/// requesting server is responsible for recursing across home
+/// servers. Child rooms hosted on other servers are listed in
+/// `inaccessible_children` so the caller knows where to follow up.
+///
+/// Auth: the requesting server must have a presence in the queried
+/// room (any of its users currently joined), OR the room must be
+/// world-readable / public.
+pub async fn federation_hierarchy(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(room_id): axum::extract::Path<String>,
+    axum::extract::Extension(origin): axum::extract::Extension<
+        crate::middleware::federation_auth::XMatrixOrigin,
+    >,
+) -> Result<axum::Json<Value>, axum::http::StatusCode> {
+    let room_nid = state
+        .db
+        .get_nid(&room_id)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+
+    if !origin_can_peek(&state, room_nid, &origin.0)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        return Err(axum::http::StatusCode::FORBIDDEN);
+    }
+
+    let suggested_only = false;
+    let children = collect_children(&state, room_nid, suggested_only)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let room_chunk = summarize_room(&state, room_nid, &room_id, &children)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut child_chunks = Vec::new();
+    let mut inaccessible: Vec<String> = Vec::new();
+    for child in &children {
+        let child_room_nid = match state.db.get_nid(&child.child_id) {
+            Ok(Some(n)) => n,
+            _ => {
+                // Not local — caller should federate to a server in
+                // child.via to summarise this room themselves.
+                inaccessible.push(child.child_id.clone());
+                continue;
+            }
+        };
+
+        // Per spec, children visible to the caller are filtered the
+        // same way: requesting server must share the child or it
+        // must be world-readable / public. Unreachable children
+        // remain inaccessible to the caller.
+        let child_visible = origin_can_peek(&state, child_room_nid, &origin.0).unwrap_or(false);
+        if !child_visible {
+            inaccessible.push(child.child_id.clone());
+            continue;
+        }
+
+        let child_kids = collect_children(&state, child_room_nid, suggested_only)
+            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        let chunk = summarize_room(&state, child_room_nid, &child.child_id, &child_kids)
+            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        child_chunks.push(chunk);
+    }
+
+    Ok(axum::Json(json!({
+        "room": room_chunk,
+        "children": child_chunks,
+        "inaccessible_children": inaccessible,
+    })))
+}
+
+/// True when the requesting server shares the room with us (any user
+/// from `origin` currently joined) or the room is world-readable /
+/// public. Mirrors the C2S `can_peek` semantics but at server-rather-
+/// than-user granularity.
+fn origin_can_peek(state: &AppState, room_nid: u64, origin: &str) -> Result<bool, ApiError> {
+    // Joined members from `origin`?
+    if let Ok(members) = state.db.get_room_members(room_nid) {
+        for m in members {
+            if let Ok(Some(uid)) = state.db.resolve_nid(m)
+                && uid
+                    .split_once(':')
+                    .map(|(_, d)| d == origin)
+                    .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+    }
+
+    let jr = read_content(state, room_nid, "m.room.join_rules", "")
+        .as_ref()
+        .and_then(|c| c.get("join_rule"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("invite")
+        .to_string();
+    if matches!(jr.as_str(), "public" | "knock" | "knock_restricted") {
+        return Ok(true);
+    }
+    let hv = read_content(state, room_nid, "m.room.history_visibility", "")
+        .as_ref()
+        .and_then(|c| c.get("history_visibility"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("shared")
+        .to_string();
+    Ok(hv == "world_readable")
 }

@@ -32,14 +32,6 @@
 # v12-only by design, so this test is structurally inapplicable.
 ^TestPowerLevels$
 
-# Resolved by recent commits — re-include and verify next run:
-#   ^TestToDeviceMessagesOverFederation$  (m.direct_to_device EDU shipped)
-#   ^TestPushSync$                         (m.push_rules synth + sync wake)
-#   ^TestACLs$                             (server_acl enforcement)
-#   ^TestDeviceListUpdates$                (m.device_list_update EDU shipped)
-#   ^TestDeviceListsUpdateOverFederation$  (same)
-#   ^TestUserAppearsInChangedDeviceListOnJoinOverFederation$ (same)
-
 # --- v10/v12 spec-mandated rejections (NOT bugs) ---
 # spec: rooms/v12.md auth-rule 10.4:
 #   "If the `users` property in `content` contains the `sender` of
@@ -69,6 +61,41 @@
 ^TestCorruptedAuthChain$
 # v6-specific test — same v12-only design rationale.
 ^TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6$
+
+# Restricted-rooms cluster (MSC3083, restricted_rooms_test.go) hard-
+# codes `room_version: "8"` everywhere. v12 also supports the
+# `restricted` join_rule and we cover that path via
+# TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12 (kept
+# off-skiplist), but the v8-only base tests block at MustCreateRoom
+# with M_UNSUPPORTED_ROOM_VERSION. Each is a slow federation flow
+# (~15s+); skiplist them to reclaim iteration time. The V11 sibling
+# is similarly blocked by vela's v12-only support.
+^TestRestrictedRoomsLocalJoin$
+^TestRestrictedRoomsRemoteJoin$
+^TestRestrictedRoomsRemoteJoinLocalUser$
+^TestRestrictedRoomsRemoteJoinFailOver$
+^TestRestrictedRoomsLocalJoinInMSC3787Room$
+^TestRestrictedRoomsRemoteJoinInMSC3787Room$
+^TestRestrictedRoomsRemoteJoinLocalUserInMSC3787Room$
+^TestRestrictedRoomsRemoteJoinFailOverInMSC3787Room$
+^TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
+^TestRestrictedRoomsSpacesSummaryLocal$
+^TestRestrictedRoomsSpacesSummaryFederation$
+^TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
+
+# Knock cluster (knocking_test.go, knock_restricted_test.go) hard-
+# codes `room_version: "7"`. v12 supports knock too and we cover
+# the local + federated knock paths in unit tests; the suite-level
+# tests can't reach our handlers because room creation 400s first.
+# `TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12`
+# is intentionally NOT skiplisted — it forces room_version=12 and
+# is the v12 sibling we should pass.
+^TestKnocking$
+^TestKnockingInMSC3787Room$
+^TestKnockRoomsInPublicRoomsDirectory$
+^TestKnockRoomsInPublicRoomsDirectoryInMSC3787Room$
+^TestCannotSendKnockViaSendKnockInMSC3787Room$
+^TestCannotSendNonKnockViaSendKnock$
 
 
 # --- Deferred spec bugs ---
