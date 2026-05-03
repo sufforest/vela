@@ -252,6 +252,20 @@ async fn send_state_inner(
     state_key: String,
     content: Value,
 ) -> Result<Json<Value>, ApiError> {
+    // Same canonical-JSON integer-range guard we apply on /send.
+    // Required for MSC4289's
+    // `power_level_cannot_be_set_beyond_max_canonical_JSON_int`
+    // sub-test: the spec rejects values outside `[-(2^53)+1, 2^53-1]`.
+    if !content.is_object() {
+        return Err(VelaError::BadJson("event content must be a JSON object".into()).into());
+    }
+    if let Some(field) = find_invalid_number(&content) {
+        return Err(VelaError::BadJson(format!(
+            "field {field} contains an out-of-range or non-integer numeric value"
+        ))
+        .into());
+    }
+
     let room_id =
         RoomId::parse(&room_id_str).map_err(|e| ApiError(VelaError::BadJson(e.to_string())))?;
     let room_nid = state
