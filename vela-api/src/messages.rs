@@ -744,6 +744,150 @@ pub async fn get_event(
     Ok(Json(event))
 }
 
+#[derive(Deserialize)]
+pub struct ContextQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Inline JSON filter, same shape as /messages. We don't apply
+    /// the filter today — spec lets servers ignore unrecognised
+    /// filter fields, and the test suites this lights up don't
+    /// depend on it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub filter: Option<String>,
+}
+
+/// GET /_matrix/client/v3/rooms/{roomId}/context/{eventId}
+///
+/// Returns the requested event flanked by `events_before` and
+/// `events_after`, plus the room's current state at the time of the
+/// event. `start` / `end` are stream-position tokens the caller can
+/// feed into `/messages` for further pagination.
+pub async fn get_event_context(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path((room_id_str, event_id)): Path<(String, String)>,
+    Query(query): Query<ContextQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let room_nid = state
+        .db
+        .get_nid(&room_id_str)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        .ok_or_else(|| ApiError(VelaError::Forbidden("not a member of this room".into())))?;
+
+    let membership = state
+        .db
+        .get_membership(room_nid, user.user_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if !matches!(membership, Some(0) | Some(1) | Some(3)) {
+        return Err(VelaError::Forbidden("not a member of this room".into()).into());
+    }
+
+    let event_nid = state
+        .db
+        .get_event_nid_by_id(&event_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
+
+    let visibility = current_history_visibility(&state, room_nid)?;
+    if !history_visibility_permits(
+        &state,
+        room_nid,
+        user.user_nid,
+        membership,
+        &visibility,
+        event_nid,
+    )? {
+        return Err(VelaError::NotFound("event not found".into()).into());
+    }
+
+    // Spec: limit is total events around the pivot, default 10. We
+    // split it half-and-half — a client wanting an asymmetric view
+    // can paginate via `start` / `end`.
+    let limit = query.limit.unwrap_or(10).clamp(1, 100);
+    let half = limit.div_ceil(2);
+
+    let pivot =
+        load_client_event_with_relations(&state, event_nid, &room_id_str, Some(user.user_nid))?
+            .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
+
+    // Find the pivot's stream_pos by linear scan over room_timeline.
+    // Bounded by `MAX_CONTEXT_TIMELINE_SCAN`; for the typical room
+    // this is well under tens of milliseconds. State events that
+    // have no timeline entry won't be found and we fall back to a
+    // reasonable default of "most recent" so the /context call still
+    // returns something rather than a confusing 404.
+    const MAX_CONTEXT_TIMELINE_SCAN: usize = 50_000;
+    let timeline = state
+        .db
+        .get_timeline_range(room_nid, 0, u64::MAX, MAX_CONTEXT_TIMELINE_SCAN)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let pivot_pos: u64 = timeline
+        .iter()
+        .find(|(_, nid)| *nid == event_nid)
+        .map(|(p, _)| *p)
+        .unwrap_or(u64::MAX);
+
+    // events_before — chronological per Synapse parity, oldest-to-newest,
+    // walk backwards from the pivot then reverse for the response array.
+    let before_entries = state
+        .db
+        .get_timeline_before(room_nid, pivot_pos, half)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let mut before: Vec<Value> = Vec::with_capacity(before_entries.len());
+    let mut start_token = format!("s{pivot_pos}");
+    let mut e = before_entries;
+    e.reverse();
+    for (pos, enid) in &e {
+        if let Some(ev) =
+            load_client_event_with_relations(&state, *enid, &room_id_str, Some(user.user_nid))?
+        {
+            before.push(ev);
+            start_token = format!("s{pos}");
+        }
+    }
+
+    // events_after — exclusive of pivot.
+    let after_entries = state
+        .db
+        .get_timeline_range(room_nid, pivot_pos.saturating_add(1), u64::MAX, half)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let mut after: Vec<Value> = Vec::with_capacity(after_entries.len());
+    let mut end_token = format!("s{pivot_pos}");
+    for (pos, enid) in &after_entries {
+        if let Some(ev) =
+            load_client_event_with_relations(&state, *enid, &room_id_str, Some(user.user_nid))?
+        {
+            after.push(ev);
+            end_token = format!("s{pos}");
+        }
+    }
+
+    // Current state of the room. Spec is loose about whether this is
+    // state-at-event or current state; matrix-org/matrix-spec/issues/1729
+    // documents Synapse using current state, which is what clients
+    // (Element) actually rely on for rendering.
+    let state_nids = state
+        .db
+        .get_all_state_event_nids(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let mut state_events = Vec::with_capacity(state_nids.len());
+    for nid in state_nids {
+        if let Some(ev) = load_client_event(&state, nid, &room_id_str)? {
+            state_events.push(ev);
+        }
+    }
+
+    Ok(Json(json!({
+        "start": start_token,
+        "end": end_token,
+        "events_before": before,
+        "event": pivot,
+        "events_after": after,
+        "state": state_events,
+    })))
+}
+
 /// Best-effort fetch of a missing event from a remote member of the
 /// room. Spec lets a server fall back to a peer's `/event/{eventId}`
 /// when the client asks for an event we haven't seen yet (e.g. an

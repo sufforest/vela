@@ -298,6 +298,10 @@ pub fn build_router(state: AppState) -> Router {
             get(messages::get_event),
         )
         .route(
+            "/_matrix/client/v3/rooms/{room_id}/context/{event_id}",
+            get(messages::get_event_context),
+        )
+        .route(
             "/_matrix/client/v3/rooms/{room_id}/redact/{event_id}/{txn_id}",
             put(redaction::redact_event),
         )
