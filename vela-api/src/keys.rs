@@ -25,6 +25,41 @@ pub async fn upload_keys(
     Json(body): Json<KeysUploadRequest>,
 ) -> Result<Json<Value>, ApiError> {
     if let Some(device_keys) = &body.device_keys {
+        // Spec: device_keys MUST carry the caller's user_id +
+        // device_id when present, and MUST include the
+        // `algorithms`, `keys`, and `signatures` required fields.
+        // Bob can't upload keys claiming to be Alice; nor can a
+        // client elide the cryptographic payload.
+        let obj = device_keys
+            .as_object()
+            .ok_or_else(|| ApiError(VelaError::BadJson("device_keys must be an object".into())))?;
+        if let Some(uid) = obj.get("user_id").and_then(|v| v.as_str())
+            && uid != user.user_id
+        {
+            return Err(VelaError::BadJson(format!(
+                "device_keys.user_id {uid} does not match caller {}",
+                user.user_id
+            ))
+            .into());
+        }
+        if let Some(did) = obj.get("device_id").and_then(|v| v.as_str())
+            && did != user.device_id
+        {
+            return Err(VelaError::BadJson(format!(
+                "device_keys.device_id {did} does not match caller device {}",
+                user.device_id
+            ))
+            .into());
+        }
+        for required in ["algorithms", "keys", "signatures"] {
+            if !obj.contains_key(required) {
+                return Err(VelaError::BadJson(format!(
+                    "device_keys missing required field {required}"
+                ))
+                .into());
+            }
+        }
+
         state
             .db
             .set_device_keys(user.user_nid, &user.device_id, device_keys)
@@ -74,8 +109,15 @@ pub struct KeysQueryRequest {
 pub async fn query_keys(
     State(state): State<AppState>,
     _user: AuthenticatedUser,
-    Json(body): Json<KeysQueryRequest>,
+    body: axum::body::Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    // Manual parse so deserialize errors surface as 400 M_BAD_JSON
+    // rather than axum's default 422 — Complement's
+    // `TestKeysQueryWithDeviceIDAsObjectFails` asserts on 400 when
+    // a client sends `device_keys.<user>: {}` (object) where a
+    // sequence is required.
+    let body: KeysQueryRequest = serde_json::from_slice(&body)
+        .map_err(|e| ApiError(VelaError::BadJson(format!("/keys/query body: {e}"))))?;
     let mut device_keys_response: Map<String, Value> = Map::new();
     let mut master_keys: Map<String, Value> = Map::new();
     let mut self_signing_keys: Map<String, Value> = Map::new();

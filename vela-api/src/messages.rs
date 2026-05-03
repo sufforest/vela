@@ -111,6 +111,14 @@ pub async fn get_messages(
     // Cap range by leave_pos so departed users only see pre-leave
     // events. For backward pagination we cap `from`; for forward we
     // cap `to`.
+    //
+    // Matrix token semantics: a sync `next_batch` is the highest
+    // delivered position — clients re-feed it as `since`/`from`
+    // expecting events strictly after, and as `to` expecting events
+    // up to and including. Our `get_timeline_range(from, to)` is
+    // half-open `[from, to)`, so for `dir=f` we shift `from = n+1`
+    // (exclusive) and `to = n+1` (inclusive of the supplied
+    // afterToken).
     let events = if dir == "b" {
         let from = match leave_cap {
             Some(cap) => from.min(cap),
@@ -121,14 +129,19 @@ pub async fn get_messages(
             .get_timeline_before(room_nid, from, limit)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
     } else {
+        let from = match cursor {
+            Some(Cursor::Stream(n)) => n.saturating_add(1),
+            _ => 0,
+        };
         let to = query
             .to
             .as_deref()
             .and_then(|s| s.strip_prefix('s'))
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|n| n.saturating_add(1))
             .unwrap_or(u64::MAX);
         let to = match leave_cap {
-            Some(cap) => to.min(cap),
+            Some(cap) => to.min(cap.saturating_add(1)),
             None => to,
         };
         state
@@ -166,9 +179,12 @@ pub async fn get_messages(
         }
         end_token = format!("s{stream_pos}");
 
-        if let Some(client_event) =
-            load_client_event_with_relations(&state, *event_nid, &room_id_str, Some(user.user_nid))?
-        {
+        if let Some(client_event) = load_client_event_with_relations(
+            &state,
+            *event_nid,
+            &room_id_str,
+            Some((user.user_nid, &user.device_id)),
+        )? {
             chunk.push(client_event);
         }
     }
@@ -525,24 +541,31 @@ pub fn load_client_event(
     Ok(Some(Value::Object(event)))
 }
 
-/// Render an event for client consumption, then attach
-/// `unsigned.m.relations.m.thread` aggregation if it is a thread root.
-/// Pass `Some(user_nid)` to populate `current_user_participated`; pass
-/// `None` (sync timeline doesn't always carry caller context) to omit it.
+/// Render an event for client consumption with extra `unsigned`
+/// fields attached:
 ///
-/// MSC4115: when `user_nid` is `Some`, also annotate
-/// `unsigned.membership` with the user's `m.room.member` value at the
-/// time of this event. The default (no member event) is `"leave"`.
+/// - `m.relations.m.thread` aggregation when this event is a thread
+///   root.
+/// - `membership` per MSC4115 — the requesting user's
+///   `m.room.member` value as of this event (default `"leave"`).
+/// - `transaction_id` when the requesting `(user, device)` matches
+///   the originating sender's. This is the local-echo path that lets
+///   clients correlate their just-sent event with the /sync entry
+///   they receive back.
+///
+/// Pass `caller=None` (e.g. service-internal renders that aren't on a
+/// per-user code path) to skip the per-user annotations.
 pub fn load_client_event_with_relations(
     state: &AppState,
     event_nid: u64,
     room_id: &str,
-    user_nid: Option<u64>,
+    caller: Option<(u64, &str)>,
 ) -> Result<Option<Value>, ApiError> {
     let mut ev = match load_client_event(state, event_nid, room_id)? {
         Some(v) => v,
         None => return Ok(None),
     };
+    let user_nid = caller.map(|(u, _)| u);
     if let Some(agg) = compute_thread_aggregation(state, event_nid, room_id, user_nid)? {
         let unsigned = ev
             .as_object_mut()
@@ -571,6 +594,22 @@ pub fn load_client_event_with_relations(
             .as_object_mut()
             .unwrap()
             .insert("membership".to_string(), json!(membership));
+    }
+    if let Some((uid, did)) = caller
+        && let Some(txn) = state
+            .db
+            .get_event_txn_id_for_user(event_nid, uid, did)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    {
+        let unsigned = ev
+            .as_object_mut()
+            .unwrap()
+            .entry("unsigned".to_string())
+            .or_insert_with(|| json!({}));
+        unsigned
+            .as_object_mut()
+            .unwrap()
+            .insert("transaction_id".to_string(), json!(txn));
     }
     Ok(Some(ev))
 }
@@ -737,9 +776,13 @@ pub async fn get_event(
         return Err(VelaError::NotFound("event not found".into()).into());
     }
 
-    let event =
-        load_client_event_with_relations(&state, event_nid, &room_id_str, Some(user.user_nid))?
-            .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
+    let event = load_client_event_with_relations(
+        &state,
+        event_nid,
+        &room_id_str,
+        Some((user.user_nid, &user.device_id)),
+    )?
+    .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
 
     Ok(Json(event))
 }
@@ -807,9 +850,13 @@ pub async fn get_event_context(
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
     let half = limit.div_ceil(2);
 
-    let pivot =
-        load_client_event_with_relations(&state, event_nid, &room_id_str, Some(user.user_nid))?
-            .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
+    let pivot = load_client_event_with_relations(
+        &state,
+        event_nid,
+        &room_id_str,
+        Some((user.user_nid, &user.device_id)),
+    )?
+    .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
 
     // Find the pivot's stream_pos by linear scan over room_timeline.
     // Bounded by `MAX_CONTEXT_TIMELINE_SCAN`; for the typical room
@@ -839,9 +886,12 @@ pub async fn get_event_context(
     let mut e = before_entries;
     e.reverse();
     for (pos, enid) in &e {
-        if let Some(ev) =
-            load_client_event_with_relations(&state, *enid, &room_id_str, Some(user.user_nid))?
-        {
+        if let Some(ev) = load_client_event_with_relations(
+            &state,
+            *enid,
+            &room_id_str,
+            Some((user.user_nid, &user.device_id)),
+        )? {
             before.push(ev);
             start_token = format!("s{pos}");
         }
@@ -855,9 +905,12 @@ pub async fn get_event_context(
     let mut after: Vec<Value> = Vec::with_capacity(after_entries.len());
     let mut end_token = format!("s{pivot_pos}");
     for (pos, enid) in &after_entries {
-        if let Some(ev) =
-            load_client_event_with_relations(&state, *enid, &room_id_str, Some(user.user_nid))?
-        {
+        if let Some(ev) = load_client_event_with_relations(
+            &state,
+            *enid,
+            &room_id_str,
+            Some((user.user_nid, &user.device_id)),
+        )? {
             after.push(ev);
             end_token = format!("s{pos}");
         }

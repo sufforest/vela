@@ -68,5 +68,11 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // hitting /_matrix/federation/v1/openid/userinfo. Value: 8 BE
     // bytes of `expires_at_ms` followed by the user_id string.
     "openid_tokens",
+    // Per-event mapping `event_nid -> (sender_nid:8, device_id, 0xff,
+    // txn_id)` for local-echo. Read by /sync, /messages, and /event
+    // when the requesting user/device matches the sender — those
+    // responses get `unsigned.transaction_id` attached so the
+    // client can correlate.
+    "event_txn_ids",
     "room_directory",
 ];

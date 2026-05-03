@@ -274,6 +274,7 @@ pub(crate) fn build_sync_response_with_filter(
             &room_id,
             since,
             Some(user.user_nid),
+            Some(&user.device_id),
             timeline_limit,
         )?;
         if !ignored.is_empty() {
@@ -498,12 +499,43 @@ fn attach_membership_for_user(
     unsigned_obj.insert("membership".to_string(), json!(membership));
 }
 
+/// Attach `unsigned.transaction_id` to `ev` when the requesting
+/// `(user_nid, device_id)` matches the originating sender. Used on
+/// the local-echo path for /sync timeline events; matches the
+/// behaviour of `load_client_event_with_relations` for /event,
+/// /messages, and /relations.
+fn attach_txn_id_for_user(
+    state: &AppState,
+    ev: &mut Value,
+    user_nid: Option<u64>,
+    device_id: Option<&str>,
+    event_nid: u64,
+) {
+    let (Some(uid), Some(did)) = (user_nid, device_id) else {
+        return;
+    };
+    let Ok(Some(txn)) = state.db.get_event_txn_id_for_user(event_nid, uid, did) else {
+        return;
+    };
+    let Some(obj) = ev.as_object_mut() else {
+        return;
+    };
+    let unsigned = obj
+        .entry("unsigned".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(unsigned_obj) = unsigned.as_object_mut() else {
+        return;
+    };
+    unsigned_obj.insert("transaction_id".to_string(), json!(txn));
+}
+
 fn build_room_sync_for_user(
     state: &AppState,
     room_nid: u64,
     room_id: &str,
     since: Option<u64>,
     user_nid: Option<u64>,
+    device_id: Option<&str>,
     timeline_limit: usize,
 ) -> Result<Value, ApiError> {
     let (state_events, timeline_events, limited, prev_batch) = match since {
@@ -517,6 +549,7 @@ fn build_room_sync_for_user(
             for nid in &state_nids {
                 if let Some(mut ev) = load_client_event(state, *nid, room_id)? {
                     attach_membership_for_user(state, &mut ev, user_nid, *nid);
+                    attach_txn_id_for_user(state, &mut ev, user_nid, device_id, *nid);
                     state_events.push(ev);
                 }
             }
@@ -534,6 +567,7 @@ fn build_room_sync_for_user(
                 }
                 if let Some(mut ev) = load_client_event(state, *enid, room_id)? {
                     attach_membership_for_user(state, &mut ev, user_nid, *enid);
+                    attach_txn_id_for_user(state, &mut ev, user_nid, device_id, *enid);
                     timeline_events.push(ev);
                 }
             }
