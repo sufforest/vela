@@ -337,7 +337,14 @@ pub(crate) async fn claim_local_user_otks(
             user_keys.insert(device_id.clone(), Value::Object(device_map));
         }
     }
-    result.insert(user_id.to_string(), Value::Object(user_keys));
+    // Spec: omit users for whom no keys could be claimed. The test
+    // `TestFederationKeyUploadQuery/Can_claim_remote_one_time_key_using_POST`
+    // pings /keys/claim a second time after exhausting the OTK and
+    // asserts the user_id is *missing* from the response — an
+    // empty-but-present map fails that match.
+    if !user_keys.is_empty() {
+        result.insert(user_id.to_string(), Value::Object(user_keys));
+    }
     Ok(())
 }
 
