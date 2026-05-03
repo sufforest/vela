@@ -92,9 +92,21 @@ pub async fn hierarchy(
                     continue;
                 }
                 let children = collect_children(&state, nid, suggested_only)?;
+                let is_space = is_space_room(&state, nid);
                 rooms.push(summarize_room(&state, nid, &id, &children)?);
 
                 if depth + 1 > max_depth {
+                    continue;
+                }
+                // Spec: only spaces have meaningful `m.space.child` —
+                // a non-space room may legally carry such state events
+                // (the create-event type lives in `m.room.create`,
+                // separate from join_rules), but the hierarchy walker
+                // MUST NOT recurse into them. Without this guard, a
+                // child link from a regular room R2 → R5 pulls R5 into
+                // the response and Complement's `query_whole_graph`
+                // assertion fires on the unexpected entry.
+                if !is_space {
                     continue;
                 }
                 for child in &children {
@@ -468,6 +480,18 @@ pub(crate) fn summarize_room(
     }
 
     Ok(Value::Object(out))
+}
+
+/// True iff `room_nid`'s `m.room.create` event has `type:
+/// "m.space"`. Plain rooms return false even when they carry
+/// `m.space.child` state events. Used by the hierarchy walker to
+/// decide whether to descend into children.
+fn is_space_room(state: &AppState, room_nid: u64) -> bool {
+    read_content(state, room_nid, "m.room.create", "")
+        .as_ref()
+        .and_then(|c| c.get("type"))
+        .and_then(|v| v.as_str())
+        == Some("m.space")
 }
 
 fn read_content(state: &AppState, room_nid: u64, etype: &str, state_key: &str) -> Option<Value> {
