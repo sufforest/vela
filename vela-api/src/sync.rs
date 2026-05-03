@@ -134,11 +134,18 @@ pub async fn sync(
     drop(notify_tx);
 
     let filter = resolve_filter(&state, &user, query.filter.as_deref())?;
+    let full_state = query.full_state.unwrap_or(false);
 
     // Now check the DB — any events broadcast after our subscribe() call
     // will be caught by the spawned listener tasks.
-    let response =
-        build_sync_response_with_filter(&state, &user, &joined_room_nids, since, filter.as_ref())?;
+    let response = build_sync_response_with_filter(
+        &state,
+        &user,
+        &joined_room_nids,
+        since,
+        filter.as_ref(),
+        full_state,
+    )?;
 
     let has_events = response
         .get("rooms")
@@ -214,8 +221,14 @@ pub async fn sync(
         .get_user_joined_rooms(user.user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
-    let response =
-        build_sync_response_with_filter(&state, &user, &joined_room_nids, since, filter.as_ref())?;
+    let response = build_sync_response_with_filter(
+        &state,
+        &user,
+        &joined_room_nids,
+        since,
+        filter.as_ref(),
+        full_state,
+    )?;
     Ok(Json(response))
 }
 
@@ -226,7 +239,7 @@ pub(crate) fn build_sync_response(
     joined_room_nids: &[u64],
     since: Option<u64>,
 ) -> Result<Value, ApiError> {
-    build_sync_response_with_filter(state, user, joined_room_nids, since, None)
+    build_sync_response_with_filter(state, user, joined_room_nids, since, None, false)
 }
 
 pub(crate) fn build_sync_response_with_filter(
@@ -235,6 +248,7 @@ pub(crate) fn build_sync_response_with_filter(
     joined_room_nids: &[u64],
     since: Option<u64>,
     filter: Option<&Value>,
+    full_state: bool,
 ) -> Result<Value, ApiError> {
     let current_pos = state.db.current_stream_position();
     let ignored = load_ignored_users(state, user.user_nid)?;
@@ -285,6 +299,15 @@ pub(crate) fn build_sync_response_with_filter(
         }
         if lazy_load {
             crate::filters::apply_lazy_load_state(&mut room_data, &user.user_id);
+        }
+
+        // Spec: on incremental sync, joined rooms that have no new content
+        // since `since` MUST be omitted from `rooms.join` — sending them
+        // back wastes bandwidth and confuses clients into thinking the
+        // room timeline restarted. `full_state=true` overrides this and
+        // forces every joined room to appear.
+        if since.is_some() && !full_state && room_is_unchanged(&room_data) {
+            continue;
         }
         join_rooms.insert(room_id, room_data);
     }
@@ -1021,6 +1044,22 @@ fn collect_invite_or_knock_stripped(
     Ok(out)
 }
 
+/// True when the room sync block has no content to deliver: empty
+/// timeline, empty state delta, no ephemeral events, no per-room
+/// account data. Such rooms must be omitted from `rooms.join` on
+/// incremental sync per spec.
+fn room_is_unchanged(room: &Value) -> bool {
+    let arr_empty = |ptr: &str| {
+        room.pointer(ptr)
+            .and_then(|v| v.as_array())
+            .is_none_or(|a| a.is_empty())
+    };
+    arr_empty("/timeline/events")
+        && arr_empty("/state/events")
+        && arr_empty("/ephemeral/events")
+        && arr_empty("/account_data/events")
+}
+
 /// Build the `rooms.leave.{room_id}` payload.
 ///
 /// Per spec, a left user's view of the room is **frozen at their leave**:
@@ -1576,6 +1615,104 @@ mod tests {
         assert!(
             state_events.is_empty(),
             "state delta should be empty (leave is in timeline already): {state_events:?}"
+        );
+    }
+
+    /// Per spec, an incremental /sync MUST omit joined rooms with no new
+    /// content since `since`. The `full_state=true` form bypasses this.
+    #[test]
+    fn unchanged_joined_room_omitted_from_incremental_sync() {
+        let (state, _tmp) = build_test_state();
+        let db = state.db.clone();
+
+        let room_id = "!quietroom:example.com".to_string();
+        let room_nid = db.get_or_create_nid(&room_id).unwrap();
+        let alice = "@alice:example.com";
+        let alice_nid = db.get_or_create_nid(alice).unwrap();
+        let alice_user = AuthenticatedUser {
+            user_nid: alice_nid,
+            user_id: alice.into(),
+            device_id: "DEV".into(),
+        };
+
+        persist_state(
+            &db,
+            200,
+            "$create",
+            room_nid,
+            &room_id,
+            "m.room.create",
+            alice_nid,
+            alice,
+            "",
+            serde_json::json!({"room_version": "12"}),
+            1,
+            1,
+            &[],
+        );
+        persist_state(
+            &db,
+            201,
+            "$alice_join",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            alice_nid,
+            alice,
+            alice,
+            serde_json::json!({"membership": "join"}),
+            2,
+            2,
+            &[200],
+        );
+        db.set_membership(room_nid, alice_nid, 1).unwrap();
+
+        let cur = db.current_stream_position();
+
+        // Initial sync: room must appear (even if "empty" state, alice
+        // has never seen it before).
+        let resp =
+            build_sync_response_with_filter(&state, &alice_user, &[room_nid], None, None, false)
+                .unwrap();
+        assert!(
+            resp.pointer(&format!("/rooms/join/{room_id}")).is_some(),
+            "initial sync must include joined rooms"
+        );
+
+        // Incremental sync from a token equal to current pos: nothing
+        // happened since, so the room must be omitted.
+        let resp = build_sync_response_with_filter(
+            &state,
+            &alice_user,
+            &[room_nid],
+            Some(cur),
+            None,
+            false,
+        )
+        .unwrap();
+        let join = resp
+            .pointer("/rooms/join")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert!(
+            !join.contains_key(&room_id),
+            "unchanged room must not appear on incremental sync: {join:?}"
+        );
+
+        // full_state=true forces the room to be present even when nothing
+        // has happened since.
+        let resp = build_sync_response_with_filter(
+            &state,
+            &alice_user,
+            &[room_nid],
+            Some(cur),
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(
+            resp.pointer(&format!("/rooms/join/{room_id}")).is_some(),
+            "full_state=true must always include joined rooms"
         );
     }
 
