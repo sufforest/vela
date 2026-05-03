@@ -21,9 +21,9 @@ use crate::federation_sender::FederationSender;
 use crate::middleware::federation_auth::federation_auth;
 use crate::{
     account, account_data, capabilities, devices, directory, discovery, federation, filters,
-    key_backup, keys, login, logout, media, membership, messages, presence, profile, pushers,
-    pushrules, receipts, redaction, refresh, register, relations, room_upgrade, rooms, search,
-    send, sliding_sync, state, sync, to_device, typing, whoami,
+    key_backup, keys, login, logout, media, membership, messages, openid, presence, profile,
+    pushers, pushrules, receipts, redaction, refresh, register, relations, room_upgrade, rooms,
+    search, send, sliding_sync, state, sync, to_device, typing, whoami,
 };
 
 #[derive(Clone)]
@@ -414,6 +414,12 @@ pub fn build_router(state: AppState) -> Router {
             "/_matrix/client/v3/user/{userId}/filter/{filterId}",
             get(filters::get_filter),
         )
+        // OpenID — short-lived tokens for SSO into Matrix-aware
+        // third-party services. Path userId must match the caller.
+        .route(
+            "/_matrix/client/v3/user/{userId}/openid/request_token",
+            post(openid::request_token),
+        )
         // Device management
         .route("/_matrix/client/v3/devices", get(devices::list_devices))
         .route(
@@ -570,7 +576,13 @@ pub fn build_router(state: AppState) -> Router {
         // Server-version endpoint, unauthenticated per spec. Reports
         // the implementation name + version so other servers can
         // observe deployment heterogeneity.
-        .route("/_matrix/federation/v1/version", get(federation::version));
+        .route("/_matrix/federation/v1/version", get(federation::version))
+        // OpenID userinfo. Spec marks this unauthenticated — the
+        // access_token in the query string is the bearer.
+        .route(
+            "/_matrix/federation/v1/openid/userinfo",
+            get(openid::federation_userinfo),
+        );
     // Federation authenticated routes — require X-Matrix header
     // verification. Skipped entirely when federation is disabled in
     // config: the routes are not mounted, so unrelated middleware

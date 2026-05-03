@@ -63,5 +63,10 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // the federation sender. Same value/key shape as
     // `device_list_outbound`.
     "signing_key_update_outbound",
+    // Short-lived OpenID tokens issued via /_matrix/client/v3/user/
+    // {userId}/openid/request_token and validated by remote servers
+    // hitting /_matrix/federation/v1/openid/userinfo. Value: 8 BE
+    // bytes of `expires_at_ms` followed by the user_id string.
+    "openid_tokens",
     "room_directory",
 ];

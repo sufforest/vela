@@ -35,6 +35,7 @@ mod membership;
 pub mod messages;
 pub mod metrics;
 pub mod middleware;
+mod openid;
 mod presence;
 mod profile;
 pub mod push;

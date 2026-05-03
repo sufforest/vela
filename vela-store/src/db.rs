@@ -3325,6 +3325,53 @@ impl Database {
         Ok(self.db.get_cf(&cf, event_id.as_bytes())?.is_some())
     }
 
+    // --- OpenID tokens ---
+
+    /// Persist an OpenID access token. Value layout: 8 BE bytes of
+    /// `expires_at_ms` followed by the UTF-8 user_id. Lookups use
+    /// `lookup_openid_token` which checks the timestamp and returns
+    /// the user_id when still valid.
+    pub fn store_openid_token(
+        &self,
+        token: &str,
+        user_id: &str,
+        expires_at_ms: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("openid_tokens").unwrap();
+        let mut value = Vec::with_capacity(8 + user_id.len());
+        value.extend_from_slice(&expires_at_ms.to_be_bytes());
+        value.extend_from_slice(user_id.as_bytes());
+        self.db.put_cf(&cf, token.as_bytes(), value)
+    }
+
+    /// Look up an OpenID token. Returns `Some(user_id)` when the
+    /// token exists and `now_ms` is before its expiry, `None`
+    /// otherwise. Expired or unknown tokens look the same to the
+    /// caller — federation peers should get a 401 either way.
+    pub fn lookup_openid_token(
+        &self,
+        token: &str,
+        now_ms: u64,
+    ) -> Result<Option<String>, rocksdb::Error> {
+        let cf = self.db.cf_handle("openid_tokens").unwrap();
+        let Some(value) = self.db.get_cf(&cf, token.as_bytes())? else {
+            return Ok(None);
+        };
+        if value.len() < 8 {
+            return Ok(None);
+        }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&value[..8]);
+        let expires_at_ms = u64::from_be_bytes(buf);
+        if expires_at_ms <= now_ms {
+            // Best-effort cleanup; ignore the error so a parallel
+            // delete doesn't surface to the caller.
+            let _ = self.db.delete_cf(&cf, token.as_bytes());
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf8_lossy(&value[8..]).into_owned()))
+    }
+
     // --- Federation EDU cursors ---
     //
     // Per-(destination, stream_name) cursor tracking how far this server
