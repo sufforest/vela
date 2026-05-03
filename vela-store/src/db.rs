@@ -2184,14 +2184,22 @@ impl Database {
 
     // --- Transaction idempotency ---
 
+    /// Look up a previously-recorded transaction event_id. `scope` is
+    /// the request-path discriminator — for `PUT /rooms/{room}/send/
+    /// {event_type}/{txn}` we use `"send/{room}/{event_type}"`. The
+    /// scope must combine with `(user_nid, device_id, txn_id)` to
+    /// match what `set_transaction` recorded; otherwise the lookup
+    /// misses and a fresh event is minted, which is the spec-correct
+    /// behaviour for "same txn_id, different room/endpoint."
     pub fn get_transaction(
         &self,
         user_nid: u64,
         device_id: &str,
+        scope: &str,
         txn_id: &str,
     ) -> Result<Option<String>, rocksdb::Error> {
         let cf = self.db.cf_handle("transactions").unwrap();
-        let key = keys::encode_u64_bytes_bytes(user_nid, device_id.as_bytes(), txn_id.as_bytes());
+        let key = transaction_key(user_nid, device_id, scope, txn_id);
         match self.db.get_cf(&cf, &key)? {
             Some(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).to_string())),
             None => Ok(None),
@@ -2202,11 +2210,12 @@ impl Database {
         &self,
         user_nid: u64,
         device_id: &str,
+        scope: &str,
         txn_id: &str,
         event_id: &str,
     ) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("transactions").unwrap();
-        let key = keys::encode_u64_bytes_bytes(user_nid, device_id.as_bytes(), txn_id.as_bytes());
+        let key = transaction_key(user_nid, device_id, scope, txn_id);
         self.db.put_cf(&cf, &key, event_id.as_bytes())
     }
 
@@ -3591,6 +3600,22 @@ fn to_device_outbound_prefix(destination: &str) -> Vec<u8> {
 fn to_device_outbound_key(destination: &str, stream_pos: u64) -> Vec<u8> {
     let mut k = to_device_outbound_prefix(destination);
     k.extend_from_slice(&keys::encode_u64(stream_pos));
+    k
+}
+
+/// Transaction-cache key. Layout: `<user_nid:8> 0xff <device_id> 0xff
+/// <scope> 0xff <txn_id>`. The two-byte separators keep variable-
+/// length fields unambiguous so a `device_id` containing the
+/// "scope/txn" delimiter can't collide with a different request.
+fn transaction_key(user_nid: u64, device_id: &str, scope: &str, txn_id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(8 + 1 + device_id.len() + 1 + scope.len() + 1 + txn_id.len());
+    k.extend_from_slice(&keys::encode_u64(user_nid));
+    k.push(0xff);
+    k.extend_from_slice(device_id.as_bytes());
+    k.push(0xff);
+    k.extend_from_slice(scope.as_bytes());
+    k.push(0xff);
+    k.extend_from_slice(txn_id.as_bytes());
     k
 }
 

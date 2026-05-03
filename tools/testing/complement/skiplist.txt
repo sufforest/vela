@@ -62,6 +62,21 @@
 # v6-specific test — same v12-only design rationale.
 ^TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6$
 
+# v10-specific federation device-list test. The Complement mock
+# creates a v10 room and asks vela to join via federation; our
+# outbound make_join rejects with M_UNSUPPORTED_ROOM_VERSION per
+# spec. v12 sibling coverage is `TestDeviceListsUpdateOverFederation`
+# (kept off-skiplist).
+^TestDeviceListsUpdateOverFederationOnRoomJoin$
+
+# v11-specific MSC4291 sub-tests. The shared `doTestUpgrade…`
+# helper iterates `[v12, v11]`; v11 hits M_UNSUPPORTED_ROOM_VERSION
+# at /createRoom or /upgrade. The v12 sibling
+# `TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent` is
+# kept off-skiplist and runs against /context.
+^TestMSC4291RoomIDAsHashOfCreateEvent_CannotSendCreateEvent$
+^TestMSC4291RoomIDAsHashOfCreateEvent_UpgradedRooms$
+
 # Restricted-rooms cluster (MSC3083, restricted_rooms_test.go) hard-
 # codes `room_version: "8"` everywhere. v12 also supports the
 # `restricted` join_rule and we cover that path via

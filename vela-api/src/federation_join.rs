@@ -113,8 +113,11 @@ pub async fn make_join(
         }
     };
 
-    // Accept public + restricted/knock_restricted rooms. Deferred until after
-    // user_nid resolution below since the allow-list check needs it.
+    // Accept public + restricted/knock_restricted rooms outright.
+    // For invite-only rooms, accept iff the user has a current
+    // `m.room.member` invite — the spec lets invited users
+    // make_join just like the public path. Knock rooms
+    // intentionally fall through to make_knock instead.
     let join_rules_content = read_join_rules_content(&state, room_nid);
     let join_rule = join_rules_content
         .as_ref()
@@ -122,7 +125,12 @@ pub async fn make_join(
         .and_then(|r| r.as_str())
         .unwrap_or("invite");
 
-    if !matches!(join_rule, "public" | "restricted" | "knock_restricted") {
+    let user_nid = state.db.get_or_create_nid(&user_id).map_err(db_err)?;
+    let current_membership = state.db.get_membership(room_nid, user_nid).ok().flatten();
+
+    let join_rule_allows = matches!(join_rule, "public" | "restricted" | "knock_restricted");
+    let invited = current_membership == Some(2);
+    if !join_rule_allows && !invited {
         return Err(err_response(
             StatusCode::FORBIDDEN,
             "M_FORBIDDEN",
@@ -132,8 +140,7 @@ pub async fn make_join(
 
     // Reject if user is banned. Already-joined users get a fresh template
     // (the origin is presumably retrying a prior failed join).
-    let user_nid = state.db.get_or_create_nid(&user_id).map_err(db_err)?;
-    match state.db.get_membership(room_nid, user_nid).ok().flatten() {
+    match current_membership {
         Some(1) => {
             warn!(%user_id, "make_join for already-joined user (issuing fresh template)");
         }
