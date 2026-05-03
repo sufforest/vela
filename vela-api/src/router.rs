@@ -795,6 +795,12 @@ fn federation_authed_routes(state: AppState) -> Router<AppState> {
             get(federation_fetch::get_federation_public_rooms)
                 .post(federation_fetch::post_federation_public_rooms),
         )
+        // MSC2946 spaces hierarchy — single-level summary. Caller
+        // recurses across servers themselves.
+        .route(
+            "/_matrix/federation/v1/hierarchy/{room_id}",
+            get(crate::spaces::federation_hierarchy),
+        )
         .route(
             "/_matrix/federation/v1/media/download/{media_id}",
             get(federation_media::federation_download),
