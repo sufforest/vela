@@ -57,21 +57,31 @@ pub async fn search(
 
     if state.config.search_all_users {
         // Open-directory path: linear scan over the whole user table.
+        // Skip the caller themself — they don't expect to find themselves.
         let all = state
             .db
             .scan_all_users()
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-        for (_nid, record) in all {
+        for (nid, record) in all {
+            if nid == user.user_nid {
+                continue;
+            }
             if try_push(&record, &term, limit, &mut matches) {
                 truncated = true;
                 break;
             }
         }
     } else {
-        // Privacy-default path: iterate peers and point-lookup each. Cost
-        // scales with the caller's social graph, not total server users.
-        let peers = resolve_shared_room_peers(&state, user.user_nid)?;
-        for peer_nid in peers {
+        // Privacy-default path: search the union of (a) peers from rooms
+        // shared with the caller and (b) members of any public-directory
+        // room — per spec, users in published rooms are globally findable.
+        // The caller themself is always omitted from results: a directory
+        // search for "find people I know" should not echo the requester
+        // back, and Synapse/Element clients rely on this filtering.
+        let mut candidates = resolve_shared_room_peers(&state, user.user_nid)?;
+        candidates.extend(resolve_public_room_members(&state)?);
+        candidates.remove(&user.user_nid);
+        for peer_nid in candidates {
             let Some(record) = state
                 .db
                 .get_user(peer_nid)
@@ -140,12 +150,11 @@ fn matches_substring(user_id: &str, displayname: &str, term_lc: &str) -> bool {
 }
 
 /// Collect every user_nid that co-occupies at least one room with `caller`.
-/// Includes the caller themself (Element renders self results specially,
-/// but users expect to find their own profile when searching). Used to
-/// filter user-directory search under the privacy-preserving default.
+/// The caller themself is intentionally NOT inserted — see the comment on
+/// the privacy-default path where the union with public-room members
+/// happens; the caller is removed there before the search runs.
 fn resolve_shared_room_peers(state: &AppState, caller_nid: u64) -> Result<HashSet<u64>, ApiError> {
     let mut peers = HashSet::new();
-    peers.insert(caller_nid);
     let rooms = state
         .db
         .get_user_joined_rooms(caller_nid)
@@ -160,6 +169,49 @@ fn resolve_shared_room_peers(state: &AppState, caller_nid: u64) -> Result<HashSe
         }
     }
     Ok(peers)
+}
+
+/// Members of any room currently published in the public directory.
+/// Per spec the user directory must surface users that anyone can
+/// discover (i.e. members of published rooms) regardless of whether
+/// the caller shares a room with them — that's what makes "find Alice
+/// by name" work for users who haven't met yet.
+///
+/// Cost scales with the number of public rooms × members per room. For
+/// large public servers this would justify a dedicated index; for
+/// development and homeservers with a small public footprint, the
+/// scan is cheap enough.
+fn resolve_public_room_members(state: &AppState) -> Result<HashSet<u64>, ApiError> {
+    let mut members = HashSet::new();
+    let rooms = state.db.list_room_ids().unwrap_or_default();
+    for room_id in rooms {
+        let Some(room_nid) = state
+            .db
+            .get_nid(&room_id)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        else {
+            continue;
+        };
+        let in_directory = match state
+            .db
+            .get_room_directory_visibility(room_nid)
+            .unwrap_or(None)
+        {
+            Some(v) => v,
+            None => crate::directory::read_join_rule_public(state, room_nid)?,
+        };
+        if !in_directory {
+            continue;
+        }
+        let room_members = state
+            .db
+            .get_room_members(room_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        for m in room_members {
+            members.insert(m);
+        }
+    }
+    Ok(members)
 }
 
 #[cfg(test)]
