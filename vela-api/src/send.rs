@@ -282,6 +282,19 @@ async fn send_state_inner(
         validate_canonical_alias(&state, &room_id_str, &content)?;
     }
 
+    // No-op short-circuit: when a client sends a state event with
+    // content identical to the current state, return the existing
+    // event_id without minting a new event. Spec phrasing is "SHOULD
+    // NOT process … whose content has not changed"; Synapse and
+    // Continuwuity follow the optimisation, and the spec
+    // `TestInboundCanReturnMissingEvents` "shared" sub-test bakes
+    // that behaviour into its expected event count.
+    if let Some(existing_event_id) =
+        existing_state_event_if_unchanged(&state, room_nid, &event_type, &state_key, &content)
+    {
+        return Ok(Json(json!({ "event_id": existing_event_id })));
+    }
+
     let extremity_nids = state
         .db
         .get_extremities(room_nid)
@@ -688,6 +701,34 @@ const SAFE_INT_MIN: i64 = -(1i64 << 53) + 1;
 
 fn is_safe_int(i: i64) -> bool {
     (SAFE_INT_MIN..=SAFE_INT_MAX).contains(&i)
+}
+
+/// If `(event_type, state_key)` is already in the room's current
+/// state with `new_content` equal to the existing event's content,
+/// return the existing event_id (so the caller can skip persisting
+/// a no-op state event). Otherwise return `None`.
+fn existing_state_event_if_unchanged(
+    state: &AppState,
+    room_nid: u64,
+    event_type: &str,
+    state_key: &str,
+    new_content: &Value,
+) -> Option<String> {
+    let type_nid = state.db.get_nid(event_type).ok().flatten()?;
+    let skey_nid = state.db.get_nid(state_key).ok().flatten()?;
+    let event_nid = state
+        .db
+        .get_state_event_nid(room_nid, type_nid, skey_nid)
+        .ok()
+        .flatten()?;
+    let (_h, bytes) = state.db.get_event(event_nid).ok().flatten()?;
+    let existing: Value = serde_json::from_slice(&bytes).ok()?;
+    let existing_content = existing.get("content")?;
+    if existing_content == new_content {
+        state.db.get_event_id_by_nid(event_nid).ok().flatten()
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -797,6 +797,17 @@ fn federation_authed_routes(state: AppState) -> Router<AppState> {
             "/_matrix/federation/v1/user/devices/{user_id}",
             get(federation_devices::get_user_devices),
         )
+        // Federation key endpoints — peers query these for our local
+        // users' device + cross-signing keys, and to claim their
+        // one-time keys when starting an Olm session.
+        .route(
+            "/_matrix/federation/v1/user/keys/query",
+            post(keys::federation_query_keys),
+        )
+        .route(
+            "/_matrix/federation/v1/user/keys/claim",
+            post(keys::federation_claim_keys),
+        )
         // Public-rooms federation directory. Always mounted; the
         // handler returns 404 when
         // `allow_public_rooms_over_federation` is false (default),

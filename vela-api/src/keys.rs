@@ -150,7 +150,7 @@ fn user_server(user_id: &str) -> Option<&str> {
 
 /// Read a local user's device + cross-signing keys into the four
 /// per-user maps that build up the /keys/query response.
-fn fold_local_user_keys(
+pub(crate) fn fold_local_user_keys(
     state: &AppState,
     user_id: &str,
     device_ids: &[String],
@@ -303,7 +303,7 @@ pub async fn claim_keys(
 
 /// Claim one-time keys for a local user under the per-user lock and
 /// fold the result into the per-user response map.
-async fn claim_local_user_otks(
+pub(crate) async fn claim_local_user_otks(
     state: &AppState,
     user_id: &str,
     devices: &HashMap<String, String>,
@@ -854,4 +854,87 @@ pub fn federate_device_lists_on_join(
             state.federation_sender.notify_destination(dest);
         }
     }
+}
+
+// --- Federation key endpoints ---
+
+/// POST /_matrix/federation/v1/user/keys/query
+///
+/// Federation companion to the C2S `/keys/query`. Same body shape:
+/// `{device_keys: {user_id: [device_id, ...]}}`. We respond ONLY
+/// for users on our own server — peers serve their own users.
+///
+/// Spec response omits `user_signing_keys` (private to the user's
+/// home server); we discard the map populated by
+/// `fold_local_user_keys` rather than maintain a separate
+/// federation-only helper.
+pub async fn federation_query_keys(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Extension(_origin): axum::extract::Extension<
+        crate::middleware::federation_auth::XMatrixOrigin,
+    >,
+    axum::extract::Extension(crate::middleware::federation_auth::VerifiedBody(body)): axum::extract::Extension<crate::middleware::federation_auth::VerifiedBody>,
+) -> Result<Json<Value>, axum::http::StatusCode> {
+    let body = body.ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    let req: KeysQueryRequest =
+        serde_json::from_value(body).map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+
+    let mut device_keys_response: Map<String, Value> = Map::new();
+    let mut master_keys: Map<String, Value> = Map::new();
+    let mut self_signing_keys: Map<String, Value> = Map::new();
+    let mut user_signing_keys_discard: Map<String, Value> = Map::new();
+
+    let our_server = state.config.server_name.as_str();
+    for (user_id, device_ids) in &req.device_keys {
+        if user_server(user_id) != Some(our_server) {
+            continue;
+        }
+        fold_local_user_keys(
+            &state,
+            user_id,
+            device_ids,
+            &mut device_keys_response,
+            &mut master_keys,
+            &mut self_signing_keys,
+            &mut user_signing_keys_discard,
+        )
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    Ok(Json(json!({
+        "device_keys": device_keys_response,
+        "master_keys": master_keys,
+        "self_signing_keys": self_signing_keys,
+    })))
+}
+
+/// POST /_matrix/federation/v1/user/keys/claim
+///
+/// Federation companion to the C2S `/keys/claim`. Body:
+/// `{one_time_keys: {user_id: {device_id: algorithm}}}`. Claims
+/// happen under the per-user lock so two concurrent peers don't
+/// both win the same one-time key.
+pub async fn federation_claim_keys(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Extension(_origin): axum::extract::Extension<
+        crate::middleware::federation_auth::XMatrixOrigin,
+    >,
+    axum::extract::Extension(crate::middleware::federation_auth::VerifiedBody(body)): axum::extract::Extension<crate::middleware::federation_auth::VerifiedBody>,
+) -> Result<Json<Value>, axum::http::StatusCode> {
+    let body = body.ok_or(axum::http::StatusCode::BAD_REQUEST)?;
+    let req: KeysClaimRequest =
+        serde_json::from_value(body).map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+
+    let mut result: Map<String, Value> = Map::new();
+    let our_server = state.config.server_name.as_str();
+    for (user_id, devices) in &req.one_time_keys {
+        if user_server(user_id) != Some(our_server) {
+            continue;
+        }
+        claim_local_user_otks(&state, user_id, devices, &mut result)
+            .await
+            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    Ok(Json(json!({ "one_time_keys": result })))
 }
