@@ -3668,4 +3668,32 @@ mod stream_recovery_tests {
         let p3 = db.next_stream_position().as_u64();
         assert!(p1 < p2 && p2 < p3, "monotonic: {p1} < {p2} < {p3}");
     }
+
+    /// Mark/lookup roundtrip on `rejected_events`. The cascade
+    /// rejection in process_pdu reads is_event_rejected on every
+    /// auth_event of an inbound PDU; this verifies the underlying
+    /// store contract before that wiring depends on it.
+    #[test]
+    fn rejected_events_marker_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+
+        let event_id = "$rejected:example.com";
+        assert!(
+            !db.is_event_rejected(event_id).unwrap(),
+            "fresh DB has no rejection marker"
+        );
+
+        db.mark_event_rejected(event_id, "auth_events check failed")
+            .unwrap();
+        assert!(
+            db.is_event_rejected(event_id).unwrap(),
+            "marked event_id is detected"
+        );
+        // Adjacent event_ids stay unmarked — the lookup must be exact.
+        assert!(
+            !db.is_event_rejected("$other:example.com").unwrap(),
+            "non-marked event_id stays clean"
+        );
+    }
 }
