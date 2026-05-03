@@ -283,6 +283,67 @@ pub fn apply_timeline_filter(room: &mut Value, timeline_filter: &Value) {
     }
 }
 
+/// Apply the state-side of a sync filter to a single room sync block.
+/// Edits the `state.events` array in place. Same shape as the timeline
+/// filter (the spec uses `RoomEventFilter` for both).
+pub fn apply_state_filter(room: &mut Value, state_filter: &Value) {
+    let Some(events) = room
+        .pointer_mut("/state/events")
+        .and_then(|v| v.as_array_mut())
+    else {
+        return;
+    };
+
+    let allow_types = state_filter
+        .get("types")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        });
+    let deny_types = state_filter
+        .get("not_types")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        });
+    let deny_senders = state_filter
+        .get("not_senders")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        });
+
+    events.retain(|e| {
+        let etype = e.event_type().unwrap_or("");
+        let sender = e.sender().unwrap_or("");
+        if let Some(allow) = &allow_types
+            && !allow.iter().any(|p| type_matches(etype, p))
+        {
+            return false;
+        }
+        if let Some(deny) = &deny_types
+            && deny.iter().any(|p| type_matches(etype, p))
+        {
+            return false;
+        }
+        if let Some(deny) = &deny_senders
+            && deny.iter().any(|s| s == sender)
+        {
+            return false;
+        }
+        true
+    });
+}
+
 /// True if either the `state` or `timeline` sub-filter requests
 /// lazy-loaded members. Spec accepts the flag in both locations.
 pub fn lazy_load_members_enabled(

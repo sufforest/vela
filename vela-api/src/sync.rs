@@ -330,7 +330,27 @@ pub(crate) fn build_sync_response_with_filter(
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
             .unwrap_or_default();
 
-        let leave_data = build_leave_sync(state, room_nid, &room_id)?;
+        let timeline_limit = timeline_filter
+            .and_then(|tf| tf.get("limit"))
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).min(DEFAULT_TIMELINE_LIMIT))
+            .unwrap_or(DEFAULT_TIMELINE_LIMIT);
+
+        let mut leave_data = build_leave_sync(
+            state,
+            room_nid,
+            &room_id,
+            user.user_nid,
+            &user.user_id,
+            since,
+            timeline_limit,
+        )?;
+        if let Some(tf) = timeline_filter {
+            crate::filters::apply_timeline_filter(&mut leave_data, tf);
+        }
+        if let Some(sf) = state_filter {
+            crate::filters::apply_state_filter(&mut leave_data, sf);
+        }
         leave_rooms.insert(room_id, leave_data);
     }
 
@@ -1002,23 +1022,175 @@ fn collect_invite_or_knock_stripped(
 }
 
 /// Build the `rooms.leave.{room_id}` payload.
-/// Returns state and timeline events visible to the user at the time they left.
-fn build_leave_sync(state: &AppState, room_nid: u64, room_id: &str) -> Result<Value, ApiError> {
-    let state_nids = state
+///
+/// Per spec, a left user's view of the room is **frozen at their leave**:
+/// they must not see events sent (or state changed) after that point. The
+/// state we expose anchors at the user's leave event, and the timeline
+/// stops there too.
+///
+/// Layout:
+/// - `timeline.events` — events up to and including the user's leave,
+///   newest-first capped to `timeline_limit`, returned chronologically.
+///   For incremental sync, events at or before `since` are also dropped.
+/// - `state.events` — state at the start of the timeline (or state at
+///   the leave event itself when timeline_limit==0). For incremental
+///   sync, the delta against `state-at-since` is emitted instead.
+/// - `state.events` excludes events that already appear in
+///   `timeline.events` (spec rule: don't duplicate).
+///
+/// `timeline_limit` is the post-filter cap requested by the client; the
+/// caller still applies `timeline_filter`/`state_filter` on top of what
+/// we return, which can shrink either array further.
+const LEAVE_SCAN_WINDOW: usize = 10_000;
+
+fn build_leave_sync(
+    state: &AppState,
+    room_nid: u64,
+    room_id: &str,
+    user_nid: u64,
+    user_id: &str,
+    since: Option<u64>,
+    timeline_limit: usize,
+) -> Result<Value, ApiError> {
+    // Locate the user's leave event. Because the user is currently in the
+    // "left" set, the live state entry for `(m.room.member, user_id)` IS
+    // the leave event — any subsequent rejoin would have moved them to
+    // the joined set.
+    let member_type_nid = state
         .db
-        .get_all_state_event_nids(room_nid)
+        .get_or_create_nid("m.room.member")
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let user_skey_nid = state
+        .db
+        .get_or_create_nid(user_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let leave_event_nid = state
+        .db
+        .get_state_event_nid(room_nid, member_type_nid, user_skey_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
+    // Walk room timeline backwards from the latest position, skipping
+    // events that were sent AFTER the user left (those belong to other
+    // members and must not be visible). Once we hit the leave event we
+    // include it and continue collecting older events up to the limit.
+    let scan = state
+        .db
+        .get_timeline_before(room_nid, u64::MAX, LEAVE_SCAN_WINDOW)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
+    let mut timeline_newest_first: Vec<(u64, u64)> = Vec::new();
+    let mut found_leave = leave_event_nid.is_none();
+    let mut more_before_first = false;
+    for (pos, enid) in scan.iter().rev() {
+        if !found_leave {
+            if Some(*enid) == leave_event_nid {
+                found_leave = true;
+            } else {
+                continue;
+            }
+        }
+        if let Some(s) = since
+            && *pos <= s
+        {
+            // Already on the client; stop here.
+            break;
+        }
+        if timeline_newest_first.len() >= timeline_limit {
+            more_before_first = true;
+            break;
+        }
+        timeline_newest_first.push((*pos, *enid));
+    }
+    let first_pos = timeline_newest_first.last().map(|(p, _)| *p);
+    let prev_batch = first_pos.map(|p| format!("s{p}")).unwrap_or_default();
+
+    // State at the start of the timeline (chronologically). When the
+    // timeline is empty we fall back to state-at-leave so the client
+    // still sees the room as it was at the moment of departure.
+    let state_at_anchor: Vec<u64> = match first_pos {
+        Some(p) => {
+            // Find the event immediately preceding the timeline's first
+            // event in the same room and read its persisted state
+            // snapshot. If our timeline starts at the room's create
+            // event there's no predecessor — pre-state is empty.
+            let predecessor = state
+                .db
+                .get_timeline_before(room_nid, p, 1)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+            match predecessor.last() {
+                Some((_, pred_nid)) => state
+                    .db
+                    .get_state_at_event(*pred_nid)
+                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            }
+        }
+        None => match leave_event_nid {
+            Some(nid) => state
+                .db
+                .get_state_at_event(nid)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                .unwrap_or_default(),
+            None => Vec::new(),
+        },
+    };
+
+    // For incremental sync, emit only the delta against state-at-since
+    // (events that became state between `since` and the timeline start).
+    let state_to_emit: Vec<u64> = match since {
+        Some(since_pos) => {
+            let at_since_event = state
+                .db
+                .get_timeline_before(room_nid, since_pos.saturating_add(1), 1)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+            let state_at_since = match at_since_event.last() {
+                Some((_, snid)) => state
+                    .db
+                    .get_state_at_event(*snid)
+                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let since_set: std::collections::HashSet<u64> = state_at_since.into_iter().collect();
+            state_at_anchor
+                .into_iter()
+                .filter(|n| !since_set.contains(n))
+                .collect()
+        }
+        None => state_at_anchor,
+    };
+
+    // Don't duplicate state events that are already in the timeline.
+    let timeline_set: std::collections::HashSet<u64> =
+        timeline_newest_first.iter().map(|(_, n)| *n).collect();
+
     let mut state_events = Vec::new();
-    for nid in &state_nids {
+    for nid in &state_to_emit {
+        if timeline_set.contains(nid) {
+            continue;
+        }
         if let Some(ev) = load_client_event(state, *nid, room_id)? {
             state_events.push(ev);
         }
     }
 
+    let mut timeline_events = Vec::new();
+    for (_, enid) in timeline_newest_first.iter().rev() {
+        if let Some(ev) = load_client_event(state, *enid, room_id)? {
+            timeline_events.push(ev);
+        }
+    }
+
+    let _ = user_nid;
+
     Ok(json!({
         "state": {"events": state_events},
-        "timeline": {"events": [], "limited": false, "prev_batch": ""},
+        "timeline": {
+            "events": timeline_events,
+            "limited": more_before_first,
+            "prev_batch": prev_batch,
+        },
         "account_data": {"events": []},
     }))
 }
@@ -1096,6 +1268,315 @@ mod tests {
         let resp = build_sync_response(&state, &user, &[], Some(pos - 1)).unwrap();
         let invites = resp.pointer("/rooms/invite").unwrap().as_object().unwrap();
         assert!(invites.contains_key("!room:example.com"));
+    }
+
+    /// Persist a state event, allocate a fresh stream pos, and update
+    /// the room's snapshot so `get_state_at_event` returns it.
+    #[allow(clippy::too_many_arguments)]
+    fn persist_state(
+        db: &vela_store::db::Database,
+        nid: u64,
+        eid: &str,
+        room_nid: u64,
+        room_id: &str,
+        type_name: &str,
+        sender_nid: u64,
+        sender_id: &str,
+        state_key: &str,
+        content: serde_json::Value,
+        ts: u64,
+        depth: u64,
+        prev: &[u64],
+    ) -> u64 {
+        let type_nid = db.get_or_create_nid(type_name).unwrap();
+        let skey_nid = db.get_or_create_nid(state_key).unwrap();
+        let body = serde_json::json!({
+            "type": type_name,
+            "sender": sender_id,
+            "state_key": state_key,
+            "room_id": room_id,
+            "content": content,
+            "origin_server_ts": ts, "depth": depth,
+            "prev_events": [], "auth_events": [],
+        });
+        let pos = db
+            .persist_event(
+                nid,
+                eid,
+                room_nid,
+                type_nid,
+                sender_nid,
+                skey_nid,
+                ts,
+                depth,
+                &serde_json::to_vec(&body).unwrap(),
+                prev,
+                &[],
+                true,
+                false,
+            )
+            .unwrap();
+        db.promote_state_event(room_nid, nid, type_nid, skey_nid)
+            .unwrap();
+        pos
+    }
+
+    /// Setup that mirrors the Complement TestArchivedRoomsHistory shape:
+    /// alice + bob in a room, both joined, alice writes a custom state
+    /// `a.madeup.state` with my_key=before, bob leaves, then alice writes
+    /// the same state with my_key=after.
+    fn build_archive_scenario() -> (AppState, tempfile::TempDir, AuthenticatedUser, String) {
+        let (state, tmp) = build_test_state();
+        let db = state.db.clone();
+
+        let room_id = "!leaveroom:example.com".to_string();
+        let room_nid = db.get_or_create_nid(&room_id).unwrap();
+        let alice = "@alice:example.com";
+        let alice_nid = db.get_or_create_nid(alice).unwrap();
+        let bob = fake_user(&state, "@bob:example.com");
+
+        persist_state(
+            &db,
+            100,
+            "$create",
+            room_nid,
+            &room_id,
+            "m.room.create",
+            alice_nid,
+            alice,
+            "",
+            serde_json::json!({"room_version": "12"}),
+            1,
+            1,
+            &[],
+        );
+        persist_state(
+            &db,
+            101,
+            "$alice_join",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            alice_nid,
+            alice,
+            alice,
+            serde_json::json!({"membership": "join"}),
+            2,
+            2,
+            &[100],
+        );
+        persist_state(
+            &db,
+            102,
+            "$bob_join",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            bob.user_nid,
+            "@bob:example.com",
+            "@bob:example.com",
+            serde_json::json!({"membership": "join"}),
+            3,
+            3,
+            &[101],
+        );
+        db.set_membership(room_nid, alice_nid, 1).unwrap();
+        db.set_membership(room_nid, bob.user_nid, 1).unwrap();
+
+        persist_state(
+            &db,
+            103,
+            "$state_before",
+            room_nid,
+            &room_id,
+            "a.madeup.state",
+            alice_nid,
+            alice,
+            "",
+            serde_json::json!({"my_key": "before"}),
+            4,
+            4,
+            &[102],
+        );
+        persist_state(
+            &db,
+            104,
+            "$bob_leave",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            bob.user_nid,
+            "@bob:example.com",
+            "@bob:example.com",
+            serde_json::json!({"membership": "leave"}),
+            5,
+            5,
+            &[103],
+        );
+        db.set_membership(room_nid, bob.user_nid, 0).unwrap();
+        persist_state(
+            &db,
+            105,
+            "$state_after",
+            room_nid,
+            &room_id,
+            "a.madeup.state",
+            alice_nid,
+            alice,
+            "",
+            serde_json::json!({"my_key": "after"}),
+            6,
+            6,
+            &[104],
+        );
+
+        (state, tmp, bob, room_id)
+    }
+
+    /// With timeline_limit=0 the leave room shows state-AT-LEAVE in
+    /// `state.events`. The post-leave `$state_after` must not appear.
+    #[test]
+    fn leave_sync_with_empty_timeline_returns_state_at_leave() {
+        let (state, _tmp, bob, room_id) = build_archive_scenario();
+        let room_nid = state.db.get_nid(&room_id).unwrap().unwrap();
+
+        let leave = build_leave_sync(
+            &state,
+            room_nid,
+            &room_id,
+            bob.user_nid,
+            &bob.user_id,
+            None,
+            0,
+        )
+        .unwrap();
+        let state_events = leave
+            .pointer("/state/events")
+            .and_then(|v| v.as_array())
+            .unwrap();
+
+        let madeup = state_events
+            .iter()
+            .find(|e| e.get("type").and_then(|t| t.as_str()) == Some("a.madeup.state"))
+            .expect("madeup state event present");
+        assert_eq!(
+            madeup.pointer("/content/my_key").and_then(|v| v.as_str()),
+            Some("before"),
+            "state must be at-leave, not current"
+        );
+
+        let bob_member = state_events
+            .iter()
+            .find(|e| {
+                e.get("type").and_then(|t| t.as_str()) == Some("m.room.member")
+                    && e.get("state_key").and_then(|s| s.as_str()) == Some("@bob:example.com")
+            })
+            .expect("bob's member event present in state");
+        assert_eq!(
+            bob_member
+                .pointer("/content/membership")
+                .and_then(|v| v.as_str()),
+            Some("leave"),
+        );
+
+        let timeline = leave
+            .pointer("/timeline/events")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert!(timeline.is_empty(), "timeline_limit=0 → empty timeline");
+    }
+
+    /// With a non-zero limit, the leave room timeline ends at the user's
+    /// leave event — events sent after the leave must NOT appear, even if
+    /// they're newer than the leave in the room timeline.
+    #[test]
+    fn leave_sync_timeline_ends_at_leave_event() {
+        let (state, _tmp, bob, room_id) = build_archive_scenario();
+        let room_nid = state.db.get_nid(&room_id).unwrap().unwrap();
+
+        let leave = build_leave_sync(
+            &state,
+            room_nid,
+            &room_id,
+            bob.user_nid,
+            &bob.user_id,
+            None,
+            10,
+        )
+        .unwrap();
+        let timeline = leave
+            .pointer("/timeline/events")
+            .and_then(|v| v.as_array())
+            .unwrap();
+
+        let last_id = timeline
+            .last()
+            .and_then(|e| e.get("event_id").and_then(|v| v.as_str()))
+            .expect("timeline non-empty");
+        assert_eq!(last_id, "$bob_leave", "timeline must end at bob's leave");
+        assert!(
+            !timeline
+                .iter()
+                .any(|e| e.get("event_id").and_then(|v| v.as_str()) == Some("$state_after")),
+            "post-leave events must not appear in bob's timeline"
+        );
+    }
+
+    /// Incremental sync where `since` falls just before the leave event:
+    /// timeline should be exactly the leave event, and state.events
+    /// should be empty (the only state delta is the leave event itself,
+    /// which already appears in the timeline).
+    #[test]
+    fn leave_sync_incremental_emits_leave_in_timeline_and_no_duplicate_state() {
+        let (state, _tmp, bob, room_id) = build_archive_scenario();
+        let db = &state.db;
+        let room_nid = db.get_nid(&room_id).unwrap().unwrap();
+
+        // Find the stream pos of `$state_before` and use it as `since`.
+        // The leave event was persisted right after it, so events after
+        // that point are exactly the leave + the post-leave state change.
+        let scan = db.get_timeline_before(room_nid, u64::MAX, 100).unwrap();
+        let state_before_pos = scan
+            .iter()
+            .find_map(|(pos, nid)| {
+                let eid = db.get_event_id_by_nid(*nid).unwrap().unwrap_or_default();
+                if eid == "$state_before" {
+                    Some(*pos)
+                } else {
+                    None
+                }
+            })
+            .expect("found $state_before");
+
+        let leave = build_leave_sync(
+            &state,
+            room_nid,
+            &room_id,
+            bob.user_nid,
+            &bob.user_id,
+            Some(state_before_pos),
+            10,
+        )
+        .unwrap();
+
+        let timeline = leave
+            .pointer("/timeline/events")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        let ids: Vec<&str> = timeline
+            .iter()
+            .filter_map(|e| e.get("event_id").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(ids, vec!["$bob_leave"], "timeline only the leave event");
+
+        let state_events = leave
+            .pointer("/state/events")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert!(
+            state_events.is_empty(),
+            "state delta should be empty (leave is in timeline already): {state_events:?}"
+        );
     }
 
     #[test]
