@@ -67,10 +67,13 @@ pub async fn send_message(
         .clone();
     let _guard = lock.lock().await;
 
-    // Check idempotency (inside lock)
+    // Check idempotency (inside lock). Spec scopes the txn_id to
+    // (user, device, room, event_type) — same id in a different
+    // room or event_type means a fresh request, not a replay.
+    let txn_scope = format!("send/{}/{}", room_id.as_str(), event_type);
     if let Some(existing_event_id) = state
         .db
-        .get_transaction(user.user_nid, &user.device_id, &txn_id)
+        .get_transaction(user.user_nid, &user.device_id, &txn_scope, &txn_id)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
     {
         return Ok(Json(json!({"event_id": existing_event_id})));
@@ -189,7 +192,13 @@ pub async fn send_message(
     // Store transaction for idempotency
     state
         .db
-        .set_transaction(user.user_nid, &user.device_id, &txn_id, event_id.as_str())
+        .set_transaction(
+            user.user_nid,
+            &user.device_id,
+            &txn_scope,
+            &txn_id,
+            event_id.as_str(),
+        )
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     // Update room bump (messages are bump events)

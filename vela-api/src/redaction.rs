@@ -62,10 +62,14 @@ pub async fn redact_event(
         .clone();
     let _guard = lock.lock().await;
 
-    // Idempotency (inside lock).
+    // Idempotency (inside lock). Scope keyed by (room, target event)
+    // so the same txn_id used to redact a different event in the
+    // same room — or the same event in a different room — is treated
+    // as a fresh request.
+    let txn_scope = format!("redact/{}/{}", room_id_str, target_event_id);
     if let Some(existing_event_id) = state
         .db
-        .get_transaction(user.user_nid, &user.device_id, &txn_id)
+        .get_transaction(user.user_nid, &user.device_id, &txn_scope, &txn_id)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
     {
         return Ok(Json(json!({"event_id": existing_event_id})));
@@ -238,7 +242,13 @@ pub async fn redact_event(
 
     state
         .db
-        .set_transaction(user.user_nid, &user.device_id, &txn_id, event_id.as_str())
+        .set_transaction(
+            user.user_nid,
+            &user.device_id,
+            &txn_scope,
+            &txn_id,
+            event_id.as_str(),
+        )
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     state
