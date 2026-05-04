@@ -241,6 +241,51 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
         }
     };
 
+    // Invite-rescind shortcut. When the inviter (or someone authorised to
+    // rescind on their behalf) sends a leave/ban for a *locally-invited*
+    // user, the receiving server has only the invite event in its store
+    // — no power_levels, no create — so the normal state-at-event check
+    // resolves to empty and rejects. Spec-correct path: trust the
+    // sender match against the original invite, persist directly, flip
+    // membership to leave. Mirrors federation_invite's "no auth chain
+    // available, persist + flip" pattern.
+    if effective_pdu.event_type == "m.room.member"
+        && matches!(effective_pdu.membership(), Some("leave") | Some("ban"))
+        && let Some(target_user_id) = effective_pdu.state_key.as_deref()
+        && target_user_id
+            .split_once(':')
+            .map(|(_, d)| d == state.config.server_name)
+            .unwrap_or(false)
+        && let Ok(target_nid) = state.db.get_or_create_nid(target_user_id)
+        && state.db.get_membership(room_nid, target_nid).ok().flatten() == Some(2)
+    {
+        // Confirm sender matches the original inviter. Without this,
+        // anyone on the federation could rescind anyone's invite.
+        let inviter_match = state
+            .db
+            .get_nid("m.room.member")
+            .ok()
+            .flatten()
+            .and_then(|type_nid| {
+                state
+                    .db
+                    .get_state_event_nid(room_nid, type_nid, target_nid)
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|invite_nid| state.db.get_event(invite_nid).ok().flatten())
+            .and_then(|(_, bytes)| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|v| v.get("sender").and_then(|s| s.as_str().map(String::from)))
+            .map(|s| s == effective_pdu.sender)
+            .unwrap_or(false);
+        if inviter_match {
+            return (
+                effective_pdu.event_id.clone(),
+                apply_invite_rescind(state, room_nid, &effective_pdu, &effective_event_json).await,
+            );
+        }
+    }
+
     // --- Check 4: auth rules against auth_events ---
     // Build a state view from the event's auth_events. On a missing auth event,
     // attempt a bounded fetch from the sender's server via /event_auth.
@@ -753,6 +798,96 @@ async fn persist_received_pdu(
     }
 
     Ok(())
+}
+
+/// Apply an invite-rescind shortcut. Persist the leave/ban PDU,
+/// promote it into current state, flip membership, wake observers.
+/// Bypasses the normal auth/state-at-event/current-state checks
+/// because the receiving server only has the invite event in store
+/// and would otherwise reject the rescind for state-resolution
+/// reasons it can't fix without first joining the room. Caller has
+/// already validated signature, hash, and the inviter-sender match.
+async fn apply_invite_rescind(
+    state: &AppState,
+    room_nid: u64,
+    pdu: &Pdu,
+    effective_event_json: &Map<String, Value>,
+) -> PduOutcome {
+    use vela_core::canonical::canonical_json_object;
+
+    let target_user_id = match pdu.state_key.as_deref() {
+        Some(s) => s,
+        None => return PduOutcome::Rejected("rescind missing state_key".into()),
+    };
+    let type_nid = match state.db.get_or_create_nid("m.room.member") {
+        Ok(n) => n,
+        Err(e) => return PduOutcome::Rejected(format!("nid alloc: {e}")),
+    };
+    let sender_nid = match state.db.get_or_create_nid(&pdu.sender) {
+        Ok(n) => n,
+        Err(e) => return PduOutcome::Rejected(format!("nid alloc: {e}")),
+    };
+    let target_nid = match state.db.get_or_create_nid(target_user_id) {
+        Ok(n) => n,
+        Err(e) => return PduOutcome::Rejected(format!("nid alloc: {e}")),
+    };
+
+    let event_nid = state.db.next_nid();
+    let json_bytes = canonical_json_object(effective_event_json);
+
+    let mut prev_nids: Vec<u64> = Vec::new();
+    for pid in &pdu.prev_events {
+        if let Ok(Some(n)) = state.db.get_event_nid_by_id(pid) {
+            prev_nids.push(n);
+        }
+    }
+    let mut auth_nids: Vec<u64> = Vec::new();
+    for aid in &pdu.auth_events {
+        if let Ok(Some(n)) = state.db.get_event_nid_by_id(aid) {
+            auth_nids.push(n);
+        }
+    }
+
+    let stream_pos = match state.db.persist_event(
+        event_nid,
+        &pdu.event_id,
+        room_nid,
+        type_nid,
+        sender_nid,
+        target_nid,
+        pdu.origin_server_ts,
+        pdu.depth,
+        &json_bytes,
+        &prev_nids,
+        &auth_nids,
+        true,
+        false,
+    ) {
+        Ok(pos) => pos,
+        Err(e) => return PduOutcome::Rejected(format!("persist: {e}")),
+    };
+    if let Err(e) = state
+        .db
+        .promote_state_event(room_nid, event_nid, type_nid, target_nid)
+    {
+        return PduOutcome::Rejected(format!("promote: {e}"));
+    }
+    let new_membership: u8 = if pdu.membership() == Some("ban") {
+        3
+    } else {
+        0
+    };
+    if let Err(e) = state
+        .db
+        .set_membership(room_nid, target_nid, new_membership)
+    {
+        return PduOutcome::Rejected(format!("set_membership: {e}"));
+    }
+    crate::router::notify_user(state, target_nid);
+    if let Some(sender_ch) = state.room_senders.get(&Nid(room_nid)) {
+        let _ = sender_ch.send(stream_pos);
+    }
+    PduOutcome::Accepted
 }
 
 /// Record an `m.relates_to` index entry for an inbound event, mirroring
