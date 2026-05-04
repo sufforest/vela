@@ -1495,17 +1495,53 @@ impl Database {
         type_nid: u64,
         state_key_nid: u64,
     ) -> Result<(), rocksdb::Error> {
+        // Build the new snapshot from current room_state. persist_event has
+        // already overwritten room_state[(type, state_key)] with event_nid,
+        // so retain-filter the matching entry and re-append (no-op for the
+        // entry, but keeps any other state events for this (type, sk) out
+        // of duplicates if the indexing ever changes).
         let mut all_state_nids = self.get_all_state_event_nids(room_nid)?;
-        let mut replaced: Option<u64> = None;
         all_state_nids.retain(|existing| match self.get_event(*existing) {
-            Ok(Some((h, _))) if h.type_nid == type_nid && h.state_key_nid == state_key_nid => {
-                replaced = Some(*existing);
-                false
-            }
+            Ok(Some((h, _))) => !(h.type_nid == type_nid && h.state_key_nid == state_key_nid),
             _ => true,
         });
         all_state_nids.push(event_nid);
         self.persist_state_snapshot(room_nid, event_nid, &all_state_nids)?;
+
+        // Find the predecessor (the state event this one replaces) by
+        // scanning the parent snapshot — i.e. the state BEFORE event_nid
+        // was applied. We can't use current room_state for this because
+        // persist_event already overwrote the (type, state_key) slot with
+        // event_nid; reading there would yield a self-reference and stamp
+        // `unsigned.replaces_state` with the event's own id (regression
+        // observed in TestUnbanViaInvite where a fresh ban/leave reported
+        // its own id as the prior membership event).
+        //
+        // event_state[event_nid] currently holds the parent snapshot id
+        // (set by persist_event); persist_state_snapshot above just
+        // overwrote it, so re-fetch from the new snapshot would be wrong.
+        // We therefore look at the prev_events directly.
+        let prev_event_nids = self.get_prev_events(event_nid)?;
+        let mut replaced: Option<u64> = None;
+        for prev_nid in &prev_event_nids {
+            if let Some(parent_snapshot) = self.get_state_at_event(*prev_nid)? {
+                for candidate in parent_snapshot {
+                    if candidate == event_nid {
+                        continue;
+                    }
+                    if let Ok(Some((h, _))) = self.get_event(candidate)
+                        && h.type_nid == type_nid
+                        && h.state_key_nid == state_key_nid
+                    {
+                        replaced = Some(candidate);
+                        break;
+                    }
+                }
+                if replaced.is_some() {
+                    break;
+                }
+            }
+        }
         if let Some(prev_nid) = replaced {
             let cf = self.db.cf_handle("state_replaces").unwrap();
             self.db
