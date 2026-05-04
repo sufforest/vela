@@ -236,6 +236,13 @@ pub async fn put_room_visibility(
     Ok(Json(json!({})))
 }
 
+/// `read_join_rule(...) == "public"` — exposed for callers (e.g. the
+/// user_directory search) that want directory-equivalence on legacy
+/// rooms without their own copy of this fallback.
+pub(crate) fn read_join_rule_public(state: &AppState, room_nid: u64) -> Result<bool, ApiError> {
+    Ok(read_join_rule(state, room_nid)? == "public")
+}
+
 fn read_join_rule(state: &AppState, room_nid: u64) -> Result<String, ApiError> {
     let type_nid = match state
         .db

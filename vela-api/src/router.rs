@@ -104,6 +104,13 @@ pub struct AppState {
     pub room_senders: Arc<DashMap<Nid, tokio::sync::broadcast::Sender<u64>>>,
     /// In-memory typing state: room_nid → [(user_nid, expires_at_ms)]
     pub typing_state: Arc<DashMap<u64, Vec<(u64, u64)>>>,
+    /// Stream position at which `typing_state[room]` last transitioned.
+    /// /sync uses this to decide whether to emit an `m.typing` ephemeral
+    /// for an incremental sync — we emit only when the user's `since`
+    /// predates a transition, otherwise the room would always be marked
+    /// "changed" by the always-current EDU and clients would receive
+    /// redundant typing events.
+    pub typing_change_pos: Arc<DashMap<u64, u64>>,
     /// Federation outbound typing buffer (also registered in the
     /// federation sender's stream list). Held here as a concrete handle
     /// so the local /typing handler can `enqueue()` on every PUT.

@@ -59,6 +59,63 @@ async fn set_displayname(harness: &Harness, token: &str, user_id: &str, name: &s
     assert_eq!(resp.status(), StatusCode::OK, "set_displayname failed");
 }
 
+/// Spec: a directory search must not return the requester themselves.
+/// Synapse and Element clients depend on this — without the filter,
+/// a query like "find users containing 'alice'" echoes alice back to
+/// herself which surprises every UI.
+#[tokio::test]
+async fn search_excludes_the_caller() {
+    let harness = Harness::new();
+    let (alice_id, alice_tok) = harness.register("alice", "pw").await;
+    let (bob_id, bob_tok) = harness.register("bob", "pw").await;
+    shared_room(&harness, &alice_tok, &[(&bob_id, &bob_tok)]).await;
+
+    // Both alice and bob's user_ids contain "alice"-vs-"bob" so we
+    // search a substring that matches both ("user-" is in the harness
+    // localpart format) and verify alice is filtered out.
+    let result = search(&harness, &alice_tok, "user-", None).await;
+    let user_ids: Vec<&str> = result["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["user_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        !user_ids.iter().any(|u| *u == alice_id),
+        "alice (the searcher) must not appear in her own results: {result}"
+    );
+}
+
+/// Spec: members of public-directory rooms are globally findable —
+/// the requester does not need to share a room with them. This is
+/// what makes "find a user by name before adding them" work.
+#[tokio::test]
+async fn finds_user_in_a_public_room_via_display_name() {
+    let harness = Harness::new();
+    let (alice_id, alice_tok) = harness.register("alice", "pw").await;
+    let (_eve_id, eve_tok) = harness.register("eve", "pw").await;
+
+    set_displayname(&harness, &alice_tok, &alice_id, "Alice Cooper").await;
+
+    // Alice creates a public room. Eve does NOT join it.
+    harness
+        .create_room(
+            &alice_tok,
+            json!({"preset": "public_chat", "visibility": "public"}),
+        )
+        .await;
+
+    let result = search(&harness, &eve_tok, "Alice Cooper", None).await;
+    let entries = result["results"].as_array().unwrap();
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly Alice in results: {result}"
+    );
+    assert_eq!(entries[0]["user_id"], alice_id);
+    assert_eq!(entries[0]["display_name"], "Alice Cooper");
+}
+
 #[tokio::test]
 async fn matches_user_id_substring_when_sharing_a_room() {
     let harness = Harness::new();

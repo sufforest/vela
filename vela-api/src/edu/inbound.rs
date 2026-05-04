@@ -546,11 +546,32 @@ async fn handle_typing(state: &AppState, origin: &str, content: &Value) {
         .unwrap_or(0);
     const REMOTE_TYPING_TTL_MS: u64 = 30_000;
 
-    let mut entry = state.typing_state.entry(room_nid).or_default();
-    let typers = entry.value_mut();
-    typers.retain(|(uid, exp)| *uid != user_nid && *exp > now_ms);
-    if typing {
-        typers.push((user_nid, now_ms + REMOTE_TYPING_TTL_MS));
+    let was_typing;
+    {
+        let mut entry = state.typing_state.entry(room_nid).or_default();
+        let typers = entry.value_mut();
+        was_typing = typers
+            .iter()
+            .any(|(uid, exp)| *uid == user_nid && *exp > now_ms);
+        typers.retain(|(uid, exp)| *uid != user_nid && *exp > now_ms);
+        if typing {
+            typers.push((user_nid, now_ms + REMOTE_TYPING_TTL_MS));
+        }
+    }
+
+    // Same wake-up + transition-position bump as the local /typing
+    // handler. Without these, remote-originated typing is invisible
+    // to local /sync clients: the long-poll never wakes, and the
+    // EDU emit gate (since < typing_change_pos) never trips.
+    if was_typing != typing {
+        let pos = state.db.next_stream_position().as_u64();
+        state.typing_change_pos.insert(room_nid, pos);
+        if let Some(sender) = state
+            .room_senders
+            .get(&vela_core::identifiers::Nid(room_nid))
+        {
+            let _ = sender.send(pos);
+        }
     }
 }
 

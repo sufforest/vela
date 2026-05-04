@@ -60,6 +60,25 @@ pub async fn set_typing(
     // typing). Clients re-PUT every 20–30s while still typing per
     // c2s spec — federating those would be pure noise on the wire.
     if was_typing != body.typing {
+        // Bump the "typing changed" stream pos so /sync knows this
+        // room has a fresh typing transition. We must allocate a
+        // FRESH position (not just read current_stream_position),
+        // otherwise the value can equal a previously-returned
+        // `next_batch` and the `>` comparison in /sync drops the
+        // EDU. Burning a pos per transition is fine — typing is
+        // rare relative to PDUs.
+        let pos = state.db.next_stream_position().as_u64();
+        state.typing_change_pos.insert(room_nid, pos);
+
+        // Wake local /sync long-polls in the room so the typing EDU
+        // is delivered immediately, not after the long-poll timeout.
+        if let Some(sender) = state
+            .room_senders
+            .get(&vela_core::identifiers::Nid(room_nid))
+        {
+            let _ = sender.send(pos);
+        }
+
         state
             .typing_stream
             .enqueue(&room_id_str, &user.user_id, room_nid, body.typing);
