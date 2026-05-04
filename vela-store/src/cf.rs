@@ -75,4 +75,9 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // client can correlate.
     "event_txn_ids",
     "room_directory",
+    // `event_nid -> replaced_event_nid`. Written when a state event
+    // is promoted into current state; lets `load_client_event` cheap-
+    // lookup `unsigned.prev_content` and `unsigned.replaces_state`
+    // without walking the timeline backwards.
+    "state_replaces",
 ];

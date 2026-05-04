@@ -1496,13 +1496,47 @@ impl Database {
         state_key_nid: u64,
     ) -> Result<(), rocksdb::Error> {
         let mut all_state_nids = self.get_all_state_event_nids(room_nid)?;
+        let mut replaced: Option<u64> = None;
         all_state_nids.retain(|existing| match self.get_event(*existing) {
-            Ok(Some((h, _))) => !(h.type_nid == type_nid && h.state_key_nid == state_key_nid),
+            Ok(Some((h, _))) if h.type_nid == type_nid && h.state_key_nid == state_key_nid => {
+                replaced = Some(*existing);
+                false
+            }
             _ => true,
         });
         all_state_nids.push(event_nid);
         self.persist_state_snapshot(room_nid, event_nid, &all_state_nids)?;
+        if let Some(prev_nid) = replaced {
+            let cf = self.db.cf_handle("state_replaces").unwrap();
+            self.db
+                .put_cf(&cf, keys::encode_u64(event_nid), keys::encode_u64(prev_nid))?;
+        }
         Ok(())
+    }
+
+    /// Returns the event_nid that this state event replaced (i.e. the
+    /// previous state event with the same (type, state_key)), or None
+    /// if this is the first state event of its kind. Populated by
+    /// `promote_state_event`.
+    pub fn get_replaced_state_nid(&self, event_nid: u64) -> Result<Option<u64>, rocksdb::Error> {
+        let cf = self.db.cf_handle("state_replaces").unwrap();
+        match self.db.get_cf(&cf, keys::encode_u64(event_nid))? {
+            Some(b) => Ok(Some(keys::decode_u64(&b))),
+            None => Ok(None),
+        }
+    }
+
+    /// Record that `event_nid` replaced `prev_nid` in current state.
+    /// Used by federated-join paths which build snapshots manually
+    /// instead of calling `promote_state_event`.
+    pub fn record_state_replaces(
+        &self,
+        event_nid: u64,
+        prev_nid: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("state_replaces").unwrap();
+        self.db
+            .put_cf(&cf, keys::encode_u64(event_nid), keys::encode_u64(prev_nid))
     }
 
     /// Force `room_state[room_nid][type_nid][state_key_nid] = event_nid`.

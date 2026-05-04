@@ -399,8 +399,12 @@ async fn bootstrap_remote_room(
         .map_err(|e| format!("persist join: {e}"))?;
 
     // Replace any existing (m.room.member, user) in state_nids with our new one.
+    let mut replaced_nid: Option<u64> = None;
     state_nids.retain(|existing| match state.db.get_event(*existing) {
-        Ok(Some((h, _))) => !(h.type_nid == type_nid && h.state_key_nid == skey_nid),
+        Ok(Some((h, _))) if h.type_nid == type_nid && h.state_key_nid == skey_nid => {
+            replaced_nid = Some(*existing);
+            false
+        }
         _ => true,
     });
     state_nids.push(join_event_nid);
@@ -408,6 +412,9 @@ async fn bootstrap_remote_room(
         .db
         .persist_state_snapshot(room_nid, join_event_nid, &state_nids)
         .map_err(|e| format!("state snapshot: {e}"))?;
+    if let Some(prev_nid) = replaced_nid {
+        let _ = state.db.record_state_replaces(join_event_nid, prev_nid);
+    }
 
     // Set our own membership.
     state
