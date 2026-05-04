@@ -2773,18 +2773,35 @@ impl Database {
         prefix.extend_from_slice(&len.to_be_bytes());
         prefix.extend_from_slice(device_bytes);
 
+        // Synapse returns the lexicographically-largest key id (i.e.
+        // `signed_curve25519:N` for the highest N the client uploaded
+        // with single-digit suffixes). The test ordering relies on
+        // this. We forward-scan all matches, take the max — N is
+        // small (~50 OTKs per device) so the linear pass is cheap and
+        // avoids the rocksdb reverse-prefix-iterator footgun.
         let iter = self.db.prefix_iterator_cf(&cf, &prefix);
+        let mut best: Option<(Vec<u8>, String, Value)> = None;
         for item in iter {
             let (key, val) = item?;
             if key.len() <= prefix.len() || key[..prefix.len()] != prefix[..] {
                 break;
             }
             let key_id = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
-            if key_id.starts_with(algorithm) {
-                let value: Value = serde_json::from_slice(&val).unwrap_or(Value::Null);
-                self.db.delete_cf(&cf, &key)?;
-                return Ok(Some((key_id, value)));
+            if !key_id.starts_with(algorithm) {
+                continue;
             }
+            let take = best
+                .as_ref()
+                .map(|(_, prev_id, _)| key_id > *prev_id)
+                .unwrap_or(true);
+            if take {
+                let value: Value = serde_json::from_slice(&val).unwrap_or(Value::Null);
+                best = Some((key.to_vec(), key_id, value));
+            }
+        }
+        if let Some((key_bytes, key_id, value)) = best {
+            self.db.delete_cf(&cf, &key_bytes)?;
+            return Ok(Some((key_id, value)));
         }
         Ok(None)
     }
