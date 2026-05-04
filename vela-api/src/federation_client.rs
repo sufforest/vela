@@ -567,6 +567,27 @@ impl FederationClient {
             .ok_or_else(|| FederationClientError::BadJson("response missing pdus[0]".into()))
     }
 
+    /// `GET /_matrix/federation/v1/timestamp_to_event/{roomId}?ts=…&dir=…`
+    ///
+    /// MSC3030 federation companion. Caller passes "f" or "b" for `dir`.
+    /// Returns the peer's `{event_id, origin_server_ts}` response, or an
+    /// error if the call failed or the peer has no matching event (404
+    /// surfaces as `Http`).
+    pub async fn timestamp_to_event(
+        &self,
+        destination: &str,
+        room_id: &str,
+        ts: u64,
+        dir: &str,
+    ) -> Result<Value, FederationClientError> {
+        let path = format!(
+            "/_matrix/federation/v1/timestamp_to_event/{}?ts={ts}&dir={dir}",
+            url_query_encode(room_id)
+        );
+        self.signed_request(reqwest::Method::GET, destination, &path, None)
+            .await
+    }
+
     /// `POST /_matrix/federation/v1/user/keys/query` — fetch device +
     /// cross-signing keys for users on a remote server. Body shape
     /// matches the C2S /keys/query: `{device_keys: {user_id:

@@ -124,6 +124,17 @@ pub async fn timestamp_to_event(
         });
     }
 
+    // Federation fallback (MSC3030): if local search came up empty,
+    // ask remote servers in the room. The closer answer beats no
+    // answer; we backfill the returned event so subsequent /context
+    // and /messages requests find it locally.
+    if best.is_none()
+        && let Some(answer) =
+            remote_timestamp_to_event(&state, room_nid, &room_id_str, q.ts, &q.dir).await
+    {
+        return Ok(Json(answer));
+    }
+
     let (event_ts, _, event_nid) =
         best.ok_or_else(|| ApiError(VelaError::NotFound("no event matches timestamp".into())))?;
     let event_id = state
@@ -136,6 +147,75 @@ pub async fn timestamp_to_event(
         "event_id": event_id,
         "origin_server_ts": event_ts,
     })))
+}
+
+/// Iterate remote members of `room_nid` asking each for their best
+/// match. First peer that returns a 200 with a usable event wins; we
+/// validate-and-persist the PDU so it shows up in subsequent /context
+/// or /messages calls. Returns the JSON to send back, or `None` if
+/// nothing usable came back from any peer.
+async fn remote_timestamp_to_event(
+    state: &AppState,
+    room_nid: u64,
+    room_id: &str,
+    ts: u64,
+    dir: &str,
+) -> Option<Value> {
+    let candidates = state
+        .db
+        .get_remote_servers_in_room(room_nid, &state.config.server_name)
+        .ok()?;
+    if candidates.is_empty() {
+        return None;
+    }
+    for server in &candidates {
+        let resp = match state
+            .federation_client
+            .timestamp_to_event(server, room_id, ts, dir)
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let event_id = resp
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let origin_ts = resp.get("origin_server_ts").and_then(|v| v.as_u64());
+        let (Some(event_id), Some(origin_ts)) = (event_id, origin_ts) else {
+            continue;
+        };
+
+        // Backfill the event so future requests find it locally.
+        // Tolerate failure: the spec answer is the event_id; a
+        // persistence miss only means /context will need its own
+        // fetch later.
+        if state
+            .db
+            .get_event_nid_by_id(&event_id)
+            .ok()
+            .flatten()
+            .is_none()
+            && let Ok(pdu_value) = state
+                .federation_client
+                .fetch_event_pdu(server, &event_id)
+                .await
+        {
+            let _ = crate::federation_receive::persist_fetched_event(
+                state,
+                &pdu_value,
+                server,
+                crate::federation_receive::new_fetch_budget(),
+                crate::federation_receive::FetchKind::AuthChain,
+            )
+            .await;
+        }
+        return Some(json!({
+            "event_id": event_id,
+            "origin_server_ts": origin_ts,
+        }));
+    }
+    None
 }
 
 /// GET /_matrix/federation/v1/timestamp_to_event/{roomId}?ts=…&dir=…
