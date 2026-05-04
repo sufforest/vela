@@ -114,6 +114,16 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
         );
     }
 
+    // Idempotency: ignore PDUs we already accepted. The /send fan-out
+    // (federation_sender::broadcast) re-echoes accepted events to
+    // every remote in the room, including the origin server, so a
+    // peer's transaction can come back at us under a different
+    // round-trip. Re-persisting would clobber event_ids → nid and
+    // re-fire device-list/membership side effects.
+    if let Ok(Some(_)) = state.db.get_event_nid_by_id(&pdu.event_id) {
+        return (pdu.event_id, PduOutcome::Accepted);
+    }
+
     // Spec limits on array sizes.
     if pdu.auth_events.len() > 10 {
         return (
@@ -241,14 +251,18 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
         }
     };
 
-    // Invite-rescind shortcut. When the inviter (or someone authorised to
-    // rescind on their behalf) sends a leave/ban for a *locally-invited*
-    // user, the receiving server has only the invite event in its store
-    // — no power_levels, no create — so the normal state-at-event check
-    // resolves to empty and rejects. Spec-correct path: trust the
-    // sender match against the original invite, persist directly, flip
-    // membership to leave. Mirrors federation_invite's "no auth chain
-    // available, persist + flip" pattern.
+    // Invite-rescind path. When a remote sends a leave/ban for a
+    // *locally-invited* user, the receiving server can't run normal
+    // state-at-event auth (it has only the invite event, no
+    // power_levels or create). Spec-correct gate: ONLY the original
+    // inviter can rescind. We handle both branches here:
+    //   - sender matches the invite's sender → accept directly
+    //     (mirrors federation_invite's "persist + flip" pattern).
+    //   - sender doesn't match → reject. Falling through to the
+    //     normal pipeline would let auth-chain fetching pull in
+    //     enough state to authorise a room-admin kick that the spec
+    //     forbids over federation, since the receiving server can't
+    //     verify the kick's full authorisation context.
     if effective_pdu.event_type == "m.room.member"
         && matches!(effective_pdu.membership(), Some("leave") | Some("ban"))
         && let Some(target_user_id) = effective_pdu.state_key.as_deref()
@@ -259,8 +273,6 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
         && let Ok(target_nid) = state.db.get_or_create_nid(target_user_id)
         && state.db.get_membership(room_nid, target_nid).ok().flatten() == Some(2)
     {
-        // Confirm sender matches the original inviter. Without this,
-        // anyone on the federation could rescind anyone's invite.
         let inviter_match = state
             .db
             .get_nid("m.room.member")
@@ -284,6 +296,12 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
                 apply_invite_rescind(state, room_nid, &effective_pdu, &effective_event_json).await,
             );
         }
+        return (
+            effective_pdu.event_id.clone(),
+            PduOutcome::Rejected(
+                "only the original inviter can rescind an invite over federation".into(),
+            ),
+        );
     }
 
     // --- Check 4: auth rules against auth_events ---
@@ -795,6 +813,14 @@ async fn persist_received_pdu(
         if let Some(sender_ch) = state.room_senders.get(&Nid(room_nid)) {
             let _ = sender_ch.send(stream_pos);
         }
+
+        // Relay to other resident remotes. The peer that sent us this
+        // PDU only knows about the destinations IT could reach. We're
+        // a hub for the room's other peers; without this fan-out a
+        // three-way room A→B→C never sees B's events arrive at C
+        // unless B itself federates to C (and B doesn't always know
+        // who's in the room beyond its own peer list).
+        state.federation_sender.broadcast(room_nid, event_nid);
     }
 
     Ok(())
@@ -1529,6 +1555,12 @@ pub async fn persist_join_event(
     if let Some(sender_ch) = state.room_senders.get(&Nid(room_nid)) {
         let _ = sender_ch.send(stream_pos);
     }
+
+    // Fan-out to other resident remotes. Without this, the just-joined
+    // server is the only peer that knows about itself — bob@hs2 looking
+    // up "who's in this room" for federation will miss charlie@hs3 and
+    // skip delivery, breaking three-server rooms (TestACLs sentinel).
+    state.federation_sender.broadcast(room_nid, event_nid);
 
     Ok(())
 }
