@@ -703,6 +703,21 @@ async fn persist_received_pdu(
                 Some("knock") => 4u8,
                 _ => 0u8, // leave or anything else
             };
+            // For join → leave/ban transitions of federated users,
+            // surface the departure to local observers via
+            // device_list_left so /sync's `device_lists.left` reflects
+            // the new "no longer shared" relationship. Run BEFORE the
+            // membership update so `get_room_members` still includes
+            // the observer set.
+            let was_joined = state
+                .db
+                .get_membership(room_nid, state_key_nid)
+                .ok()
+                .flatten()
+                == Some(1);
+            if was_joined && (membership_byte == 0 || membership_byte == 3) {
+                crate::keys::record_device_changes_on_leave(state, state_key_nid, room_nid);
+            }
             if let Err(e) = state
                 .db
                 .set_membership(room_nid, state_key_nid, membership_byte)
