@@ -332,35 +332,55 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
         let p = match pdu_opt {
             Some(p) => p,
             None => {
-                match fetch_auth_chain(
+                // Spec: `/event_auth/{room}/{event}` returns the auth
+                // chain *for the named event*. Synapse keys the
+                // request on the event we're validating, not on each
+                // missing auth_event id — so a peer that 404s the
+                // per-aev URL but supplies the full chain at the
+                // trigger event's URL still resolves. Try the
+                // trigger first; fall back to the per-aev URL.
+                let _ = fetch_auth_chain(
                     state,
                     &sender_domain,
                     &effective_pdu.room_id,
-                    aev_id,
+                    &effective_pdu.event_id,
                     fetch_budget.clone(),
                 )
-                .await
-                {
-                    Ok(()) => match load_pdu_by_event_id(state, aev_id) {
-                        Some(p) => p,
-                        None => {
-                            // The fetch may have surfaced a chain
-                            // that included a rejected ancestor; in
-                            // that case `aev_id` is now in
-                            // `rejected_events`. Cascade.
-                            let reason = if state.db.is_event_rejected(aev_id).unwrap_or(false) {
-                                format!("auth_event {aev_id} is rejected")
-                            } else {
-                                format!("auth event {aev_id} still missing after fetch")
-                            };
-                            return (effective_pdu.event_id.clone(), PduOutcome::Rejected(reason));
+                .await;
+                if state.db.is_event_rejected(aev_id).unwrap_or(false) {
+                    return (
+                        effective_pdu.event_id.clone(),
+                        PduOutcome::Rejected(format!("auth_event {aev_id} is rejected")),
+                    );
+                }
+                // Fallback for peers that key /event_auth on the
+                // missing aev_id rather than the trigger.
+                match load_pdu_by_event_id(state, aev_id) {
+                    Some(p) => p,
+                    None => {
+                        let _ = fetch_auth_chain(
+                            state,
+                            &sender_domain,
+                            &effective_pdu.room_id,
+                            aev_id,
+                            fetch_budget.clone(),
+                        )
+                        .await;
+                        match load_pdu_by_event_id(state, aev_id) {
+                            Some(p) => p,
+                            None => {
+                                let reason = if state.db.is_event_rejected(aev_id).unwrap_or(false)
+                                {
+                                    format!("auth_event {aev_id} is rejected")
+                                } else {
+                                    format!("auth event {aev_id} still missing after fetch")
+                                };
+                                return (
+                                    effective_pdu.event_id.clone(),
+                                    PduOutcome::Rejected(reason),
+                                );
+                            }
                         }
-                    },
-                    Err(e) => {
-                        return (
-                            effective_pdu.event_id.clone(),
-                            PduOutcome::Rejected(format!("fetch auth {aev_id}: {e}")),
-                        );
                     }
                 }
             }
