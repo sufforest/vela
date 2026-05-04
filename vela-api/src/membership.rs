@@ -819,7 +819,13 @@ pub async fn invite_user_internal(
     room_nid: u64,
     room_id: RoomId,
     target_user_id: String,
+    is_direct: bool,
 ) -> Result<(), ApiError> {
+    let extra = if is_direct {
+        Some(json!({"is_direct": true}))
+    } else {
+        None
+    };
     emit_membership_event_for_target(
         &state,
         &user,
@@ -827,7 +833,7 @@ pub async fn invite_user_internal(
         &room_id,
         &target_user_id,
         "invite",
-        None,
+        extra.as_ref(),
     )
     .await
 }
