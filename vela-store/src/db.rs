@@ -3717,20 +3717,29 @@ fn recover_max_presence_stream(db: &DB) -> Option<u64> {
 }
 
 /// Recover max position from `to_device_outbound`. Keys are
-/// `<destination> 0xff <stream_pos_be>`; max position is in the
-/// trailing 8 bytes of the largest key under any prefix.
+/// `<destination> 0xff <stream_pos_be>`. Lex-largest *key* is not
+/// the lex-largest *position* — a destination "z" with pos=10 sorts
+/// after "a" with pos=999, so `IteratorMode::End` would return 11
+/// and the next enqueue under "a" would land at pos=11 (already
+/// delivered, sender skips it; new EDU lost). Scan every entry and
+/// take the global max position.
 fn recover_max_to_device_outbound(db: &DB) -> Option<u64> {
     let cf = db.cf_handle("to_device_outbound")?;
-    let mut iter = db.iterator_cf(&cf, IteratorMode::End);
-    iter.next().and_then(|r| r.ok()).map(|(key, _)| {
+    let mut max_pos: Option<u64> = None;
+    for entry in db.iterator_cf(&cf, IteratorMode::Start) {
+        let (key, _) = match entry {
+            Ok(kv) => kv,
+            Err(_) => continue,
+        };
         if key.len() < 8 {
-            return 1;
+            continue;
         }
-        let pos_bytes = &key[key.len() - 8..];
         let mut buf = [0u8; 8];
-        buf.copy_from_slice(pos_bytes);
-        u64::from_be_bytes(buf) + 1
-    })
+        buf.copy_from_slice(&key[key.len() - 8..]);
+        let pos = u64::from_be_bytes(buf);
+        max_pos = Some(max_pos.map_or(pos, |m| m.max(pos)));
+    }
+    max_pos.map(|m| m + 1)
 }
 
 /// Recover max snapshot NID from state_snapshots CF.
@@ -3922,6 +3931,51 @@ mod stream_recovery_tests {
         let p2 = db.next_stream_position().as_u64();
         let p3 = db.next_stream_position().as_u64();
         assert!(p1 < p2 && p2 < p3, "monotonic: {p1} < {p2} < {p3}");
+    }
+
+    /// Counter recovery for `to_device_outbound` must take the max
+    /// across all destinations, not just the lex-last key. With
+    /// destination "z" holding a small pos and "a" holding a large
+    /// pos, a wrong recovery would resume at the small pos+1 and
+    /// new enqueues under "a" would silently overwrite-or-skip
+    /// already-delivered slots.
+    #[test]
+    fn to_device_outbound_recovers_global_max_across_destinations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path();
+
+        let high_pos_under_a = {
+            let db = Database::open(path).unwrap();
+            // 5 enqueues for "a" (gets pos 1..=5), then 1 for "z" (pos 6).
+            // Without the fix, recovery picks "z" + pos 6 -> counter=7.
+            // With the fix, max is 6 -> counter=7. Same here, so we
+            // arrange the opposite: enqueue under "z" first so its pos
+            // is small, then under "a" so its pos is large. lex-end
+            // returns "z"'s key (small pos), broken recovery jumps
+            // counter back to that.
+            for _ in 0..1 {
+                db.enqueue_to_device_outbound("z.example.com", &serde_json::json!({"first": true}))
+                    .unwrap();
+            }
+            let mut last_a = 0;
+            for i in 0..5 {
+                last_a = db
+                    .enqueue_to_device_outbound("a.example.com", &serde_json::json!({"i": i}))
+                    .unwrap();
+            }
+            last_a
+        };
+
+        // Reopen — counter must be strictly above the highest
+        // persisted pos under any destination.
+        let db = Database::open(path).unwrap();
+        let next = db
+            .enqueue_to_device_outbound("a.example.com", &serde_json::json!({"new": true}))
+            .unwrap();
+        assert!(
+            next > high_pos_under_a,
+            "next pos ({next}) must exceed highest persisted ({high_pos_under_a})"
+        );
     }
 
     /// Mark/lookup roundtrip on `rejected_events`. The cascade
