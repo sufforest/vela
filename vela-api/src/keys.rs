@@ -705,20 +705,26 @@ fn merge_signatures(existing: &mut Value, new_body: &Value) {
 }
 
 /// Enqueue an `m.device_list_update` EDU for every remote server that
-/// shares any joined room with `user`. Wakes the affected senders so
-/// the EDU rides out promptly. No-op for users with no remote
+/// shares any joined room with the user. Wakes the affected senders
+/// so the EDU rides out promptly. No-op for users with no remote
 /// audience.
-fn federate_device_list_update(
+///
+/// `device_keys` is the device-keys object for the affected device
+/// (with optional `device_display_name`). For changes that don't
+/// touch crypto material — a rename, say — pass a value containing
+/// just `{"device_display_name": "..."}`; receivers will re-query
+/// `/keys/query` to pick up the canonical key set.
+pub(crate) fn federate_device_list_update_for(
     state: &AppState,
-    user: &AuthenticatedUser,
+    user_nid: u64,
+    user_id: &str,
+    device_id: &str,
     device_keys: Value,
     deleted: bool,
 ) {
     use std::collections::HashSet;
 
-    // Resolve the audience: union of remote servers across all rooms
-    // the user is joined to.
-    let rooms = match state.db.get_user_joined_rooms(user.user_nid) {
+    let rooms = match state.db.get_user_joined_rooms(user_nid) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "device_list federate: get_user_joined_rooms failed");
@@ -739,7 +745,7 @@ fn federate_device_list_update(
         return;
     }
 
-    let stream_id = match state.db.bump_user_device_list_stream(user.user_nid) {
+    let stream_id = match state.db.bump_user_device_list_stream(user_nid) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!(error = %e, "device_list federate: stream bump failed");
@@ -753,8 +759,8 @@ fn federate_device_list_update(
         .map(String::from);
 
     let mut content = serde_json::Map::new();
-    content.insert("user_id".into(), json!(user.user_id));
-    content.insert("device_id".into(), json!(user.device_id));
+    content.insert("user_id".into(), json!(user_id));
+    content.insert("device_id".into(), json!(device_id));
     content.insert("stream_id".into(), json!(stream_id));
     content.insert("deleted".into(), json!(deleted));
     if let Some(name) = display_name {
@@ -772,6 +778,22 @@ fn federate_device_list_update(
         }
         state.federation_sender.notify_destination(&dest);
     }
+}
+
+fn federate_device_list_update(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    device_keys: Value,
+    deleted: bool,
+) {
+    federate_device_list_update_for(
+        state,
+        user.user_nid,
+        &user.user_id,
+        &user.device_id,
+        device_keys,
+        deleted,
+    );
 }
 
 /// Bookkeeping run when a local user joins (or is joined to) a room.

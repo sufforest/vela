@@ -72,6 +72,31 @@ pub async fn rename_device(
             .db
             .update_device_display_name(user.user_nid, &device_id, name)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
+        // Surface the change to /sync's device_lists.changed for local
+        // observers and over federation as m.device_list_update so
+        // peers know to re-fetch the device's metadata. Without this,
+        // a remote client showing alice's device-name list never
+        // updates after she renames a device.
+        let _ = state.db.record_device_key_change(user.user_nid);
+        crate::router::notify_user(&state, user.user_nid);
+
+        let mut keys_value = state
+            .db
+            .get_device_keys(user.user_nid, &device_id)
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        keys_value.insert("device_display_name".into(), json!(name));
+        crate::keys::federate_device_list_update_for(
+            &state,
+            user.user_nid,
+            &user.user_id,
+            &device_id,
+            Value::Object(keys_value),
+            false,
+        );
     }
     Ok(Json(json!({})))
 }
