@@ -180,3 +180,14 @@
 # shape); skipping until/unless we take that on.
 ^TestPushRuleRoomUpgrade$
 ^TestMSC4289PrivilegedRoomCreators_Upgrades$
+
+# URL preview / OpenGraph at /_matrix/media/v3/preview_url. Implementing
+# means an HTTP fetch + HTML parse + OpenGraph extraction + image
+# caching path; sizable feature in its own right and not on the
+# critical path. Skip until we choose to take it on.
+^TestUrlPreview$
+
+# MSC2246 async upload — POST /create + PUT /upload/{server}/{mediaId}
+# in two stages, with the mxc:// returned ahead of the bytes. Not
+# implemented; clients fall back to the synchronous upload path.
+^TestAsyncUpload$
