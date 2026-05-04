@@ -3001,6 +3001,58 @@ impl Database {
         Ok(changed_users)
     }
 
+    /// Mirror of `notify_device_key_change` for the "user no longer
+    /// shares a room with X" direction. Each observer gets one entry
+    /// per (departure, pos) so /sync can emit `device_lists.left`.
+    pub fn record_peer_departure(
+        &self,
+        departed_nid: u64,
+        observer_nids: &[u64],
+        stream_pos: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("device_list_left").unwrap();
+        let val = keys::encode_u64(departed_nid);
+        let mut batch = WriteBatch::default();
+        for &obs in observer_nids {
+            if obs == departed_nid {
+                continue;
+            }
+            batch.put_cf(&cf, keys::encode_u64_pair(obs, stream_pos), val);
+        }
+        self.db.write(batch)
+    }
+
+    /// Forward-scan `device_list_left[observer]` between [from, to)
+    /// and return the deduplicated departed user_nids.
+    pub fn get_device_list_left(
+        &self,
+        user_nid: u64,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<u64>, rocksdb::Error> {
+        let cf = self.db.cf_handle("device_list_left").unwrap();
+        let start = keys::encode_u64_pair(user_nid, from);
+        let mut left_users = Vec::new();
+        let iter = self
+            .db
+            .iterator_cf(&cf, IteratorMode::From(&start, rocksdb::Direction::Forward));
+        for item in iter {
+            let (key, val) = item?;
+            if key.len() < 16 {
+                break;
+            }
+            let (observer, pos) = keys::decode_u64_pair(&key);
+            if observer != user_nid || pos >= to {
+                break;
+            }
+            let departed_nid = keys::decode_u64(&val);
+            if !left_users.contains(&departed_nid) {
+                left_users.push(departed_nid);
+            }
+        }
+        Ok(left_users)
+    }
+
     /// Return the prev_events (as NIDs) recorded for an event.
     pub fn get_prev_events(&self, event_nid: u64) -> Result<Vec<u64>, rocksdb::Error> {
         let cf = self.db.cf_handle("event_edges").unwrap();

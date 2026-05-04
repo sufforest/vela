@@ -860,6 +860,44 @@ pub fn record_device_changes_on_join(state: &AppState, user_nid: u64, room_nid: 
     crate::router::notify_user(state, user_nid);
 }
 
+/// Bookkeeping run when a member is about to leave (or be banned/
+/// kicked from) `room_nid`. Mirror of `record_device_changes_on_join`
+/// for the inverse direction. We must call this BEFORE updating
+/// memberships so `get_room_members(room_nid)` still includes the
+/// other observers; the leaving user is excluded from the observer
+/// set inside `record_peer_departure`.
+///
+/// /sync's `device_lists.left` reads these entries and post-filters
+/// any observer who still shares an (encrypted) room with the
+/// departing user — handling the rare case where alice and bob also
+/// share another room beyond the one bob just left.
+pub fn record_device_changes_on_leave(state: &AppState, departing_nid: u64, room_nid: u64) {
+    let observers = match state.db.get_room_members(room_nid) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "device_list_left: get_room_members failed");
+            return;
+        }
+    };
+    if observers.is_empty() {
+        return;
+    }
+    let stream_pos = state.db.next_stream_position().as_u64();
+    if let Err(e) = state
+        .db
+        .record_peer_departure(departing_nid, &observers, stream_pos)
+    {
+        tracing::warn!(error = %e, "record_peer_departure failed");
+        return;
+    }
+    for &obs in &observers {
+        if obs == departing_nid {
+            continue;
+        }
+        crate::router::notify_user(state, obs);
+    }
+}
+
 /// Push `m.device_list_update` EDUs for every device the local user
 /// owns to every remote server in the room they just joined. Spec:
 ///

@@ -764,6 +764,7 @@ async fn do_remote_leave(
         )
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
+    crate::keys::record_device_changes_on_leave(state, user.user_nid, room_nid);
     state
         .db
         .set_membership(room_nid, user.user_nid, 0)
@@ -1682,6 +1683,21 @@ async fn emit_membership_event_for_target(
         )
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
+    // For leave/kick/ban (target was joined and is now no longer):
+    // surface the departure to local observers via the device_list_left
+    // CF so /sync's `device_lists.left` reflects the new "no longer
+    // shared" relationships. Run BEFORE the membership update so
+    // `get_room_members` still includes the observer set.
+    let was_joined = state
+        .db
+        .get_membership(room_nid, target_user_nid)
+        .ok()
+        .flatten()
+        == Some(1);
+    let now_left = matches!(membership, "leave" | "ban");
+    if was_joined && now_left {
+        crate::keys::record_device_changes_on_leave(state, target_user_nid, room_nid);
+    }
     // Update membership
     state
         .db

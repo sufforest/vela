@@ -80,4 +80,10 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // lookup `unsigned.prev_content` and `unsigned.replaces_state`
     // without walking the timeline backwards.
     "state_replaces",
+    // `(observer_nid, stream_pos) -> departed_nid`. Mirror of
+    // `device_key_changes` but for the "no longer share any room"
+    // direction. Drives `device_lists.left` in /sync — E2EE clients
+    // need to invalidate cached device keys for users who left every
+    // shared room.
+    "device_list_left",
 ];
