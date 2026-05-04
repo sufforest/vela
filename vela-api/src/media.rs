@@ -212,7 +212,7 @@ pub async fn config(State(state): State<AppState>) -> Json<Value> {
 /// `filename=` is kept for legacy clients but with non-ASCII bytes
 /// stripped — anything else risks header-injection or invalid
 /// header bytes that proxies will reject.
-fn format_content_disposition(filename: &str) -> String {
+pub(crate) fn format_content_disposition(filename: &str) -> String {
     // Strip control chars and the literals that would break the
     // header value (`"`, `\\`, CR, LF, NUL, etc.).
     fn safe_char(c: char) -> bool {
@@ -253,7 +253,7 @@ async fn download_remote(
     server_name: &str,
     media_id: &str,
 ) -> Result<Response, ApiError> {
-    let (content_type, bytes) = state
+    let media = state
         .federation_client
         .fetch_media(server_name, media_id)
         .await
@@ -262,11 +262,24 @@ async fn download_remote(
             ApiError(VelaError::NotFound("remote media unavailable".into()))
         })?;
 
-    let len = bytes.len();
-    Response::builder()
+    let len = media.bytes.len();
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CONTENT_LENGTH, len.to_string())
-        .body(Body::from(bytes))
+        .header(header::CONTENT_TYPE, media.content_type)
+        .header(header::CONTENT_LENGTH, len.to_string());
+    // Propagate the original filename from the peer so clients see the
+    // Unicode-safe filename whether the file came from us or via
+    // federation. Stripping it here would silently lose Unicode names
+    // when bob on hs2 downloads alice@hs1's file via hs2.
+    if let Some(filename) = media.filename.as_deref()
+        && !filename.is_empty()
+    {
+        builder = builder.header(
+            header::CONTENT_DISPOSITION,
+            format_content_disposition(filename),
+        );
+    }
+    builder
+        .body(Body::from(media.bytes))
         .map_err(|e| ApiError(VelaError::Unknown(e.to_string())))
 }

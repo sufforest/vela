@@ -632,7 +632,7 @@ impl FederationClient {
         &self,
         destination: &str,
         media_id: &str,
-    ) -> Result<(String, Vec<u8>), FederationClientError> {
+    ) -> Result<MediaResponse, FederationClientError> {
         if !self.enabled {
             return Err(FederationClientError::FederationDisabled);
         }
@@ -684,6 +684,14 @@ impl FederationClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/octet-stream")
             .to_string();
+        // Capture filename from the top-level Content-Disposition before
+        // consuming the response — only used on the non-multipart compat
+        // path below, but `resp.bytes()` takes ownership.
+        let top_level_filename = resp
+            .headers()
+            .get(reqwest::header::CONTENT_DISPOSITION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_filename_from_content_disposition);
         let body = resp
             .bytes()
             .await
@@ -698,9 +706,26 @@ impl FederationClient {
             parse_multipart_media(&body, &boundary)
                 .map_err(|e| FederationClientError::BadJson(format!("multipart: {e}")))
         } else {
-            Ok((response_ct, body.to_vec()))
+            Ok(MediaResponse {
+                content_type: response_ct,
+                filename: top_level_filename,
+                bytes: body.to_vec(),
+            })
         }
     }
+}
+
+/// Outcome of a federated `/media/download` fetch. The `filename` is
+/// present when the peer's response carried one (either as a multipart
+/// part's Content-Disposition or, on the legacy non-multipart path, the
+/// top-level Content-Disposition); otherwise `None`. Callers propagate
+/// it back to the local-download response so clients see the original
+/// filename even when the file came from a remote homeserver.
+#[derive(Debug)]
+pub struct MediaResponse {
+    pub content_type: String,
+    pub filename: Option<String>,
+    pub bytes: Vec<u8>,
 }
 
 /// Pull `boundary=...` out of a `Content-Type: multipart/mixed; boundary=...`
@@ -727,10 +752,11 @@ fn parse_multipart_boundary(content_type: &str) -> Option<String> {
 }
 
 /// Parse a `multipart/mixed` body and return the media part —
-/// `(content_type, bytes)` — assuming the spec-defined two-part
-/// layout (JSON metadata first, file content second). Returns an
-/// error string on any structural mismatch.
-fn parse_multipart_media(body: &[u8], boundary: &str) -> Result<(String, Vec<u8>), String> {
+/// `MediaResponse` — assuming the spec-defined two-part layout
+/// (JSON metadata first, file content second). The `filename` field
+/// is extracted from the file part's Content-Disposition when present.
+/// Returns an error string on any structural mismatch.
+fn parse_multipart_media(body: &[u8], boundary: &str) -> Result<MediaResponse, String> {
     let marker = format!("--{boundary}");
     let marker_b = marker.as_bytes();
     let positions: Vec<usize> = (0..body.len())
@@ -767,19 +793,87 @@ fn parse_multipart_media(body: &[u8], boundary: &str) -> Result<(String, Vec<u8>
 
     let headers_str =
         std::str::from_utf8(headers_bytes).map_err(|e| format!("non-UTF-8 part headers: {e}"))?;
-    let content_type = headers_str
-        .split("\r\n")
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            if name.trim().eq_ignore_ascii_case("content-type") {
-                Some(value.trim().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let mut content_type = "application/octet-stream".to_string();
+    let mut filename: Option<String> = None;
+    for line in headers_str.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let n = name.trim();
+        if n.eq_ignore_ascii_case("content-type") {
+            content_type = value.trim().to_string();
+        } else if n.eq_ignore_ascii_case("content-disposition") {
+            filename = parse_filename_from_content_disposition(value.trim());
+        }
+    }
 
-    Ok((content_type, body[content_start..content_end].to_vec()))
+    Ok(MediaResponse {
+        content_type,
+        filename,
+        bytes: body[content_start..content_end].to_vec(),
+    })
+}
+
+/// Parse `filename` out of an HTTP Content-Disposition header value,
+/// preferring `filename*=UTF-8''<percent-encoded>` (RFC 5987) over the
+/// plain `filename="..."` form. Returns `None` when no filename is
+/// declared. Defensive against malformed or empty values.
+fn parse_filename_from_content_disposition(value: &str) -> Option<String> {
+    let mut plain: Option<String> = None;
+    let mut starred: Option<String> = None;
+    for param in value.split(';').skip(1) {
+        let param = param.trim();
+        let Some((name, raw_value)) = param.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        let raw_value = raw_value.trim();
+        if name.eq_ignore_ascii_case("filename*") {
+            // RFC 5987: charset'language'percent-encoded-value
+            let mut parts = raw_value.splitn(3, '\'');
+            let charset = parts.next().unwrap_or("");
+            let _lang = parts.next().unwrap_or("");
+            let encoded = parts.next().unwrap_or("");
+            if !charset.eq_ignore_ascii_case("utf-8") || encoded.is_empty() {
+                continue;
+            }
+            let mut decoded = Vec::with_capacity(encoded.len());
+            let bytes = encoded.as_bytes();
+            let mut i = 0;
+            let mut ok = true;
+            while i < bytes.len() {
+                if bytes[i] == b'%' && i + 2 < bytes.len() {
+                    let hi = (bytes[i + 1] as char).to_digit(16);
+                    let lo = (bytes[i + 2] as char).to_digit(16);
+                    match (hi, lo) {
+                        (Some(h), Some(l)) => {
+                            decoded.push((h * 16 + l) as u8);
+                            i += 3;
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                } else {
+                    decoded.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            if ok && let Ok(s) = String::from_utf8(decoded) {
+                starred = Some(s);
+            }
+        } else if name.eq_ignore_ascii_case("filename") {
+            let v = raw_value
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(raw_value);
+            if !v.is_empty() {
+                plain = Some(v.to_string());
+            }
+        }
+    }
+    starred.or(plain)
 }
 
 #[cfg(test)]
@@ -813,9 +907,52 @@ mod multipart_tests {
         body.extend_from_slice(b"\r\n");
         body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 
-        let (ct, bytes) = parse_multipart_media(&body, boundary).unwrap();
-        assert_eq!(ct, "text/plain; charset=utf-8");
-        assert_eq!(bytes, body_inner);
+        let media = parse_multipart_media(&body, boundary).unwrap();
+        assert_eq!(media.content_type, "text/plain; charset=utf-8");
+        assert_eq!(media.bytes, body_inner);
+        assert!(media.filename.is_none(), "no Content-Disposition → None");
+    }
+
+    #[test]
+    fn multipart_extracts_unicode_filename_from_part_content_disposition() {
+        let boundary = "vela-unicode";
+        let body_inner = b"\xe2\x98\x95".to_vec();
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Type: application/json\r\n\r\n");
+        body.extend_from_slice(b"{}\r\n");
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Type: image/png\r\n");
+        body.extend_from_slice(
+            b"Content-Disposition: inline; filename=\"\"; filename*=UTF-8''%E2%98%95\r\n\r\n",
+        );
+        body.extend_from_slice(&body_inner);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let media = parse_multipart_media(&body, boundary).unwrap();
+        assert_eq!(media.content_type, "image/png");
+        assert_eq!(media.filename.as_deref(), Some("☕"));
+        assert_eq!(media.bytes, body_inner);
+    }
+
+    #[test]
+    fn parse_filename_prefers_rfc5987_over_plain() {
+        use super::parse_filename_from_content_disposition;
+        // plain only
+        assert_eq!(
+            parse_filename_from_content_disposition("inline; filename=\"hello.txt\""),
+            Some("hello.txt".to_string())
+        );
+        // RFC 5987 wins
+        assert_eq!(
+            parse_filename_from_content_disposition(
+                "inline; filename=\"fallback\"; filename*=UTF-8''%E2%98%95"
+            ),
+            Some("☕".to_string())
+        );
+        // No filename at all
+        assert!(parse_filename_from_content_disposition("inline").is_none());
     }
 }
 
