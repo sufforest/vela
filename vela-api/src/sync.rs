@@ -788,9 +788,12 @@ fn build_room_sync_for_user(
 
     let joined_count = state
         .db
-        .get_room_members(room_nid)
-        .map(|m| m.len())
+        .count_room_members_by_membership(room_nid, 1)
         .unwrap_or(1);
+    let invited_count = state
+        .db
+        .count_room_members_by_membership(room_nid, 2)
+        .unwrap_or(0);
 
     let room_account_data = match user_nid {
         Some(uid) => state
@@ -812,7 +815,7 @@ fn build_room_sync_for_user(
         },
         "summary": {
             "m.joined_member_count": joined_count,
-            "m.invited_member_count": 0,
+            "m.invited_member_count": invited_count,
         },
         "ephemeral": {"events": ephemeral_events},
         "account_data": {"events": room_account_data},

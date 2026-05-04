@@ -152,3 +152,15 @@
 # The MAY makes this optional. Skiplisting until/unless we add
 # it for client UX parity with synapse.
 ^TestRoomDeleteAlias/Parallel/Can_delete_canonical_alias$
+
+# Complement mock bug on the MSC3916 federation media endpoint:
+# /federation/v1/media/download/{mediaId} doesn't have an `origin`
+# URL var, but the mock's downloadFn reads vars["origin"] and
+# rejects requests where it doesn't match the mock's serverName.
+# Result: every federation media fetch to a Complement mock returns
+# 400 even before the handler runs. Affects the federation sub-test
+# only (local sub-tests pass). See
+# references/complement/federation/handle.go:430-447. Synapse
+# already skips this test for an unrelated reason (legacy
+# unauthenticated download endpoint disabled by default).
+^TestMediaWithoutFileName/parallel/Can_download_without_a_file_name_over_federation$

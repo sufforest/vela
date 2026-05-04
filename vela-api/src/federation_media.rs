@@ -71,18 +71,35 @@ pub async fn federation_download(
         .get("content_type")
         .and_then(|v| v.as_str())
         .unwrap_or("application/octet-stream");
+    let filename = metadata.get("filename").and_then(|v| v.as_str());
 
     let boundary = format!("vela-{}", uuid::Uuid::new_v4().simple());
     let multipart_ct = format!("multipart/mixed; boundary={boundary}");
 
     // Body layout per MSC3916: JSON metadata part, then file content
-    // part. Trailing `--<boundary>--` closes the message.
+    // part. The file part carries Content-Disposition with the
+    // original filename when set — receivers re-emit this when they
+    // serve the file to their own clients, so Unicode filenames
+    // survive a download → federation → download chain. Trailing
+    // `--<boundary>--` closes the message.
     let mut body = Vec::with_capacity(buf.len() + 256);
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
     body.extend_from_slice(b"Content-Type: application/json\r\n\r\n");
     body.extend_from_slice(b"{}\r\n");
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(format!("Content-Type: {content_type}\r\n").as_bytes());
+    if let Some(name) = filename
+        && !name.is_empty()
+    {
+        body.extend_from_slice(
+            format!(
+                "Content-Disposition: {}\r\n",
+                crate::media::format_content_disposition(name)
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(b"\r\n");
     body.extend_from_slice(&buf);
     body.extend_from_slice(b"\r\n");
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());

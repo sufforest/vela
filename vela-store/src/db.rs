@@ -1834,6 +1834,31 @@ impl Database {
         Ok(members)
     }
 
+    /// Count members with the given membership byte (1=join, 2=invite,
+    /// 3=knock, 4=ban, 0=leave). Faster than materialising the full
+    /// list when the caller only needs a count (e.g. /sync's room
+    /// `summary` block).
+    pub fn count_room_members_by_membership(
+        &self,
+        room_nid: u64,
+        membership: u8,
+    ) -> Result<u64, rocksdb::Error> {
+        let cf = self.db.cf_handle("memberships").unwrap();
+        let prefix = keys::encode_u64(room_nid);
+        let mut count: u64 = 0;
+        let iter = self.db.prefix_iterator_cf(&cf, prefix);
+        for item in iter {
+            let (key, val) = item?;
+            if key.len() < 16 || key[..8] != prefix[..] {
+                break;
+            }
+            if !val.is_empty() && val[0] == membership {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// Record that a user's device keys changed, visible to a set of members.
     /// Used when membership changes in encrypted rooms.
     pub fn notify_device_key_change(
