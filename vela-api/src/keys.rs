@@ -209,24 +209,50 @@ pub(crate) fn fold_local_user_keys(
         return Ok(());
     };
     let mut user_devices: Map<String, Value> = Map::new();
-    if device_ids.is_empty() {
-        let all_keys = state
+    let collected: Vec<(String, Value)> = if device_ids.is_empty() {
+        state
             .db
             .get_all_device_keys(user_nid)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-        for (device_id, keys) in all_keys {
-            user_devices.insert(device_id, keys);
-        }
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
     } else {
+        let mut out = Vec::with_capacity(device_ids.len());
         for device_id in device_ids {
             if let Some(keys) = state
                 .db
                 .get_device_keys(user_nid, device_id)
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
             {
-                user_devices.insert(device_id.clone(), keys);
+                out.push((device_id.clone(), keys));
             }
         }
+        out
+    };
+    for (device_id, mut keys) in collected {
+        // Spec: /keys/query carries the display name (if any) under
+        // `unsigned.device_display_name`. Stored separately from the
+        // crypto material in the `devices` CF — pulled in here so a
+        // PUT /devices rename surfaces in the next /keys/query.
+        let display_name = state
+            .db
+            .get_device(user_nid, &device_id)
+            .ok()
+            .flatten()
+            .and_then(|rec| {
+                rec.get("display_name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
+        if let Some(name) = display_name
+            && let Some(obj) = keys.as_object_mut()
+        {
+            let unsigned = obj
+                .entry("unsigned".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Some(u) = unsigned.as_object_mut() {
+                u.insert("device_display_name".to_string(), Value::String(name));
+            }
+        }
+        user_devices.insert(device_id, keys);
     }
     device_keys_response.insert(user_id.to_string(), Value::Object(user_devices));
 
