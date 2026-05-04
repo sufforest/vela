@@ -487,18 +487,23 @@ pub async fn send_join_v2(
     };
     // Accept public + restricted/knock_restricted send_join; auth rule
     // 5.3.5 will enforce the join_authorised_via_users_server constraint
-    // for restricted variants. Invite-only/knock-only rooms reject here
-    // (those joins should arrive via /send rather than /send_join).
+    // for restricted variants. Invite-only/knock-only rooms also accept
+    // when the joiner already has an invite — Synapse parity, and the
+    // path TestDeviceListsUpdateOverFederation exercises (alice invites
+    // bob across federation; bob's hs2 then send_joins via hs1).
     let join_rule = read_join_rules_content(&state, room_nid)
         .as_ref()
         .and_then(|c| c.get("join_rule"))
         .and_then(|r| r.as_str())
         .unwrap_or("invite")
         .to_string();
-    if !matches!(
+    let joiner_nid = state.db.get_or_create_nid(state_key).map_err(db_err)?;
+    let joiner_invited = state.db.get_membership(room_nid, joiner_nid).ok().flatten() == Some(2);
+    let join_rule_allows = matches!(
         join_rule.as_str(),
         "public" | "restricted" | "knock_restricted"
-    ) {
+    );
+    if !join_rule_allows && !joiner_invited {
         return Err(err_response(
             StatusCode::FORBIDDEN,
             "M_FORBIDDEN",
