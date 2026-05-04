@@ -191,3 +191,13 @@
 # in two stages, with the mxc:// returned ahead of the bytes. Not
 # implemented; clients fall back to the synchronous upload path.
 ^TestAsyncUpload$
+
+# MSC4297 state-resolution v2.1. The new algorithm ("conflicted
+# subgraph" derivation) materially changes how state res handles
+# auth chains across forks, with fairly subtle convergence
+# requirements. We're on v2 and have deferred v2.1 — it's the
+# single biggest blast-radius change we could make to event
+# acceptance, and we're not taking it on as part of the parity
+# sprint. Skiplisted until/unless we choose to do that work.
+^TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph$
+^TestMSC4297StateResolutionV2_1_starts_from_empty_set$
