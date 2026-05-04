@@ -861,40 +861,73 @@ pub fn record_device_changes_on_join(state: &AppState, user_nid: u64, room_nid: 
 }
 
 /// Bookkeeping run when a member is about to leave (or be banned/
-/// kicked from) `room_nid`. Mirror of `record_device_changes_on_join`
-/// for the inverse direction. We must call this BEFORE updating
-/// memberships so `get_room_members(room_nid)` still includes the
-/// other observers; the leaving user is excluded from the observer
-/// set inside `record_peer_departure`.
+/// kicked from) `room_nid`. The "no longer shared" relation is
+/// symmetric: every remaining member loses the leaver from their
+/// shared-room set, AND the leaver themselves loses every remaining
+/// member. We write `device_list_left` entries in both directions so
+/// /sync's `device_lists.left` is correct from either side.
 ///
-/// /sync's `device_lists.left` reads these entries and post-filters
-/// any observer who still shares an (encrypted) room with the
-/// departing user — handling the rare case where alice and bob also
-/// share another room beyond the one bob just left.
+/// Must be called BEFORE updating memberships so `get_room_members`
+/// still returns the full member list including the departing user.
+/// The post-filter in /sync deals with the case where two users
+/// still share another room.
 pub fn record_device_changes_on_leave(state: &AppState, departing_nid: u64, room_nid: u64) {
-    let observers = match state.db.get_room_members(room_nid) {
+    let members = match state.db.get_room_members(room_nid) {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(error = %e, "device_list_left: get_room_members failed");
             return;
         }
     };
-    if observers.is_empty() {
+    if members.is_empty() {
         return;
     }
     let stream_pos = state.db.next_stream_position().as_u64();
+
+    // Direction 1: from each remaining member's perspective, the
+    // departing user has left.
     if let Err(e) = state
         .db
-        .record_peer_departure(departing_nid, &observers, stream_pos)
+        .record_peer_departure(departing_nid, &members, stream_pos)
     {
-        tracing::warn!(error = %e, "record_peer_departure failed");
-        return;
+        tracing::warn!(error = %e, "record_peer_departure (forward) failed");
     }
-    for &obs in &observers {
+
+    // Direction 2: from the departing user's perspective, each
+    // remaining member has dropped out of their shared set. Skip
+    // remote-domain peers because their server publishes its own
+    // membership transitions independently.
+    let our_server = state.config.server_name.as_str();
+    let leaver_is_local = state
+        .db
+        .resolve_nid(departing_nid)
+        .ok()
+        .flatten()
+        .and_then(|s| s.split_once(':').map(|(_, d)| d.to_string()))
+        .map(|d| d == our_server)
+        .unwrap_or(false);
+    if leaver_is_local {
+        for &peer in &members {
+            if peer == departing_nid {
+                continue;
+            }
+            if let Err(e) = state
+                .db
+                .record_peer_departure(peer, &[departing_nid], stream_pos)
+            {
+                tracing::warn!(error = %e, "record_peer_departure (reverse) failed");
+            }
+        }
+    }
+
+    for &obs in &members {
         if obs == departing_nid {
             continue;
         }
         crate::router::notify_user(state, obs);
+    }
+    if leaver_is_local {
+        crate::router::notify_user(state, departing_nid);
     }
 }
 
