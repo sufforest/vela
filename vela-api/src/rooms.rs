@@ -170,6 +170,16 @@ pub async fn create_room(
 
     // --- 1. m.room.create (no room_id, no auth) ---
     let mut create_content_val = content::create_content(room_version);
+    // Set `content.creator = caller`. MSC4291 removes the field for v12,
+    // but most clients (and many integration tests) still read it; the
+    // field is harmless on v12 because we authorise off `sender`, not
+    // `content.creator`. Caller-supplied `creation_content.creator` is
+    // explicitly NOT honoured (a client cannot impersonate another user
+    // as the creator).
+    create_content_val
+        .as_object_mut()
+        .unwrap()
+        .insert("creator".to_string(), Value::String(user.user_id.clone()));
     if let Some(extra) = &body.creation_content
         && let Some(extra_obj) = extra.as_object()
     {
