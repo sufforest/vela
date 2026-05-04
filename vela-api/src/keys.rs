@@ -209,24 +209,50 @@ pub(crate) fn fold_local_user_keys(
         return Ok(());
     };
     let mut user_devices: Map<String, Value> = Map::new();
-    if device_ids.is_empty() {
-        let all_keys = state
+    let collected: Vec<(String, Value)> = if device_ids.is_empty() {
+        state
             .db
             .get_all_device_keys(user_nid)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-        for (device_id, keys) in all_keys {
-            user_devices.insert(device_id, keys);
-        }
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
     } else {
+        let mut out = Vec::with_capacity(device_ids.len());
         for device_id in device_ids {
             if let Some(keys) = state
                 .db
                 .get_device_keys(user_nid, device_id)
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
             {
-                user_devices.insert(device_id.clone(), keys);
+                out.push((device_id.clone(), keys));
             }
         }
+        out
+    };
+    for (device_id, mut keys) in collected {
+        // Spec: /keys/query carries the display name (if any) under
+        // `unsigned.device_display_name`. Stored separately from the
+        // crypto material in the `devices` CF — pulled in here so a
+        // PUT /devices rename surfaces in the next /keys/query.
+        let display_name = state
+            .db
+            .get_device(user_nid, &device_id)
+            .ok()
+            .flatten()
+            .and_then(|rec| {
+                rec.get("display_name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
+        if let Some(name) = display_name
+            && let Some(obj) = keys.as_object_mut()
+        {
+            let unsigned = obj
+                .entry("unsigned".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if let Some(u) = unsigned.as_object_mut() {
+                u.insert("device_display_name".to_string(), Value::String(name));
+            }
+        }
+        user_devices.insert(device_id, keys);
     }
     device_keys_response.insert(user_id.to_string(), Value::Object(user_devices));
 
@@ -705,20 +731,26 @@ fn merge_signatures(existing: &mut Value, new_body: &Value) {
 }
 
 /// Enqueue an `m.device_list_update` EDU for every remote server that
-/// shares any joined room with `user`. Wakes the affected senders so
-/// the EDU rides out promptly. No-op for users with no remote
+/// shares any joined room with the user. Wakes the affected senders
+/// so the EDU rides out promptly. No-op for users with no remote
 /// audience.
-fn federate_device_list_update(
+///
+/// `device_keys` is the device-keys object for the affected device
+/// (with optional `device_display_name`). For changes that don't
+/// touch crypto material — a rename, say — pass a value containing
+/// just `{"device_display_name": "..."}`; receivers will re-query
+/// `/keys/query` to pick up the canonical key set.
+pub(crate) fn federate_device_list_update_for(
     state: &AppState,
-    user: &AuthenticatedUser,
+    user_nid: u64,
+    user_id: &str,
+    device_id: &str,
     device_keys: Value,
     deleted: bool,
 ) {
     use std::collections::HashSet;
 
-    // Resolve the audience: union of remote servers across all rooms
-    // the user is joined to.
-    let rooms = match state.db.get_user_joined_rooms(user.user_nid) {
+    let rooms = match state.db.get_user_joined_rooms(user_nid) {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "device_list federate: get_user_joined_rooms failed");
@@ -739,7 +771,7 @@ fn federate_device_list_update(
         return;
     }
 
-    let stream_id = match state.db.bump_user_device_list_stream(user.user_nid) {
+    let stream_id = match state.db.bump_user_device_list_stream(user_nid) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!(error = %e, "device_list federate: stream bump failed");
@@ -753,8 +785,8 @@ fn federate_device_list_update(
         .map(String::from);
 
     let mut content = serde_json::Map::new();
-    content.insert("user_id".into(), json!(user.user_id));
-    content.insert("device_id".into(), json!(user.device_id));
+    content.insert("user_id".into(), json!(user_id));
+    content.insert("device_id".into(), json!(device_id));
     content.insert("stream_id".into(), json!(stream_id));
     content.insert("deleted".into(), json!(deleted));
     if let Some(name) = display_name {
@@ -772,6 +804,22 @@ fn federate_device_list_update(
         }
         state.federation_sender.notify_destination(&dest);
     }
+}
+
+fn federate_device_list_update(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    device_keys: Value,
+    deleted: bool,
+) {
+    federate_device_list_update_for(
+        state,
+        user.user_nid,
+        &user.user_id,
+        &user.device_id,
+        device_keys,
+        deleted,
+    );
 }
 
 /// Bookkeeping run when a local user joins (or is joined to) a room.
