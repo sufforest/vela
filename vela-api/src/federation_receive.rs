@@ -438,11 +438,20 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
             }
         }
         Ok(None) => {
-            // No prev_events (only valid for m.room.create, which we don't accept over federation anyway)
-            return (
-                effective_pdu.event_id.clone(),
-                PduOutcome::Rejected("no prev_events".into()),
-            );
+            if effective_pdu.prev_events.is_empty() {
+                // No prev_events at all — only valid for m.room.create,
+                // which we don't accept over federation anyway.
+                return (
+                    effective_pdu.event_id.clone(),
+                    PduOutcome::Rejected("no prev_events".into()),
+                );
+            }
+            // Every prev_event is rejected/missing — skip the
+            // state-at-event check. Check 4 already validated the
+            // event against its declared auth_events, which is the
+            // only authoritative anchor we have. Mirrors Synapse's
+            // outlier path: accept the event so it can show up in
+            // /sync timelines without contributing to current state.
         }
         Err(reason) => {
             // Log the detailed reason (may include internal DB error text or
@@ -531,14 +540,27 @@ async fn compute_state_at_event(
     }
 
     // Load each prev_event's state_snapshot (the state map AFTER that event
-    // was applied, i.e. the state before this event would see it).
+    // was applied, i.e. the state before this event would see it). Skip
+    // prev_events that are rejected or missing — their snapshots aren't
+    // meaningful, but at least one usable prev keeps state-at-event sane.
+    // If every prev is rejected/missing, return Ok(None) so process_pdu can
+    // fall back to auth_events-derived state (Check 4 already validated
+    // those). Synapse's outlier path makes the same call.
     let mut state_sets: Vec<StateMap> = Vec::new();
     for prev_id in &event.prev_events {
-        let prev_nid = state
+        let prev_nid = match state
             .db
             .get_event_nid_by_id(prev_id)
             .map_err(|e| format!("db: {e}"))?
-            .ok_or_else(|| format!("unknown prev_event {prev_id}"))?;
+        {
+            Some(n) => n,
+            None => {
+                if state.db.is_event_rejected(prev_id).unwrap_or(false) {
+                    continue;
+                }
+                return Err(format!("unknown prev_event {prev_id}"));
+            }
+        };
 
         // Load snapshot for this prev_event.
         let snapshot_nids = state
@@ -582,6 +604,14 @@ async fn compute_state_at_event(
             sm.insert((et, sk), eid);
         }
         state_sets.push(sm);
+    }
+
+    // Every prev_event was rejected/skipped — no usable state to resolve
+    // against. Signal "skip Check 5" by returning Ok(None); the caller
+    // distinguishes this from "no prev_events at all" by inspecting
+    // event.prev_events itself.
+    if state_sets.is_empty() {
+        return Ok(None);
     }
 
     // Event + auth chain lookup closures for state_res.
