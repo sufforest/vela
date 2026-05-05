@@ -181,7 +181,11 @@ pub async fn sync(
     let has_device_list_changes = response
         .pointer("/device_lists/changed")
         .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty());
+        .is_some_and(|a| !a.is_empty())
+        || response
+            .pointer("/device_lists/left")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| !a.is_empty());
     let has_new_data = has_events
         || has_invites
         || has_leaves
@@ -471,17 +475,16 @@ pub(crate) fn build_sync_response_with_filter(
     // since `since` (or since 0 on initial sync). Element uses this to
     // decide when to re-query /keys/query; without it, self-signature
     // uploads don't surface and the device stays "unverified".
+    // `since` is the highest position already returned to the client
+    // (next_batch from the prior /sync). The rest of sync treats it
+    // as exclusive — strictly newer events. Match that here by
+    // starting one position past `since`, otherwise the long-poll
+    // re-serves a change that was already in the prior response.
+    let dl_from = since.map(|s| s.saturating_add(1)).unwrap_or(0);
     let device_lists_changed: Vec<String> = {
-        // `since` is the highest position already returned to the
-        // client (next_batch from the prior /sync). The rest of sync
-        // treats it as exclusive — strictly newer events. Match that
-        // here by starting one position past `since`, otherwise the
-        // long-poll re-serves a change that was already in the prior
-        // response.
-        let from = since.map(|s| s.saturating_add(1)).unwrap_or(0);
         let nids = state
             .db
-            .get_device_key_changes(user.user_nid, from, current_pos + 1)
+            .get_device_key_changes(user.user_nid, dl_from, current_pos + 1)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
         let mut out = Vec::new();
         for nid in nids {
@@ -495,6 +498,45 @@ pub(crate) fn build_sync_response_with_filter(
         }
         out
     };
+    // device_lists.left: users we no longer share any room with since
+    // `since`. Post-filter the raw "departed from a room I was in"
+    // events against current shared-room state — bob may have left
+    // the room that triggered the entry but still share another room
+    // with us, in which case we do NOT report him as "left".
+    let device_lists_left: Vec<String> = {
+        let raw = state
+            .db
+            .get_device_list_left(user.user_nid, dl_from, current_pos + 1)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        let our_rooms = state
+            .db
+            .get_user_joined_rooms(user.user_nid)
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for nid in raw {
+            // Drop the change-side dedup: a user may appear in both
+            // changed and left within the same window. Spec says left
+            // wins for the "no longer shares" semantic.
+            let still_sharing = our_rooms
+                .iter()
+                .any(|&room_nid| state.db.get_membership(room_nid, nid).ok().flatten() == Some(1));
+            if still_sharing {
+                continue;
+            }
+            if let Some(uid) = state
+                .db
+                .resolve_nid(nid)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            {
+                out.push(uid);
+            }
+        }
+        out
+    };
+    let device_lists_changed: Vec<String> = device_lists_changed
+        .into_iter()
+        .filter(|u| !device_lists_left.contains(u))
+        .collect();
 
     Ok(json!({
         "next_batch": format!("s{current_pos}"),
@@ -507,7 +549,7 @@ pub(crate) fn build_sync_response_with_filter(
         "presence": {"events": presence_events},
         "account_data": {"events": global_account_data},
         "to_device": {"events": to_device_events},
-        "device_lists": {"changed": device_lists_changed, "left": []},
+        "device_lists": {"changed": device_lists_changed, "left": device_lists_left},
         "device_one_time_keys_count": otk_counts,
         "device_unused_fallback_key_types": [],
     }))

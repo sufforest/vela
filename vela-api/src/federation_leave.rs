@@ -344,9 +344,18 @@ pub async fn send_leave_v2(
         .promote_state_event(room_nid, event_nid, type_nid, state_key_nid)
         .map_err(db_err)?;
 
+    // device_lists.left bookkeeping: if the leaver was a joined member,
+    // fan out a peer-departure entry to every observer (other room
+    // members) so their /sync surfaces this user moving out of the
+    // shared device-key set. Run BEFORE apply_membership_change so
+    // get_room_members still includes the observers.
+    let membership_byte = if membership == "ban" { 3u8 } else { 0u8 };
+    let was_joined = state.db.get_membership(room_nid, sender_nid).ok().flatten() == Some(1);
+    if was_joined {
+        crate::keys::record_device_changes_on_leave(&state, sender_nid, room_nid);
+    }
     // Update per-user membership index + notify local sync, then
     // broadcast to remote peers.
-    let membership_byte = if membership == "ban" { 3u8 } else { 0u8 };
     crate::router::apply_membership_change(
         &state,
         room_nid,

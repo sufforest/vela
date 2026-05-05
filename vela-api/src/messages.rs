@@ -524,7 +524,10 @@ pub fn load_client_event(
             .unwrap()
             .as_millis() as u64;
         let age = now.saturating_sub(header.origin_server_ts);
-        event.insert("unsigned".to_string(), json!({"age": age}));
+        let mut unsigned = serde_json::Map::new();
+        unsigned.insert("age".to_string(), json!(age));
+        attach_prev_state_unsigned(state, event_nid, &header, &mut unsigned);
+        event.insert("unsigned".to_string(), Value::Object(unsigned));
     }
 
     event.insert("event_id".to_string(), json!(event_id));
@@ -539,6 +542,42 @@ pub fn load_client_event(
     event.remove("depth");
 
     Ok(Some(Value::Object(event)))
+}
+
+/// Spec: state events carry `unsigned.prev_content` (the content of the
+/// event being replaced), `unsigned.prev_sender` (its sender), and
+/// `unsigned.replaces_state` (its event_id). The `state_replaces` CF
+/// resolves the predecessor in O(1); we then dig out the fields from the
+/// stored event JSON. No-op for non-state events and for the very first
+/// state event of its kind in a room.
+fn attach_prev_state_unsigned(
+    state: &AppState,
+    event_nid: u64,
+    header: &vela_store::db::EventHeader,
+    unsigned: &mut serde_json::Map<String, Value>,
+) {
+    if header.state_key_nid == 0 {
+        return;
+    }
+    let prev_nid = match state.db.get_replaced_state_nid(event_nid) {
+        Ok(Some(n)) => n,
+        _ => return,
+    };
+    let Ok(Some((_, prev_bytes))) = state.db.get_event(prev_nid) else {
+        return;
+    };
+    let Ok(prev_value) = serde_json::from_slice::<Value>(&prev_bytes) else {
+        return;
+    };
+    if let Some(prev_content) = prev_value.get("content").cloned() {
+        unsigned.insert("prev_content".to_string(), prev_content);
+    }
+    if let Some(prev_sender) = prev_value.get("sender").cloned() {
+        unsigned.insert("prev_sender".to_string(), prev_sender);
+    }
+    if let Ok(Some(prev_eid)) = state.db.get_event_id_by_nid(prev_nid) {
+        unsigned.insert("replaces_state".to_string(), json!(prev_eid));
+    }
 }
 
 /// Render an event for client consumption with extra `unsigned`

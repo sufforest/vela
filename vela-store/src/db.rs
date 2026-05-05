@@ -1495,6 +1495,11 @@ impl Database {
         type_nid: u64,
         state_key_nid: u64,
     ) -> Result<(), rocksdb::Error> {
+        // Build the new snapshot from current room_state. persist_event has
+        // already overwritten room_state[(type, state_key)] with event_nid,
+        // so retain-filter the matching entry and re-append (no-op for the
+        // entry, but keeps any other state events for this (type, sk) out
+        // of duplicates if the indexing ever changes).
         let mut all_state_nids = self.get_all_state_event_nids(room_nid)?;
         all_state_nids.retain(|existing| match self.get_event(*existing) {
             Ok(Some((h, _))) => !(h.type_nid == type_nid && h.state_key_nid == state_key_nid),
@@ -1502,7 +1507,72 @@ impl Database {
         });
         all_state_nids.push(event_nid);
         self.persist_state_snapshot(room_nid, event_nid, &all_state_nids)?;
+
+        // Find the predecessor (the state event this one replaces) by
+        // scanning the parent snapshot — i.e. the state BEFORE event_nid
+        // was applied. We can't use current room_state for this because
+        // persist_event already overwrote the (type, state_key) slot with
+        // event_nid; reading there would yield a self-reference and stamp
+        // `unsigned.replaces_state` with the event's own id (regression
+        // observed in TestUnbanViaInvite where a fresh ban/leave reported
+        // its own id as the prior membership event).
+        //
+        // event_state[event_nid] currently holds the parent snapshot id
+        // (set by persist_event); persist_state_snapshot above just
+        // overwrote it, so re-fetch from the new snapshot would be wrong.
+        // We therefore look at the prev_events directly.
+        let prev_event_nids = self.get_prev_events(event_nid)?;
+        let mut replaced: Option<u64> = None;
+        for prev_nid in &prev_event_nids {
+            if let Some(parent_snapshot) = self.get_state_at_event(*prev_nid)? {
+                for candidate in parent_snapshot {
+                    if candidate == event_nid {
+                        continue;
+                    }
+                    if let Ok(Some((h, _))) = self.get_event(candidate)
+                        && h.type_nid == type_nid
+                        && h.state_key_nid == state_key_nid
+                    {
+                        replaced = Some(candidate);
+                        break;
+                    }
+                }
+                if replaced.is_some() {
+                    break;
+                }
+            }
+        }
+        if let Some(prev_nid) = replaced {
+            let cf = self.db.cf_handle("state_replaces").unwrap();
+            self.db
+                .put_cf(&cf, keys::encode_u64(event_nid), keys::encode_u64(prev_nid))?;
+        }
         Ok(())
+    }
+
+    /// Returns the event_nid that this state event replaced (i.e. the
+    /// previous state event with the same (type, state_key)), or None
+    /// if this is the first state event of its kind. Populated by
+    /// `promote_state_event`.
+    pub fn get_replaced_state_nid(&self, event_nid: u64) -> Result<Option<u64>, rocksdb::Error> {
+        let cf = self.db.cf_handle("state_replaces").unwrap();
+        match self.db.get_cf(&cf, keys::encode_u64(event_nid))? {
+            Some(b) => Ok(Some(keys::decode_u64(&b))),
+            None => Ok(None),
+        }
+    }
+
+    /// Record that `event_nid` replaced `prev_nid` in current state.
+    /// Used by federated-join paths which build snapshots manually
+    /// instead of calling `promote_state_event`.
+    pub fn record_state_replaces(
+        &self,
+        event_nid: u64,
+        prev_nid: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("state_replaces").unwrap();
+        self.db
+            .put_cf(&cf, keys::encode_u64(event_nid), keys::encode_u64(prev_nid))
     }
 
     /// Force `room_state[room_nid][type_nid][state_key_nid] = event_nid`.
@@ -2967,6 +3037,58 @@ impl Database {
         Ok(changed_users)
     }
 
+    /// Mirror of `notify_device_key_change` for the "user no longer
+    /// shares a room with X" direction. Each observer gets one entry
+    /// per (departure, pos) so /sync can emit `device_lists.left`.
+    pub fn record_peer_departure(
+        &self,
+        departed_nid: u64,
+        observer_nids: &[u64],
+        stream_pos: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("device_list_left").unwrap();
+        let val = keys::encode_u64(departed_nid);
+        let mut batch = WriteBatch::default();
+        for &obs in observer_nids {
+            if obs == departed_nid {
+                continue;
+            }
+            batch.put_cf(&cf, keys::encode_u64_pair(obs, stream_pos), val);
+        }
+        self.db.write(batch)
+    }
+
+    /// Forward-scan `device_list_left[observer]` between [from, to)
+    /// and return the deduplicated departed user_nids.
+    pub fn get_device_list_left(
+        &self,
+        user_nid: u64,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<u64>, rocksdb::Error> {
+        let cf = self.db.cf_handle("device_list_left").unwrap();
+        let start = keys::encode_u64_pair(user_nid, from);
+        let mut left_users = Vec::new();
+        let iter = self
+            .db
+            .iterator_cf(&cf, IteratorMode::From(&start, rocksdb::Direction::Forward));
+        for item in iter {
+            let (key, val) = item?;
+            if key.len() < 16 {
+                break;
+            }
+            let (observer, pos) = keys::decode_u64_pair(&key);
+            if observer != user_nid || pos >= to {
+                break;
+            }
+            let departed_nid = keys::decode_u64(&val);
+            if !left_users.contains(&departed_nid) {
+                left_users.push(departed_nid);
+            }
+        }
+        Ok(left_users)
+    }
+
     /// Return the prev_events (as NIDs) recorded for an event.
     pub fn get_prev_events(&self, event_nid: u64) -> Result<Vec<u64>, rocksdb::Error> {
         let cf = self.db.cf_handle("event_edges").unwrap();
@@ -3631,20 +3753,29 @@ fn recover_max_presence_stream(db: &DB) -> Option<u64> {
 }
 
 /// Recover max position from `to_device_outbound`. Keys are
-/// `<destination> 0xff <stream_pos_be>`; max position is in the
-/// trailing 8 bytes of the largest key under any prefix.
+/// `<destination> 0xff <stream_pos_be>`. Lex-largest *key* is not
+/// the lex-largest *position* — a destination "z" with pos=10 sorts
+/// after "a" with pos=999, so `IteratorMode::End` would return 11
+/// and the next enqueue under "a" would land at pos=11 (already
+/// delivered, sender skips it; new EDU lost). Scan every entry and
+/// take the global max position.
 fn recover_max_to_device_outbound(db: &DB) -> Option<u64> {
     let cf = db.cf_handle("to_device_outbound")?;
-    let mut iter = db.iterator_cf(&cf, IteratorMode::End);
-    iter.next().and_then(|r| r.ok()).map(|(key, _)| {
+    let mut max_pos: Option<u64> = None;
+    for entry in db.iterator_cf(&cf, IteratorMode::Start) {
+        let (key, _) = match entry {
+            Ok(kv) => kv,
+            Err(_) => continue,
+        };
         if key.len() < 8 {
-            return 1;
+            continue;
         }
-        let pos_bytes = &key[key.len() - 8..];
         let mut buf = [0u8; 8];
-        buf.copy_from_slice(pos_bytes);
-        u64::from_be_bytes(buf) + 1
-    })
+        buf.copy_from_slice(&key[key.len() - 8..]);
+        let pos = u64::from_be_bytes(buf);
+        max_pos = Some(max_pos.map_or(pos, |m| m.max(pos)));
+    }
+    max_pos.map(|m| m + 1)
 }
 
 /// Recover max snapshot NID from state_snapshots CF.
@@ -3836,6 +3967,51 @@ mod stream_recovery_tests {
         let p2 = db.next_stream_position().as_u64();
         let p3 = db.next_stream_position().as_u64();
         assert!(p1 < p2 && p2 < p3, "monotonic: {p1} < {p2} < {p3}");
+    }
+
+    /// Counter recovery for `to_device_outbound` must take the max
+    /// across all destinations, not just the lex-last key. With
+    /// destination "z" holding a small pos and "a" holding a large
+    /// pos, a wrong recovery would resume at the small pos+1 and
+    /// new enqueues under "a" would silently overwrite-or-skip
+    /// already-delivered slots.
+    #[test]
+    fn to_device_outbound_recovers_global_max_across_destinations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path();
+
+        let high_pos_under_a = {
+            let db = Database::open(path).unwrap();
+            // 5 enqueues for "a" (gets pos 1..=5), then 1 for "z" (pos 6).
+            // Without the fix, recovery picks "z" + pos 6 -> counter=7.
+            // With the fix, max is 6 -> counter=7. Same here, so we
+            // arrange the opposite: enqueue under "z" first so its pos
+            // is small, then under "a" so its pos is large. lex-end
+            // returns "z"'s key (small pos), broken recovery jumps
+            // counter back to that.
+            for _ in 0..1 {
+                db.enqueue_to_device_outbound("z.example.com", &serde_json::json!({"first": true}))
+                    .unwrap();
+            }
+            let mut last_a = 0;
+            for i in 0..5 {
+                last_a = db
+                    .enqueue_to_device_outbound("a.example.com", &serde_json::json!({"i": i}))
+                    .unwrap();
+            }
+            last_a
+        };
+
+        // Reopen — counter must be strictly above the highest
+        // persisted pos under any destination.
+        let db = Database::open(path).unwrap();
+        let next = db
+            .enqueue_to_device_outbound("a.example.com", &serde_json::json!({"new": true}))
+            .unwrap();
+        assert!(
+            next > high_pos_under_a,
+            "next pos ({next}) must exceed highest persisted ({high_pos_under_a})"
+        );
     }
 
     /// Mark/lookup roundtrip on `rejected_events`. The cascade

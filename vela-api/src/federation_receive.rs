@@ -114,6 +114,16 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
         );
     }
 
+    // Idempotency: ignore PDUs we already accepted. The /send fan-out
+    // (federation_sender::broadcast) re-echoes accepted events to
+    // every remote in the room, including the origin server, so a
+    // peer's transaction can come back at us under a different
+    // round-trip. Re-persisting would clobber event_ids → nid and
+    // re-fire device-list/membership side effects.
+    if let Ok(Some(_)) = state.db.get_event_nid_by_id(&pdu.event_id) {
+        return (pdu.event_id, PduOutcome::Accepted);
+    }
+
     // Spec limits on array sizes.
     if pdu.auth_events.len() > 10 {
         return (
@@ -241,6 +251,59 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
         }
     };
 
+    // Invite-rescind path. When a remote sends a leave/ban for a
+    // *locally-invited* user, the receiving server can't run normal
+    // state-at-event auth (it has only the invite event, no
+    // power_levels or create). Spec-correct gate: ONLY the original
+    // inviter can rescind. We handle both branches here:
+    //   - sender matches the invite's sender → accept directly
+    //     (mirrors federation_invite's "persist + flip" pattern).
+    //   - sender doesn't match → reject. Falling through to the
+    //     normal pipeline would let auth-chain fetching pull in
+    //     enough state to authorise a room-admin kick that the spec
+    //     forbids over federation, since the receiving server can't
+    //     verify the kick's full authorisation context.
+    if effective_pdu.event_type == "m.room.member"
+        && matches!(effective_pdu.membership(), Some("leave") | Some("ban"))
+        && let Some(target_user_id) = effective_pdu.state_key.as_deref()
+        && target_user_id
+            .split_once(':')
+            .map(|(_, d)| d == state.config.server_name)
+            .unwrap_or(false)
+        && let Ok(target_nid) = state.db.get_or_create_nid(target_user_id)
+        && state.db.get_membership(room_nid, target_nid).ok().flatten() == Some(2)
+    {
+        let inviter_match = state
+            .db
+            .get_nid("m.room.member")
+            .ok()
+            .flatten()
+            .and_then(|type_nid| {
+                state
+                    .db
+                    .get_state_event_nid(room_nid, type_nid, target_nid)
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|invite_nid| state.db.get_event(invite_nid).ok().flatten())
+            .and_then(|(_, bytes)| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|v| v.get("sender").and_then(|s| s.as_str().map(String::from)))
+            .map(|s| s == effective_pdu.sender)
+            .unwrap_or(false);
+        if inviter_match {
+            return (
+                effective_pdu.event_id.clone(),
+                apply_invite_rescind(state, room_nid, &effective_pdu, &effective_event_json).await,
+            );
+        }
+        return (
+            effective_pdu.event_id.clone(),
+            PduOutcome::Rejected(
+                "only the original inviter can rescind an invite over federation".into(),
+            ),
+        );
+    }
+
     // --- Check 4: auth rules against auth_events ---
     // Build a state view from the event's auth_events. On a missing auth event,
     // attempt a bounded fetch from the sender's server via /event_auth.
@@ -269,34 +332,36 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
         let p = match pdu_opt {
             Some(p) => p,
             None => {
-                match fetch_auth_chain(
+                // Spec: `/event_auth/{room}/{event}` returns the auth
+                // chain *for the named event*. Key the fetch on the
+                // event we're validating (the trigger), not on each
+                // missing aev — synapse / dendrite do the same, and
+                // Complement (TestInboundFederationRejectsEventsWith
+                // RejectedAuthEvents) actively forbids a per-aev call
+                // because it lets a malicious peer probe the auth
+                // graph one node at a time, bypassing rejection.
+                let _ = fetch_auth_chain(
                     state,
                     &sender_domain,
                     &effective_pdu.room_id,
-                    aev_id,
+                    &effective_pdu.event_id,
                     fetch_budget.clone(),
                 )
-                .await
-                {
-                    Ok(()) => match load_pdu_by_event_id(state, aev_id) {
-                        Some(p) => p,
-                        None => {
-                            // The fetch may have surfaced a chain
-                            // that included a rejected ancestor; in
-                            // that case `aev_id` is now in
-                            // `rejected_events`. Cascade.
-                            let reason = if state.db.is_event_rejected(aev_id).unwrap_or(false) {
-                                format!("auth_event {aev_id} is rejected")
-                            } else {
-                                format!("auth event {aev_id} still missing after fetch")
-                            };
-                            return (effective_pdu.event_id.clone(), PduOutcome::Rejected(reason));
-                        }
-                    },
-                    Err(e) => {
+                .await;
+                if state.db.is_event_rejected(aev_id).unwrap_or(false) {
+                    return (
+                        effective_pdu.event_id.clone(),
+                        PduOutcome::Rejected(format!("auth_event {aev_id} is rejected")),
+                    );
+                }
+                match load_pdu_by_event_id(state, aev_id) {
+                    Some(p) => p,
+                    None => {
                         return (
                             effective_pdu.event_id.clone(),
-                            PduOutcome::Rejected(format!("fetch auth {aev_id}: {e}")),
+                            PduOutcome::Rejected(format!(
+                                "auth event {aev_id} not provided in /event_auth chain"
+                            )),
                         );
                     }
                 }
@@ -703,6 +768,21 @@ async fn persist_received_pdu(
                 Some("knock") => 4u8,
                 _ => 0u8, // leave or anything else
             };
+            // For join → leave/ban transitions of federated users,
+            // surface the departure to local observers via
+            // device_list_left so /sync's `device_lists.left` reflects
+            // the new "no longer shared" relationship. Run BEFORE the
+            // membership update so `get_room_members` still includes
+            // the observer set.
+            let was_joined = state
+                .db
+                .get_membership(room_nid, state_key_nid)
+                .ok()
+                .flatten()
+                == Some(1);
+            if was_joined && (membership_byte == 0 || membership_byte == 3) {
+                crate::keys::record_device_changes_on_leave(state, state_key_nid, room_nid);
+            }
             if let Err(e) = state
                 .db
                 .set_membership(room_nid, state_key_nid, membership_byte)
@@ -735,9 +815,107 @@ async fn persist_received_pdu(
         if let Some(sender_ch) = state.room_senders.get(&Nid(room_nid)) {
             let _ = sender_ch.send(stream_pos);
         }
+
+        // Relay to other resident remotes. The peer that sent us this
+        // PDU only knows about the destinations IT could reach. We're
+        // a hub for the room's other peers; without this fan-out a
+        // three-way room A→B→C never sees B's events arrive at C
+        // unless B itself federates to C (and B doesn't always know
+        // who's in the room beyond its own peer list).
+        state.federation_sender.broadcast(room_nid, event_nid);
     }
 
     Ok(())
+}
+
+/// Apply an invite-rescind shortcut. Persist the leave/ban PDU,
+/// promote it into current state, flip membership, wake observers.
+/// Bypasses the normal auth/state-at-event/current-state checks
+/// because the receiving server only has the invite event in store
+/// and would otherwise reject the rescind for state-resolution
+/// reasons it can't fix without first joining the room. Caller has
+/// already validated signature, hash, and the inviter-sender match.
+async fn apply_invite_rescind(
+    state: &AppState,
+    room_nid: u64,
+    pdu: &Pdu,
+    effective_event_json: &Map<String, Value>,
+) -> PduOutcome {
+    use vela_core::canonical::canonical_json_object;
+
+    let target_user_id = match pdu.state_key.as_deref() {
+        Some(s) => s,
+        None => return PduOutcome::Rejected("rescind missing state_key".into()),
+    };
+    let type_nid = match state.db.get_or_create_nid("m.room.member") {
+        Ok(n) => n,
+        Err(e) => return PduOutcome::Rejected(format!("nid alloc: {e}")),
+    };
+    let sender_nid = match state.db.get_or_create_nid(&pdu.sender) {
+        Ok(n) => n,
+        Err(e) => return PduOutcome::Rejected(format!("nid alloc: {e}")),
+    };
+    let target_nid = match state.db.get_or_create_nid(target_user_id) {
+        Ok(n) => n,
+        Err(e) => return PduOutcome::Rejected(format!("nid alloc: {e}")),
+    };
+
+    let event_nid = state.db.next_nid();
+    let json_bytes = canonical_json_object(effective_event_json);
+
+    let mut prev_nids: Vec<u64> = Vec::new();
+    for pid in &pdu.prev_events {
+        if let Ok(Some(n)) = state.db.get_event_nid_by_id(pid) {
+            prev_nids.push(n);
+        }
+    }
+    let mut auth_nids: Vec<u64> = Vec::new();
+    for aid in &pdu.auth_events {
+        if let Ok(Some(n)) = state.db.get_event_nid_by_id(aid) {
+            auth_nids.push(n);
+        }
+    }
+
+    let stream_pos = match state.db.persist_event(
+        event_nid,
+        &pdu.event_id,
+        room_nid,
+        type_nid,
+        sender_nid,
+        target_nid,
+        pdu.origin_server_ts,
+        pdu.depth,
+        &json_bytes,
+        &prev_nids,
+        &auth_nids,
+        true,
+        false,
+    ) {
+        Ok(pos) => pos,
+        Err(e) => return PduOutcome::Rejected(format!("persist: {e}")),
+    };
+    if let Err(e) = state
+        .db
+        .promote_state_event(room_nid, event_nid, type_nid, target_nid)
+    {
+        return PduOutcome::Rejected(format!("promote: {e}"));
+    }
+    let new_membership: u8 = if pdu.membership() == Some("ban") {
+        3
+    } else {
+        0
+    };
+    if let Err(e) = state
+        .db
+        .set_membership(room_nid, target_nid, new_membership)
+    {
+        return PduOutcome::Rejected(format!("set_membership: {e}"));
+    }
+    crate::router::notify_user(state, target_nid);
+    if let Some(sender_ch) = state.room_senders.get(&Nid(room_nid)) {
+        let _ = sender_ch.send(stream_pos);
+    }
+    PduOutcome::Accepted
 }
 
 /// Record an `m.relates_to` index entry for an inbound event, mirroring
@@ -1379,6 +1557,12 @@ pub async fn persist_join_event(
     if let Some(sender_ch) = state.room_senders.get(&Nid(room_nid)) {
         let _ = sender_ch.send(stream_pos);
     }
+
+    // Fan-out to other resident remotes. Without this, the just-joined
+    // server is the only peer that knows about itself — bob@hs2 looking
+    // up "who's in this room" for federation will miss charlie@hs3 and
+    // skip delivery, breaking three-server rooms (TestACLs sentinel).
+    state.federation_sender.broadcast(room_nid, event_nid);
 
     Ok(())
 }

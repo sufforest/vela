@@ -616,6 +616,7 @@ pub async fn create_room(
             room_nid,
             room_id.clone(),
             target.clone(),
+            body.is_direct == Some(true),
         )
         .await
         {
