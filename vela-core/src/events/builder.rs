@@ -19,27 +19,31 @@ use crate::events::room_version::RoomVersion;
 use crate::events::sign::ServerSigningKey;
 use crate::identifiers::{EventId, RoomId};
 
-/// Process-wide monotonic timestamp counter (milliseconds since Unix
-/// epoch). Two calls to `monotonic_now_ms()` within the same wall-clock
-/// millisecond return *different* values — the counter always advances
-/// by at least 1. v12 derives `room_id` from `hash(redacted create
-/// event)`, and parallel createRoom calls with identical content +
-/// identical sender + identical ms-resolution timestamps would collide
-/// on the same room_id, causing alias/state cross-contamination across
-/// independent rooms. The strictly-increasing counter guarantees every
-/// event built in this process has a unique `origin_server_ts` and
-/// therefore a unique reference hash.
-static LAST_TS_MS: AtomicU64 = AtomicU64::new(0);
+/// Strictly-increasing counter scoped to `m.room.create` events only.
+/// v12 derives `room_id` from `hash(redacted create event)`, so two
+/// parallel createRoom calls with identical content, identical sender,
+/// and identical ms-resolution timestamps would collide on the same
+/// room_id and cross-contaminate state. Bumping the create event's ts
+/// by at least 1ms over the last create guarantees a unique reference
+/// hash. Non-create events use plain wall-clock — MSC3030 jump-to-date
+/// relies on event tses tracking real time, and a process-wide
+/// monotonic counter pushes state-event tses ahead of the test
+/// client's `time.Now()` even when wall-clock hasn't moved.
+static LAST_CREATE_TS_MS: AtomicU64 = AtomicU64::new(0);
 
-fn monotonic_now_ms() -> u64 {
-    let now = SystemTime::now()
+fn wall_now_ms() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_millis() as u64;
-    let mut prev = LAST_TS_MS.load(Ordering::Acquire);
+        .as_millis() as u64
+}
+
+fn monotonic_create_ts_ms() -> u64 {
+    let now = wall_now_ms();
+    let mut prev = LAST_CREATE_TS_MS.load(Ordering::Acquire);
     loop {
         let next = now.max(prev.saturating_add(1));
-        match LAST_TS_MS.compare_exchange(prev, next, Ordering::AcqRel, Ordering::Acquire) {
+        match LAST_CREATE_TS_MS.compare_exchange(prev, next, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return next,
             Err(actual) => prev = actual,
         }
@@ -62,7 +66,12 @@ pub fn build_event(
     server_name: &str,
     _room_version: RoomVersion,
 ) -> (Map<String, Value>, EventId) {
-    let now = monotonic_now_ms();
+    let is_create = event_type == "m.room.create";
+    let now = if is_create {
+        monotonic_create_ts_ms()
+    } else {
+        wall_now_ms()
+    };
 
     let mut event = Map::new();
     event.insert("type".to_string(), json!(event_type));
@@ -76,7 +85,6 @@ pub fn build_event(
     }
 
     // room_id: required on all events EXCEPT m.room.create in v12
-    let is_create = event_type == "m.room.create";
     if let Some(rid) = room_id
         && !(is_create && _room_version.omit_room_id_from_create())
     {
@@ -314,42 +322,42 @@ mod tests {
         assert!(event_id.as_str().starts_with('$'));
     }
 
-    /// Monotonic timestamp guard: even when called in rapid succession
-    /// inside a single millisecond, every call must return a strictly
-    /// greater value than the previous. v12 derives `room_id` from the
-    /// hash of the redacted create event, which includes
-    /// `origin_server_ts` — duplicates would collide rooms across
-    /// parallel createRoom requests.
+    /// Monotonic timestamp guard for `m.room.create`: even when called
+    /// in rapid succession inside a single millisecond, every call must
+    /// return a strictly greater value than the previous. v12 derives
+    /// `room_id` from the hash of the redacted create event, which
+    /// includes `origin_server_ts` — duplicates would collide rooms
+    /// across parallel createRoom requests.
     #[test]
-    fn monotonic_now_ms_strictly_increases_under_rapid_calls() {
+    fn monotonic_create_ts_ms_strictly_increases_under_rapid_calls() {
         let mut prev = 0u64;
         for _ in 0..10_000 {
-            let now = monotonic_now_ms();
+            let now = monotonic_create_ts_ms();
             assert!(
                 now > prev,
-                "monotonic_now_ms returned {now} after {prev}; must strictly increase"
+                "monotonic_create_ts_ms returned {now} after {prev}; must strictly increase"
             );
             prev = now;
         }
     }
 
-    /// Two events built back-to-back with identical inputs must end
-    /// up with different `origin_server_ts` (and therefore different
-    /// reference hashes). This is the property the room_id collision
-    /// fix relies on.
+    /// Two `m.room.create` events built back-to-back must hash
+    /// differently — that's the property the v12 room_id collision
+    /// fix relies on. Non-create events can share an `origin_server_ts`
+    /// with their predecessor; their uniqueness comes from prev_events
+    /// chaining in real flows, not from the timestamp counter.
     #[test]
-    fn build_event_back_to_back_has_distinct_timestamps_and_ids() {
+    fn build_create_event_back_to_back_has_distinct_timestamps_and_ids() {
         let key = ServerSigningKey::generate();
-        let room_id = RoomId::parse("!collide:example.com").unwrap();
         let mut prev_id: Option<EventId> = None;
         let mut prev_ts: Option<u64> = None;
         for _ in 0..50 {
             let (event, event_id) = build_event(
-                "m.room.message",
-                None,
-                json!({"msgtype": "m.text", "body": "hi"}),
+                "m.room.create",
+                Some(""),
+                json!({"creator": "@alice:example.com", "room_version": "12"}),
                 "@alice:example.com",
-                Some(&room_id),
+                None,
                 &[],
                 &[],
                 1,
@@ -359,12 +367,12 @@ mod tests {
             );
             let ts = event["origin_server_ts"].as_u64().unwrap();
             if let Some(p) = prev_ts {
-                assert!(ts > p, "ts not strictly increasing: {p} -> {ts}");
+                assert!(ts > p, "create ts not strictly increasing: {p} -> {ts}");
             }
             if let Some(p) = prev_id {
                 assert_ne!(
                     p, event_id,
-                    "back-to-back identical events must hash differently"
+                    "back-to-back identical create events must hash differently"
                 );
             }
             prev_ts = Some(ts);
