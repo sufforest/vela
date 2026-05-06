@@ -388,7 +388,16 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
     // permanently unrootable.
     let mut missing_prev = false;
     for pid in &effective_pdu.prev_events {
-        if state.db.get_event_nid_by_id(pid).ok().flatten().is_none() {
+        if state.db.get_event_nid_by_id(pid).ok().flatten().is_none()
+            && !state.db.is_event_rejected(pid).unwrap_or(false)
+        {
+            // Genuinely missing — try to fill the gap. A prev that's
+            // marked rejected isn't "missing" in the sense that warrants
+            // a /get_missing_events probe; the upstream server already
+            // told us about it (it just didn't pass auth). Calling
+            // /get_missing_events for a known-rejected ancestor confuses
+            // peers and trips Complement's UnexpectedRequestsAreErrors
+            // (TestInboundFederationRejectsEventsWithRejectedAuthEvents).
             missing_prev = true;
             break;
         }
@@ -416,7 +425,18 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
     // --- Check 5: state-at-event ---
     // Resolve state from each prev_event's state_snapshot via state_res v2.
     match compute_state_at_event(state, &effective_pdu).await {
-        Ok(Some(state_at_event)) => {
+        Ok(Some(mut state_at_event)) => {
+            // v12 (MSC4291): m.room.create isn't a state event in the
+            // post-state snapshot, so it's absent from the resolved
+            // state_at_event map. The auth-check rules read the create
+            // event for the creator identity; without injection, every
+            // federated PDU would fail Check 5 with "no m.room.create
+            // in state" — which is exactly what TestSyncTimelineGap hit.
+            crate::federation_state::ensure_create_in_state(
+                &state.db,
+                room_nid,
+                &mut state_at_event,
+            );
             let sf = |t: &str, sk: &str| state_at_event.get(&(t.to_string(), sk.to_string()));
             if let Err(AuthError::Rejected(reason)) = check_auth(&effective_pdu, &sf) {
                 let keys: Vec<String> = state_at_event
