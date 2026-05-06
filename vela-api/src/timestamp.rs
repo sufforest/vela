@@ -124,29 +124,62 @@ pub async fn timestamp_to_event(
         });
     }
 
-    // Federation fallback (MSC3030): if local search came up empty,
-    // ask remote servers in the room. The closer answer beats no
-    // answer; we backfill the returned event so subsequent /context
-    // and /messages requests find it locally.
-    if best.is_none()
-        && let Some(answer) =
-            remote_timestamp_to_event(&state, room_nid, &room_id_str, q.ts, &q.dir).await
-    {
-        return Ok(Json(answer));
-    }
+    // Federation fallback (MSC3030): always query peers when the room
+    // is federated, then pick whichever answer is closer to ts. Local
+    // empty alone isn't a sufficient trigger — after send_join we have
+    // some state events, so a local search returns *something*, but
+    // that something can be far from ts when the timeline messages
+    // we're after were sent before we joined and never reached us.
+    let remote_answer =
+        remote_timestamp_to_event(&state, room_nid, &room_id_str, q.ts, &q.dir).await;
 
-    let (event_ts, _, event_nid) =
-        best.ok_or_else(|| ApiError(VelaError::NotFound("no event matches timestamp".into())))?;
-    let event_id = state
-        .db
-        .get_event_id_by_nid(event_nid)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        .ok_or_else(|| ApiError(VelaError::NotFound("no event matches timestamp".into())))?;
+    let local_answer = if let Some((event_ts, _, event_nid)) = best {
+        let event_id = state
+            .db
+            .get_event_id_by_nid(event_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        event_id.map(|eid| (eid, event_ts))
+    } else {
+        None
+    };
+
+    let chosen = match (local_answer, remote_answer) {
+        (Some(local), None) => local,
+        (None, Some(remote_v)) => extract_remote(&remote_v)
+            .ok_or_else(|| ApiError(VelaError::NotFound("no event matches timestamp".into())))?,
+        (Some(local), Some(remote_v)) => {
+            let remote = extract_remote(&remote_v);
+            match remote {
+                Some(rem) => closer_to(q.ts, local, rem),
+                None => local,
+            }
+        }
+        (None, None) => {
+            return Err(ApiError(VelaError::NotFound(
+                "no event matches timestamp".into(),
+            )));
+        }
+    };
 
     Ok(Json(json!({
-        "event_id": event_id,
-        "origin_server_ts": event_ts,
+        "event_id": chosen.0,
+        "origin_server_ts": chosen.1,
     })))
+}
+
+fn extract_remote(resp: &Value) -> Option<(String, u64)> {
+    let event_id = resp
+        .get("event_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())?;
+    let ts = resp.get("origin_server_ts").and_then(|v| v.as_u64())?;
+    Some((event_id, ts))
+}
+
+fn closer_to(target: u64, a: (String, u64), b: (String, u64)) -> (String, u64) {
+    let da = target.abs_diff(a.1);
+    let db = target.abs_diff(b.1);
+    if da <= db { a } else { b }
 }
 
 /// Iterate remote members of `room_nid` asking each for their best

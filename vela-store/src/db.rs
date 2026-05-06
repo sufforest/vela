@@ -2618,6 +2618,32 @@ impl Database {
         Ok(pos)
     }
 
+    /// Lookup the event_id of the most recent receipt of `receipt_type`
+    /// (e.g. "m.read") that `user_nid` posted in `room_nid`, or `None`
+    /// if no such receipt exists. Used by /sync to compute
+    /// `unread_notifications` against the user's last-seen position.
+    pub fn get_user_receipt_event_id(
+        &self,
+        room_nid: u64,
+        receipt_type: &str,
+        user_nid: u64,
+    ) -> Result<Option<String>, rocksdb::Error> {
+        let cf = self.db.cf_handle("receipts").unwrap();
+        let key = receipt_key(room_nid, receipt_type, user_nid);
+        match self.db.get_cf(&cf, &key)? {
+            Some(bytes) => {
+                let v: Value = match serde_json::from_slice(&bytes) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(None),
+                };
+                Ok(v.get("event_id")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string()))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Scan `receipts_stream` strictly after `cursor`, returning up to
     /// `limit` entries plus the new cursor (= position of the last
     /// entry returned, or `cursor` if none). Each entry is the raw
@@ -3098,6 +3124,39 @@ impl Database {
         }
     }
 
+    /// Resolve prev_event NIDs by parsing the stored event JSON.
+    /// `persist_event` only records prevs whose NIDs were resolvable at
+    /// write time — for a federated join the prev_events are messages
+    /// on the originating server we don't have NIDs for, so the cache
+    /// is empty. The spec keeps prev_events as event_id strings in the
+    /// event JSON, so reading there is authoritative whenever we need
+    /// the original list (e.g. driving a /backfill request). Falls
+    /// back to the cached array when JSON isn't usable.
+    pub fn get_prev_events_from_json(&self, event_nid: u64) -> Result<Vec<u64>, rocksdb::Error> {
+        let Some((_, json_bytes)) = self.get_event(event_nid)? else {
+            return self.get_prev_events(event_nid);
+        };
+        let value: Value = match serde_json::from_slice(&json_bytes) {
+            Ok(v) => v,
+            Err(_) => return self.get_prev_events(event_nid),
+        };
+        let Some(arr) = value.get("prev_events").and_then(|v| v.as_array()) else {
+            return self.get_prev_events(event_nid);
+        };
+        let mut resolved: Vec<u64> = Vec::with_capacity(arr.len());
+        for v in arr {
+            if let Some(eid) = v.as_str()
+                && let Ok(Some(n)) = self.get_event_nid_by_id(eid)
+            {
+                resolved.push(n);
+            }
+        }
+        if resolved.is_empty() {
+            return self.get_prev_events(event_nid);
+        }
+        Ok(resolved)
+    }
+
     /// Return the auth_events (as NIDs) recorded for an event.
     pub fn get_auth_events(&self, event_nid: u64) -> Result<Vec<u64>, rocksdb::Error> {
         let cf = self.db.cf_handle("event_auth_edges").unwrap();
@@ -3145,7 +3204,12 @@ impl Database {
 
         // Seed: enqueue the start event's prev_events. Start event itself
         // is excluded.
-        let start_prev = self.get_prev_events(start_event_nid)?;
+        // Use JSON-derived prev_events: a freshly-joined peer's join
+        // event has empty event_edges (the original prev event ids
+        // weren't resolvable to NIDs at send_join time), but reading
+        // the join's stored JSON gives us the authoritative list and
+        // any NIDs that have since been backfilled in resolve here.
+        let start_prev = self.get_prev_events_from_json(start_event_nid)?;
         for p in start_prev {
             if !seen.contains(&p)
                 && let Some(key) = self.event_walk_key(p)?
@@ -3164,7 +3228,7 @@ impl Database {
             if out.len() >= limit {
                 break;
             }
-            let prevs = self.get_prev_events(nid)?;
+            let prevs = self.get_prev_events_from_json(nid)?;
             for p in prevs {
                 if seen.contains(&p) {
                     continue;
@@ -3378,21 +3442,36 @@ impl Database {
     /// pending entry, so the federation sender can spawn a task per
     /// stuck queue without waiting for a fresh broadcast.
     pub fn list_outbound_destinations(&self) -> Result<Vec<String>, rocksdb::Error> {
-        let cf = self.db.cf_handle("federation_outbox").unwrap();
+        // Scan every outbound CF that holds per-destination work, not just
+        // the PDU outbox. EDU queues (to-device, device-list updates,
+        // signing-key updates) all share the same key shape
+        // `<destination> 0xff <pos>`. After a crash with only an EDU
+        // pending for some peer, scanning federation_outbox alone would
+        // miss that peer entirely; the sender wouldn't start for it and
+        // the EDU would sit forever (this was the cause of
+        // TestToDeviceMessagesOverFederation/stopped_server failing).
+        let cfs = [
+            "federation_outbox",
+            "to_device_outbound",
+            "device_list_outbound",
+            "signing_key_update_outbound",
+        ];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut destinations: Vec<String> = Vec::new();
-        let mut last_seen: Option<String> = None;
-        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
-        for item in iter {
-            let (key, _) = item?;
-            // Key is `dest_bytes || 0xff || stream_pos(8)`. Find the
-            // separator to recover destination.
-            let Some(sep_idx) = key.iter().position(|&b| b == 0xff) else {
+        for cf_name in cfs {
+            let Some(cf) = self.db.cf_handle(cf_name) else {
                 continue;
             };
-            let dest = String::from_utf8_lossy(&key[..sep_idx]).into_owned();
-            if last_seen.as_deref() != Some(&dest) {
-                destinations.push(dest.clone());
-                last_seen = Some(dest);
+            let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+            for item in iter {
+                let (key, _) = item?;
+                let Some(sep_idx) = key.iter().position(|&b| b == 0xff) else {
+                    continue;
+                };
+                let dest = String::from_utf8_lossy(&key[..sep_idx]).into_owned();
+                if seen.insert(dest.clone()) {
+                    destinations.push(dest);
+                }
             }
         }
         Ok(destinations)

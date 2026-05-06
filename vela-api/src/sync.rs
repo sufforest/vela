@@ -848,6 +848,59 @@ fn build_room_sync_for_user(
         None => Vec::new(),
     };
 
+    // Approximate unread_notifications by counting non-state events
+    // newer than the user's m.read receipt that aren't from the user
+    // themselves. Highlights aren't matched against push rules yet
+    // (full push-rule application is a separate effort), but the
+    // notification count alone is enough for clients that only check
+    // the room badge — and for TestThreadedReceipts, which expects a
+    // positive count when user-2 has unread messages from user-1.
+    let (notification_count, highlight_count) = match user_nid {
+        Some(uid) => {
+            let read_eid = state
+                .db
+                .get_user_receipt_event_id(room_nid, "m.read", uid)
+                .ok()
+                .flatten();
+            let mut found_receipt = read_eid.is_none();
+            let mut count = 0u64;
+            let mut highlights = 0u64;
+            let user_id_str = state.db.resolve_nid(uid).ok().flatten().unwrap_or_default();
+            for ev in &timeline_events {
+                if !found_receipt {
+                    if ev.get("event_id").and_then(|v| v.as_str()) == read_eid.as_deref() {
+                        found_receipt = true;
+                    }
+                    continue;
+                }
+                let ev_type = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let sender = ev.get("sender").and_then(|v| v.as_str()).unwrap_or("");
+                let is_state = ev.get("state_key").is_some();
+                if is_state || sender == user_id_str {
+                    continue;
+                }
+                if matches!(ev_type, "m.room.message" | "m.room.encrypted") {
+                    count = count.saturating_add(1);
+                    // .m.rule.contains_user_name highlight (partial push-
+                    // rules implementation): body containing the user's
+                    // MXID flags as a highlight. Doesn't cover
+                    // contains_display_name; that needs profile lookup
+                    // and is the gap blocking TestThreadedReceipts'
+                    // display-name highlight expectations.
+                    let body = ev
+                        .pointer("/content/body")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !user_id_str.is_empty() && body.contains(&user_id_str) {
+                        highlights = highlights.saturating_add(1);
+                    }
+                }
+            }
+            (count, highlights)
+        }
+        None => (0, 0),
+    };
+
     Ok(json!({
         "state": {"events": state_events},
         "timeline": {
@@ -862,8 +915,8 @@ fn build_room_sync_for_user(
         "ephemeral": {"events": ephemeral_events},
         "account_data": {"events": room_account_data},
         "unread_notifications": {
-            "highlight_count": 0,
-            "notification_count": 0,
+            "highlight_count": highlight_count,
+            "notification_count": notification_count,
         },
     }))
 }

@@ -232,11 +232,15 @@ pub async fn get_messages(
         });
     }
 
-    let mut response = json!({
-        "chunk": chunk,
-        "start": start_token,
-        "end": end_token,
-    });
+    // Spec: omit `end` when there are no further events. Returning
+    // an empty string leaves Matrix clients pin-polling forever.
+    let mut response = serde_json::Map::new();
+    response.insert("chunk".to_string(), json!(chunk));
+    response.insert("start".to_string(), json!(start_token));
+    if !end_token.is_empty() {
+        response.insert("end".to_string(), json!(end_token));
+    }
+    let mut response = Value::Object(response);
 
     // `lazy_load_members`: if the filter requests it, surface the
     // m.room.member state events for every distinct sender in the
@@ -441,39 +445,53 @@ async fn paginate_dag(
         }
     }
 
-    // The start token reflects where this page begins (the cursor we received).
-    // The end token reflects the last event of this page, suitable for the
-    // next backwards request. Empty chunk → both equal the cursor.
+    // Spec (CS-API §/messages): `end` MUST be omitted when the start of
+    // the room has been reached. Returning the cursor as `end` whenever
+    // the chunk is empty makes Matrix clients pin-poll forever — they
+    // only stop on the absent `end` signal. Emit `end` only when we
+    // actually advanced past the cursor; otherwise drop the field so
+    // the client knows there's nothing further.
     let start_token = format!("e{from_event_id}");
-    let end_token = match last_event_id {
-        Some(eid) => format!("e{eid}"),
-        None => format!("e{from_event_id}"),
-    };
+    let mut body = serde_json::Map::new();
+    body.insert("chunk".to_string(), json!(chunk));
+    body.insert("start".to_string(), json!(start_token));
+    if let Some(eid) = last_event_id {
+        body.insert("end".to_string(), json!(format!("e{eid}")));
+    }
 
-    Ok(Json(json!({
-        "chunk": chunk,
-        "start": start_token,
-        "end": end_token,
-    })))
+    Ok(Json(Value::Object(body)))
 }
 
-/// Look up an event's prev_events and resolve them to event_id strings.
-/// Returns Ok(Some(ids)) on success, Ok(None) on missing event_nid, Err on DB error.
+/// Look up an event's prev_event ids. Reads from the stored event JSON
+/// rather than the `event_edges` NID array — `persist_event` drops
+/// prev_events whose NIDs aren't resolvable at write time, so a
+/// federated join's prev_events (messages on the originating server)
+/// end up missing from the cache. Backfill needs those original ids
+/// to know where to start the peer's BFS.
 fn collect_prev_event_ids(
     state: &AppState,
     event_nid: u64,
 ) -> Result<Option<Vec<String>>, rocksdb::Error> {
-    let prevs = state.db.get_prev_events(event_nid)?;
+    let Some((_, json_bytes)) = state.db.get_event(event_nid)? else {
+        return Ok(None);
+    };
+    let value: Value = match serde_json::from_slice(&json_bytes) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let prevs: Vec<String> = value
+        .get("prev_events")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
     if prevs.is_empty() {
         return Ok(None);
     }
-    let mut out = Vec::with_capacity(prevs.len());
-    for p in prevs {
-        if let Some(eid) = state.db.get_event_id_by_nid(p)? {
-            out.push(eid);
-        }
-    }
-    Ok(Some(out))
+    Ok(Some(prevs))
 }
 
 /// Load an event from storage and format it for client consumption.
@@ -908,52 +926,72 @@ pub async fn get_event_context(
         .db
         .get_timeline_range(room_nid, 0, u64::MAX, MAX_CONTEXT_TIMELINE_SCAN)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    let pivot_pos: u64 = timeline
+    // Outlier events (no stream_pos — typically backfilled or fetched
+    // via /timestamp_to_event) aren't in room_timeline. Returning a
+    // bogus s{u64::MAX} would point /messages at the live timeline
+    // edge, missing the historical chain the caller actually wants
+    // to walk. Use a DAG cursor in that case so /messages goes
+    // through paginate_dag and walks prev_events from this event.
+    let pivot_pos: Option<u64> = timeline
         .iter()
         .find(|(_, nid)| *nid == event_nid)
-        .map(|(p, _)| *p)
-        .unwrap_or(u64::MAX);
+        .map(|(p, _)| *p);
 
     // events_before — chronological per Synapse parity, oldest-to-newest,
     // walk backwards from the pivot then reverse for the response array.
-    let before_entries = state
-        .db
-        .get_timeline_before(room_nid, pivot_pos, half)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    let mut before: Vec<Value> = Vec::with_capacity(before_entries.len());
-    let mut start_token = format!("s{pivot_pos}");
-    let mut e = before_entries;
-    e.reverse();
-    for (pos, enid) in &e {
-        if let Some(ev) = load_client_event_with_relations(
-            &state,
-            *enid,
-            &room_id_str,
-            Some((user.user_nid, &user.device_id)),
-        )? {
-            before.push(ev);
-            start_token = format!("s{pos}");
+    // Outlier pivot (no stream_pos): skip the stream-pos slice — the
+    // chunk only covers timeline events anyway, and the tokens below
+    // switch to a DAG cursor that lets /messages walk via prev_events.
+    let (before, start_token, after, end_token) = if let Some(pp) = pivot_pos {
+        let before_entries = state
+            .db
+            .get_timeline_before(room_nid, pp, half)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        let mut before: Vec<Value> = Vec::with_capacity(before_entries.len());
+        let mut start_token = format!("s{pp}");
+        let mut e = before_entries;
+        e.reverse();
+        for (pos, enid) in &e {
+            if let Some(ev) = load_client_event_with_relations(
+                &state,
+                *enid,
+                &room_id_str,
+                Some((user.user_nid, &user.device_id)),
+            )? {
+                before.push(ev);
+                start_token = format!("s{pos}");
+            }
         }
-    }
 
-    // events_after — exclusive of pivot.
-    let after_entries = state
-        .db
-        .get_timeline_range(room_nid, pivot_pos.saturating_add(1), u64::MAX, half)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    let mut after: Vec<Value> = Vec::with_capacity(after_entries.len());
-    let mut end_token = format!("s{pivot_pos}");
-    for (pos, enid) in &after_entries {
-        if let Some(ev) = load_client_event_with_relations(
-            &state,
-            *enid,
-            &room_id_str,
-            Some((user.user_nid, &user.device_id)),
-        )? {
-            after.push(ev);
-            end_token = format!("s{pos}");
+        let after_entries = state
+            .db
+            .get_timeline_range(room_nid, pp.saturating_add(1), u64::MAX, half)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        let mut after: Vec<Value> = Vec::with_capacity(after_entries.len());
+        let mut end_token = format!("s{pp}");
+        for (pos, enid) in &after_entries {
+            if let Some(ev) = load_client_event_with_relations(
+                &state,
+                *enid,
+                &room_id_str,
+                Some((user.user_nid, &user.device_id)),
+            )? {
+                after.push(ev);
+                end_token = format!("s{pos}");
+            }
         }
-    }
+        (before, start_token, after, end_token)
+    } else {
+        // DAG cursor for outlier pivots — /messages will hit
+        // paginate_dag and walk prev_events, triggering attempt_backfill
+        // when it reaches an unknown ancestor.
+        (
+            Vec::new(),
+            format!("e{event_id}"),
+            Vec::new(),
+            format!("e{event_id}"),
+        )
+    };
 
     // Current state of the room. Spec is loose about whether this is
     // state-at-event or current state; matrix-org/matrix-spec/issues/1729
