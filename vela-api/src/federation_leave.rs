@@ -308,14 +308,26 @@ pub async fn send_leave_v2(
     let state_key_nid = state.db.get_or_create_nid(state_key).map_err(db_err)?;
     let mut prev_nids: Vec<u64> = Vec::new();
     for pid in &pdu.prev_events {
-        if let Ok(Some(n)) = state.db.get_event_nid_by_id(pid) {
-            prev_nids.push(n);
+        match state.db.get_event_nid_by_id(pid) {
+            Ok(Some(n)) => prev_nids.push(n),
+            Ok(None) => {
+                debug!(event_id = %pdu.event_id, prev_event = %pid, "send_leave: prev_event unknown locally, dropped from event_edges")
+            }
+            Err(e) => {
+                debug!(event_id = %pdu.event_id, prev_event = %pid, error = %e, "send_leave: prev_event lookup error")
+            }
         }
     }
     let mut auth_nids: Vec<u64> = Vec::new();
     for aid in &pdu.auth_events {
-        if let Ok(Some(n)) = state.db.get_event_nid_by_id(aid) {
-            auth_nids.push(n);
+        match state.db.get_event_nid_by_id(aid) {
+            Ok(Some(n)) => auth_nids.push(n),
+            Ok(None) => {
+                debug!(event_id = %pdu.event_id, auth_event = %aid, "send_leave: auth_event unknown locally, dropped from event_auth_edges")
+            }
+            Err(e) => {
+                debug!(event_id = %pdu.event_id, auth_event = %aid, error = %e, "send_leave: auth_event lookup error")
+            }
         }
     }
     let event_nid = state.db.next_nid();

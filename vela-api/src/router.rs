@@ -111,6 +111,15 @@ pub struct AppState {
     /// "changed" by the always-current EDU and clients would receive
     /// redundant typing events.
     pub typing_change_pos: Arc<DashMap<u64, u64>>,
+    /// Stream position of the most recent `/get_missing_events` or
+    /// `/state_ids` fetch in each room — i.e. the last time we plugged
+    /// a federation gap. /sync's `limited` flag is true on any batch
+    /// whose `since` predates this position, signalling that earlier
+    /// events in the room may be missing from the local view (per
+    /// spec: "homeserver determined the timeline events were
+    /// inadequate to render the room state at the start of the
+    /// batch"). TestSyncTimelineGap covers this.
+    pub last_gap_fill_pos: Arc<DashMap<u64, u64>>,
     /// Federation outbound typing buffer (also registered in the
     /// federation sender's stream list). Held here as a concrete handle
     /// so the local /typing handler can `enqueue()` on every PUT.
@@ -306,6 +315,12 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/context/{event_id}",
+            get(messages::get_event_context),
+        )
+        // r0 alias for legacy clients (and TestJumpToDateEndpoint's
+        // pagination sub-test, which still issues r0 URIs).
+        .route(
+            "/_matrix/client/r0/rooms/{room_id}/context/{event_id}",
             get(messages::get_event_context),
         )
         .route(

@@ -230,10 +230,11 @@ async fn bootstrap_remote_room(
         .create_room_meta(room_nid, room_id.as_str(), room_version);
 
     // --- Auth chain (historical) ---
-    // Persist with suppress_current_state=true — these are ancestors, not live state.
-    // Sort by depth ascending so ancestors are persisted before events that
-    // reference them; without this, `auth_nids` lookups silently drop edges
-    // when an event's ancestor isn't yet in the DB.
+    // Outlier: events CF only — auth chain events are ancestors, never on
+    // the live timeline, never current state. Sort by depth ascending so
+    // ancestors are persisted before events that reference them; otherwise
+    // `auth_nids` lookups silently drop edges when an event's ancestor
+    // isn't yet in the DB.
     let auth_chain = send_join_resp
         .get("auth_chain")
         .and_then(|v| v.as_array())
@@ -241,18 +242,24 @@ async fn bootstrap_remote_room(
         .unwrap_or_default();
     let auth_chain_sorted = sort_by_depth(auth_chain);
     for ev in &auth_chain_sorted {
-        if let Err(e) = persist_remote_event(state, room_nid, ev, true).await {
+        if let Err(e) =
+            persist_remote_event(state, room_nid, ev, vela_store::db::PersistKind::Outlier).await
+        {
             debug!(error = %e, "auth_chain event skipped");
         }
     }
 
     // --- State (current) ---
-    // suppress_current_state=false so these DO update room_state. But per spec,
-    // send_join's `state` is the state PRIOR to the join. We want that to be
-    // our current state's baseline; our join event (processed next) will add
-    // the sender's m.room.member on top.
+    // StateBundleOnly: state events from send_join define current state for
+    // the joining server but predate the join — they update room_state so
+    // /sync's state field reflects them, but DON'T enter the timeline (no
+    // stream_pos) and DON'T replace forward extremities. This is critical
+    // for /messages: with stream_pos these state events would surface as
+    // "events" the joining user can paginate through, blocking the
+    // backfill DAG-walk from the join event back through real history.
     //
-    // Collect state_event NIDs as we go so we can assemble a snapshot.
+    // The join event itself is persisted next as Live and becomes the
+    // post-join extremity.
     let state_events = send_join_resp
         .get("state")
         .and_then(|v| v.as_array())
@@ -268,7 +275,13 @@ async fn bootstrap_remote_room(
         // state_nids is a subset of the true state and later snapshots miss
         // key state events — e.g. the creator's m.room.member, yielding
         // "sender is not joined" rejections for any subsequent message PDU.
-        let nid_result = persist_remote_event(state, room_nid, ev, false).await;
+        let nid_result = persist_remote_event(
+            state,
+            room_nid,
+            ev,
+            vela_store::db::PersistKind::StateBundleOnly,
+        )
+        .await;
         let resolved_nid: Option<u64> = match nid_result {
             Ok(Some(nid)) => Some(nid),
             Ok(None) => {
@@ -368,14 +381,26 @@ async fn bootstrap_remote_room(
 
     let mut prev_nids: Vec<u64> = Vec::new();
     for pid in &join_pdu.prev_events {
-        if let Ok(Some(n)) = state.db.get_event_nid_by_id(pid) {
-            prev_nids.push(n);
+        match state.db.get_event_nid_by_id(pid) {
+            Ok(Some(n)) => prev_nids.push(n),
+            Ok(None) => {
+                debug!(event_id = %event_id, prev_event = %pid, "outbound_join: prev_event unknown locally, dropped from event_edges")
+            }
+            Err(e) => {
+                debug!(event_id = %event_id, prev_event = %pid, error = %e, "outbound_join: prev_event lookup error")
+            }
         }
     }
     let mut auth_nids: Vec<u64> = Vec::new();
     for aid in &join_pdu.auth_events {
-        if let Ok(Some(n)) = state.db.get_event_nid_by_id(aid) {
-            auth_nids.push(n);
+        match state.db.get_event_nid_by_id(aid) {
+            Ok(Some(n)) => auth_nids.push(n),
+            Ok(None) => {
+                debug!(event_id = %event_id, auth_event = %aid, "outbound_join: auth_event unknown locally, dropped from event_auth_edges")
+            }
+            Err(e) => {
+                debug!(event_id = %event_id, auth_event = %aid, error = %e, "outbound_join: auth_event lookup error")
+            }
         }
     }
 
@@ -447,7 +472,7 @@ async fn persist_remote_event(
     state: &AppState,
     room_nid: u64,
     event_json: &Value,
-    suppress_current_state: bool,
+    kind: vela_store::db::PersistKind,
 ) -> Result<Option<u64>, String> {
     use vela_core::events::hash::{compute_content_hash, compute_event_id};
 
@@ -554,14 +579,26 @@ async fn persist_remote_event(
 
     let mut prev_nids: Vec<u64> = Vec::new();
     for pid in &pdu.prev_events {
-        if let Ok(Some(n)) = state.db.get_event_nid_by_id(pid) {
-            prev_nids.push(n);
+        match state.db.get_event_nid_by_id(pid) {
+            Ok(Some(n)) => prev_nids.push(n),
+            Ok(None) => {
+                debug!(event_id = %event_id, prev_event = %pid, "outbound_join state: prev_event unknown locally, dropped from event_edges")
+            }
+            Err(e) => {
+                debug!(event_id = %event_id, prev_event = %pid, error = %e, "outbound_join state: prev_event lookup error")
+            }
         }
     }
     let mut auth_nids: Vec<u64> = Vec::new();
     for aid in &pdu.auth_events {
-        if let Ok(Some(n)) = state.db.get_event_nid_by_id(aid) {
-            auth_nids.push(n);
+        match state.db.get_event_nid_by_id(aid) {
+            Ok(Some(n)) => auth_nids.push(n),
+            Ok(None) => {
+                debug!(event_id = %event_id, auth_event = %aid, "outbound_join state: auth_event unknown locally, dropped from event_auth_edges")
+            }
+            Err(e) => {
+                debug!(event_id = %event_id, auth_event = %aid, error = %e, "outbound_join state: auth_event lookup error")
+            }
         }
     }
 
@@ -569,7 +606,7 @@ async fn persist_remote_event(
     let json_bytes = canonical_json_object(&to_persist);
     state
         .db
-        .persist_event(
+        .persist_event_kind(
             event_nid,
             &event_id,
             room_nid,
@@ -582,7 +619,7 @@ async fn persist_remote_event(
             &prev_nids,
             &auth_nids,
             pdu.state_key.is_some(),
-            suppress_current_state,
+            kind,
         )
         .map_err(|e| format!("persist_event: {e}"))?;
 

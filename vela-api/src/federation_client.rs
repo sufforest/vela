@@ -567,6 +567,31 @@ impl FederationClient {
             .ok_or_else(|| FederationClientError::BadJson("response missing pdus[0]".into()))
     }
 
+    /// `GET /_matrix/federation/v1/state_ids/{roomId}?event_id=…`
+    ///
+    /// Fetch the room's state at the given event as event_id arrays
+    /// (lighter than `/state` which returns full PDUs). Returns the
+    /// peer's `{auth_chain_ids: [...], pdu_ids: [...]}` shape; caller
+    /// resolves missing events via `fetch_event_pdu` and persists
+    /// them as outliers. Used as a last-resort fallback when our
+    /// own snapshot chain doesn't anchor for an inbound event (e.g.
+    /// gap-fill events whose oldest ancestor's prev isn't a known
+    /// snapshot).
+    pub async fn state_ids(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Value, FederationClientError> {
+        let path = format!(
+            "/_matrix/federation/v1/state_ids/{}?event_id={}",
+            url_query_encode(room_id),
+            url_query_encode(event_id),
+        );
+        self.signed_request(reqwest::Method::GET, destination, &path, None)
+            .await
+    }
+
     /// `GET /_matrix/federation/v1/timestamp_to_event/{roomId}?ts=…&dir=…`
     ///
     /// MSC3030 federation companion. Caller passes "f" or "b" for `dir`.

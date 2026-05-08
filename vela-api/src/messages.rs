@@ -205,6 +205,27 @@ pub async fn get_messages(
             {
                 end_token = format!("e{earliest_eid}");
             }
+            // Eagerly backfill from the earliest event's prev_events so the
+            // very next /messages?dir=b call already sees the federated
+            // history. TestJumpToDateEndpoint's paginate sub-test polls
+            // /messages without a `from` token waiting for alice's events
+            // to appear on charlie's freshly-federated-joined hs2; without
+            // this the client's poll never advances beyond charlie's local
+            // join because backfill only fires through paginate_dag.
+            if cursor.is_none()
+                && let Some((_, earliest_nid)) = events.last()
+                && let Ok(Some(prev_eids)) = collect_prev_event_ids(&state, *earliest_nid)
+                && !prev_eids.is_empty()
+            {
+                let _ = crate::federation_backfill::attempt_backfill(
+                    &state,
+                    room_nid,
+                    &room_id_str,
+                    &prev_eids,
+                    crate::federation_backfill::BACKFILL_LIMIT,
+                )
+                .await;
+            }
         } else if events.is_empty()
             && let Some(entry_eid) = user_member_event_id(&state, room_nid, user.user_nid)?
         {
@@ -968,7 +989,12 @@ pub async fn get_event_context(
             .get_timeline_range(room_nid, pp.saturating_add(1), u64::MAX, half)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
         let mut after: Vec<Value> = Vec::with_capacity(after_entries.len());
-        let mut end_token = format!("s{pp}");
+        // end_token must point AFTER the pivot (and after events_after when
+        // present) so that /messages dir=b from end_token returns events
+        // <= last shown event — including the pivot. /messages dir=b uses
+        // get_timeline_before(from, ...) which is strictly less-than, so
+        // we offset by +1.
+        let mut end_token = format!("s{}", pp.saturating_add(1));
         for (pos, enid) in &after_entries {
             if let Some(ev) = load_client_event_with_relations(
                 &state,
@@ -977,7 +1003,7 @@ pub async fn get_event_context(
                 Some((user.user_nid, &user.device_id)),
             )? {
                 after.push(ev);
-                end_token = format!("s{pos}");
+                end_token = format!("s{}", pos.saturating_add(1));
             }
         }
         (before, start_token, after, end_token)

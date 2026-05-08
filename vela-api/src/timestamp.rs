@@ -92,6 +92,17 @@ pub async fn timestamp_to_event(
     // order for events persisted on this server.
     let want_forward = q.dir == "f";
     let mut best: Option<(u64, u64, u64)> = None;
+    // Skip state events: clients use timestamp_to_event to "jump to date"
+    // in the message timeline, and state events (m.room.create,
+    // m.room.member, etc.) shouldn't be selected when a client points
+    // at a timestamp expecting a chat message. matters in practice
+    // because v12 m.room.create uses a monotonic counter for ts (to
+    // keep room_id hashes unique under concurrent createRoom from the
+    // same sender) — under parallel test pressure that counter can
+    // outpace wall-clock by enough that an old create event qualifies
+    // for a `dir=f` query whose given_ts was meant to land between
+    // create and the first message. tested by TestJumpToDateEndpoint's
+    // looking_forwards sub-test.
     for (stream_pos, event_nid) in entries {
         let header = match state
             .db
@@ -101,6 +112,11 @@ pub async fn timestamp_to_event(
             Some((h, _)) => h,
             None => continue,
         };
+        // state_key_nid 0 means the event has no state_key (= timeline
+        // event). All state events have a non-zero state_key_nid.
+        if header.state_key_nid != 0 {
+            continue;
+        }
         let event_ts = header.origin_server_ts;
         let qualifies = if want_forward {
             event_ts >= q.ts
@@ -239,9 +255,37 @@ async fn remote_timestamp_to_event(
                 &pdu_value,
                 server,
                 crate::federation_receive::new_fetch_budget(),
-                crate::federation_receive::FetchKind::AuthChain,
+                crate::federation_receive::FetchKind::Backfill,
             )
             .await;
+
+            // Also pull the pivot's ancestors so /context-then-/messages
+            // can return a useful chunk. Without this the test pattern
+            // is /timestamp_to_event → /context (cursor at pivot) →
+            // /messages dir=b: vela has the pivot but no older events,
+            // so the chunk is just the pivot. attempt_backfill walks
+            // the pivot's prev_events and pulls a window of historical
+            // PDUs persisted with stream_pos.
+            if let Some(prev_events) =
+                pdu_value
+                    .get("prev_events")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                && !prev_events.is_empty()
+            {
+                let _ = crate::federation_backfill::attempt_backfill(
+                    state,
+                    room_nid,
+                    room_id,
+                    &prev_events,
+                    crate::federation_backfill::BACKFILL_LIMIT,
+                )
+                .await;
+            }
         }
         return Some(json!({
             "event_id": event_id,
@@ -283,6 +327,8 @@ pub async fn federation_timestamp_to_event(
 
     let want_forward = q.dir == "f";
     let mut best: Option<(u64, u64, u64)> = None;
+    // Skip state events on the federation surface too — see C2S handler
+    // comment; same monotonic-create-ts vs wall-clock issue.
     for (stream_pos, event_nid) in entries {
         let header = match state
             .db
@@ -292,6 +338,9 @@ pub async fn federation_timestamp_to_event(
             Some((h, _)) => h,
             None => continue,
         };
+        if header.state_key_nid != 0 {
+            continue;
+        }
         let event_ts = header.origin_server_ts;
         let qualifies = if want_forward {
             event_ts >= q.ts

@@ -166,39 +166,58 @@ pub struct MissingEventsRequest {
     pub min_depth: Option<u32>,
 }
 
-#[derive(Deserialize)]
-pub struct BackfillQuery {
-    /// Event IDs to start walking back from (repeated ?v= params).
-    #[serde(default)]
-    pub v: Vec<String>,
-    #[serde(default)]
-    pub limit: Option<u32>,
-}
-
 /// GET /_matrix/federation/v1/backfill/{roomId}?v=...&limit=N
 ///
 /// Walk back through `prev_events` from `v`, collecting up to `limit` events.
 /// Returns a transaction-shaped response.
+///
+/// Parses the query string manually because the spec passes `v` as a
+/// repeated query parameter (`?v=$a&v=$b`), which `serde_urlencoded` —
+/// what axum's default `Query` extractor uses — silently flattens to
+/// the last occurrence. Vela was returning 400 BAD_REQUEST without
+/// logging because the deserialised `v: Vec<String>` came back empty,
+/// and the only signal was that paginate_dag callers got 0 events
+/// from /messages backfill.
 pub async fn get_backfill(
     State(state): State<AppState>,
     Path(_room_id): Path<String>,
-    Query(q): Query<BackfillQuery>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     axum::extract::Extension(origin): axum::extract::Extension<XMatrixOrigin>,
 ) -> Result<Json<Value>, StatusCode> {
-    if q.v.is_empty() {
+    let mut v_params: Vec<String> = Vec::new();
+    let mut limit_param: Option<u32> = None;
+    if let Some(qs) = raw_query.as_deref() {
+        for pair in qs.split('&') {
+            let Some((k, val)) = pair.split_once('=') else {
+                continue;
+            };
+            // Spec event IDs use the URL-unreserved char set plus `$`,
+            // and our outbound /backfill caller doesn't percent-encode
+            // — so a byte-for-byte string copy here matches what was
+            // signed. If we later normalise outbound encoding, this
+            // side has to decode in lockstep.
+            match k {
+                "v" => v_params.push(val.to_string()),
+                "limit" => limit_param = val.parse().ok(),
+                _ => {}
+            }
+        }
+    }
+    if v_params.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let limit = q.limit.unwrap_or(10).min(100) as usize;
+    let q_v = v_params;
+    let limit = limit_param.unwrap_or(10).min(100) as usize;
 
     debug!(
         origin = %origin.0,
-        starting = q.v.len(),
+        starting = q_v.len(),
         limit,
         "federation /backfill request"
     );
 
     let mut seen: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<String> = q.v.into_iter().collect();
+    let mut queue: VecDeque<String> = q_v.into_iter().collect();
     let mut pdus: Vec<Value> = Vec::new();
 
     while let Some(eid) = queue.pop_front() {

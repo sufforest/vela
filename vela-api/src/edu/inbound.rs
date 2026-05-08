@@ -400,6 +400,16 @@ async fn handle_receipt(state: &AppState, origin: &str, content: &Value) {
                     .and_then(|d| d.get("ts"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
+                // MSC4102: inbound m.receipt EDUs from federation may carry
+                // a `thread_id` under `data` to scope the receipt to a
+                // thread (or "main"). Pass it through to storage so /sync
+                // surfaces the threaded receipt for local users in the
+                // same room.
+                let thread_id = data
+                    .get("data")
+                    .and_then(|d| d.get("thread_id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
 
                 let user_nid = match state.db.get_or_create_nid(user_id) {
                     Ok(n) => n,
@@ -410,11 +420,14 @@ async fn handle_receipt(state: &AppState, origin: &str, content: &Value) {
                 };
 
                 for event_id in event_ids.iter().filter_map(|v| v.as_str()) {
-                    if let Err(e) =
-                        state
-                            .db
-                            .set_receipt(room_nid, receipt_type, user_nid, event_id, ts)
-                    {
+                    if let Err(e) = state.db.set_receipt(
+                        room_nid,
+                        receipt_type,
+                        user_nid,
+                        event_id,
+                        ts,
+                        thread_id.as_deref(),
+                    ) {
                         warn!(error = %e, "set_receipt (inbound) failed");
                     }
                 }
