@@ -75,5 +75,19 @@ path = "$DATA_DIR"
 enabled = false
 EOF
 
+# Append [[appservices]] sections for any registration files Complement
+# mounted at /complement/appservice/*.yaml. tests using
+# BlueprintHSWithApplicationService land here; everything else has an
+# empty directory and skips this loop.
+if [ -d /complement/appservice ]; then
+    for reg in /complement/appservice/*.yaml; do
+        [ -f "$reg" ] || continue
+        echo "[vela-complement] registering appservice $reg"
+        echo "" >> "$CONF_DIR/vela.toml"
+        echo "[[appservice]]" >> "$CONF_DIR/vela.toml"
+        echo "registration = \"$reg\"" >> "$CONF_DIR/vela.toml"
+    done
+fi
+
 echo "[vela-complement] starting vela with config $CONF_DIR/vela.toml"
 exec /usr/local/bin/vela --config "$CONF_DIR/vela.toml"

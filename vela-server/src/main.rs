@@ -61,6 +61,17 @@ struct Config {
     tracing: TracingSection,
     #[serde(default)]
     rate_limit: RateLimitSection,
+    /// Repeated `[[appservice]]` sections; each entry references a
+    /// registration YAML file (id, hs_token, as_token, sender_localpart,
+    /// namespaces). Empty by default.
+    #[serde(default, rename = "appservice")]
+    appservices: Vec<AppserviceEntry>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AppserviceEntry {
+    /// Path to a Synapse-compatible registration YAML.
+    registration: PathBuf,
 }
 
 /// `[retention]` section. Drives the periodic retention sweeper.
@@ -538,6 +549,19 @@ impl Default for DatabaseSection {
     }
 }
 
+fn load_appservices(
+    entries: &[AppserviceEntry],
+) -> anyhow::Result<Vec<vela_core::appservice::AppserviceRegistration>> {
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let reg = vela_core::appservice::AppserviceRegistration::load(&entry.registration)
+            .map_err(|e| anyhow::anyhow!("appservice load: {e}"))?;
+        info!(id = %reg.id, sender = %reg.sender_localpart, path = %entry.registration.display(), "loaded appservice registration");
+        out.push(reg);
+    }
+    Ok(out)
+}
+
 fn load_extra_ca_certs(paths: &[PathBuf]) -> anyhow::Result<Vec<reqwest::Certificate>> {
     let mut out = Vec::new();
     for path in paths {
@@ -764,6 +788,7 @@ fn main() -> anyhow::Result<()> {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
+            appservices: Arc::new(load_appservices(&config.appservices)?),
         };
 
         let app = vela_api::router::build_router(state);

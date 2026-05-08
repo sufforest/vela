@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use vela_core::canonical::canonical_json_object;
 use vela_core::error::VelaError;
-use vela_core::events::builder::{build_event, select_auth_events};
+use vela_core::events::builder::{build_event_with_ts, select_auth_events};
 use vela_core::events::room_version::RoomVersion;
 use vela_core::events::view::EventView;
 use vela_core::identifiers::{EventId, Nid, RoomId};
@@ -16,11 +17,23 @@ use crate::middleware::error::ApiError;
 use crate::rooms::get_or_create_signing_key;
 use crate::router::AppState;
 
+/// Query string for /send/. `ts` is an MSC2409 / Synapse-legacy
+/// extension: an Application Service may set the event's
+/// `origin_server_ts` to a back-dated time so a bridged message
+/// surfaces in `/messages` and `/timestamp_to_event` as if it had
+/// happened then. Ignored for non-AS callers — regular clients can't
+/// rewrite history just by passing a query string.
+#[derive(Deserialize, Default)]
+pub struct SendQuery {
+    pub ts: Option<u64>,
+}
+
 /// PUT /_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}
 pub async fn send_message(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path((room_id_str, event_type, txn_id)): Path<(String, String, String)>,
+    Query(query): Query<SendQuery>,
     Json(content): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     // Spec: event content MUST be a JSON object. Reject any other
@@ -129,8 +142,13 @@ pub async fn send_message(
         )
     };
 
+    // AS-only `?ts=` override (MSC2409): back-date the event so it
+    // surfaces in /messages and /timestamp_to_event as if it had
+    // happened at `ts`. Silently ignored for non-AS callers.
+    let ts_override = if user.is_appservice { query.ts } else { None };
+
     // Build event
-    let (event, event_id) = build_event(
+    let (event, event_id) = build_event_with_ts(
         &event_type,
         None,
         content,
@@ -142,6 +160,7 @@ pub async fn send_message(
         &signing_key,
         server_name,
         room_version,
+        ts_override,
     );
 
     // Gate: authorise against current room state before persisting.
@@ -368,7 +387,7 @@ async fn send_state_inner(
         )
     };
 
-    let (event, event_id) = build_event(
+    let (event, event_id) = vela_core::events::builder::build_event(
         &event_type,
         Some(&state_key),
         content,

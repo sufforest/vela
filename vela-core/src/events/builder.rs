@@ -66,11 +66,47 @@ pub fn build_event(
     server_name: &str,
     _room_version: RoomVersion,
 ) -> (Map<String, Value>, EventId) {
+    build_event_with_ts(
+        event_type,
+        state_key,
+        content,
+        sender,
+        room_id,
+        prev_events,
+        auth_events,
+        depth,
+        signing_key,
+        server_name,
+        _room_version,
+        None,
+    )
+}
+
+/// Variant of `build_event` that accepts an explicit
+/// `origin_server_ts` override. Used by the application-service
+/// `?ts=` path (MSC2409) so bridged messages can be back-dated to
+/// when they happened on the remote network. Pass `None` to use the
+/// normal monotonic-create / wall-clock timestamp.
+#[allow(clippy::too_many_arguments)]
+pub fn build_event_with_ts(
+    event_type: &str,
+    state_key: Option<&str>,
+    content: Value,
+    sender: &str,
+    room_id: Option<&RoomId>,
+    prev_events: &[EventId],
+    auth_events: &[EventId],
+    depth: u64,
+    signing_key: &ServerSigningKey,
+    server_name: &str,
+    _room_version: RoomVersion,
+    ts_override: Option<u64>,
+) -> (Map<String, Value>, EventId) {
     let is_create = event_type == "m.room.create";
-    let now = if is_create {
-        monotonic_create_ts_ms()
-    } else {
-        wall_now_ms()
+    let now = match ts_override {
+        Some(t) => t,
+        None if is_create => monotonic_create_ts_ms(),
+        None => wall_now_ms(),
     };
 
     let mut event = Map::new();

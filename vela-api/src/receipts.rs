@@ -137,6 +137,7 @@ mod tests {
             user_nid: nid,
             user_id: "@alice:example.com".into(),
             device_id: "DEV".into(),
+            is_appservice: false,
         }
     }
 

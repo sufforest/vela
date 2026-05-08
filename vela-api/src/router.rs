@@ -154,6 +154,12 @@ pub struct AppState {
     /// can detect process restarts (the value changes) without relying
     /// on a monotonic clock alone.
     pub started_at_ms: u64,
+    /// Loaded application-service registrations. Empty in production
+    /// when no [[appservice]] sections are configured. Used by the
+    /// auth middleware to recognise AS bearer tokens and grant the
+    /// caller `act-as` rights for users in the registration's
+    /// namespaces (plus `?ts=` overrides on send).
+    pub appservices: Arc<Vec<vela_core::appservice::AppserviceRegistration>>,
 }
 
 pub fn build_router(state: AppState) -> Router {

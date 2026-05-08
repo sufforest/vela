@@ -1,3 +1,4 @@
+pub mod appservice;
 pub mod auth_rules;
 pub mod canonical;
 pub mod error;

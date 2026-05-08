@@ -1934,6 +1934,7 @@ pub(crate) async fn force_leave_all_rooms_for_deactivation(
                 user_nid: user.user_nid,
                 user_id: user.user_id.clone(),
                 device_id: user.device_id.clone(),
+                is_appservice: user.is_appservice,
             };
             let room_id_owned = room_id.clone();
             let resident_owned = rs.clone();
@@ -2301,6 +2302,7 @@ mod tests {
             user_nid: nid,
             user_id: user_id.into(),
             device_id: "DEV".into(),
+            is_appservice: false,
         }
     }
 

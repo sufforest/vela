@@ -1774,6 +1774,17 @@ impl Database {
         event_nid: u64,
     ) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("room_bump").unwrap();
+        // Don't regress the bump when an AS back-dates a message via
+        // ?ts= (MSC2409). The room's "last activity" should track
+        // wall-clock progression, not artifacts of bridge imports.
+        if let Some(existing_bytes) = self.db.get_cf(&cf, keys::encode_u64(room_nid))?
+            && existing_bytes.len() >= 16
+        {
+            let (existing_ts, _) = keys::decode_u64_pair(&existing_bytes);
+            if existing_ts > timestamp {
+                return Ok(());
+            }
+        }
         self.db.put_cf(
             &cf,
             keys::encode_u64(room_nid),

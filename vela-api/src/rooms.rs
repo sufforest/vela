@@ -609,6 +609,7 @@ pub async fn create_room(
             user_nid: user.user_nid,
             user_id: user.user_id.clone(),
             device_id: user.device_id.clone(),
+            is_appservice: user.is_appservice,
         };
         if let Err(e) = crate::membership::invite_user_internal(
             state.clone(),

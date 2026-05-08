@@ -90,6 +90,7 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
+        appservices: Arc::new(Vec::new()),
     };
     (state, tmp)
 }
