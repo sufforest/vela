@@ -17,6 +17,58 @@ use crate::nid;
 pub const SCHEMA_VERSION: &str = "1";
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
+/// How `persist_event_kind` should treat an event with respect to the
+/// timeline, current state, and forward extremities. Use this for new
+/// callers that need the in-between behaviours the bool form of
+/// `persist_event` can't express:
+/// - `BackfillTimeline`: gap-fill events that need a `stream_pos` so
+///   `/messages` stream pagination finds them, but mustn't replace the
+///   live forward extremity (they're historically older than it).
+/// - `StateBundleOnly`: `send_join` state events that define current
+///   state for the joining server but predate the join — they update
+///   `room_state` so /sync surfaces them via the state.events channel,
+///   without faking a recent timeline entry.
+///
+/// Existing callers using `persist_event(.., suppress)` keep working:
+/// `suppress=false` → `Live`, `suppress=true` → `Outlier`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum PersistKind {
+    /// Live event from a local user or fresh federation transaction.
+    /// Timeline yes, state yes (when the event has a state_key),
+    /// extremity yes.
+    Live,
+    /// Backfilled gap-fill: /backfill response, /get_missing_events,
+    /// /timestamp_to_event remote answer. Timeline yes, state no,
+    /// extremity no — the event predates the room's actual forward
+    /// extremity.
+    BackfillTimeline,
+    /// Outlier — auth-chain context, /event PDU fetches, soft-failed
+    /// events. events CF only; absent from timeline, current state,
+    /// and extremity set. paginate_dag still walks through outliers
+    /// via prev_events.
+    Outlier,
+    /// State events from a `send_join` state bundle. State yes (when
+    /// the event has a state_key), timeline no, extremity no. Only
+    /// the join event itself becomes the post-join extremity, persisted
+    /// separately as `Live` by the caller.
+    StateBundleOnly,
+}
+
+impl PersistKind {
+    pub(crate) fn writes_timeline(self) -> bool {
+        matches!(self, PersistKind::Live | PersistKind::BackfillTimeline)
+    }
+
+    pub(crate) fn writes_room_state(self) -> bool {
+        matches!(self, PersistKind::Live | PersistKind::StateBundleOnly)
+    }
+
+    pub(crate) fn updates_extremities(self) -> bool {
+        matches!(self, PersistKind::Live)
+    }
+}
+
 pub struct Database {
     pub(crate) db: DB,
     pub(crate) nid_counter: AtomicU64,
@@ -1321,14 +1373,58 @@ impl Database {
         is_state: bool,
         suppress_current_state: bool,
     ) -> Result<u64, rocksdb::Error> {
+        let kind = if suppress_current_state {
+            PersistKind::Outlier
+        } else {
+            PersistKind::Live
+        };
+        self.persist_event_kind(
+            event_nid,
+            event_id,
+            room_nid,
+            type_nid,
+            sender_nid,
+            state_key_nid,
+            origin_server_ts,
+            depth,
+            event_json,
+            prev_event_nids,
+            auth_event_nids,
+            is_state,
+            kind,
+        )
+    }
+
+    /// `persist_event` extended with explicit `PersistKind`. Use this
+    /// for callers that need `BackfillTimeline` or `StateBundleOnly`
+    /// — bool form maps `false → Live` and `true → Outlier`, which
+    /// covers the live and outlier paths but not backfill or
+    /// send_join state bootstrap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn persist_event_kind(
+        &self,
+        event_nid: u64,
+        event_id: &str,
+        room_nid: u64,
+        type_nid: u64,
+        sender_nid: u64,
+        state_key_nid: u64,
+        origin_server_ts: u64,
+        depth: u64,
+        event_json: &[u8],
+        prev_event_nids: &[u64],
+        auth_event_nids: &[u64],
+        is_state: bool,
+        kind: PersistKind,
+    ) -> Result<u64, rocksdb::Error> {
         // Only allocate a timeline stream position for events that should
         // appear in the forward timeline. Historical / soft-failed events
         // must not consume a position (they'd sort after all current events,
         // scrambling backwards pagination).
-        let stream_pos: u64 = if suppress_current_state {
-            0
-        } else {
+        let stream_pos: u64 = if kind.writes_timeline() {
             self.next_stream_position().as_u64()
+        } else {
+            0
         };
 
         // Build binary header + JSON value
@@ -1376,9 +1472,10 @@ impl Database {
             event_id.as_bytes(),
         );
 
-        // room_timeline CF: only forward-timeline events. Historical /
-        // soft-failed events are queryable by event_id but not by stream_pos.
-        if !suppress_current_state {
+        // room_timeline CF: events that should appear in the stream-pos
+        // timeline. Outliers and StateBundleOnly are queryable by
+        // event_id but not by stream_pos.
+        if kind.writes_timeline() {
             let cf_timeline = self.db.cf_handle("room_timeline").unwrap();
             batch.put_cf(
                 &cf_timeline,
@@ -1425,20 +1522,63 @@ impl Database {
         }
 
         // room_state CF: only state events that should affect current state.
-        if is_state && !suppress_current_state {
+        // Backfilled state events are historical — they shouldn't rewrite
+        // current state. Outliers don't appear in current state either.
+        //
+        // Federation state-res tiebreak at write time: when an EXISTING
+        // state event for this (type, state_key) is newer by depth /
+        // origin_server_ts / event_id (the spec's reverse-topological
+        // ordering), keep it. Without this, federated transactions that
+        // arrive out of order can clobber a newer state event with an
+        // older one — TestUnbanViaInvite hits exactly this when the
+        // ban→unban→invite sequence reaches us in (ban, invite, leave)
+        // arrival order: the older `leave` overwrites the newer
+        // `invite` and the test never sees the room transition into
+        // rooms.invite.
+        if is_state && kind.writes_room_state() {
             let cf_state = self.db.cf_handle("room_state").unwrap();
-            batch.put_cf(
-                &cf_state,
-                keys::encode_u64_triple(room_nid, type_nid, state_key_nid),
-                keys::encode_u64(event_nid),
-            );
+            let key = keys::encode_u64_triple(room_nid, type_nid, state_key_nid);
+            let mut overwrite = true;
+            if let Ok(Some(existing_bytes)) = self.db.get_cf(&cf_state, key) {
+                let existing_nid = keys::decode_u64(&existing_bytes);
+                if existing_nid != event_nid
+                    && let Ok(Some((existing, _))) = self.get_event(existing_nid)
+                {
+                    let existing_id = self.get_event_id_by_nid(existing_nid).ok().flatten();
+                    let new_wins = match (depth.cmp(&existing.depth), existing_id.as_deref()) {
+                        (std::cmp::Ordering::Greater, _) => true,
+                        (std::cmp::Ordering::Less, _) => false,
+                        (std::cmp::Ordering::Equal, _) => {
+                            match origin_server_ts.cmp(&existing.origin_server_ts) {
+                                std::cmp::Ordering::Greater => true,
+                                std::cmp::Ordering::Less => false,
+                                std::cmp::Ordering::Equal => match existing_id {
+                                    Some(eid) => event_id > eid.as_str(),
+                                    None => true,
+                                },
+                            }
+                        }
+                    };
+                    overwrite = new_wins;
+                }
+            }
+            if overwrite {
+                batch.put_cf(&cf_state, key, keys::encode_u64(event_nid));
+            }
         }
 
-        // room_extremities CF: only events that should become forward extremities.
-        // Per spec §Soft failure: soft-failed events MUST NOT be added.
-        // Historical events fetched via gap-filling similarly must not become
-        // extremities.
-        if !suppress_current_state {
+        // room_extremities CF: only events that should become forward
+        // extremities. Backfilled and outlier events MUST NOT replace
+        // the live extremity set. Live events overwrite to `[event_nid]`
+        // — same as pre-refactor. Read-modify-write to preserve fork
+        // extremities is the spec-correct shape, but federated events
+        // whose prev_events don't match our current extremities cause
+        // the set to grow indefinitely (the federated event isn't
+        // referenced as prev by any subsequent local event), and
+        // downstream flows that pick a single "latest" extremity break
+        // in subtle ways. Tracked as future work; the overwrite at
+        // least keeps the room's forward DAG navigable.
+        if kind.updates_extremities() {
             let cf_extremities = self.db.cf_handle("room_extremities").unwrap();
             batch.put_cf(
                 &cf_extremities,
@@ -2569,9 +2709,10 @@ impl Database {
         user_nid: u64,
         event_id: &str,
         timestamp: u64,
+        thread_id: Option<&str>,
     ) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("receipts").unwrap();
-        let key = receipt_key(room_nid, receipt_type, user_nid);
+        let key = receipt_key(room_nid, receipt_type, user_nid, thread_id);
         let val = serde_json::json!({"event_id": event_id, "ts": timestamp});
         self.db.put_cf(&cf, &key, val.to_string().as_bytes())
     }
@@ -2592,13 +2733,14 @@ impl Database {
         user_nid: u64,
         event_id: &str,
         timestamp: u64,
+        thread_id: Option<&str>,
     ) -> Result<u64, rocksdb::Error> {
         let receipts_cf = self.db.cf_handle("receipts").unwrap();
         let stream_cf = self.db.cf_handle("receipts_stream").unwrap();
 
         let pos = self.receipts_stream_counter.fetch_add(1, Ordering::Relaxed);
 
-        let receipts_key = receipt_key(room_nid, receipt_type, user_nid);
+        let receipts_key = receipt_key(room_nid, receipt_type, user_nid, thread_id);
         let receipts_val = serde_json::json!({"event_id": event_id, "ts": timestamp}).to_string();
 
         let stream_key = keys::encode_u64(pos);
@@ -2608,6 +2750,7 @@ impl Database {
             "user": user_nid,
             "event_id": event_id,
             "ts": timestamp,
+            "thread_id": thread_id,
         })
         .to_string();
 
@@ -2622,14 +2765,29 @@ impl Database {
     /// (e.g. "m.read") that `user_nid` posted in `room_nid`, or `None`
     /// if no such receipt exists. Used by /sync to compute
     /// `unread_notifications` against the user's last-seen position.
+    /// Looks at the unthreaded receipt only; threaded counts use
+    /// `get_user_thread_receipt_event_id`.
     pub fn get_user_receipt_event_id(
         &self,
         room_nid: u64,
         receipt_type: &str,
         user_nid: u64,
     ) -> Result<Option<String>, rocksdb::Error> {
+        self.get_user_thread_receipt_event_id(room_nid, receipt_type, user_nid, None)
+    }
+
+    /// Same shape as `get_user_receipt_event_id` but scoped to a specific
+    /// thread_id (or unthreaded when `thread_id == None`). Used by /sync's
+    /// notification accounting to honour threaded "main" receipts.
+    pub fn get_user_thread_receipt_event_id(
+        &self,
+        room_nid: u64,
+        receipt_type: &str,
+        user_nid: u64,
+        thread_id: Option<&str>,
+    ) -> Result<Option<String>, rocksdb::Error> {
         let cf = self.db.cf_handle("receipts").unwrap();
-        let key = receipt_key(room_nid, receipt_type, user_nid);
+        let key = receipt_key(room_nid, receipt_type, user_nid, thread_id);
         match self.db.get_cf(&cf, &key)? {
             Some(bytes) => {
                 let v: Value = match serde_json::from_slice(&bytes) {
@@ -2682,10 +2840,13 @@ impl Database {
         Ok((out, new_cursor))
     }
 
+    /// Returned tuples: `(receipt_type, user_nid, thread_id, value)`.
+    /// `thread_id` is `None` for unthreaded receipts; otherwise carries the
+    /// `"main"` sentinel or a thread-root event id (CS-API §receipts).
     pub fn get_room_receipts(
         &self,
         room_nid: u64,
-    ) -> Result<Vec<(String, u64, Value)>, rocksdb::Error> {
+    ) -> Result<Vec<(String, u64, Option<String>, Value)>, rocksdb::Error> {
         let cf = self.db.cf_handle("receipts").unwrap();
         let prefix = keys::encode_u64(room_nid);
         let mut results = Vec::new();
@@ -2697,15 +2858,33 @@ impl Database {
                 break;
             }
             let receipt: Value = serde_json::from_slice(&val).unwrap_or(Value::Null);
-            // Extract receipt_type and user_nid from key
+            // Layout after room prefix: `<type> 0x00 <user_nid:8> 0x00 <thread_id?>`.
             let rest = &key[8..];
-            if let Some(sep_pos) = rest.iter().position(|&b| b == 0) {
-                let receipt_type = String::from_utf8_lossy(&rest[..sep_pos]).to_string();
-                if rest.len() >= sep_pos + 1 + 8 {
-                    let user_nid = keys::decode_u64(&rest[sep_pos + 1..sep_pos + 9]);
-                    results.push((receipt_type, user_nid, receipt));
-                }
+            let Some(type_end) = rest.iter().position(|&b| b == 0) else {
+                continue;
+            };
+            let receipt_type = String::from_utf8_lossy(&rest[..type_end]).to_string();
+            let after_type = &rest[type_end + 1..];
+            if after_type.len() < 8 {
+                continue;
             }
+            let user_nid = keys::decode_u64(&after_type[..8]);
+            let after_user = &after_type[8..];
+            // Pre-thread-id keys may not have the trailing 0x00 separator; treat
+            // such keys as unthreaded receipts to stay tolerant of older data.
+            let thread_id: Option<String> = if after_user.is_empty() {
+                None
+            } else if after_user[0] == 0 {
+                let tid_bytes = &after_user[1..];
+                if tid_bytes.is_empty() {
+                    None
+                } else {
+                    Some(String::from_utf8_lossy(tid_bytes).to_string())
+                }
+            } else {
+                None
+            };
+            results.push((receipt_type, user_nid, thread_id, receipt));
         }
         Ok(results)
     }
@@ -3883,15 +4062,29 @@ fn outbox_key(destination: &str, stream_pos: u64) -> Vec<u8> {
     k
 }
 
-/// Receipts CF key: `<room_nid_be> <receipt_type> 0x00 <user_nid_be>`.
-/// Shared between `set_receipt` and `set_local_receipt` so both produce
-/// the same key for the same logical receipt.
-fn receipt_key(room_nid: u64, receipt_type: &str, user_nid: u64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(8 + receipt_type.len() + 1 + 8);
+/// Receipts CF key:
+/// `<room_nid_be:8> <receipt_type> 0x00 <user_nid_be:8> 0x00 <thread_id?>`.
+///
+/// Trailing thread_id is empty for unthreaded receipts and `main` /
+/// `<thread_root_event_id>` for threaded receipts (CS-API §receipts).
+/// Empty thread_id is a separate key from any threaded receipt, so a
+/// user can carry both an unthreaded receipt AND multiple per-thread
+/// receipts simultaneously — which is what TestThreadedReceipts
+/// exercises.
+fn receipt_key(
+    room_nid: u64,
+    receipt_type: &str,
+    user_nid: u64,
+    thread_id: Option<&str>,
+) -> Vec<u8> {
+    let tid = thread_id.unwrap_or("");
+    let mut k = Vec::with_capacity(8 + receipt_type.len() + 1 + 8 + 1 + tid.len());
     k.extend_from_slice(&keys::encode_u64(room_nid));
     k.extend_from_slice(receipt_type.as_bytes());
     k.push(0);
     k.extend_from_slice(&keys::encode_u64(user_nid));
+    k.push(0);
+    k.extend_from_slice(tid.as_bytes());
     k
 }
 

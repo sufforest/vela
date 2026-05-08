@@ -420,11 +420,19 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
             // paths.
             debug!(error = %e, "fetch_missing_events failed");
         }
+        // Mark the room as having had a gap fill at the current stream
+        // position. /sync uses this to flag the next batch as `limited`
+        // for users whose `since` predates the fill — per spec, when
+        // the homeserver had to gap-fill, the timeline events alone are
+        // inadequate and limited=true signals that to the client.
+        state
+            .last_gap_fill_pos
+            .insert(room_nid, state.db.current_stream_position());
     }
 
     // --- Check 5: state-at-event ---
     // Resolve state from each prev_event's state_snapshot via state_res v2.
-    match compute_state_at_event(state, &effective_pdu).await {
+    match compute_state_at_event(state, &effective_pdu, &sender_domain).await {
         Ok(Some(mut state_at_event)) => {
             // v12 (MSC4291): m.room.create isn't a state event in the
             // post-state snapshot, so it's absent from the resolved
@@ -554,6 +562,7 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
 async fn compute_state_at_event(
     state: &AppState,
     event: &Pdu,
+    origin: &str,
 ) -> Result<Option<HashMap<(String, String), Pdu>>, String> {
     if event.prev_events.is_empty() {
         return Ok(None);
@@ -632,6 +641,76 @@ async fn compute_state_at_event(
     // event.prev_events itself.
     if state_sets.is_empty() {
         return Ok(None);
+    }
+
+    // /state_ids fallback. When prev_events are known locally but their
+    // event_state inheritance is broken (e.g. fetched gap-fill events
+    // whose oldest ancestor's prev wasn't a snapshot we have), each
+    // prev's snapshot_nids comes back empty and state_res would
+    // resolve to the empty set — Check 5 then rejects every federated
+    // event with "sender is not joined". Ask the sending peer for the
+    // canonical state at this event, fetch any missing PDUs as
+    // outliers, and seed state_sets with that snapshot. Spec'd shape:
+    // `/state_ids` returns `{auth_chain_ids, pdu_ids}`. We use only
+    // pdu_ids (current state) — auth_chain validation already ran in
+    // Check 4.
+    if state_sets.iter().all(|sm| sm.is_empty())
+        && let Ok(state_resp) = state
+            .federation_client
+            .state_ids(origin, &event.room_id, &event.event_id)
+            .await
+    {
+        // Don't set last_gap_fill_pos here. /state_ids only fetches state
+        // events (persisted as outliers, no stream_pos), so they don't
+        // affect /sync timeline rendering. Setting the gap marker on
+        // every state-only fallback wedges the /sync gap filter for any
+        // user whose since predated the fallback — bob's hs2 hits
+        // /state_ids routinely when state can't be anchored, and the
+        // resulting filter drops post-fallback live events that the
+        // user does need to see.
+        let pdu_ids = state_resp
+            .get("pdu_ids")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut sm: StateMap = StateMap::new();
+        let budget = new_fetch_budget();
+        for v in pdu_ids {
+            let Some(eid) = v.as_str() else { continue };
+            if state.db.get_event_nid_by_id(eid).ok().flatten().is_none()
+                && let Ok(pdu_value) = state.federation_client.fetch_event_pdu(origin, eid).await
+            {
+                let _ = persist_fetched_event(
+                    state,
+                    &pdu_value,
+                    origin,
+                    budget.clone(),
+                    FetchKind::AuthChain,
+                )
+                .await;
+            }
+            let nid = match state.db.get_event_nid_by_id(eid).ok().flatten() {
+                Some(n) => n,
+                None => continue,
+            };
+            let Ok(Some((header, _))) = state.db.get_event(nid) else {
+                continue;
+            };
+            let et = match state.db.resolve_nid(header.type_nid).ok().flatten() {
+                Some(s) => s,
+                None => continue,
+            };
+            let sk = state
+                .db
+                .resolve_nid(header.state_key_nid)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            sm.insert((et, sk), eid.to_string());
+        }
+        if !sm.is_empty() {
+            state_sets = vec![sm];
+        }
     }
 
     // Event + auth chain lookup closures for state_res.
@@ -759,17 +838,33 @@ async fn persist_received_pdu(
         0
     };
 
-    // Resolve prev_events and auth_events to NIDs.
+    // Resolve prev_events and auth_events to NIDs. Unknown ids drop
+    // out of the cached edge arrays — paginate_dag's backfill chain
+    // re-resolves prev_events from the event JSON, so a chain break
+    // here is recoverable. We trace the drops because they're load-
+    // bearing for any "why didn't backfill find X?" debugging.
     let mut prev_nids: Vec<u64> = Vec::new();
     for pid in &pdu.prev_events {
-        if let Ok(Some(n)) = state.db.get_event_nid_by_id(pid) {
-            prev_nids.push(n);
+        match state.db.get_event_nid_by_id(pid) {
+            Ok(Some(n)) => prev_nids.push(n),
+            Ok(None) => {
+                debug!(event_id = %pdu.event_id, prev_event = %pid, "persist_received: prev_event unknown locally, dropped from event_edges")
+            }
+            Err(e) => {
+                debug!(event_id = %pdu.event_id, prev_event = %pid, error = %e, "persist_received: prev_event lookup error")
+            }
         }
     }
     let mut auth_nids: Vec<u64> = Vec::new();
     for aid in &pdu.auth_events {
-        if let Ok(Some(n)) = state.db.get_event_nid_by_id(aid) {
-            auth_nids.push(n);
+        match state.db.get_event_nid_by_id(aid) {
+            Ok(Some(n)) => auth_nids.push(n),
+            Ok(None) => {
+                debug!(event_id = %pdu.event_id, auth_event = %aid, "persist_received: auth_event unknown locally, dropped from event_auth_edges")
+            }
+            Err(e) => {
+                debug!(event_id = %pdu.event_id, auth_event = %aid, error = %e, "persist_received: auth_event lookup error")
+            }
         }
     }
 
@@ -811,7 +906,28 @@ async fn persist_received_pdu(
         // user keeps appearing in their `/sync` rooms.join section
         // and the room never moves to `rooms.leave`.
         if pdu.event_type == "m.room.member" {
-            let membership_byte = match pdu.membership() {
+            // Read membership from CURRENT state, not from the just-received
+            // PDU. Persistence may have rejected the PDU's room_state
+            // overwrite under the state-res tiebreak (older origin_ts loses
+            // to a newer existing entry), in which case the existing entry
+            // — not this PDU — defines the user's current membership.
+            // Without this, an out-of-order older state event (e.g.
+            // unban=leave arriving after invite in TestUnbanViaInvite)
+            // would still call set_membership and stomp on the newer
+            // invite that won state res.
+            let current_member_nid = state
+                .db
+                .get_state_event_nid(room_nid, type_nid, state_key_nid)
+                .ok()
+                .flatten();
+            let current_membership_str = current_member_nid
+                .and_then(|nid| state.db.get_event(nid).ok().flatten())
+                .and_then(|(_, json)| serde_json::from_slice::<Value>(&json).ok())
+                .as_ref()
+                .and_then(|v| v.pointer("/content/membership"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let membership_byte = match current_membership_str.as_deref() {
                 Some("join") => 1u8,
                 Some("invite") => 2u8,
                 Some("ban") => 3u8,
@@ -1207,10 +1323,17 @@ async fn fetch_missing_events(
     }
 
     let path = format!("/_matrix/federation/v1/get_missing_events/{room_id}");
+    // Spec default is 10 but it's far too small to cover real gaps:
+    // a slow inbound transaction commonly skips 30+ events. Synapse uses 20
+    // and Conduwuit uses 50 — we match the higher bound so a single
+    // /get_missing_events round-trip walks far enough that the
+    // /sync timeline truncation (typically 20) drops events from before
+    // the gap, preserving the spec's "limited batch contains only post-gap
+    // events" expectation without an explicit pre/post-gap split.
     let body = serde_json::json!({
         "earliest_events": earliest_event_ids,
         "latest_events": [latest_event_id],
-        "limit": 10,
+        "limit": 50,
     });
     let resp = state
         .federation_client
@@ -1272,6 +1395,13 @@ pub(crate) enum FetchKind {
     /// extremities, then the trigger event supersedes them via its own
     /// prev_events chain.
     MissingTimeline,
+    /// One-shot historical fetch (e.g. /timestamp_to_event followed by
+    /// /event/{event_id}). The event needs a stream_pos so /context
+    /// returns a stream cursor and /messages dir=b can include it,
+    /// but it must NOT update current room state or become a forward
+    /// extremity — it's not part of the live DAG, just a pinpoint
+    /// historical reference. Maps to PersistKind::BackfillTimeline.
+    Backfill,
 }
 
 /// Validate and persist a single fetched event.
@@ -1495,18 +1625,19 @@ async fn persist_fetched_event_inner(
     let event_nid = state.db.next_nid();
     let json_bytes = canonical_json_object(&event_obj_to_persist);
 
-    // suppress_current_state semantics:
-    //   AuthChain      → true  (historical auth context, never on timeline)
-    //   MissingTimeline → false (real timeline events that fill a gap;
-    //                            they need a stream_pos and to surface
-    //                            via /sync. The downstream trigger
-    //                            event will supersede them as the
-    //                            forward extremity once we move on.)
-    let suppress_current_state = matches!(kind, FetchKind::AuthChain);
+    // PersistKind by FetchKind:
+    //   AuthChain       → Outlier            (historical auth context, no stream_pos)
+    //   MissingTimeline → Live               (gap-fill on the live timeline)
+    //   Backfill        → BackfillTimeline   (stream_pos, but no current state, no extremity)
+    let persist_kind = match kind {
+        FetchKind::AuthChain => vela_store::db::PersistKind::Outlier,
+        FetchKind::MissingTimeline => vela_store::db::PersistKind::Live,
+        FetchKind::Backfill => vela_store::db::PersistKind::BackfillTimeline,
+    };
 
     state
         .db
-        .persist_event(
+        .persist_event_kind(
             event_nid,
             &target_pdu.event_id,
             room_nid,
@@ -1519,7 +1650,7 @@ async fn persist_fetched_event_inner(
             &prev_nids,
             &auth_nids,
             target_pdu.state_key.is_some(),
-            suppress_current_state,
+            persist_kind,
         )
         .map_err(|e| format!("persist_event: {e}"))?;
 
@@ -1558,14 +1689,26 @@ pub async fn persist_join_event(
 
     let mut prev_nids: Vec<u64> = Vec::new();
     for pid in &pdu.prev_events {
-        if let Ok(Some(n)) = state.db.get_event_nid_by_id(pid) {
-            prev_nids.push(n);
+        match state.db.get_event_nid_by_id(pid) {
+            Ok(Some(n)) => prev_nids.push(n),
+            Ok(None) => {
+                debug!(event_id = %pdu.event_id, prev_event = %pid, "persist_join: prev_event unknown locally, dropped from event_edges")
+            }
+            Err(e) => {
+                debug!(event_id = %pdu.event_id, prev_event = %pid, error = %e, "persist_join: prev_event lookup error")
+            }
         }
     }
     let mut auth_nids: Vec<u64> = Vec::new();
     for aid in &pdu.auth_events {
-        if let Ok(Some(n)) = state.db.get_event_nid_by_id(aid) {
-            auth_nids.push(n);
+        match state.db.get_event_nid_by_id(aid) {
+            Ok(Some(n)) => auth_nids.push(n),
+            Ok(None) => {
+                debug!(event_id = %pdu.event_id, auth_event = %aid, "persist_join: auth_event unknown locally, dropped from event_auth_edges")
+            }
+            Err(e) => {
+                debug!(event_id = %pdu.event_id, auth_event = %aid, error = %e, "persist_join: auth_event lookup error")
+            }
         }
     }
 
@@ -1907,7 +2050,7 @@ mod tests {
         let body: Value = serde_json::from_slice(&received[0].body).unwrap();
         assert_eq!(body["latest_events"], json!(["$latest"]));
         assert_eq!(body["earliest_events"], json!(["$ext-1", "$ext-2"]));
-        assert_eq!(body["limit"], json!(10));
+        assert_eq!(body["limit"], json!(50));
     }
 
     /// Budget exhaustion short-circuits before the HTTP request — no call made.

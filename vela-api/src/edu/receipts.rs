@@ -92,6 +92,13 @@ impl EduStream for ReceiptStream {
                 continue;
             };
             let ts = obj.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
+            // MSC4102: thread_id rides on the EDU under data.thread_id when
+            // the receipt was scoped to a thread. Pull it out of the
+            // stream entry (set_local_receipt persists it there).
+            let thread_id = obj
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             // Filter: only fan out to destinations that share this room.
             // Spec: "Read receipts […] sent to all servers in the room."
@@ -110,18 +117,49 @@ impl EduStream for ReceiptStream {
                 continue;
             };
 
-            content
+            let mut data = serde_json::Map::new();
+            data.insert("ts".into(), json!(ts));
+            if let Some(tid) = &thread_id {
+                data.insert("thread_id".into(), json!(tid));
+            }
+            // MSC4102: the federation EDU shape only carries one receipt
+            // per (room, type, user), so when the user has both a
+            // threaded and unthreaded receipt for the same room+type the
+            // unthreaded one is the room-wide anchor and must win.
+            // Tested by TestThreadReceiptsInSyncMSC4102: alice posts
+            // threaded then unthreaded; the test asserts bob (federated)
+            // sees the unthreaded receipt down /sync. Without this guard
+            // the latest-write-wins aggregation drops the unthreaded
+            // receipt under the threaded one.
+            let user_slot = content
                 .entry(room_id)
                 .or_default()
                 .entry(receipt_type.to_string())
                 .or_default()
-                .insert(
-                    user_id,
+                .entry(user_id)
+                .or_insert_with(|| {
                     json!({
                         "event_ids": [event_id],
-                        "data": { "ts": ts },
-                    }),
-                );
+                        "data": Value::Object(data.clone()),
+                    })
+                });
+            let existing_threaded = user_slot
+                .pointer("/data/thread_id")
+                .and_then(|v| v.as_str())
+                .is_some();
+            let new_unthreaded = thread_id.is_none();
+            // Overwrite when:
+            //   - the existing slot is threaded and the new entry is
+            //     unthreaded (MSC4102 priority)
+            //   - both have the same threading shape (latest wins)
+            // Skip when the new entry is threaded but the existing one
+            // is unthreaded — preserve the unthreaded anchor.
+            if (existing_threaded && new_unthreaded) || (existing_threaded == thread_id.is_some()) {
+                *user_slot = json!({
+                    "event_ids": [event_id],
+                    "data": Value::Object(data),
+                });
+            }
             included += 1;
         }
 
@@ -170,9 +208,9 @@ mod tests {
         let (db, _tmp, room_nid, alice_nid) = setup_db_with_room(&["peer.example"]);
 
         // Two locally-originated receipts for the same user — latest wins.
-        db.set_local_receipt(room_nid, "m.read", alice_nid, "$msg1", 100)
+        db.set_local_receipt(room_nid, "m.read", alice_nid, "$msg1", 100, None)
             .unwrap();
-        db.set_local_receipt(room_nid, "m.read", alice_nid, "$msg2", 200)
+        db.set_local_receipt(room_nid, "m.read", alice_nid, "$msg2", 200, None)
             .unwrap();
 
         let stream = ReceiptStream {
@@ -198,7 +236,7 @@ mod tests {
     fn scan_filters_destinations_not_in_room() {
         let (db, _tmp, room_nid, alice_nid) = setup_db_with_room(&["peer.example"]);
 
-        db.set_local_receipt(room_nid, "m.read", alice_nid, "$msg", 100)
+        db.set_local_receipt(room_nid, "m.read", alice_nid, "$msg", 100, None)
             .unwrap();
 
         let stream = ReceiptStream {
@@ -216,9 +254,9 @@ mod tests {
         let (db, _tmp, room_nid, alice_nid) = setup_db_with_room(&["peer.example"]);
 
         let pos1 = db
-            .set_local_receipt(room_nid, "m.read", alice_nid, "$msg1", 100)
+            .set_local_receipt(room_nid, "m.read", alice_nid, "$msg1", 100, None)
             .unwrap();
-        db.set_local_receipt(room_nid, "m.read", alice_nid, "$msg2", 200)
+        db.set_local_receipt(room_nid, "m.read", alice_nid, "$msg2", 200, None)
             .unwrap();
 
         let stream = ReceiptStream {

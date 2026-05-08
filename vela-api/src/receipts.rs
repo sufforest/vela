@@ -8,11 +8,21 @@ use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::error::ApiError;
 use crate::router::AppState;
 
+#[derive(Debug, Default, Deserialize)]
+pub struct ReceiptBody {
+    /// Threaded receipt scope (CS-API §receipts). Either `"main"` for the
+    /// main timeline or a thread-root event id. Absent for unthreaded
+    /// receipts (which TestThreadedReceipts contrasts against).
+    #[serde(default)]
+    pub thread_id: Option<String>,
+}
+
 /// POST /_matrix/client/v3/rooms/{roomId}/receipt/{receiptType}/{eventId}
 pub async fn post_receipt(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path((room_id_str, receipt_type, event_id)): Path<(String, String, String)>,
+    body: Option<Json<ReceiptBody>>,
 ) -> Result<Json<Value>, ApiError> {
     let room_nid = state
         .db
@@ -25,9 +35,18 @@ pub async fn post_receipt(
         .unwrap()
         .as_millis() as u64;
 
+    let thread_id = body.as_ref().and_then(|b| b.thread_id.as_deref());
+
     state
         .db
-        .set_local_receipt(room_nid, &receipt_type, user.user_nid, &event_id, now_ms)
+        .set_local_receipt(
+            room_nid,
+            &receipt_type,
+            user.user_nid,
+            &event_id,
+            now_ms,
+            thread_id,
+        )
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     // Wake the federation senders for any peers in this room so the
     // m.receipt EDU rides out without waiting for the idle poll.
@@ -83,7 +102,7 @@ pub async fn post_read_markers(
     if let Some(event_id) = body.read {
         state
             .db
-            .set_local_receipt(room_nid, "m.read", user.user_nid, &event_id, now_ms)
+            .set_local_receipt(room_nid, "m.read", user.user_nid, &event_id, now_ms, None)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
         state.federation_sender.notify_room(room_nid);
     }
@@ -92,7 +111,14 @@ pub async fn post_read_markers(
         // it's a per-user-per-server marker. Persist locally only.
         state
             .db
-            .set_receipt(room_nid, "m.read.private", user.user_nid, &event_id, now_ms)
+            .set_receipt(
+                room_nid,
+                "m.read.private",
+                user.user_nid,
+                &event_id,
+                now_ms,
+                None,
+            )
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     }
 
@@ -167,7 +193,7 @@ mod tests {
 
         let receipts = state.db.get_room_receipts(room_nid).unwrap();
         assert!(
-            receipts.iter().any(|(rt, un, val)| rt == "m.read"
+            receipts.iter().any(|(rt, un, _tid, val)| rt == "m.read"
                 && *un == user_nid
                 && val.get("event_id").and_then(|v| v.as_str()) == Some("$msg")),
             "expected m.read receipt, got {receipts:?}"

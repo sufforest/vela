@@ -207,23 +207,41 @@ async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Res
 
     let mut prev_nids: Vec<u64> = Vec::new();
     for pid in &pdu.prev_events {
-        if let Ok(Some(n)) = state.db.get_event_nid_by_id(pid) {
-            prev_nids.push(n);
+        match state.db.get_event_nid_by_id(pid) {
+            Ok(Some(n)) => prev_nids.push(n),
+            Ok(None) => {
+                debug!(%event_id, prev_event = %pid, "backfill: prev_event unknown locally, dropping from event_edges")
+            }
+            Err(e) => {
+                debug!(%event_id, prev_event = %pid, error = %e, "backfill: prev_event lookup error")
+            }
         }
     }
     let mut auth_nids: Vec<u64> = Vec::new();
     for aid in &pdu.auth_events {
-        if let Ok(Some(n)) = state.db.get_event_nid_by_id(aid) {
-            auth_nids.push(n);
+        match state.db.get_event_nid_by_id(aid) {
+            Ok(Some(n)) => auth_nids.push(n),
+            Ok(None) => {
+                debug!(%event_id, auth_event = %aid, "backfill: auth_event unknown locally, dropping from event_auth_edges")
+            }
+            Err(e) => {
+                debug!(%event_id, auth_event = %aid, error = %e, "backfill: auth_event lookup error")
+            }
         }
     }
 
     let event_nid = state.db.next_nid();
     let json_bytes = canonical_json_object(&to_persist);
 
+    // BackfillTimeline: events get a stream_pos so /messages can return
+    // them (TestJumpToDateEndpoint paginate sub-test calls /messages
+    // without a `from` token after /context, expecting backfilled
+    // alice events to surface; outliers without stream_pos miss that
+    // path). They're still excluded from current room_state and from
+    // forward extremities so they don't disrupt live state.
     state
         .db
-        .persist_event(
+        .persist_event_kind(
             event_nid,
             &event_id,
             room_nid,
@@ -236,8 +254,7 @@ async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Res
             &prev_nids,
             &auth_nids,
             pdu.state_key.is_some(),
-            // Historical — must not update current state or become an extremity.
-            true,
+            vela_store::db::PersistKind::BackfillTimeline,
         )
         .map_err(|e| format!("persist_event: {e}"))?;
 

@@ -740,6 +740,7 @@ fn main() -> anyhow::Result<()> {
             room_senders: Arc::new(DashMap::new()),
             typing_state: Arc::new(DashMap::new()),
             typing_change_pos: Arc::new(DashMap::new()),
+            last_gap_fill_pos: Arc::new(DashMap::new()),
             typing_stream,
             media_store: media_store.clone(),
             signing_key,
