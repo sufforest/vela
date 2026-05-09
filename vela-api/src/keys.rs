@@ -452,12 +452,49 @@ pub async fn key_changes(
         .get_device_key_changes(user.user_nid, from, to)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
+    // `left`: users with whom the caller no longer shares ANY room
+    // within the [from, to) window. Mirrors /sync's device_lists.left
+    // computation: take the raw "departed-from-shared-room" events,
+    // post-filter against current shared-room membership so a user
+    // who left one room but still shares another isn't reported.
+    let raw_left = state
+        .db
+        .get_device_list_left(user.user_nid, from, to)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let our_rooms = state
+        .db
+        .get_user_joined_rooms(user.user_nid)
+        .unwrap_or_default();
+    let mut left = Vec::new();
+    for nid in raw_left {
+        let still_sharing = our_rooms
+            .iter()
+            .any(|&room_nid| state.db.get_membership(room_nid, nid).ok().flatten() == Some(1));
+        if still_sharing {
+            continue;
+        }
+        if let Some(uid) = state
+            .db
+            .resolve_nid(nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        {
+            left.push(Value::String(uid));
+        }
+    }
+
+    // Spec: a user appearing in both `changed` and `left` should only
+    // appear in `left` (the stronger signal). Sync follows the same rule.
+    let left_set: std::collections::HashSet<String> = left
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
     let mut changed = Vec::new();
     for nid in changed_nids {
         if let Some(user_id) = state
             .db
             .resolve_nid(nid)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            && !left_set.contains(&user_id)
         {
             changed.push(Value::String(user_id));
         }
@@ -465,7 +502,7 @@ pub async fn key_changes(
 
     Ok(Json(json!({
         "changed": changed,
-        "left": [],
+        "left": left,
     })))
 }
 

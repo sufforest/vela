@@ -53,38 +53,38 @@
 # from a v2 creation, which is server-specific.
 ^TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version$
 
-# Tests that hard-code older room versions vela doesn't support.
-# `TestCorruptedAuthChain` creates a v10 room; we reject with
-# M_UNSUPPORTED_ROOM_VERSION per spec. The test is also marked
-# SkipIf(Dendrite) upstream — meant for synapse-specific bugfix
-# coverage.
+# `TestCorruptedAuthChain` is marked SkipIf(Dendrite) upstream —
+# synapse-specific bugfix coverage that exercises a redaction
+# corner case. Vela's redactor doesn't reproduce the synapse bug,
+# so the test either passes trivially or fails on unrelated grounds.
 ^TestCorruptedAuthChain$
-# v6-specific test — same v12-only design rationale.
+
+# Tests below were unblocked at the room-creation layer by PR #35
+# (v6-v11 support), but a re-run revealed deeper gaps that aren't
+# in scope for the room-version sprint:
+#
+# 1. Mock-server signature verification: every test that uses
+#    Complement's fake federation `Server` (signing-key
+#    `ed25519:complement_*`, sender_domain
+#    `host.docker.internal:NNNNN`) fails sig-verify on the auth
+#    chain. Vela accepts well-formed peer keys when both ends are
+#    real homeservers (the v12 sibling tests pass on hs1+hs2
+#    deploys), but the mock-server's key-fetch + verify path has a
+#    bug we haven't traced. Affects most pre-v12 federation tests.
+#
+# 2. Version-aware auth-rules: vela's auth_rules.rs accepts
+#    knock and restricted-join transitions on ALL versions
+#    unconditionally (see deferred-work note in PR #35). v7 knock
+#    + v8 restricted tests assert membership transitions per their
+#    spec versions, which require version-conditional gating.
+#
+# Each entry below is a real spec gap we should close; revisit
+# once mock-server sig verify is fixed and version-aware
+# auth-rules land.
 ^TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6$
-
-# v10-specific federation device-list test. The Complement mock
-# creates a v10 room and asks vela to join via federation; our
-# outbound make_join rejects with M_UNSUPPORTED_ROOM_VERSION per
-# spec. v12 sibling coverage is `TestDeviceListsUpdateOverFederation`
-# (kept off-skiplist).
 ^TestDeviceListsUpdateOverFederationOnRoomJoin$
-
-# v11-specific MSC4291 sub-tests. The shared `doTestUpgrade…`
-# helper iterates `[v12, v11]`; v11 hits M_UNSUPPORTED_ROOM_VERSION
-# at /createRoom or /upgrade. The v12 sibling
-# `TestMSC4291RoomIDAsHashOfCreateEvent_RoomIDIsOnCreateEvent` is
-# kept off-skiplist and runs against /context.
 ^TestMSC4291RoomIDAsHashOfCreateEvent_CannotSendCreateEvent$
 ^TestMSC4291RoomIDAsHashOfCreateEvent_UpgradedRooms$
-
-# Restricted-rooms cluster (MSC3083, restricted_rooms_test.go) hard-
-# codes `room_version: "8"` everywhere. v12 also supports the
-# `restricted` join_rule and we cover that path via
-# TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12 (kept
-# off-skiplist), but the v8-only base tests block at MustCreateRoom
-# with M_UNSUPPORTED_ROOM_VERSION. Each is a slow federation flow
-# (~15s+); skiplist them to reclaim iteration time. The V11 sibling
-# is similarly blocked by vela's v12-only support.
 ^TestRestrictedRoomsLocalJoin$
 ^TestRestrictedRoomsRemoteJoin$
 ^TestRestrictedRoomsRemoteJoinLocalUser$
@@ -97,14 +97,6 @@
 ^TestRestrictedRoomsSpacesSummaryLocal$
 ^TestRestrictedRoomsSpacesSummaryFederation$
 ^TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
-
-# Knock cluster (knocking_test.go, knock_restricted_test.go) hard-
-# codes `room_version: "7"`. v12 supports knock too and we cover
-# the local + federated knock paths in unit tests; the suite-level
-# tests can't reach our handlers because room creation 400s first.
-# `TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12`
-# is intentionally NOT skiplisted — it forces room_version=12 and
-# is the v12 sibling we should pass.
 ^TestKnocking$
 ^TestKnockingInMSC3787Room$
 ^TestKnockRoomsInPublicRoomsDirectory$
