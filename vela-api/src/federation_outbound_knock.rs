@@ -77,7 +77,12 @@ async fn try_knock_via(
     // --- 1. make_knock ---
     let make_knock_resp = state
         .federation_client
-        .make_knock(server, room_id.as_str(), user_id, &["12"])
+        .make_knock(
+            server,
+            room_id.as_str(),
+            user_id,
+            &["6", "7", "8", "9", "10", "11", "12"],
+        )
         .await
         .map_err(|e| format!("make_knock failed: {e}"))?;
 
@@ -85,9 +90,12 @@ async fn try_knock_via(
         .get("room_version")
         .and_then(|v| v.as_str())
         .ok_or("make_knock response missing room_version")?;
-    if room_version != "12" {
+    let room_version_typed = vela_core::events::room_version::RoomVersion::parse(room_version)
+        .ok_or_else(|| format!("unsupported room_version {room_version} (vela: v6–v12)"))?;
+    if !room_version_typed.at_least(state.config.minimum_room_version) {
         return Err(format!(
-            "unsupported room_version {room_version} (Vela only supports v12)"
+            "room_version {room_version} below operator minimum {}",
+            state.config.minimum_room_version.as_str()
         ));
     }
 

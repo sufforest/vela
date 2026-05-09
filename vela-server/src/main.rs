@@ -489,6 +489,10 @@ struct ServerSection {
     /// to system roots. Empty in production; used by Complement where both
     /// servers' certs are signed by a CA mounted in the container.
     extra_ca_certs: Vec<PathBuf>,
+    /// Minimum room version vela accepts. Default `"6"`. Operators
+    /// who want spec-modern-only deployments set this to `"10"` or
+    /// higher. Below v6 is never supported regardless of this setting.
+    minimum_room_version: String,
 }
 
 impl Default for ServerSection {
@@ -499,8 +503,20 @@ impl Default for ServerSection {
             port: 8008,
             tls: None,
             extra_ca_certs: Vec::new(),
+            minimum_room_version: "6".to_string(),
         }
     }
+}
+
+fn parse_minimum_room_version(
+    s: &str,
+) -> anyhow::Result<vela_core::events::room_version::RoomVersion> {
+    use vela_core::events::room_version::RoomVersion;
+    RoomVersion::parse(s.trim()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "[server] minimum_room_version: {s:?} is not a supported room version (expected 6..12)"
+        )
+    })
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -734,6 +750,9 @@ fn main() -> anyhow::Result<()> {
                     .directory
                     .allow_public_rooms_over_federation,
                 user_directory_federate: config.user_directory.federate,
+                minimum_room_version: parse_minimum_room_version(
+                    &config.server.minimum_room_version,
+                )?,
             }),
             room_locks: Arc::new(DashMap::new()),
             user_locks: Arc::new(DashMap::new()),

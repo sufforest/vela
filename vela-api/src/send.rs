@@ -6,7 +6,6 @@ use serde_json::{Value, json};
 use vela_core::canonical::canonical_json_object;
 use vela_core::error::VelaError;
 use vela_core::events::builder::{build_event, select_auth_events};
-use vela_core::events::room_version::RoomVersion;
 use vela_core::events::view::EventView;
 use vela_core::identifiers::{EventId, Nid, RoomId};
 
@@ -81,7 +80,10 @@ pub async fn send_message(
 
     let signing_key = get_or_create_signing_key(&state)?;
     let server_name = &state.config.server_name;
-    let room_version = RoomVersion::V12; // TODO: look up from room_meta
+    let room_version = state
+        .db
+        .get_room_version_typed(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     // Get forward extremities for prev_events
     let extremity_nids = state
@@ -298,9 +300,10 @@ async fn send_state_inner(
 
     let signing_key = get_or_create_signing_key(&state)?;
     let server_name = &state.config.server_name;
-    let room_version = RoomVersion::V12;
-
-    // Up-front structural validation for power_levels: MSC4289 forbids
+    let room_version = state
+        .db
+        .get_room_version_typed(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     // creators in `users`. Without this we'd let auth-rules reject as
     // 403 M_FORBIDDEN, but per spec/Complement this is a 400 M_BAD_JSON.
     if event_type == "m.room.power_levels" {

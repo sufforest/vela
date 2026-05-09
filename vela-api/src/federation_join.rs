@@ -20,7 +20,6 @@ use vela_core::auth_rules::{AuthError, check_auth};
 use vela_core::events::builder::select_auth_events;
 use vela_core::events::content;
 use vela_core::events::pdu::Pdu;
-use vela_core::events::room_version::RoomVersion;
 use vela_core::federation::keys::{decode_public_key, verify_event_signature};
 use vela_core::identifiers::{EventId, Nid};
 
@@ -73,17 +72,27 @@ pub async fn make_join(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     debug!(%room_id, %user_id, origin = %origin.0, "make_join");
 
-    // Version negotiation. We only serve v12 rooms; if the origin doesn't
-    // list 12 in its supported versions, return M_INCOMPATIBLE_ROOM_VERSION
-    // with the room's actual version so the origin knows to upgrade.
+    // Version negotiation. We need the origin to support OUR room's
+    // actual version (vela hosts v6–v12 rooms). If the origin doesn't
+    // list our room's version in `?ver=`, return
+    // M_INCOMPATIBLE_ROOM_VERSION so the origin knows to refuse the join.
     let supported = parse_supported_versions(raw_query.as_deref());
-    let our_version = RoomVersion::V12.as_str();
+    let room_nid_for_version = state
+        .db
+        .get_nid(&room_id)
+        .map_err(|e| err_response(StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN", e.as_ref()))?
+        .ok_or_else(|| err_response(StatusCode::NOT_FOUND, "M_NOT_FOUND", "room not found"))?;
+    let our_version_typed = state
+        .db
+        .get_room_version_typed(room_nid_for_version)
+        .map_err(|e| err_response(StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN", e.as_ref()))?;
+    let our_version = our_version_typed.as_str();
     if !supported.iter().any(|v| v == our_version) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "errcode": "M_INCOMPATIBLE_ROOM_VERSION",
-                "error": "room is v12; requesting server does not list 12 in ver",
+                "error": format!("room is v{our_version}; requesting server does not list it in ver"),
                 "room_version": our_version,
             })),
         ));
@@ -154,9 +163,13 @@ pub async fn make_join(
         _ => {}
     }
 
-    let room_version = RoomVersion::V12;
-
-    // For restricted / knock_restricted, embed a `join_authorised_via_users_server`
+    let room_version = state.db.get_room_version_typed(room_nid).map_err(|e| {
+        err_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &format!("db: {e}"),
+        )
+    })?;
     // pointing at a local member with invite power. The calling user must
     // also satisfy the allow list. Auth rule 5.3.5 (check_member_join) will
     // enforce both on the send_join side.

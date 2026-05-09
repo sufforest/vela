@@ -133,6 +133,7 @@ impl Harness {
                 encrypt_by_default: overrides.encrypt_by_default,
                 allow_public_rooms_over_federation: false,
                 user_directory_federate: false,
+                minimum_room_version: vela_core::events::room_version::RoomVersion::V6,
             }),
             room_locks: Arc::new(DashMap::new()),
             user_locks: Arc::new(DashMap::new()),

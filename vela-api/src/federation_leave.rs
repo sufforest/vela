@@ -20,7 +20,6 @@ use vela_core::auth_rules::{AuthError, check_auth};
 use vela_core::events::builder::select_auth_events;
 use vela_core::events::hash::compute_content_hash;
 use vela_core::events::pdu::Pdu;
-use vela_core::events::room_version::RoomVersion;
 use vela_core::events::view::EventView;
 use vela_core::federation::keys::{decode_public_key, verify_event_signature};
 use vela_core::identifiers::EventId;
@@ -70,7 +69,13 @@ pub async fn make_leave(
         }
     }
 
-    let room_version = RoomVersion::V12;
+    let room_version = state.db.get_room_version_typed(room_nid).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &format!("db: {e}"),
+        )
+    })?;
 
     let content_val = vela_core::events::content::member_content_leave();
     let auth_events = select_auth_events(

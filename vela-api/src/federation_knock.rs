@@ -22,7 +22,6 @@ use vela_core::events::builder::select_auth_events;
 use vela_core::events::content;
 use vela_core::events::hash::compute_content_hash;
 use vela_core::events::pdu::Pdu;
-use vela_core::events::room_version::RoomVersion;
 use vela_core::events::view::EventView;
 use vela_core::federation::keys::{decode_public_key, verify_event_signature};
 use vela_core::identifiers::{EventId, Nid};
@@ -42,13 +41,22 @@ pub async fn make_knock(
     debug!(%room_id, %user_id, origin = %origin.0, "make_knock");
 
     let supported = parse_supported_versions(raw_query.as_deref());
-    let our_version = RoomVersion::V12.as_str();
+    let room_nid_for_version = state
+        .db
+        .get_nid(&room_id)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN", e.as_ref()))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "M_NOT_FOUND", "room not found"))?;
+    let our_version_typed = state
+        .db
+        .get_room_version_typed(room_nid_for_version)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, "M_UNKNOWN", e.as_ref()))?;
+    let our_version = our_version_typed.as_str();
     if !supported.iter().any(|v| v == our_version) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "errcode": "M_INCOMPATIBLE_ROOM_VERSION",
-                "error": "room is v12; requesting server does not list 12 in ver",
+                "error": format!("room is v{our_version}; requesting server does not list it in ver"),
                 "room_version": our_version,
             })),
         ));
@@ -95,7 +103,13 @@ pub async fn make_knock(
         return Err(err(StatusCode::FORBIDDEN, "M_FORBIDDEN", "user is banned"));
     }
 
-    let room_version = RoomVersion::V12;
+    let room_version = state.db.get_room_version_typed(room_nid).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "M_UNKNOWN",
+            &format!("db: {e}"),
+        )
+    })?;
     let content_val = content::member_content_knock(None);
     let auth_events = select_auth_events(
         "m.room.member",
