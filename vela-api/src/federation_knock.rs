@@ -297,8 +297,12 @@ pub async fn send_knock_v1(
         ));
     }
 
-    // event_id in URL must match the computed reference hash.
-    let computed_event_id = vela_core::events::hash::compute_event_id(event_obj);
+    // event_id in URL must match the computed reference hash. Use
+    // the room's actual version: redaction shape differs across
+    // versions, and pre-v11 events would mismatch under the V12
+    // default.
+    let computed_event_id =
+        vela_core::events::hash::compute_event_id_for_version(event_obj, send_knock_room_version);
     if computed_event_id.as_str() != event_id {
         return Err(err(
             StatusCode::BAD_REQUEST,
