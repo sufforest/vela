@@ -76,6 +76,19 @@ impl RoomId {
         Self(s)
     }
 
+    /// Generate a fresh `!opaque:server` room ID for pre-v12 rooms.
+    /// 18 url-safe base64 chars of randomness — same shape Synapse and
+    /// Dendrite use for their pre-v12 room ids.
+    pub fn generate_for_server(server_name: &str) -> Self {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use rand::RngCore;
+        let mut bytes = [0u8; 14];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let opaque = URL_SAFE_NO_PAD.encode(bytes);
+        Self(format!("!{opaque}:{server_name}"))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

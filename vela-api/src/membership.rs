@@ -708,7 +708,19 @@ async fn do_remote_leave(
         template.insert("origin_server_ts".to_string(), Value::from(now));
     }
 
-    let (signed_event, event_id) = sign_unsigned_template(template, &signing_key, server_name);
+    // Use the room's actual version for signing — vela's outbound
+    // leave on a v6-v10 room must produce v6-v10 canonical bytes or
+    // the resident server will reject our signature.
+    let outbound_leave_room_version = state
+        .db
+        .get_room_version_typed(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let (signed_event, event_id) = sign_unsigned_template(
+        template,
+        &signing_key,
+        server_name,
+        outbound_leave_room_version,
+    );
 
     if let Err(e) = state
         .federation_client
@@ -1840,10 +1852,16 @@ fn build_invite_stripped_state(
         if etype == "m.room.create" {
             // MSC4311: emit the full create event. Re-derive event_id
             // (v3+ events on the wire don't carry event_id) and ensure
-            // room_id is present so receivers can verify the v12 hash
-            // matches.
-            let event_id =
-                vela_core::events::hash::compute_event_id(ev.as_object().unwrap_or(&Map::new()));
+            // room_id is present so receivers can verify the version-
+            // appropriate hash matches.
+            let stripped_state_room_version = state
+                .db
+                .get_room_version_typed(room_nid)
+                .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
+            let event_id = vela_core::events::hash::compute_event_id_for_version(
+                ev.as_object().unwrap_or(&Map::new()),
+                stripped_state_room_version,
+            );
             let mut full = ev;
             if let Some(obj) = full.as_object_mut() {
                 obj.insert("event_id".to_string(), json!(event_id.as_str()));

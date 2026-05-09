@@ -48,14 +48,15 @@ pub fn check_auth(event: &Pdu, state: StateFn<'_>) -> AuthResult {
         return check_create(event);
     }
 
-    // --- Rule 2: room_id must be the m.room.create event ID (v12) ---
-    // The create event has ID "$xxx" and room_id is "!xxx" (same hash, different sigil).
-    // We enforce that a create event exists in state with a matching ID.
+    // --- Rule 2: v12-only — room_id must be derived from create event ID ---
+    // For v12 rooms (MSC4291) room_id = "!" + create event_id minus "$". Pre-v12
+    // rooms mint random `!opaque:server` ids and this rule doesn't apply.
     let create =
         state("m.room.create", "").ok_or_else(|| AuthError::reject("no m.room.create in state"))?;
-    if !room_id_matches_create(&event.room_id, &create.event_id) {
+    let is_v12_create = create.content.get("room_version").and_then(|v| v.as_str()) == Some("12");
+    if is_v12_create && !room_id_matches_create(&event.room_id, &create.event_id) {
         return Err(AuthError::reject(
-            "event room_id does not match m.room.create event id",
+            "event room_id does not match m.room.create event id (v12)",
         ));
     }
 
@@ -128,10 +129,36 @@ fn check_create(event: &Pdu) -> AuthResult {
         return Err(AuthError::reject("m.room.create has prev_events"));
     }
 
-    // 1.2 (v12): if it has a room_id, reject
-    // (room_id is implicit from event_id with sigil change)
-    if !event.room_id.is_empty() {
-        return Err(AuthError::reject("m.room.create has a room_id (v12)"));
+    // 1.2: room_id rules differ by version. Read the create event's
+    // own `content.room_version` to decide. Default v1 per spec when
+    // unset (matches Synapse's `KNOWN_ROOM_VERSIONS["1"]`).
+    let content_version = event
+        .content
+        .get("room_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("1");
+    let is_v12_plus = matches!(content_version, "12");
+    if is_v12_plus {
+        // v12 (MSC4291): room_id is derived from this event, MUST NOT
+        // appear as a top-level field.
+        if !event.room_id.is_empty() {
+            return Err(AuthError::reject("m.room.create has a room_id (v12)"));
+        }
+    } else {
+        // Pre-v12: room_id MUST be present; its domain MUST match the
+        // sender's domain (Synapse rule 1.2).
+        if event.room_id.is_empty() {
+            return Err(AuthError::reject(format!(
+                "m.room.create missing room_id (pre-v12, room_version={content_version})"
+            )));
+        }
+        let sender_domain = event.sender.split_once(':').map(|(_, d)| d).unwrap_or("");
+        let room_domain = event.room_id.split_once(':').map(|(_, d)| d).unwrap_or("");
+        if sender_domain != room_domain {
+            return Err(AuthError::reject(
+                "m.room.create room_id domain doesn't match sender domain",
+            ));
+        }
     }
 
     // 1.3: if content.room_version is present and not recognised, reject

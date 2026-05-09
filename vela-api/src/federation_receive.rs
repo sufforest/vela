@@ -74,13 +74,23 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
         }
     };
 
-    // v3+ event format uses reference-hash event_ids. For v12, we compute
-    // the event_id from the reference hash of the (possibly already-redacted)
-    // event. We do this after hash validation (check 3). For now derive a
-    // tentative event_id from the content hash so we can report errors.
-    let tentative_event_id = vela_core::events::hash::compute_event_id(obj)
-        .as_str()
-        .to_string();
+    // v3+ event format derives event_ids from the reference hash. The
+    // hash is version-aware (different redaction shapes produce
+    // different bytes), so we have to know the room version before
+    // computing event_id. Look up via room_id (which is in the event
+    // JSON) → room_nid → meta. Falls back to v12 if the room is
+    // unknown locally — that's harmless: we'll re-evaluate per-event
+    // once the room is bootstrapped.
+    let room_version_for_event_id = obj
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .and_then(|rid| state.db.get_nid(rid).ok().flatten())
+        .and_then(|nid| state.db.get_room_version_typed(nid).ok())
+        .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
+    let tentative_event_id =
+        vela_core::events::hash::compute_event_id_for_version(obj, room_version_for_event_id)
+            .as_str()
+            .to_string();
 
     let pdu = match Pdu::from_json(tentative_event_id.clone(), obj) {
         Some(p) => p,
@@ -202,6 +212,14 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
         }
     };
 
+    // Look up the room version so redaction matches the SENDER's
+    // shape — a v10 room's create event needs v10-redacted canonical
+    // bytes for sig verify, not v12's "preserve all content" rule.
+    let event_room_version = state
+        .db
+        .get_room_version_typed(room_nid)
+        .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
+
     let mut verified = false;
     for (key_id, _) in sender_sigs {
         let Some(pub_b64) = sender_keys.verify_keys.get(key_id) else {
@@ -210,7 +228,9 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
         let Ok(public_key) = decode_public_key(pub_b64) else {
             continue;
         };
-        if verify_event_signature(obj, &sender_domain, key_id, &public_key).is_ok() {
+        if verify_event_signature(obj, &sender_domain, key_id, &public_key, event_room_version)
+            .is_ok()
+        {
             verified = true;
             break;
         }
@@ -237,7 +257,7 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
 
     let effective_event_json: Map<String, Value> = if use_redacted {
         warn!(event_id = %pdu.event_id, "content hash mismatch, using redacted form");
-        vela_core::events::redact::redact_event(obj)
+        vela_core::events::redact::redact_event_for_version(obj, event_room_version)
     } else {
         obj.clone()
     };
@@ -1435,13 +1455,25 @@ async fn persist_fetched_event_inner(
     kind: FetchKind,
 ) -> Result<(), String> {
     use vela_core::canonical::canonical_json_object;
-    use vela_core::events::hash::{compute_content_hash, compute_event_id};
+    use vela_core::events::hash::{compute_content_hash, compute_event_id_for_version};
 
     let obj = event_json
         .as_object()
         .ok_or_else(|| "fetched event is not an object".to_string())?;
 
-    let event_id = compute_event_id(obj).as_str().to_string();
+    // event_id derivation must use the sender's redaction shape; look
+    // up via room_id → room_nid → version, fall back to v12 for
+    // unknown rooms (which is the typical bootstrap path — fetched
+    // events arrive before we've persisted the room locally).
+    let event_id_room_version = obj
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .and_then(|rid| state.db.get_nid(rid).ok().flatten())
+        .and_then(|nid| state.db.get_room_version_typed(nid).ok())
+        .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
+    let event_id = compute_event_id_for_version(obj, event_id_room_version)
+        .as_str()
+        .to_string();
 
     // Idempotent: if already known, skip.
     if state
@@ -1455,6 +1487,21 @@ async fn persist_fetched_event_inner(
 
     let pdu = Pdu::from_json(event_id.clone(), obj)
         .ok_or_else(|| "fetched event malformed".to_string())?;
+
+    // Look up the room version from local meta. Pre-v11 events have a
+    // different redaction shape (m.room.create keeps only `creator`,
+    // m.room.member keeps only `membership`) and using the wrong shape
+    // makes our canonical bytes disagree with the sender's, breaking
+    // sig verify. Fall back to v12 if the room isn't yet registered
+    // locally — fetched events arriving for an unknown room go down
+    // that path during outbound-join bootstrapping.
+    let event_room_version = state
+        .db
+        .get_nid(&pdu.room_id)
+        .ok()
+        .flatten()
+        .and_then(|n| state.db.get_room_version_typed(n).ok())
+        .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
 
     // Signature: at least one signature from sender's domain must verify.
     let sender_domain = pdu
@@ -1485,6 +1532,7 @@ async fn persist_fetched_event_inner(
             &sender_domain,
             key_id,
             &public_key,
+            event_room_version,
         )
         .is_ok()
         {
@@ -1504,7 +1552,7 @@ async fn persist_fetched_event_inner(
         .and_then(|v| v.as_str());
     let event_obj_to_persist: Map<String, Value> = match declared_hash {
         Some(d) if d == computed_hash => obj.clone(),
-        _ => vela_core::events::redact::redact_event(obj),
+        _ => vela_core::events::redact::redact_event_for_version(obj, event_room_version),
     };
 
     let target_pdu = Pdu::from_json(event_id.clone(), &event_obj_to_persist)

@@ -16,7 +16,8 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::canonical::canonical_json_object;
-use crate::events::redact::redact_event;
+use crate::events::redact::redact_event_for_version;
+use crate::events::room_version::RoomVersion;
 
 #[derive(Debug, Error)]
 pub enum SignatureError {
@@ -103,11 +104,18 @@ pub fn verify_json_signature(
 /// Verify an event signature. Unlike verify_json_signature, this first redacts
 /// the event (per the Matrix event signing algorithm), then removes unsigned,
 /// then verifies the signature over the canonical redacted form.
+///
+/// `room_version` selects the redaction shape — must match the version
+/// the SENDER used to compute the signature. Mismatched version =
+/// mismatched canonical bytes = verify failure even on a valid sig.
+/// For locally-emitted events that don't carry a version (own keys
+/// signing flow), pass `RoomVersion::V12`.
 pub fn verify_event_signature(
     event: &Map<String, Value>,
     entity_name: &str,
     key_id: &str,
     public_key: &VerifyingKey,
+    room_version: RoomVersion,
 ) -> Result<(), SignatureError> {
     let sigs = event
         .get("signatures")
@@ -134,7 +142,7 @@ pub fn verify_event_signature(
     let signature = Signature::from_bytes(&sig_array);
 
     // Redact, then remove signatures + unsigned (per JSON signing algorithm), then canonical JSON
-    let mut redacted = redact_event(event);
+    let mut redacted = redact_event_for_version(event, room_version);
     redacted.remove("signatures");
     redacted.remove("unsigned");
     let canonical = canonical_json_object(&redacted);
@@ -142,13 +150,15 @@ pub fn verify_event_signature(
     match public_key.verify(&canonical, &signature) {
         Ok(()) => Ok(()),
         Err(_) => {
-            // Diagnostic: callers (federation receive / outbound join) log
-            // just the event id. Emit the canonical form at TRACE so it's
-            // queryable with `RUST_LOG=vela_core::federation::keys=trace`
-            // without polluting default output.
+            // Diagnostic at TRACE — comparing the original event
+            // against the canonical bytes vela computed is the only
+            // way to narrow down a redaction-shape mismatch. Enable
+            // with `RUST_LOG=vela_core::federation::keys=trace`.
             tracing::trace!(
                 entity = %entity_name,
                 key_id = %key_id,
+                room_version = ?room_version,
+                original = %serde_json::to_string(event).unwrap_or_default(),
                 canonical = %String::from_utf8_lossy(&canonical),
                 "event signature verification failed"
             );
@@ -256,7 +266,13 @@ mod tests {
         key.sign_event(&mut event, "example.com");
 
         let pub_key = key.verifying_key();
-        let result = verify_event_signature(&event, "example.com", key.key_id(), &pub_key);
+        let result = verify_event_signature(
+            &event,
+            "example.com",
+            key.key_id(),
+            &pub_key,
+            RoomVersion::V12,
+        );
         assert!(result.is_ok(), "event signature should verify: {result:?}");
     }
 

@@ -264,6 +264,10 @@ pub async fn send_knock_v1(
         .and_then(|s| s.get(sender_domain))
         .and_then(|v| v.as_object())
         .ok_or_else(|| err(StatusCode::FORBIDDEN, "M_FORBIDDEN", "no signatures"))?;
+    let send_knock_room_version = state
+        .db
+        .get_room_version_typed(room_nid)
+        .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
     let mut verified = false;
     for (key_id, _) in sigs {
         let Some(pub_b64) = keys.verify_keys.get(key_id) else {
@@ -272,7 +276,15 @@ pub async fn send_knock_v1(
         let Ok(public_key) = decode_public_key(pub_b64) else {
             continue;
         };
-        if verify_event_signature(event_obj, sender_domain, key_id, &public_key).is_ok() {
+        if verify_event_signature(
+            event_obj,
+            sender_domain,
+            key_id,
+            &public_key,
+            send_knock_room_version,
+        )
+        .is_ok()
+        {
             verified = true;
             break;
         }

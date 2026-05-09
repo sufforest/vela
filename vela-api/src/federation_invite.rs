@@ -46,11 +46,19 @@ pub async fn invite_v2(
         .get("room_version")
         .and_then(|v| v.as_str())
         .unwrap_or("12");
-    if room_version != "12" {
+    let event_room_version = vela_core::events::room_version::RoomVersion::parse(room_version)
+        .ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "M_INCOMPATIBLE_ROOM_VERSION",
+                "unsupported room_version",
+            )
+        })?;
+    if !event_room_version.at_least(state.config.minimum_room_version) {
         return Err(err(
             StatusCode::BAD_REQUEST,
             "M_INCOMPATIBLE_ROOM_VERSION",
-            "only room_version 12 is supported",
+            "room_version below operator minimum",
         ));
     }
 
@@ -144,7 +152,15 @@ pub async fn invite_v2(
         let Ok(public_key) = decode_public_key(pub_b64) else {
             continue;
         };
-        if verify_event_signature(&event, &sender_domain, key_id, &public_key).is_ok() {
+        if verify_event_signature(
+            &event,
+            &sender_domain,
+            key_id,
+            &public_key,
+            event_room_version,
+        )
+        .is_ok()
+        {
             verified = true;
             break;
         }

@@ -131,9 +131,13 @@ async fn try_knock_via(
         content.insert("reason".into(), json!(reason));
     }
 
-    // --- 2. Sign ---
-    let (signed_event, event_id) =
-        sign_unsigned_template(template, &state.signing_key, &state.config.server_name);
+    // --- 2. Sign under the room's actual version (parsed from make_knock).
+    let (signed_event, event_id) = sign_unsigned_template(
+        template,
+        &state.signing_key,
+        &state.config.server_name,
+        room_version_typed,
+    );
 
     // --- 3. send_knock ---
     let send_resp = state
