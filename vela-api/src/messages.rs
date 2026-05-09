@@ -200,31 +200,61 @@ pub async fn get_messages(
     //   client would see `end == start == ""` and have no way to continue.
     if dir == "b" {
         if events.len() < limit && !events.is_empty() {
-            if let Some((_, earliest_nid)) = events.last()
-                && let Ok(Some(earliest_eid)) = state.db.get_event_id_by_nid(*earliest_nid)
-            {
-                end_token = format!("e{earliest_eid}");
-            }
-            // Eagerly backfill from the earliest event's prev_events so the
-            // very next /messages?dir=b call already sees the federated
-            // history. TestJumpToDateEndpoint's paginate sub-test polls
-            // /messages without a `from` token waiting for alice's events
-            // to appear on charlie's freshly-federated-joined hs2; without
-            // this the client's poll never advances beyond charlie's local
-            // join because backfill only fires through paginate_dag.
+            // For an initial /messages call (no `from` token) anchor
+            // end_token at the NEWEST event in the chunk rather than the
+            // oldest. Right for re-join: bob's local timeline after a
+            // re-join is [bob_join_1, bob_leave, bob_join_2].
+            // paginate_dag from the OLDEST event (bob_join_1) walks to
+            // alice's pre-join state — not the messages alice sent while
+            // bob was away. Those messages are descendants of bob_leave
+            // and ancestors of bob_join_2, reachable only by walking
+            // back from bob_join_2 (the newest event). For caller-driven
+            // paginations (cursor=Some) we leave the per-event s{} token
+            // alone — the JumpToDateEndpoint paginate sub-test relies on
+            // stream-cursor end-tokens to terminate cleanly.
             if cursor.is_none()
-                && let Some((_, earliest_nid)) = events.last()
-                && let Ok(Some(prev_eids)) = collect_prev_event_ids(&state, *earliest_nid)
-                && !prev_eids.is_empty()
+                && let Some((_, newest_nid)) = events.first()
+                && let Ok(Some(newest_eid)) = state.db.get_event_id_by_nid(*newest_nid)
             {
-                let _ = crate::federation_backfill::attempt_backfill(
-                    &state,
-                    room_nid,
-                    &room_id_str,
-                    &prev_eids,
-                    crate::federation_backfill::BACKFILL_LIMIT,
-                )
-                .await;
+                end_token = format!("e{newest_eid}");
+            }
+            // Eagerly backfill from the chunk's edges so the very next
+            // /messages?dir=b call already sees the federated history.
+            //
+            // We anchor on BOTH the earliest and the latest event:
+            // - earliest's prev_events: the obvious "older" direction,
+            //   covers a fresh federated join (charlie sees alice's
+            //   pre-join messages on the next page).
+            // - latest's prev_events: needed for the re-join scenario.
+            //   on re-join, bob's local timeline is [bob_join_1,
+            //   bob_leave, bob_join_2]. earliest = bob_join_1, whose
+            //   prev_events point at alice's PRE-join state — useless.
+            //   the messages alice sent while bob was away are
+            //   descendants of bob_leave and ancestors of bob_join_2,
+            //   so they're reachable only by walking back from
+            //   bob_join_2 (the latest membership event).
+            if cursor.is_none() {
+                let mut seen = std::collections::HashSet::<String>::new();
+                let mut prevs = Vec::new();
+                for anchor in [events.first(), events.last()].into_iter().flatten() {
+                    if let Ok(Some(eids)) = collect_prev_event_ids(&state, anchor.1) {
+                        for eid in eids {
+                            if seen.insert(eid.clone()) {
+                                prevs.push(eid);
+                            }
+                        }
+                    }
+                }
+                if !prevs.is_empty() {
+                    let _ = crate::federation_backfill::attempt_backfill(
+                        &state,
+                        room_nid,
+                        &room_id_str,
+                        &prevs,
+                        crate::federation_backfill::BACKFILL_LIMIT,
+                    )
+                    .await;
+                }
             }
         } else if events.is_empty()
             && let Some(entry_eid) = user_member_event_id(&state, room_nid, user.user_nid)?
