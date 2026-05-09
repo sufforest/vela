@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
-use crate::events::hash::{add_content_hash, compute_event_id};
+use crate::events::hash::add_content_hash;
 use crate::events::room_version::RoomVersion;
 use crate::events::sign::ServerSigningKey;
 use crate::identifiers::{EventId, RoomId};
@@ -98,13 +98,15 @@ pub fn build_event(
     event.insert("auth_events".to_string(), Value::Array(auth));
 
     // Step 1: compute content hash and add to hashes field
+    // (content hash is version-independent — it's the full event
+    // before redaction).
     add_content_hash(&mut event);
 
-    // Step 2: sign the event
-    signing_key.sign_event(&mut event, server_name);
+    // Step 2: sign the event under the room's redaction shape
+    signing_key.sign_event_for_version(&mut event, server_name, _room_version);
 
-    // Step 3: compute event_id from reference hash
-    let event_id = compute_event_id(&event);
+    // Step 3: compute event_id from version-aware reference hash
+    let event_id = crate::events::hash::compute_event_id_for_version(&event, _room_version);
 
     (event, event_id)
 }
@@ -117,20 +119,23 @@ pub fn build_event(
 /// 1. The content hash (`hashes.sha256`).
 /// 2. Our signature under `signatures[server_name]`.
 ///
-/// Returns the completed event + the computed `event_id`.
+/// Returns the completed event + the computed `event_id`. The `room_version`
+/// argument is the version returned by `make_join`/`make_knock`; sign + ref-hash
+/// must match that or the receiving peer will reject the event.
 pub fn sign_unsigned_template(
     mut template: Map<String, Value>,
     signing_key: &ServerSigningKey,
     server_name: &str,
+    room_version: RoomVersion,
 ) -> (Map<String, Value>, EventId) {
-    // Step 1: compute + insert content hash.
+    // Step 1: compute + insert content hash (version-independent).
     crate::events::hash::add_content_hash(&mut template);
 
-    // Step 2: sign.
-    signing_key.sign_event(&mut template, server_name);
+    // Step 2: sign under the room's redaction shape.
+    signing_key.sign_event_for_version(&mut template, server_name, room_version);
 
-    // Step 3: compute event_id from reference hash.
-    let event_id = crate::events::hash::compute_event_id(&template);
+    // Step 3: compute event_id from version-aware reference hash.
+    let event_id = crate::events::hash::compute_event_id_for_version(&template, room_version);
 
     (template, event_id)
 }
@@ -308,7 +313,8 @@ mod tests {
         template.insert("prev_events".into(), json!(["$prev"]));
         template.insert("auth_events".into(), json!(["$pl", "$cr"]));
 
-        let (signed, event_id) = sign_unsigned_template(template, &key, "our.example");
+        let (signed, event_id) =
+            sign_unsigned_template(template, &key, "our.example", RoomVersion::V12);
 
         // Hashes + signatures added.
         assert!(signed.contains_key("hashes"));

@@ -117,13 +117,19 @@ async fn persist_backfilled(state: &AppState, room_nid: u64, pdus: &[Value]) -> 
 }
 
 async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Result<bool, String> {
-    use vela_core::events::hash::{compute_content_hash, compute_event_id};
+    use vela_core::events::hash::{compute_content_hash, compute_event_id_for_version};
 
     let obj = event_json
         .as_object()
         .ok_or_else(|| "event is not an object".to_string())?;
 
-    let event_id = compute_event_id(obj).as_str().to_string();
+    let event_room_version = state
+        .db
+        .get_room_version_typed(room_nid)
+        .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
+    let event_id = compute_event_id_for_version(obj, event_room_version)
+        .as_str()
+        .to_string();
 
     if state
         .db
@@ -152,6 +158,14 @@ async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Res
         .and_then(|s| s.get(&sender_domain))
         .and_then(|v| v.as_object())
         .ok_or_else(|| format!("no signatures from {sender_domain}"))?;
+    // Match the room's redaction shape so canonical bytes line up
+    // with the sender's signature (pre-v11 rooms strip create.creator
+    // differently; mismatched shapes mean every sig verify fails).
+    let event_room_version = state
+        .db
+        .get_room_version_typed(room_nid)
+        .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
+
     let mut verified = false;
     for (key_id, _) in sigs {
         let Some(pub_b64) = keys.verify_keys.get(key_id) else {
@@ -165,6 +179,7 @@ async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Res
             &sender_domain,
             key_id,
             &public_key,
+            event_room_version,
         )
         .is_ok()
         {
@@ -183,7 +198,7 @@ async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Res
     let computed = compute_content_hash(obj);
     let to_persist = match declared {
         Some(d) if d == computed => obj.clone(),
-        _ => vela_core::events::redact::redact_event(obj),
+        _ => vela_core::events::redact::redact_event_for_version(obj, event_room_version),
     };
     let pdu = Pdu::from_json(event_id.clone(), &to_persist)
         .ok_or_else(|| "malformed after hash check".to_string())?;

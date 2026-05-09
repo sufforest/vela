@@ -125,9 +125,15 @@ async fn try_join_via(
         template.insert("origin".into(), json!(state.config.server_name));
     }
 
-    // --- 2. Sign the template ---
-    let (signed_event, event_id) =
-        sign_unsigned_template(template, &state.signing_key, &state.config.server_name);
+    // --- 2. Sign the template under the room's actual version (which
+    // we just parsed from make_join's response). Mismatched version =
+    // mismatched canonical bytes = peer rejects our signature.
+    let (signed_event, event_id) = sign_unsigned_template(
+        template,
+        &state.signing_key,
+        &state.config.server_name,
+        room_version_typed,
+    );
 
     // --- 3. send_join ---
     let send_join_resp = state
@@ -294,9 +300,10 @@ async fn bootstrap_remote_room(
             Ok(Some(nid)) => Some(nid),
             Ok(None) => {
                 // Already known (typically from the auth_chain pass above).
+                let parsed_version = RoomVersion::parse(room_version).unwrap_or(RoomVersion::V12);
                 ev.as_object()
                     .map(|obj| {
-                        vela_core::events::hash::compute_event_id(obj)
+                        vela_core::events::hash::compute_event_id_for_version(obj, parsed_version)
                             .as_str()
                             .to_string()
                     })
@@ -482,11 +489,25 @@ async fn persist_remote_event(
     event_json: &Value,
     kind: vela_store::db::PersistKind,
 ) -> Result<Option<u64>, String> {
-    use vela_core::events::hash::{compute_content_hash, compute_event_id};
+    use vela_core::events::hash::{compute_content_hash, compute_event_id_for_version};
 
     let obj = event_json.as_object().ok_or("event is not an object")?;
 
-    let event_id = compute_event_id(obj).as_str().to_string();
+    // Look up the room version FIRST: event_id derivation, sig verify
+    // and content-hash all redact under the version-specific shape, so
+    // we have to know the version before computing the canonical bytes.
+    // send_join's state + auth_chain events were minted by the SENDER
+    // under that room's version. Falling back to v12 when meta is
+    // missing is fine: persist_remote_event is only called after
+    // create_room_meta has been written for the joined room.
+    let event_room_version = state
+        .db
+        .get_room_version_typed(room_nid)
+        .map_err(|e| format!("db room_version: {e}"))?;
+
+    let event_id = compute_event_id_for_version(obj, event_room_version)
+        .as_str()
+        .to_string();
 
     if state
         .db
@@ -530,6 +551,7 @@ async fn persist_remote_event(
             &sender_domain,
             key_id,
             &public_key,
+            event_room_version,
         ) {
             Ok(()) => {
                 verified = true;
@@ -564,7 +586,7 @@ async fn persist_remote_event(
     let computed = compute_content_hash(obj);
     let to_persist: Map<String, Value> = match declared {
         Some(d) if d == computed => obj.clone(),
-        _ => vela_core::events::redact::redact_event(obj),
+        _ => vela_core::events::redact::redact_event_for_version(obj, event_room_version),
     };
     let pdu = Pdu::from_json(event_id.clone(), &to_persist).ok_or("malformed after hash check")?;
 

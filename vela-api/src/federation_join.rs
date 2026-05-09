@@ -272,9 +272,11 @@ pub async fn make_join(
     // server-server spec §"Restricted rooms".
     if authoriser.is_some() {
         vela_core::events::hash::add_content_hash(&mut template);
-        state
-            .signing_key
-            .sign_event(&mut template, &state.config.server_name);
+        state.signing_key.sign_event_for_version(
+            &mut template,
+            &state.config.server_name,
+            room_version,
+        );
     }
 
     Ok(Json(json!({
@@ -374,6 +376,19 @@ pub async fn send_join_v2(
         ));
     }
 
+    // Look up the room version up-front so verify_event_signature
+    // redacts under the sender's shape; pre-v11 join member events
+    // strip everything except `membership` from content (and v8+ keep
+    // join_authorised_via_users_server too), and v12 redaction would
+    // over-preserve, breaking sig verify.
+    let send_join_room_version = state
+        .db
+        .get_nid(&room_id)
+        .ok()
+        .flatten()
+        .and_then(|n| state.db.get_room_version_typed(n).ok())
+        .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
+
     // Verify the signature over the event.
     let keys = state
         .remote_keys
@@ -406,7 +421,15 @@ pub async fn send_join_v2(
         let Ok(public_key) = decode_public_key(pub_b64) else {
             continue;
         };
-        if verify_event_signature(event_obj, sender_domain, key_id, &public_key).is_ok() {
+        if verify_event_signature(
+            event_obj,
+            sender_domain,
+            key_id,
+            &public_key,
+            send_join_room_version,
+        )
+        .is_ok()
+        {
             sig_verified = true;
             break;
         }
@@ -471,7 +494,14 @@ pub async fn send_join_v2(
                 let Ok(public_key) = decode_public_key(pub_b64) else {
                     continue;
                 };
-                if verify_event_signature(event_obj, authoriser_domain, key_id, &public_key).is_ok()
+                if verify_event_signature(
+                    event_obj,
+                    authoriser_domain,
+                    key_id,
+                    &public_key,
+                    send_join_room_version,
+                )
+                .is_ok()
                 {
                     auth_verified = true;
                     break;
@@ -527,7 +557,8 @@ pub async fn send_join_v2(
     // Verify event_id in URL matches the computed reference hash. An origin
     // could otherwise send a legitimate signed event under a chosen URL id,
     // causing us to persist it under a fabricated identifier.
-    let computed_event_id = vela_core::events::hash::compute_event_id(event_obj);
+    let computed_event_id =
+        vela_core::events::hash::compute_event_id_for_version(event_obj, send_join_room_version);
     if computed_event_id.as_str() != event_id {
         return Err(err_response(
             StatusCode::BAD_REQUEST,
@@ -550,7 +581,7 @@ pub async fn send_join_v2(
     };
     let effective_event_obj: Map<String, Value> = if use_redacted {
         tracing::warn!(%event_id, "send_join: content hash mismatch, using redacted form");
-        vela_core::events::redact::redact_event(event_obj)
+        vela_core::events::redact::redact_event_for_version(event_obj, send_join_room_version)
     } else {
         event_obj.clone()
     };

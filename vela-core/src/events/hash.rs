@@ -7,7 +7,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::canonical::canonical_json_object;
-use crate::events::redact::redact_event;
+use crate::events::redact::{redact_event, redact_event_for_version};
+use crate::events::room_version::RoomVersion;
 use crate::identifiers::EventId;
 
 /// Compute the content hash of an event.
@@ -30,14 +31,30 @@ pub fn compute_content_hash(event: &Map<String, Value>) -> String {
     STANDARD_NO_PAD.encode(hash)
 }
 
-/// Compute the reference hash of an event (used as event_id in v4+).
+/// Compute the reference hash of an event for a specific room version.
 ///
 /// Per spec:
-/// 1. Redact the event (strip non-essential fields per event type)
+/// 1. Redact the event under the version-specific shape
 /// 2. Remove signatures and unsigned from redacted event
 /// 3. Canonical JSON encode
 /// 4. SHA-256 hash
 /// 5. Return as unpadded URL-safe base64
+pub fn compute_reference_hash_for_version(
+    event: &Map<String, Value>,
+    version: RoomVersion,
+) -> String {
+    let mut redacted = redact_event_for_version(event, version);
+    redacted.remove("signatures");
+    redacted.remove("unsigned");
+
+    let canonical = canonical_json_object(&redacted);
+    let hash = Sha256::digest(&canonical);
+    URL_SAFE_NO_PAD.encode(hash)
+}
+
+/// V12-default wrapper. Use `compute_reference_hash_for_version` when
+/// the room version is known; this is for tests and back-compat callers
+/// that haven't been threaded yet.
 pub fn compute_reference_hash(event: &Map<String, Value>) -> String {
     let mut redacted = redact_event(event);
     redacted.remove("signatures");
@@ -48,7 +65,17 @@ pub fn compute_reference_hash(event: &Map<String, Value>) -> String {
     URL_SAFE_NO_PAD.encode(hash)
 }
 
-/// Compute the event_id from the reference hash.
+/// Compute the event_id from the reference hash for a specific room
+/// version. The reference hash MUST match the sender's redaction shape
+/// or the event_id derived will disagree with what every other peer
+/// computes — propagating up to broken state res, federation, and
+/// auth-event lookups.
+pub fn compute_event_id_for_version(event: &Map<String, Value>, version: RoomVersion) -> EventId {
+    let hash = compute_reference_hash_for_version(event, version);
+    EventId::from_reference_hash(&hash)
+}
+
+/// V12-default wrapper for `compute_event_id_for_version`.
 pub fn compute_event_id(event: &Map<String, Value>) -> EventId {
     let hash = compute_reference_hash(event);
     EventId::from_reference_hash(&hash)

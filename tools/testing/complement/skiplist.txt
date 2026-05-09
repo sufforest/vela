@@ -59,50 +59,9 @@
 # so the test either passes trivially or fails on unrelated grounds.
 ^TestCorruptedAuthChain$
 
-# Tests below were unblocked at the room-creation layer by PR #35
-# (v6-v11 support), but a re-run revealed deeper gaps that aren't
-# in scope for the room-version sprint:
-#
-# 1. Mock-server signature verification: every test that uses
-#    Complement's fake federation `Server` (signing-key
-#    `ed25519:complement_*`, sender_domain
-#    `host.docker.internal:NNNNN`) fails sig-verify on the auth
-#    chain. Vela accepts well-formed peer keys when both ends are
-#    real homeservers (the v12 sibling tests pass on hs1+hs2
-#    deploys), but the mock-server's key-fetch + verify path has a
-#    bug we haven't traced. Affects most pre-v12 federation tests.
-#
-# 2. Version-aware auth-rules: vela's auth_rules.rs accepts
-#    knock and restricted-join transitions on ALL versions
-#    unconditionally (see deferred-work note in PR #35). v7 knock
-#    + v8 restricted tests assert membership transitions per their
-#    spec versions, which require version-conditional gating.
-#
-# Each entry below is a real spec gap we should close; revisit
-# once mock-server sig verify is fixed and version-aware
-# auth-rules land.
-^TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6$
-^TestDeviceListsUpdateOverFederationOnRoomJoin$
-^TestMSC4291RoomIDAsHashOfCreateEvent_CannotSendCreateEvent$
-^TestMSC4291RoomIDAsHashOfCreateEvent_UpgradedRooms$
-^TestRestrictedRoomsLocalJoin$
-^TestRestrictedRoomsRemoteJoin$
-^TestRestrictedRoomsRemoteJoinLocalUser$
-^TestRestrictedRoomsRemoteJoinFailOver$
-^TestRestrictedRoomsLocalJoinInMSC3787Room$
-^TestRestrictedRoomsRemoteJoinInMSC3787Room$
-^TestRestrictedRoomsRemoteJoinLocalUserInMSC3787Room$
-^TestRestrictedRoomsRemoteJoinFailOverInMSC3787Room$
-^TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
-^TestRestrictedRoomsSpacesSummaryLocal$
-^TestRestrictedRoomsSpacesSummaryFederation$
-^TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
-^TestKnocking$
-^TestKnockingInMSC3787Room$
-^TestKnockRoomsInPublicRoomsDirectory$
-^TestKnockRoomsInPublicRoomsDirectoryInMSC3787Room$
-^TestCannotSendKnockViaSendKnockInMSC3787Room$
-^TestCannotSendNonKnockViaSendKnock$
+
+
+
 
 
 # --- Deferred spec bugs ---

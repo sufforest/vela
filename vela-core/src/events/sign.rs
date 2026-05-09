@@ -59,12 +59,29 @@ impl ServerSigningKey {
         STANDARD_NO_PAD.encode(self.verifying_key().as_bytes())
     }
 
-    /// Sign an event per the Matrix signing algorithm:
-    /// 1. Redact the event
-    /// 2. Remove signatures and unsigned from redacted copy (per JSON signing algorithm)
-    /// 3. Canonical JSON of redacted event
-    /// 4. Ed25519 sign
-    /// 5. Store in signatures.{server_name}.{key_id}
+    /// Sign an event under a specific room version's redaction shape.
+    /// Mismatch with the receiver's verify version produces canonical
+    /// bytes that disagree, and the signature fails to verify
+    /// downstream. Always pass the room's actual version.
+    pub fn sign_event_for_version(
+        &self,
+        event: &mut Map<String, Value>,
+        server_name: &str,
+        room_version: crate::events::room_version::RoomVersion,
+    ) {
+        let mut redacted = crate::events::redact::redact_event_for_version(event, room_version);
+        redacted.remove("signatures");
+        redacted.remove("unsigned");
+
+        let canonical = canonical_json_object(&redacted);
+        let signature = self.signing_key.sign(&canonical);
+        let sig_b64 = STANDARD_NO_PAD.encode(signature.to_bytes());
+
+        Self::insert_signature(event, server_name, &self.key_id, sig_b64);
+    }
+
+    /// V12-default wrapper. Use `sign_event_for_version` when the room
+    /// version is known.
     pub fn sign_event(&self, event: &mut Map<String, Value>, server_name: &str) {
         let mut redacted = redact_event(event);
         redacted.remove("signatures");

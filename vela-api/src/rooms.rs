@@ -219,12 +219,21 @@ pub async fn create_room(
         }
         cc.insert("additional_creators".to_string(), Value::Array(existing));
     }
+    // v12 derives room_id from the create event's event_id (so the
+    // create has no `room_id` field). Pre-v12 rooms mint a random
+    // `!opaque:server` first and the create event carries the field.
+    // Build the create accordingly.
+    let pre_v12_room_id = if room_version.omit_room_id_from_create() {
+        None
+    } else {
+        Some(RoomId::generate_for_server(server_name))
+    };
     let (create_ev, create_eid) = build_event(
         "m.room.create",
         Some(""),
         create_content_val,
         &user.user_id,
-        None,
+        pre_v12_room_id.as_ref(),
         &[],
         &[],
         depth,
@@ -232,7 +241,10 @@ pub async fn create_room(
         server_name,
         room_version,
     );
-    let room_id = RoomId::from_create_event_id(&create_eid);
+    let room_id = match pre_v12_room_id {
+        Some(r) => r,
+        None => RoomId::from_create_event_id(&create_eid),
+    };
     created.push(("m.room.create".into(), "".into(), create_eid.clone()));
     all_events.push(PendingEvent {
         event: create_ev,
