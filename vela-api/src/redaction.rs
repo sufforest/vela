@@ -15,7 +15,6 @@ use vela_core::canonical::canonical_json_object;
 use vela_core::error::VelaError;
 use vela_core::events::builder::{build_event, select_auth_events};
 use vela_core::events::pdu::Pdu;
-use vela_core::events::room_version::RoomVersion;
 use vela_core::identifiers::{EventId, Nid, RoomId};
 
 use crate::auth_check::authorise_event;
@@ -129,7 +128,10 @@ pub async fn redact_event(
 
     let signing_key = get_or_create_signing_key(&state)?;
     let server_name = &state.config.server_name;
-    let room_version = RoomVersion::V12;
+    let room_version = state
+        .db
+        .get_room_version_typed(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     let event_type = "m.room.redaction";
 
     let extremity_nids = state

@@ -68,6 +68,13 @@ pub async fn upgrade_room(
 ) -> Result<Json<Value>, ApiError> {
     let room_version = RoomVersion::parse(&body.new_version)
         .ok_or_else(|| ApiError(VelaError::UnsupportedRoomVersion(body.new_version.clone())))?;
+    if !room_version.at_least(state.config.minimum_room_version) {
+        return Err(ApiError(VelaError::UnsupportedRoomVersion(format!(
+            "room version {} is below operator minimum {}",
+            room_version.as_str(),
+            state.config.minimum_room_version.as_str(),
+        ))));
+    }
 
     let old_room_id =
         RoomId::parse(&old_room_id_str).map_err(|e| ApiError(VelaError::BadJson(e.to_string())))?;
@@ -508,7 +515,10 @@ async fn send_tombstone(
 ) -> Result<(), ApiError> {
     let signing_key = get_or_create_signing_key(state)?;
     let server_name = &state.config.server_name;
-    let room_version = RoomVersion::V12;
+    let room_version = state
+        .db
+        .get_room_version_typed(old_room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     let lock = state
         .room_locks

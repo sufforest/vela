@@ -73,6 +73,14 @@ pub struct ServerConfig {
     /// (`@alice:other.server`) to start a DM with a stranger, which
     /// is the right privacy default.
     pub user_directory_federate: bool,
+    /// Minimum room version vela accepts on `/createRoom` and on
+    /// inbound federated joins. Default v6 — older versions have known
+    /// auth-rule issues (v1/v2 float-coerced PLs, sig-failed events
+    /// accepted) and aren't supported in this codebase regardless.
+    /// Operators wanting "spec-modern only" can set this to "10" or
+    /// higher; clients/peers requesting older versions get
+    /// M_UNSUPPORTED_ROOM_VERSION.
+    pub minimum_room_version: vela_core::events::room_version::RoomVersion,
 }
 
 /// Server policy for auto-injecting `m.room.encryption` on

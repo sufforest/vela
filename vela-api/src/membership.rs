@@ -9,7 +9,6 @@ use vela_core::canonical::canonical_json_object;
 use vela_core::error::VelaError;
 use vela_core::events::builder::{build_event, select_auth_events};
 use vela_core::events::content;
-use vela_core::events::room_version::RoomVersion;
 use vela_core::events::view::EventView;
 use vela_core::identifiers::{EventId, Nid, RoomId};
 
@@ -1012,7 +1011,10 @@ pub async fn knock_room(
 
     let signing_key = get_or_create_signing_key(&state)?;
     let server_name = &state.config.server_name;
-    let room_version = RoomVersion::V12;
+    let room_version = state
+        .db
+        .get_room_version_typed(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     let lock = state
         .room_locks
@@ -1254,7 +1256,10 @@ async fn emit_join_event(
     // to the content. Mirrors `emit_membership_event_for_target` shape.
     let signing_key = get_or_create_signing_key(state)?;
     let server_name = &state.config.server_name;
-    let room_version = RoomVersion::V12;
+    let room_version = state
+        .db
+        .get_room_version_typed(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     let lock = state
         .room_locks
@@ -1432,7 +1437,10 @@ async fn emit_self_profile_event(
 ) -> Result<(), ApiError> {
     let signing_key = get_or_create_signing_key(state)?;
     let server_name = &state.config.server_name;
-    let room_version = RoomVersion::V12;
+    let room_version = state
+        .db
+        .get_room_version_typed(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     let lock = state
         .room_locks
@@ -1557,7 +1565,10 @@ async fn emit_membership_event_for_target(
 ) -> Result<(), ApiError> {
     let signing_key = get_or_create_signing_key(state)?;
     let server_name = &state.config.server_name;
-    let room_version = RoomVersion::V12;
+    let room_version = state
+        .db
+        .get_room_version_typed(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     let lock = state
         .room_locks
@@ -1982,7 +1993,10 @@ async fn emit_self_leave_with_reason(
 ) -> Result<(), ApiError> {
     let signing_key = get_or_create_signing_key(state)?;
     let server_name = &state.config.server_name;
-    let room_version = RoomVersion::V12;
+    let room_version = state
+        .db
+        .get_room_version_typed(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     let lock = state
         .room_locks

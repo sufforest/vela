@@ -101,6 +101,13 @@ pub async fn create_room(
             .ok_or_else(|| ApiError(VelaError::UnsupportedRoomVersion(v.to_string())))?,
         None => RoomVersion::V12,
     };
+    if !room_version.at_least(state.config.minimum_room_version) {
+        return Err(ApiError(VelaError::UnsupportedRoomVersion(format!(
+            "room version {} is below operator minimum {}",
+            room_version.as_str(),
+            state.config.minimum_room_version.as_str(),
+        ))));
+    }
 
     // Up-front structural validation. The auth-rules engine would also
     // reject these at check_auth time, but as 403 M_FORBIDDEN — Complement

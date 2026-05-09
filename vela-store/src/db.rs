@@ -649,6 +649,47 @@ impl Database {
         )
     }
 
+    /// Read the persisted room version string. Returns `None` if the
+    /// room is unknown or its meta record is malformed. Callers parse
+    /// this through `RoomVersion::parse` and fall back to v12 when the
+    /// value is absent (pre-v6 rooms aren't persisted by vela in the
+    /// first place; legacy meta records from very early development
+    /// occasionally lacked the field).
+    pub fn get_room_version(&self, room_nid: u64) -> Result<Option<String>, rocksdb::Error> {
+        let cf = self.db.cf_handle("room_meta").unwrap();
+        let bytes = match self.db.get_cf(&cf, keys::encode_u64(room_nid))? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let record: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        Ok(record
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()))
+    }
+
+    /// `get_room_version` decoded straight to the typed enum. Falls back
+    /// to v12 when the meta record is missing, malformed, or carries an
+    /// unsupported version string — that's safe for vela because v12 is
+    /// the only version we EMIT today and any room we already persisted
+    /// went through `create_room_meta` with a known-supported value.
+    /// Federated joins hitting this fallback path will fail
+    /// downstream auth-rule checks if the wire-format event shape
+    /// disagrees, which is the right outcome.
+    pub fn get_room_version_typed(
+        &self,
+        room_nid: u64,
+    ) -> Result<vela_core::events::room_version::RoomVersion, rocksdb::Error> {
+        let raw = self.get_room_version(room_nid)?;
+        Ok(raw
+            .as_deref()
+            .and_then(vela_core::events::room_version::RoomVersion::parse)
+            .unwrap_or(vela_core::events::room_version::RoomVersion::V12))
+    }
+
     // --- User filters (sync) ---
 
     /// Store a sync filter definition for a user. Returns the assigned
