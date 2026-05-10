@@ -389,12 +389,13 @@ pub(crate) fn collect_public_rooms(
             }
         }
 
+        let join_rule = read_join_rule(state, room_nid)?;
         let mut entry = serde_json::Map::new();
         entry.insert("room_id".to_string(), json!(room_id));
         entry.insert("num_joined_members".to_string(), json!(joined));
         entry.insert("world_readable".to_string(), json!(false));
         entry.insert("guest_can_join".to_string(), json!(false));
-        entry.insert("join_rule".to_string(), json!("public"));
+        entry.insert("join_rule".to_string(), json!(join_rule));
         if let Some(n) = name {
             entry.insert("name".to_string(), json!(n));
         }

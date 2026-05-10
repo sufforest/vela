@@ -19,7 +19,7 @@ use serde_json::{Map, Value, json};
 use tracing::debug;
 
 use vela_core::canonical::canonical_json_object;
-use vela_core::events::hash::{compute_content_hash, compute_event_id};
+use vela_core::events::hash::{compute_content_hash, compute_event_id_for_version};
 use vela_core::events::pdu::Pdu;
 use vela_core::events::view::EventView;
 use vela_core::federation::keys::{decode_public_key, verify_event_signature};
@@ -174,7 +174,9 @@ pub async fn invite_v2(
     }
 
     // event_id in the URL must match the computed reference hash.
-    let computed_id = compute_event_id(&event);
+    // Pre-v11 redaction shape differs from v12 — the URL-vs-hash
+    // check has to use the actual room version we negotiated above.
+    let computed_id = compute_event_id_for_version(&event, event_room_version);
     if computed_id.as_str() != event_id {
         return Err(err(
             StatusCode::BAD_REQUEST,

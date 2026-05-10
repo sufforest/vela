@@ -297,8 +297,12 @@ pub async fn send_knock_v1(
         ));
     }
 
-    // event_id in URL must match the computed reference hash.
-    let computed_event_id = vela_core::events::hash::compute_event_id(event_obj);
+    // event_id in URL must match the computed reference hash. Use
+    // the room's actual version: redaction shape differs across
+    // versions, and pre-v11 events would mismatch under the V12
+    // default.
+    let computed_event_id =
+        vela_core::events::hash::compute_event_id_for_version(event_obj, send_knock_room_version);
     if computed_event_id.as_str() != event_id {
         return Err(err(
             StatusCode::BAD_REQUEST,
@@ -326,6 +330,25 @@ pub async fn send_knock_v1(
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone();
     let _guard = lock.lock().await;
+
+    // Idempotent re-knock: if the user is already in knock state on us
+    // (the resident), accept without persisting a new event. Synapse
+    // does the same thing — surfacing every repeat knock as a fresh
+    // state event clobbers `content.reason` for everyone in the room
+    // and breaks TestKnocking's "Users in the room see a user's
+    // membership update when they knock" #01 sub-test, which expects
+    // the *first* knock's reason to remain visible.
+    let sender_nid_check = state.db.get_or_create_nid(sender).map_err(db_err)?;
+    if state
+        .db
+        .get_membership(room_nid, sender_nid_check)
+        .ok()
+        .flatten()
+        == Some(4)
+    {
+        let knock_room_state = build_knock_room_state(&state, room_nid).map_err(db_err)?;
+        return Ok(Json(json!({"knock_room_state": knock_room_state})));
+    }
 
     // Auth check via the rule engine.
     let mut auth_state = std::collections::HashMap::new();

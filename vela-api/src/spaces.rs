@@ -199,7 +199,9 @@ async fn walk_full(
                 let Some(resp) = fetch_remote_hierarchy(state, &remote_id, &via).await else {
                     continue;
                 };
-                if let Some(room_chunk) = resp.get("room").cloned() {
+                if let Some(room_chunk) = resp.get("room").cloned()
+                    && user_can_see_remote_chunk(state, user.user_nid, &room_chunk)?
+                {
                     rooms.push(room_chunk);
                 }
                 if depth + 1 > max_depth {
@@ -211,6 +213,9 @@ async fn walk_full(
                             continue;
                         };
                         if visited.contains(cid) {
+                            continue;
+                        }
+                        if !user_can_see_remote_chunk(state, user.user_nid, child_chunk)? {
                             continue;
                         }
                         rooms.push(child_chunk.clone());
@@ -234,6 +239,73 @@ async fn walk_full(
         }
     }
     Ok(rooms)
+}
+
+/// User-level peek check for a chunk returned by a remote /hierarchy.
+/// Public / knock / world_readable rooms are always shown. Restricted /
+/// knock_restricted rooms are shown when the user is joined to one of
+/// the chunk's `allowed_room_ids` (MSC2946) — i.e. they could already
+/// join the room. Anything else is hidden so the hierarchy doesn't
+/// leak invite-only rooms past the requesting user's reach.
+fn user_can_see_remote_chunk(
+    state: &AppState,
+    user_nid: u64,
+    chunk: &Value,
+) -> Result<bool, ApiError> {
+    let join_rule = chunk
+        .get("join_rule")
+        .and_then(|v| v.as_str())
+        .unwrap_or("invite");
+    if matches!(join_rule, "public" | "knock" | "knock_restricted") {
+        return Ok(true);
+    }
+    if chunk
+        .get("world_readable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Ok(true);
+    }
+    if matches!(join_rule, "restricted" | "knock_restricted")
+        && let Some(arr) = chunk.get("allowed_room_ids").and_then(|v| v.as_array())
+    {
+        for entry in arr {
+            let Some(room_id) = entry.as_str() else {
+                continue;
+            };
+            let Some(rn) = state
+                .db
+                .get_nid(room_id)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            else {
+                continue;
+            };
+            if state
+                .db
+                .get_membership(rn, user_nid)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                == Some(1)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    // Joined / invited locally → also visible. Cheap to check last.
+    if let Some(room_id) = chunk.get("room_id").and_then(|v| v.as_str())
+        && let Some(rn) = state
+            .db
+            .get_nid(room_id)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    {
+        let m = state
+            .db
+            .get_membership(rn, user_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        if matches!(m, Some(1) | Some(2)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Try each `via` server in turn until one returns a parseable
@@ -264,13 +336,27 @@ pub(crate) fn can_peek(state: &AppState, room_nid: u64, user_nid: u64) -> Result
     if matches!(membership, Some(1) | Some(2)) {
         return Ok(true);
     }
-    let jr = read_content(state, room_nid, "m.room.join_rules", "")
+    let jr_content = read_content(state, room_nid, "m.room.join_rules", "");
+    let jr = jr_content
         .as_ref()
         .and_then(|c| c.get("join_rule"))
         .and_then(|v| v.as_str())
         .unwrap_or("invite")
         .to_string();
     if matches!(jr.as_str(), "public" | "knock" | "knock_restricted") {
+        return Ok(true);
+    }
+    // MSC2946: restricted/knock_restricted rooms are peekable by users who
+    // satisfy the join_rules.allow list — typically space membership. The
+    // hierarchy summary uses this so a space member can see the rooms
+    // they're already authorised to join.
+    if matches!(jr.as_str(), "restricted" | "knock_restricted")
+        && let Some(allow) = jr_content
+            .as_ref()
+            .and_then(|c| c.get("allow"))
+            .and_then(|a| a.as_array())
+        && crate::membership::user_qualifies_via_allow_list_pub(state, user_nid, allow)?
+    {
         return Ok(true);
     }
     // world_readable via m.room.history_visibility.
@@ -424,12 +510,40 @@ pub(crate) fn summarize_room(
         .and_then(|c| c.get("alias"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let join_rule = read_content(state, room_nid, "m.room.join_rules", "")
+    let jr_content = read_content(state, room_nid, "m.room.join_rules", "");
+    let join_rule = jr_content
         .as_ref()
         .and_then(|c| c.get("join_rule"))
         .and_then(|v| v.as_str())
         .unwrap_or("invite")
         .to_string();
+    // For restricted/knock_restricted rooms, surface `allowed_room_ids`
+    // (MSC2946) so the requesting server can do user-level peek
+    // filtering — without it a peeking server can't tell which users
+    // qualify and ends up exposing the room to everyone who has the
+    // hierarchy URL.
+    let allowed_room_ids: Vec<String> =
+        if matches!(join_rule.as_str(), "restricted" | "knock_restricted") {
+            jr_content
+                .as_ref()
+                .and_then(|c| c.get("allow"))
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|e| {
+                            e.get("type").and_then(|v| v.as_str()) == Some("m.room_membership")
+                        })
+                        .filter_map(|e| {
+                            e.get("room_id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
     let guest_can_join = read_content(state, room_nid, "m.room.guest_access", "")
         .as_ref()
         .and_then(|c| c.get("guest_access"))
@@ -482,6 +596,9 @@ pub(crate) fn summarize_room(
     out.insert("join_rule".into(), json!(join_rule));
     out.insert("room_version".into(), json!(room_version));
     out.insert("children_state".into(), json!(children_state));
+    if !allowed_room_ids.is_empty() {
+        out.insert("allowed_room_ids".into(), json!(allowed_room_ids));
+    }
     if let Some(n) = name {
         out.insert("name".into(), json!(n));
     }
@@ -644,13 +761,28 @@ fn origin_can_peek(state: &AppState, room_nid: u64, origin: &str) -> Result<bool
         }
     }
 
-    let jr = read_content(state, room_nid, "m.room.join_rules", "")
+    let jr_content = read_content(state, room_nid, "m.room.join_rules", "");
+    let jr = jr_content
         .as_ref()
         .and_then(|c| c.get("join_rule"))
         .and_then(|v| v.as_str())
         .unwrap_or("invite")
         .to_string();
     if matches!(jr.as_str(), "public" | "knock" | "knock_restricted") {
+        return Ok(true);
+    }
+    // MSC2946 (federation): a restricted room is summarisable to a peer
+    // server if any user from that server is a member of one of the
+    // join_rules.allow rooms — they're authorised to join, so they're
+    // authorised to see the summary. TestRestrictedRoomsSpacesSummaryFederation
+    // hangs on this when the space lives on the asker side.
+    if matches!(jr.as_str(), "restricted" | "knock_restricted")
+        && let Some(allow) = jr_content
+            .as_ref()
+            .and_then(|c| c.get("allow"))
+            .and_then(|a| a.as_array())
+        && origin_qualifies_via_allow_list(state, origin, allow)?
+    {
         return Ok(true);
     }
     let hv = read_content(state, room_nid, "m.room.history_visibility", "")
@@ -660,4 +792,52 @@ fn origin_can_peek(state: &AppState, room_nid: u64, origin: &str) -> Result<bool
         .unwrap_or("shared")
         .to_string();
     Ok(hv == "world_readable")
+}
+
+/// True when at least one joined member of any `m.room_membership` allow
+/// entry comes from `origin`. Used for federation hierarchy peeks on
+/// restricted rooms — the allow-list defines who can join, and we'll
+/// already accept federated joins from that server, so we should also
+/// expose the room summary to it.
+fn origin_qualifies_via_allow_list(
+    state: &AppState,
+    origin: &str,
+    allow: &[Value],
+) -> Result<bool, ApiError> {
+    for entry in allow {
+        if entry.get("type").and_then(|v| v.as_str()) != Some("m.room_membership") {
+            continue;
+        }
+        let Some(gate_room_id) = entry.get("room_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(gate_nid) = state
+            .db
+            .get_nid(gate_room_id)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        else {
+            continue;
+        };
+        let members = state
+            .db
+            .get_room_members(gate_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        for m in members {
+            let Some(uid) = state
+                .db
+                .resolve_nid(m)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            else {
+                continue;
+            };
+            if uid
+                .split_once(':')
+                .map(|(_, d)| d == origin)
+                .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }

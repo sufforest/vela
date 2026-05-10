@@ -47,6 +47,12 @@ pub fn power_levels_content(room_version: RoomVersion) -> Value {
     // Default power levels per spec.
     // In v12: creator has infinite power and MUST NOT be in users.
     // Tombstone must be >= 150 (higher than state_default).
+    // Spec default for `invite` in m.room.power_levels is 0, but the value
+    // synapse stamps at room-create time is 50, and Complement's
+    // restricted-rooms tests assume that baseline (e.g. "alice cannot
+    // invite due to the default power levels"). Match synapse's
+    // createRoom default so a fresh room behaves the same way other
+    // homeservers produce it.
     let mut content = json!({
         "ban": 50,
         "events": {
@@ -59,7 +65,7 @@ pub fn power_levels_content(room_version: RoomVersion) -> Value {
             "m.room.server_acl": 100
         },
         "events_default": 0,
-        "invite": 0,
+        "invite": 50,
         "kick": 50,
         "redact": 50,
         "state_default": 50,
