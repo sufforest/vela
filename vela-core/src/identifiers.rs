@@ -84,7 +84,7 @@ impl RoomId {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use rand::RngCore;
         let mut bytes = [0u8; 14];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         let opaque = URL_SAFE_NO_PAD.encode(bytes);
         Self(format!("!{opaque}:{server_name}"))
     }

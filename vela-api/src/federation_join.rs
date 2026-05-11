@@ -173,38 +173,45 @@ pub async fn make_join(
     // pointing at a local member with invite power. The calling user must
     // also satisfy the allow list. Auth rule 5.3.5 (check_member_join) will
     // enforce both on the send_join side.
-    let authoriser: Option<String> = if matches!(join_rule, "restricted" | "knock_restricted") {
-        let allow = join_rules_content
-            .as_ref()
-            .and_then(|c| c.get("allow"))
-            .and_then(|a| a.as_array())
-            .cloned()
-            .unwrap_or_default();
-        match crate::membership::user_qualifies_via_allow_list_pub(&state, user_nid, &allow) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(err_response(
-                    StatusCode::FORBIDDEN,
-                    "M_FORBIDDEN",
-                    "user is not a member of any allow-list room",
-                ));
+    // Restricted-room authoriser. An invited user joins like a public-room
+    // join — no allow-list check, no `join_authorised_via_users_server`.
+    // Skipping the authoriser is what TestKnockingInMSC3787Room's
+    // "A_user_cannot_knock_on_a_room_they_are_already_in" relies on: the
+    // user already accepted an invite, so a follow-up join shouldn't
+    // require space membership to succeed.
+    let authoriser: Option<String> =
+        if matches!(join_rule, "restricted" | "knock_restricted") && !invited {
+            let allow = join_rules_content
+                .as_ref()
+                .and_then(|c| c.get("allow"))
+                .and_then(|a| a.as_array())
+                .cloned()
+                .unwrap_or_default();
+            match crate::membership::user_qualifies_via_allow_list_pub(&state, user_nid, &allow) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(err_response(
+                        StatusCode::FORBIDDEN,
+                        "M_FORBIDDEN",
+                        "user is not a member of any allow-list room",
+                    ));
+                }
+                Err(e) => return Err(db_err(e.0)),
             }
-            Err(e) => return Err(db_err(e.0)),
-        }
-        match crate::membership::pick_local_authoriser_pub(&state, room_nid) {
-            Ok(Some(a)) => Some(a),
-            Ok(None) => {
-                return Err(err_response(
-                    StatusCode::FORBIDDEN,
-                    "M_UNABLE_TO_GRANT_JOIN",
-                    "no local member with invite power to authorise join",
-                ));
+            match crate::membership::pick_local_authoriser_pub(&state, room_nid) {
+                Ok(Some(a)) => Some(a),
+                Ok(None) => {
+                    return Err(err_response(
+                        StatusCode::FORBIDDEN,
+                        "M_UNABLE_TO_GRANT_JOIN",
+                        "no local member with invite power to authorise join",
+                    ));
+                }
+                Err(e) => return Err(db_err(e.0)),
             }
-            Err(e) => return Err(db_err(e.0)),
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // Build a TEMPLATE event (no hashes, no signatures — origin will sign).
     let mut content_val = content::member_content_join(None, None);

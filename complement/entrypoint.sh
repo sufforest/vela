@@ -79,5 +79,5 @@ echo "[vela-complement] starting vela with config $CONF_DIR/vela.toml"
 # Default to debug for vela's own modules; trace specifically for the
 # signature-verify path so canonical-bytes diagnostics surface in
 # Complement runs without flooding the rest of the log.
-exec env RUST_LOG="${RUST_LOG:-vela_api=debug,vela_core::federation::keys=trace}" \
+exec env RUST_LOG="${RUST_LOG:-vela_api=debug,vela_core=warn,vela_core::federation::keys=trace}" \
     /usr/local/bin/vela --config "$CONF_DIR/vela.toml"

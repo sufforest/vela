@@ -239,14 +239,27 @@ async fn do_join(
             return Ok(Json(json!({"room_id": room_id.as_str()})));
         }
 
-        let hints = if server_hints.is_empty() {
-            // Fall back to the inviter's server if the client didn't hint.
-            invite_sender_server(&state, room_nid, user.user_nid)?
-                .into_iter()
-                .collect::<Vec<_>>()
-        } else {
-            server_hints
-        };
+        let mut hints: Vec<String> = server_hints
+            .iter()
+            .filter(|s| s.as_str() != state.config.server_name.as_str())
+            .cloned()
+            .collect();
+        if hints.is_empty() {
+            // Client either omitted server_name or only listed us. Pick
+            // the inviter's server first, then fall back to other servers
+            // we know are in the room (creator's domain or any joined
+            // remote member). TestRestrictedRoomsRemoteJoinLocalUser
+            // sends `?server_name=hs1` for a room hosted on hs2, so we
+            // need a way to resolve hs2 from local state.
+            if let Some(inv) = invite_sender_server(&state, room_nid, user.user_nid)? {
+                hints.push(inv);
+            }
+            for s in remote_servers_in_room(&state, room_nid)? {
+                if !hints.contains(&s) {
+                    hints.push(s);
+                }
+            }
+        }
         do_remote_join(&state, &user.user_id, user.user_nid, &room_id, &hints).await?;
         crate::keys::record_device_changes_on_join(&state, user.user_nid, room_nid);
         crate::keys::federate_device_lists_on_join(&state, user.user_nid, &user.user_id, room_nid);
@@ -388,6 +401,47 @@ fn invite_sender_server(
     Ok(member
         .sender()
         .and_then(|s| s.split_once(':').map(|(_, d)| d.to_string())))
+}
+
+/// Servers other than ours that we know are participating in the room.
+/// Picks the create event's sender domain first (most likely to still be
+/// resident), then any joined member's domain. Used when a client passes
+/// `?server_name=` listing only ourselves and we need an alternate
+/// resident to drive make_join.
+fn remote_servers_in_room(state: &AppState, room_nid: u64) -> Result<Vec<String>, ApiError> {
+    let our_server = state.config.server_name.as_str();
+    let mut out: Vec<String> = Vec::new();
+    if let Some(create) = read_state_value(state, room_nid, "m.room.create", "")?
+        && let Some(sender) = create.sender()
+        && let Some((_, domain)) = sender.split_once(':')
+        && domain != our_server
+    {
+        out.push(domain.to_string());
+    }
+    let members = state
+        .db
+        .get_room_members(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    for member_nid in members {
+        let Some(user_id) = state
+            .db
+            .resolve_nid(member_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        else {
+            continue;
+        };
+        let Some((_, domain)) = user_id.split_once(':') else {
+            continue;
+        };
+        if domain == our_server {
+            continue;
+        }
+        let s = domain.to_string();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    Ok(out)
 }
 
 /// True if `user_nid` currently has membership=join in any room listed in
@@ -873,7 +927,10 @@ pub async fn kick_user(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     let target_membership =
         target_nid.and_then(|n| state.db.get_membership(room_nid, n).ok().flatten());
-    if target_membership != Some(1) && target_membership != Some(2) {
+    // Allow kick when target is joined (1), invited (2), or knocking
+    // (4). Rejecting a knock is "kick" in the spec — TestKnocking's
+    // "A_user_in_the_room_can_reject_a_knock" expects this to work.
+    if !matches!(target_membership, Some(1) | Some(2) | Some(4)) {
         return Err(VelaError::Forbidden("target is not in the room".into()).into());
     }
 
@@ -1013,6 +1070,50 @@ pub async fn knock_room(
             return Ok(Json(json!({"room_id": room_id.as_str()})));
         }
     };
+
+    // Room exists locally but isn't hosted here — re-knock after a prior
+    // federated knock falls into this branch. Stripped state from the
+    // first knock isn't a valid base for authoring locally (no signatures,
+    // no origin_server_ts), so we have to federate again. We must NOT
+    // short-circuit on "already in knock state" here — federation is
+    // async, so the resident server may have moved the user out of knock
+    // (kick / leave) without our membership table having caught up yet.
+    // TestKnocking's "reject a knock" → "knock without reason" sequence
+    // hits exactly that race.
+    if !room_is_locally_hosted(&state, room_nid)? {
+        let mut hints = parse_query_values(raw_query.as_deref(), "server_name");
+        if hints.is_empty() {
+            hints = alias_hints;
+        }
+        crate::federation_outbound_knock::do_remote_knock(
+            &state,
+            &user.user_id,
+            user.user_nid,
+            &room_id,
+            &hints,
+            body.reason.as_deref(),
+        )
+        .await?;
+        return Ok(Json(json!({"room_id": room_id.as_str()})));
+    }
+
+    // Locally-hosted re-knock: if the user is already in knock state
+    // here, don't mint a second event. Spec allows the repeat, but
+    // Synapse preserves the original knock's content (including reason)
+    // — a fresh event would silently replace the visible reason for
+    // everyone in the room. TestKnocking's "Users in the room see a
+    // user's membership update when they knock" relies on the first
+    // knock's reason still being visible after the second knock. Safe
+    // for locally-hosted rooms only because we control the authoritative
+    // state; for federated rooms the resident may have moved the user
+    // out of knock since our last sync.
+    let current_membership = state
+        .db
+        .get_membership(room_nid, user.user_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if current_membership == Some(4) {
+        return Ok(Json(json!({"room_id": room_id.as_str()})));
+    }
 
     // Pre-check: surface a clearer error than the auth-rules path when the
     // room can't accept knocks at all.

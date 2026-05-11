@@ -296,13 +296,26 @@ pub async fn create_room(
 
     // --- 3. m.room.power_levels ---
     let mut pl_content = content::power_levels_content(room_version);
+    // Preset-specific PL overrides — match synapse's `_presets_dict`. Both
+    // private_chat and trusted_private_chat drop the invite floor to 0 so
+    // any joined member can invite; public_chat keeps the default 50. The
+    // client's `power_level_content_override` (applied below) can layer on
+    // top of these preset defaults.
+    if matches!(preset, "private_chat" | "trusted_private_chat")
+        && let Some(pl_obj) = pl_content.as_object_mut()
+    {
+        pl_obj.insert("invite".to_string(), json!(0));
+    }
     if let Some(ov) = &body.power_level_content_override {
         // v12 (MSC4289): power_levels.users MUST NOT contain a room creator
         // (sender of m.room.create or anyone in additional_creators). The
         // CS-API rejects up-front rather than letting check_auth turn this
-        // into a 403.
-        let creators = collect_creators(&user.user_id, body.creation_content.as_ref());
-        validate_pl_override_no_creators(ov, &creators)?;
+        // into a 403. Pre-v12 rooms (where creators don't have implicit
+        // infinite power) can legitimately list themselves in `users`.
+        if room_version.creators_have_infinite_power() {
+            let creators = collect_creators(&user.user_id, body.creation_content.as_ref());
+            validate_pl_override_no_creators(ov, &creators)?;
+        }
         if let Some(ov_obj) = ov.as_object() {
             let pl = pl_content.as_object_mut().unwrap();
             for (k, v) in ov_obj {

@@ -306,8 +306,18 @@ async fn send_state_inner(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     // creators in `users`. Without this we'd let auth-rules reject as
     // 403 M_FORBIDDEN, but per spec/Complement this is a 400 M_BAD_JSON.
-    if event_type == "m.room.power_levels" {
+    if event_type == "m.room.power_levels" && room_version.creators_have_infinite_power() {
         validate_pl_state_no_creators(&state, room_nid, &content)?;
+    }
+    // m.room.create can only exist as the room's first event. Re-sending it
+    // via the state API has to be a 400 M_BAD_JSON; deferring to auth_rules
+    // (which rejects it as "create has prev_events") would surface as 403,
+    // and TestMSC4291...CannotSendCreateEvent gates on the status code.
+    if event_type == "m.room.create" && state_key.is_empty() {
+        return Err(VelaError::BadJson(
+            "m.room.create may only be sent as the first event in a room".into(),
+        )
+        .into());
     }
     // m.room.canonical_alias: spec requires the alias and any alt_aliases
     // to (a) exist locally and (b) point at this room. Failure → 400 M_BAD_ALIAS.

@@ -295,14 +295,25 @@ fn check_member(event: &Pdu, state: StateFn<'_>, create: &Pdu) -> AuthResult {
         .and_then(|v| v.as_str())
         .ok_or_else(|| AuthError::reject("m.room.member has no membership"))?;
 
-    // 5.2: if content has join_authorised_via_users_server, it must be a valid signature
-    // from that user's homeserver. This requires signature verification against that
-    // server's keys, which depends on key fetching. We structurally validate the key
-    // is a well-formed user ID here; full signature check is done at PDU receipt time.
+    // 5.2: if content has join_authorised_via_users_server AND the
+    // event is a fresh join (i.e. target was not already joined), it
+    // must be a valid user ID. join→join transitions (display name /
+    // avatar updates) ignore the field per spec — the test that
+    // exercises this writes `join_authorised_via_users_server:
+    // "unused"` literally to assert the field is dropped on a redundant
+    // join. Only validate when the current membership is NOT already
+    // "join" — that's where the field actually carries meaning.
+    let current_target_membership = state("m.room.member", target).and_then(|p| {
+        p.content
+            .get("membership")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    });
     if let Some(authorising) = event
         .content
         .get("join_authorised_via_users_server")
         .and_then(|v| v.as_str())
+        && current_target_membership.as_deref() != Some("join")
         && !is_valid_user_id(authorising)
     {
         return Err(AuthError::reject(
@@ -647,13 +658,20 @@ fn check_power_levels(event: &Pdu, state: StateFn<'_>, create: &Pdu) -> AuthResu
             }
         }
 
-        // 10.4 (v12): users must not contain room creators
-        let creators = room_creators(create);
-        for user_id in obj.keys() {
-            if creators.contains(user_id.as_str()) {
-                return Err(AuthError::reject(format!(
-                    "power_levels.users contains a room creator: {user_id}"
-                )));
+        // 10.4 (v12 / MSC4289): users must not contain room creators.
+        // Pre-v12 rooms didn't grant creators implicit infinite power, so
+        // a creator legitimately appears in `users` to retain authority
+        // — TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
+        // sets exactly that.
+        let is_v12 = create.content.get("room_version").and_then(|v| v.as_str()) == Some("12");
+        if is_v12 {
+            let creators = room_creators(create);
+            for user_id in obj.keys() {
+                if creators.contains(user_id.as_str()) {
+                    return Err(AuthError::reject(format!(
+                        "power_levels.users contains a room creator: {user_id}"
+                    )));
+                }
             }
         }
     }
