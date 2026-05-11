@@ -479,17 +479,57 @@ fn user_qualifies_via_allow_list(
         if gate_room_id.is_empty() {
             continue;
         }
-        let gate_nid = state
+        let Some(rn) = state
             .db
             .get_nid(gate_room_id)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-        if let Some(rn) = gate_nid
-            && state
-                .db
-                .get_membership(rn, user_nid)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-                == Some(1)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        else {
+            continue;
+        };
+        // Stale-state guard: if we have NO local joined member in the
+        // gate room, our cached membership view for that room is no
+        // longer authoritative — the last local participant left and
+        // we stopped receiving state updates. Synapse's partial-state
+        // tracking enforces the same: a server with no local member
+        // in the allow-list room must refuse to authorise joins
+        // against it. TestRestrictedRoomsRemoteJoinFailOver depends
+        // on this: bob leaves the allowed_room and hs2 must then
+        // fail charlie's join via hs2 alone.
+        if !has_local_joined_member(state, rn)? {
+            continue;
+        }
+        if state
+            .db
+            .get_membership(rn, user_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            == Some(1)
         {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// True iff at least one user on THIS server has membership=join in
+/// `room_nid`. Used by `user_qualifies_via_allow_list` to decide
+/// whether our cached membership view for the room is still
+/// authoritative — without a local member we no longer receive state
+/// updates for the room.
+fn has_local_joined_member(state: &AppState, room_nid: u64) -> Result<bool, ApiError> {
+    let server = state.config.server_name.as_str();
+    let members = state
+        .db
+        .get_room_members(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    for member_nid in members {
+        let Some(user_id) = state
+            .db
+            .resolve_nid(member_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        else {
+            continue;
+        };
+        if is_local(&user_id, server) {
             return Ok(true);
         }
     }
