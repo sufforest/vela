@@ -80,6 +80,11 @@ pub struct ExtensionsRequest {
     pub typing: Option<ExtEnabled>,
     #[serde(default)]
     pub receipts: Option<ExtEnabled>,
+    /// MSC4308 thread subscriptions sliding-sync extension. Keyed
+    /// under `io.element.msc4308.thread_subscriptions` in the wire
+    /// payload (`serde(rename)` does the translation).
+    #[serde(default, rename = "io.element.msc4308.thread_subscriptions")]
+    pub thread_subscriptions: Option<ExtEnabled>,
 }
 
 #[derive(Deserialize, Default)]
@@ -323,6 +328,59 @@ pub async fn sliding_sync(
     // receipts extension
     if body.extensions.receipts.as_ref().is_some_and(|e| e.enabled) {
         extensions.insert("receipts".to_string(), json!({"rooms": {}}));
+    }
+
+    // MSC4308 thread subscriptions extension. On initial sync return
+    // every subscription. On incremental sync return only those whose
+    // state changed strictly after `since` — clients keep their own
+    // local mirror and want a delta.
+    if body
+        .extensions
+        .thread_subscriptions
+        .as_ref()
+        .is_some_and(|e| e.enabled)
+    {
+        let subs = state
+            .db
+            .iter_thread_subscriptions(user.user_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        let mut subscribed: Map<String, Value> = Map::new();
+        for (room_nid, thread_root, sub_state, pos) in subs {
+            if sub_state == 0 {
+                continue;
+            }
+            if let Some(s) = since
+                && pos <= s
+            {
+                continue;
+            }
+            let Some(room_id) = state
+                .db
+                .resolve_nid(room_nid)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            else {
+                continue;
+            };
+            let automatic = sub_state == 2;
+            let entry = json!({
+                "bump_stamp": pos,
+                "automatic": automatic,
+            });
+            subscribed
+                .entry(room_id)
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .unwrap()
+                .insert(thread_root, entry);
+        }
+        let mut payload: Map<String, Value> = Map::new();
+        if !subscribed.is_empty() {
+            payload.insert("subscribed".into(), Value::Object(subscribed));
+        }
+        extensions.insert(
+            "io.element.msc4308.thread_subscriptions".to_string(),
+            Value::Object(payload),
+        );
     }
 
     // Check if incremental sync has new timeline events

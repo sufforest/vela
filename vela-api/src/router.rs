@@ -23,7 +23,7 @@ use crate::{
     account, account_data, capabilities, devices, directory, discovery, federation, filters,
     key_backup, keys, login, logout, media, membership, messages, openid, presence, profile,
     pushers, pushrules, receipts, redaction, refresh, register, relations, room_upgrade, rooms,
-    search, send, sliding_sync, state, sync, to_device, typing, whoami,
+    search, send, sliding_sync, state, sync, thread_subscriptions, to_device, typing, whoami,
 };
 
 #[derive(Clone)]
@@ -552,7 +552,27 @@ pub fn build_router(state: AppState) -> Router {
         )
         // Media
         .route("/_matrix/media/v3/upload", post(media::upload))
+        // MSC2246 async upload — POST /create reserves an mxc, PUT to
+        // /upload/{server}/{id} fills in bytes later. v1.x clients
+        // use this to keep upload UX snappy on large files.
+        .route("/_matrix/media/v1/create", post(media::create_media))
+        .route(
+            "/_matrix/media/v3/upload/{server_name}/{media_id}",
+            axum::routing::put(media::upload_to_id),
+        )
         .route("/_matrix/media/v3/config", get(media::config))
+        .route("/_matrix/media/v3/preview_url", get(media::preview_url))
+        .route(
+            "/_matrix/client/v1/media/preview_url",
+            get(media::preview_url),
+        )
+        // MSC4306 thread subscriptions.
+        .route(
+            "/_matrix/client/unstable/io.element.msc4306/rooms/{room_id}/thread/{thread_root_id}/subscription",
+            get(thread_subscriptions::get_subscription)
+                .put(thread_subscriptions::put_subscription)
+                .delete(thread_subscriptions::delete_subscription),
+        )
         // Legacy unauth download/thumbnail endpoints. Pre-MSC3916
         // surface — many older clients still call these. Spec
         // deprecates them but keeping them serves backward
