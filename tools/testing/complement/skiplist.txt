@@ -80,13 +80,12 @@
 
 # `?at=<sync_token>` on /rooms/{}/members — return state at a
 # stream position. Spec: rooms.yaml line 215 (the `at` query
-# parameter is part of the stable Client-Server API). We don't
-# index historical state for /members yet.
+# parameter is part of the stable Client-Server API). Real fix
+# needs (a) prev_batch pointing past createRoom state events
+# (vela includes them in timeline), and (b) a state-at-stream-pos
+# index that resolves a sync token to a snapshot. Deferred until
+# we redesign sync's timeline/state split.
 ^TestGetRoomMembersAtPoint$
-
-# Full-text search (`/_matrix/client/v3/search`) — stable Client-
-# Server API. Designed in docs/SEARCH.md but not built.
-^TestSearch$
 
 # --- Optional spec behaviour we choose not to implement ---
 
@@ -108,22 +107,6 @@
 # already skips this test for an unrelated reason (legacy
 # unauthenticated download endpoint disabled by default).
 ^TestMediaWithoutFileName/parallel/Can_download_without_a_file_name_over_federation$
-
-# Pre-v12 room version coverage. Vela targets v12 only by design
-# (the only stable version with MSC4291 room IDs and MSC4289
-# privileged creators). These tests createRoom with version "10"
-# or "11" and bail before touching the upgrade path:
-#
-#   {"errcode":"M_UNSUPPORTED_ROOM_VERSION","error":"unsupported
-#    room version: 10"}   <- TestPushRuleRoomUpgrade
-#   {"errcode":"M_UNSUPPORTED_ROOM_VERSION","error":"unsupported
-#    room version: 11"}   <- TestMSC4289PrivilegedRoomCreators_Upgrades
-#
-# Adding multi-version support is a project of its own (different
-# event ID scheme, different auth rules, different create-event
-# shape); skipping until/unless we take that on.
-^TestPushRuleRoomUpgrade$
-^TestMSC4289PrivilegedRoomCreators_Upgrades$
 
 # URL preview / OpenGraph at /_matrix/media/v3/preview_url. Implementing
 # means an HTTP fetch + HTML parse + OpenGraph extraction + image

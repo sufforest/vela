@@ -189,6 +189,7 @@ async fn do_join(
                     &user.user_id,
                     rn,
                 );
+                carry_over_predecessor_push_rules(&state, user.user_nid, rn, room_id.as_str());
             }
             return Ok(Json(json!({"room_id": room_id.as_str()})));
         }
@@ -236,6 +237,7 @@ async fn do_join(
                 &user.user_id,
                 room_nid,
             );
+            carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str());
             return Ok(Json(json!({"room_id": room_id.as_str()})));
         }
 
@@ -263,6 +265,7 @@ async fn do_join(
         do_remote_join(&state, &user.user_id, user.user_nid, &room_id, &hints).await?;
         crate::keys::record_device_changes_on_join(&state, user.user_nid, room_nid);
         crate::keys::federate_device_lists_on_join(&state, user.user_nid, &user.user_id, room_nid);
+        carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str());
         return Ok(Json(json!({"room_id": room_id.as_str()})));
     }
 
@@ -320,8 +323,38 @@ async fn do_join(
 
     crate::keys::record_device_changes_on_join(&state, user.user_nid, room_nid);
     crate::keys::federate_device_lists_on_join(&state, user.user_nid, &user.user_id, room_nid);
+    carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str());
 
     Ok(Json(json!({"room_id": room_id.as_str()})))
+}
+
+/// If the room's `m.room.create` carries `content.predecessor.room_id`,
+/// clone the joining user's `room` push rule for the predecessor so
+/// the same notify settings apply in the upgraded room. Idempotent,
+/// no-op when the user has no such rule.
+fn carry_over_predecessor_push_rules(
+    state: &AppState,
+    user_nid: u64,
+    room_nid: u64,
+    new_room_id: &str,
+) {
+    let Ok(Some(create)) = read_state_value(state, room_nid, "m.room.create", "") else {
+        return;
+    };
+    let Some(old_room_id) = create
+        .get("content")
+        .and_then(|c| c.get("predecessor"))
+        .and_then(|p| p.get("room_id"))
+        .and_then(|v| v.as_str())
+    else {
+        return;
+    };
+    let _ = crate::room_upgrade::carry_over_push_rules_for_user(
+        state,
+        user_nid,
+        old_room_id,
+        new_room_id,
+    );
 }
 
 /// For a non-locally-hosted restricted/knock_restricted room we

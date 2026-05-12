@@ -133,12 +133,21 @@ pub async fn upgrade_room(
             );
         }
     }
+    // v12 omits `room_id` from the create event (MSC4291: the room_id IS
+    // derived from the create event's id). Pre-v12 must include it.
+    // Hardcoding None here makes v11 upgrades fail auth_rules check 1.2
+    // ("m.room.create missing room_id (pre-v12)").
+    let pre_v12_new_room_id = if room_version.omit_room_id_from_create() {
+        None
+    } else {
+        Some(RoomId::generate_for_server(server_name))
+    };
     let (create_ev, create_eid) = build_event(
         "m.room.create",
         Some(""),
         create_content,
         &user.user_id,
-        None,
+        pre_v12_new_room_id.as_ref(),
         &[],
         &[],
         depth,
@@ -146,7 +155,10 @@ pub async fn upgrade_room(
         server_name,
         room_version,
     );
-    let new_room_id = RoomId::from_create_event_id(&create_eid);
+    let new_room_id = match pre_v12_new_room_id {
+        Some(r) => r,
+        None => RoomId::from_create_event_id(&create_eid),
+    };
     created.push(("m.room.create".into(), "".into(), create_eid.clone()));
     all_events.push(PendingEvent {
         event: create_ev,
@@ -192,11 +204,36 @@ pub async fn upgrade_room(
     prev = vec![eid];
     depth += 1;
 
+    // Collect the set of creators of the new room (sender + additional)
+    // so we can strip any creator out of a transferred PL `users` map.
+    // MSC4289 forbids creators in `users`; the old room's PL may put the
+    // upgrader (now the new creator) there, in which case the transfer
+    // has to drop them before they trip auth-rules 10.4.
+    let mut new_room_creators: Vec<String> = vec![user.user_id.clone()];
+    if let Some(extras) = body.additional_creators.as_ref() {
+        for s in extras {
+            if !new_room_creators.contains(s) {
+                new_room_creators.push(s.clone());
+            }
+        }
+    }
+
     // 3. Transferable state events, in spec-recommended order.
     for t in TRANSFERABLE_TYPES {
-        let Some(content) = transferable.get(*t).cloned() else {
+        let Some(mut content) = transferable.get(*t).cloned() else {
             continue;
         };
+        if *t == "m.room.power_levels"
+            && room_version.creators_have_infinite_power()
+            && let Some(users) = content
+                .as_object_mut()
+                .and_then(|o| o.get_mut("users"))
+                .and_then(|v| v.as_object_mut())
+        {
+            for creator in &new_room_creators {
+                users.remove(creator);
+            }
+        }
         let auth = select_auth_for(
             &created,
             t,
@@ -350,7 +387,109 @@ pub async fn upgrade_room(
     )
     .await?;
 
+    // --- Carry over per-user push rules from old room → new room. ---
+    // Spec MSC1772 §"behaviour" plus Synapse's reference behaviour: when
+    // a room is upgraded, every local user's `room`-kind push rule
+    // bound to the old room is cloned (same actions) for the new room.
+    // Without this clients lose their per-room mute / suppress settings
+    // on upgrade.
+    if let Err(e) = carry_over_push_rules(
+        &state,
+        old_room_nid,
+        old_room_id.as_str(),
+        new_room_id.as_str(),
+    ) {
+        tracing::warn!(error = %e.0, "push rule carry-over after upgrade failed");
+    }
+
     Ok(Json(json!({"replacement_room": new_room_id.as_str()})))
+}
+
+/// For each local member of `old_room_nid`, clone their `global.room`
+/// push rule for `old_room_id` so it also targets `new_room_id`. Idempotent.
+fn carry_over_push_rules(
+    state: &AppState,
+    old_room_nid: u64,
+    old_room_id: &str,
+    new_room_id: &str,
+) -> Result<(), ApiError> {
+    let server = state.config.server_name.as_str();
+    let members = state
+        .db
+        .get_room_members(old_room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    for member_nid in members {
+        let Some(user_id) = state
+            .db
+            .resolve_nid(member_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        else {
+            continue;
+        };
+        if !user_id
+            .split_once(':')
+            .map(|(_, d)| d == server)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        carry_over_push_rules_for_user(state, member_nid, old_room_id, new_room_id)?;
+    }
+    Ok(())
+}
+
+/// Clone a single user's `global.room` push rule for `old_room_id` so
+/// it also targets `new_room_id`. Idempotent — no-ops when the user
+/// has no rule for old, or already has one for new.
+pub(crate) fn carry_over_push_rules_for_user(
+    state: &AppState,
+    user_nid: u64,
+    old_room_id: &str,
+    new_room_id: &str,
+) -> Result<(), ApiError> {
+    let Some(mut stored) = state
+        .db
+        .get_account_data(user_nid, "m.push_rules")
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(());
+    };
+    let Some(global) = stored
+        .as_object_mut()
+        .and_then(|s| s.get_mut("global"))
+        .and_then(|v| v.as_object_mut())
+    else {
+        return Ok(());
+    };
+    let Some(room_rules) = global.get_mut("room").and_then(|v| v.as_array_mut()) else {
+        return Ok(());
+    };
+    let old_rule = room_rules
+        .iter()
+        .find(|r| r.get("rule_id").and_then(|v| v.as_str()) == Some(old_room_id))
+        .cloned();
+    let Some(old_rule) = old_rule else {
+        return Ok(());
+    };
+    let already_present = room_rules
+        .iter()
+        .any(|r| r.get("rule_id").and_then(|v| v.as_str()) == Some(new_room_id));
+    if already_present {
+        return Ok(());
+    }
+    let mut new_rule = old_rule;
+    if let Some(obj) = new_rule.as_object_mut() {
+        obj.insert("rule_id".to_string(), json!(new_room_id));
+    }
+    room_rules.push(new_rule);
+    state
+        .db
+        .set_account_data(user_nid, "m.push_rules", &stored)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if let Some(sender) = state.user_senders.get(&user_nid) {
+        let _ = sender.send(());
+    }
+    Ok(())
 }
 
 struct PendingEvent {
@@ -393,14 +532,18 @@ fn can_send_tombstone(state: &AppState, room_nid: u64, user_id: &str) -> Result<
     // And sender's current level:
     //   power_levels.users[sender] ?? users_default ?? 0
     // Short-circuit: room creators always pass (v12 infinite power).
+    // `read_state_json` returns the full event JSON; PL fields live under
+    // `content`, not at the top level. The previous version read top-level
+    // and silently fell through to `unwrap_or(0)`, so any non-creator
+    // upgrade failed with "insufficient power (0 < 50)".
     let pl = read_state_json(state, room_nid, "m.room.power_levels", "")?;
-    let required = pl
-        .as_ref()
-        .and_then(|p| p.get("events").and_then(|e| e.get("m.room.tombstone")))
+    let pl_content = pl.as_ref().and_then(|p| p.get("content"));
+    let required = pl_content
+        .and_then(|c| c.get("events").and_then(|e| e.get("m.room.tombstone")))
         .and_then(|v| v.as_i64())
         .or_else(|| {
-            pl.as_ref()
-                .and_then(|p| p.get("state_default"))
+            pl_content
+                .and_then(|c| c.get("state_default"))
                 .and_then(|v| v.as_i64())
         })
         .unwrap_or(50);
@@ -409,13 +552,12 @@ fn can_send_tombstone(state: &AppState, room_nid: u64, user_id: &str) -> Result<
     if creators.iter().any(|c| c == user_id) {
         return Ok(());
     }
-    let user_power = pl
-        .as_ref()
-        .and_then(|p| p.get("users").and_then(|u| u.get(user_id)))
+    let user_power = pl_content
+        .and_then(|c| c.get("users").and_then(|u| u.get(user_id)))
         .and_then(|v| v.as_i64())
         .or_else(|| {
-            pl.as_ref()
-                .and_then(|p| p.get("users_default"))
+            pl_content
+                .and_then(|c| c.get("users_default"))
                 .and_then(|v| v.as_i64())
         })
         .unwrap_or(0);
