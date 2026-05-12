@@ -134,6 +134,8 @@ impl Harness {
                 allow_public_rooms_over_federation: false,
                 user_directory_federate: false,
                 minimum_room_version: vela_core::events::room_version::RoomVersion::V6,
+                voip: vela_api::router::VoipConfig::default(),
+                rtc: vela_api::router::RtcConfig::default(),
             }),
             room_locks: Arc::new(DashMap::new()),
             user_locks: Arc::new(DashMap::new()),

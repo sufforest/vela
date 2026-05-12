@@ -23,7 +23,7 @@ use crate::{
     account, account_data, capabilities, devices, directory, discovery, federation, filters,
     key_backup, keys, login, logout, media, membership, messages, openid, presence, profile,
     pushers, pushrules, receipts, redaction, refresh, register, relations, room_upgrade, rooms,
-    search, send, sliding_sync, state, sync, thread_subscriptions, to_device, typing, whoami,
+    search, send, sliding_sync, state, sync, thread_subscriptions, to_device, typing, voip, whoami,
 };
 
 #[derive(Clone)]
@@ -81,6 +81,33 @@ pub struct ServerConfig {
     /// higher; clients/peers requesting older versions get
     /// M_UNSUPPORTED_ROOM_VERSION.
     pub minimum_room_version: vela_core::events::room_version::RoomVersion,
+    /// Classic VoIP (`m.call.*` 1-to-1) TURN config. Empty when the
+    /// operator hasn't set up coturn — `/voip/turnServer` then 404s
+    /// and clients fall back to direct WebRTC. Populated config means
+    /// vela mints time-limited HMAC creds (coturn standard auth) for
+    /// each `/voip/turnServer` request.
+    pub voip: VoipConfig,
+    /// matrix-rtc / Element Call (MSC4143). Empty when no SFU is
+    /// configured; clients then either piggy-back on another
+    /// participant's focus or fall back to classic VoIP.
+    pub rtc: RtcConfig,
+}
+
+/// Classic `/voip/turnServer` configuration.
+#[derive(Clone, Default)]
+pub struct VoipConfig {
+    pub uris: Vec<String>,
+    pub shared_secret: String,
+    pub ttl_seconds: u32,
+}
+
+/// matrix-rtc (MSC4143) configuration.
+#[derive(Clone, Default)]
+pub struct RtcConfig {
+    pub sfu_url: String,
+    pub livekit_api_key: String,
+    pub livekit_secret: String,
+    pub jwt_ttl_seconds: u32,
 }
 
 /// Server policy for auto-injecting `m.room.encryption` on
@@ -222,6 +249,16 @@ pub fn build_router(state: AppState) -> Router {
         )
         // Account
         .route("/_matrix/client/v3/account/whoami", get(whoami::whoami))
+        // Classic 1-to-1 VoIP: TURN credentials for clients that
+        // still drive m.call.* events over Matrix. Group calls use
+        // matrix-rtc below instead.
+        .route("/_matrix/client/v3/voip/turnServer", get(voip::turn_server))
+        // matrix-rtc / Element Call (MSC4143) — mint a per-room JWT
+        // the client uses to connect to the configured SFU.
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4143/rtc/{room_id}/transport",
+            axum::routing::post(voip::rtc_jwt),
+        )
         .route(
             "/_matrix/client/v3/account/password",
             post(account::change_password),
