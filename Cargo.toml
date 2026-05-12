@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["vela-server", "vela-core", "vela-store", "vela-api"]
+members = ["vela-server", "vela-core", "vela-store", "vela-api", "tools/vela-admin"]
 
 [workspace.package]
 edition = "2024"
