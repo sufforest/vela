@@ -903,6 +903,13 @@ mod tests {
         db.create_room_meta(gate_nid, gate_room, "12").unwrap();
         let bob_nid = db.get_or_create_nid("@bob:remote.example").unwrap();
         db.set_membership(gate_nid, bob_nid, 1).unwrap();
+        // user_qualifies_via_allow_list refuses to authorise when our
+        // server has no local member in the gate room (stale-state
+        // guard). Real-world we only have gate_room state when at
+        // least one local user joined it, so add alice to mirror
+        // that.
+        let alice_in_gate = db.get_or_create_nid("@alice:example.com").unwrap();
+        db.set_membership(gate_nid, alice_in_gate, 1).unwrap();
 
         // Build the restricted room in the same state.
         let restricted = "!restricted:example.com";

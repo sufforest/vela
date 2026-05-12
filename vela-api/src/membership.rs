@@ -189,6 +189,7 @@ async fn do_join(
                     &user.user_id,
                     rn,
                 );
+                carry_over_predecessor_push_rules(&state, user.user_nid, rn, room_id.as_str());
             }
             return Ok(Json(json!({"room_id": room_id.as_str()})));
         }
@@ -236,6 +237,7 @@ async fn do_join(
                 &user.user_id,
                 room_nid,
             );
+            carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str());
             return Ok(Json(json!({"room_id": room_id.as_str()})));
         }
 
@@ -263,6 +265,7 @@ async fn do_join(
         do_remote_join(&state, &user.user_id, user.user_nid, &room_id, &hints).await?;
         crate::keys::record_device_changes_on_join(&state, user.user_nid, room_nid);
         crate::keys::federate_device_lists_on_join(&state, user.user_nid, &user.user_id, room_nid);
+        carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str());
         return Ok(Json(json!({"room_id": room_id.as_str()})));
     }
 
@@ -320,8 +323,38 @@ async fn do_join(
 
     crate::keys::record_device_changes_on_join(&state, user.user_nid, room_nid);
     crate::keys::federate_device_lists_on_join(&state, user.user_nid, &user.user_id, room_nid);
+    carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str());
 
     Ok(Json(json!({"room_id": room_id.as_str()})))
+}
+
+/// If the room's `m.room.create` carries `content.predecessor.room_id`,
+/// clone the joining user's `room` push rule for the predecessor so
+/// the same notify settings apply in the upgraded room. Idempotent,
+/// no-op when the user has no such rule.
+fn carry_over_predecessor_push_rules(
+    state: &AppState,
+    user_nid: u64,
+    room_nid: u64,
+    new_room_id: &str,
+) {
+    let Ok(Some(create)) = read_state_value(state, room_nid, "m.room.create", "") else {
+        return;
+    };
+    let Some(old_room_id) = create
+        .get("content")
+        .and_then(|c| c.get("predecessor"))
+        .and_then(|p| p.get("room_id"))
+        .and_then(|v| v.as_str())
+    else {
+        return;
+    };
+    let _ = crate::room_upgrade::carry_over_push_rules_for_user(
+        state,
+        user_nid,
+        old_room_id,
+        new_room_id,
+    );
 }
 
 /// For a non-locally-hosted restricted/knock_restricted room we
@@ -479,17 +512,57 @@ fn user_qualifies_via_allow_list(
         if gate_room_id.is_empty() {
             continue;
         }
-        let gate_nid = state
+        let Some(rn) = state
             .db
             .get_nid(gate_room_id)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-        if let Some(rn) = gate_nid
-            && state
-                .db
-                .get_membership(rn, user_nid)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-                == Some(1)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        else {
+            continue;
+        };
+        // Stale-state guard: if we have NO local joined member in the
+        // gate room, our cached membership view for that room is no
+        // longer authoritative — the last local participant left and
+        // we stopped receiving state updates. Synapse's partial-state
+        // tracking enforces the same: a server with no local member
+        // in the allow-list room must refuse to authorise joins
+        // against it. TestRestrictedRoomsRemoteJoinFailOver depends
+        // on this: bob leaves the allowed_room and hs2 must then
+        // fail charlie's join via hs2 alone.
+        if !has_local_joined_member(state, rn)? {
+            continue;
+        }
+        if state
+            .db
+            .get_membership(rn, user_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            == Some(1)
         {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// True iff at least one user on THIS server has membership=join in
+/// `room_nid`. Used by `user_qualifies_via_allow_list` to decide
+/// whether our cached membership view for the room is still
+/// authoritative — without a local member we no longer receive state
+/// updates for the room.
+fn has_local_joined_member(state: &AppState, room_nid: u64) -> Result<bool, ApiError> {
+    let server = state.config.server_name.as_str();
+    let members = state
+        .db
+        .get_room_members(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    for member_nid in members {
+        let Some(user_id) = state
+            .db
+            .resolve_nid(member_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        else {
+            continue;
+        };
+        if is_local(&user_id, server) {
             return Ok(true);
         }
     }

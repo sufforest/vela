@@ -625,6 +625,28 @@ pub async fn create_room(
         let _ = sender.send(last_stream_pos);
     }
 
+    // Manual room upgrade: when createRoom carries a
+    // `creation_content.predecessor.room_id`, the caller is replacing
+    // an old room with this one. Carry over the creator's `room` push
+    // rule for the old room so muting/notify settings survive the
+    // upgrade. (The /upgrade endpoint does this for all local
+    // members; here we only know about the creator until others join,
+    // where the do_join path covers them.)
+    if let Some(old_room_id) = body
+        .creation_content
+        .as_ref()
+        .and_then(|cc| cc.get("predecessor"))
+        .and_then(|p| p.get("room_id"))
+        .and_then(|v| v.as_str())
+    {
+        let _ = crate::room_upgrade::carry_over_push_rules_for_user(
+            &state,
+            user.user_nid,
+            old_room_id,
+            room_id.as_str(),
+        );
+    }
+
     // Release the room lock before the remote-invite fan-out below.
     // `emit_membership_event_for_target` re-acquires the same per-room
     // mutex; without this drop the createRoom task deadlocks against
@@ -699,42 +721,50 @@ pub async fn list_members(
     let exclude = q.not_membership.as_deref();
 
     // Resolve which member events to consider:
-    //   - `at` set: replay the timeline up to that stream position,
-    //     keeping the latest m.room.member event per state_key.
+    //   - `at` set: look up the room's state snapshot at the event
+    //     whose stream_pos == at, and pull the member events from it.
+    //     (Spec semantic is "state at this pagination token", not
+    //     "member events present in the timeline range [0, at]" —
+    //     state events get stream_pos like any other event, but a
+    //     prev_batch typically points past the room-create state
+    //     events, so walking the timeline up to `at` misses
+    //     existing members. TestGetRoomMembersAtPoint relies on
+    //     the snapshot interpretation.)
     //   - departed user without `at`: use the snapshot recorded at
     //     their leave event.
     //   - currently joined: use current room state (fast path).
     let member_events: Vec<u64> =
         match (q.at.as_deref().and_then(parse_stream_token), view_at_leave) {
             (Some(at_pos), _) => {
-                // Walk the room timeline from start through `at_pos`,
-                // collecting the latest m.room.member event per state_key.
-                // Iteration order is ascending stream_pos, so a later
-                // entry naturally clobbers an earlier one.
-                let timeline = state
+                // Find the event with the largest stream_pos <= at_pos
+                // in this room and use its post-state snapshot. Falling
+                // back to current state when no such event exists
+                // (callers can pass a pre-room token; returning current
+                // state is at least usable).
+                let mut event_at: Option<u64> = None;
+                let snapshot_window = state
                     .db
                     .get_timeline_range(room_nid, 0, at_pos.saturating_add(1), 10_000)
                     .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-                let type_nid = state
-                    .db
-                    .get_nid("m.room.member")
-                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-                let mut latest_per_user: std::collections::HashMap<u64, u64> =
-                    std::collections::HashMap::new();
-                for (_pos, event_nid) in timeline {
-                    let Some((header, _)) = state
-                        .db
-                        .get_event(event_nid)
-                        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-                    else {
-                        continue;
-                    };
-                    if Some(header.type_nid) != type_nid {
-                        continue;
-                    }
-                    latest_per_user.insert(header.state_key_nid, event_nid);
+                if let Some((_, nid)) = snapshot_window.last() {
+                    event_at = Some(*nid);
                 }
-                latest_per_user.into_values().collect()
+                match event_at {
+                    Some(nid) => state
+                        .db
+                        .get_state_at_event(nid)
+                        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                        .unwrap_or_else(|| {
+                            state
+                                .db
+                                .get_all_state_event_nids(room_nid)
+                                .unwrap_or_default()
+                        }),
+                    None => state
+                        .db
+                        .get_all_state_event_nids(room_nid)
+                        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?,
+                }
             }
             (None, Some(snapshot_owner_event_nid)) => state
                 .db
