@@ -61,6 +61,53 @@ struct Config {
     tracing: TracingSection,
     #[serde(default)]
     rate_limit: RateLimitSection,
+    #[serde(default)]
+    voip: VoipSection,
+    #[serde(default)]
+    rtc: RtcSection,
+}
+
+/// `[voip]` section. Drives the classic 1-to-1 `m.call.*` path by
+/// returning TURN credentials from `/_matrix/client/v3/voip/turnServer`.
+/// Empty (the default) means we serve a 404 there — clients then fall
+/// back to direct WebRTC, which works on permissive networks but
+/// dies in restrictive NAT/firewall environments. Group calls don't
+/// use this at all; see `[rtc]` for matrix-rtc / Element Call.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default)]
+struct VoipSection {
+    /// `["turn:turn.example.com:3478", "turns:turn.example.com:5349"]`.
+    /// Vela returns these verbatim in the `uris` array of the
+    /// `/voip/turnServer` response.
+    uris: Vec<String>,
+    /// Long-term shared secret matching coturn's `static-auth-secret`
+    /// or `use-auth-secret`. Vela mints time-limited username /
+    /// password pairs from this so clients get credentials valid for
+    /// `ttl` seconds. Empty disables `/voip/turnServer`.
+    shared_secret: String,
+    /// How long the minted credential is valid for, in seconds.
+    /// Default 24h, matching synapse.
+    ttl: u32,
+}
+
+/// `[rtc]` section. Drives the matrix-rtc / Element Call path
+/// (MSC4143). Empty (the default) means we don't advertise an SFU
+/// in `.well-known` and the JWT-mint endpoint refuses; clients then
+/// fall back to whichever focus another participant brings.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default)]
+struct RtcSection {
+    /// Public URL of the SFU (LiveKit). Clients use this as the
+    /// WebRTC endpoint after we mint them a JWT scoped to a room.
+    sfu_url: String,
+    /// LiveKit API key (its public side of the JWT issuer pair).
+    livekit_api_key: String,
+    /// LiveKit API secret. We sign the JWT with HS256 using this.
+    livekit_secret: String,
+    /// JWT lifetime in seconds. Default 6h — long enough for a
+    /// reasonable meeting, short enough that a leaked token isn't
+    /// permanently dangerous.
+    jwt_ttl: u32,
 }
 
 /// `[retention]` section. Drives the periodic retention sweeper.
@@ -753,6 +800,25 @@ fn main() -> anyhow::Result<()> {
                 minimum_room_version: parse_minimum_room_version(
                     &config.server.minimum_room_version,
                 )?,
+                voip: vela_api::router::VoipConfig {
+                    uris: config.voip.uris.clone(),
+                    shared_secret: config.voip.shared_secret.clone(),
+                    ttl_seconds: if config.voip.ttl == 0 {
+                        24 * 60 * 60
+                    } else {
+                        config.voip.ttl
+                    },
+                },
+                rtc: vela_api::router::RtcConfig {
+                    sfu_url: config.rtc.sfu_url.clone(),
+                    livekit_api_key: config.rtc.livekit_api_key.clone(),
+                    livekit_secret: config.rtc.livekit_secret.clone(),
+                    jwt_ttl_seconds: if config.rtc.jwt_ttl == 0 {
+                        6 * 60 * 60
+                    } else {
+                        config.rtc.jwt_ttl
+                    },
+                },
             }),
             room_locks: Arc::new(DashMap::new()),
             user_locks: Arc::new(DashMap::new()),

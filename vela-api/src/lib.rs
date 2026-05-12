@@ -64,4 +64,5 @@ mod to_device;
 pub mod typing;
 pub mod uia;
 mod user_directory;
+mod voip;
 mod whoami;
