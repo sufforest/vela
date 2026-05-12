@@ -44,6 +44,16 @@ pub enum VelaError {
     /// `ApiError::into_response` can surface the prebuilt JSON verbatim.
     #[error("uia: status={status}")]
     Uia { status: u16, body: String },
+    /// Carries a status / errcode / message verbatim. Used by handlers
+    /// returning Matrix-extension errcodes (e.g. MSC4306's
+    /// `IO.ELEMENT.MSC4306.M_NOT_IN_THREAD`) that don't fit the
+    /// standard Vela-wide error vocabulary.
+    #[error("{msg}")]
+    Custom {
+        status: u16,
+        errcode: &'static str,
+        msg: String,
+    },
 }
 
 impl VelaError {
@@ -65,6 +75,7 @@ impl VelaError {
             Self::UnsupportedRoomVersion(_) => "M_UNSUPPORTED_ROOM_VERSION",
             Self::Store(_) => "M_UNKNOWN",
             Self::Uia { .. } => "M_FORBIDDEN",
+            Self::Custom { errcode, .. } => errcode,
         }
     }
 
@@ -84,6 +95,7 @@ impl VelaError {
             // Note: EventTooLarge is handled above (413).
             Self::UserDeactivated => 403,
             Self::Uia { status, .. } => *status,
+            Self::Custom { status, .. } => *status,
             Self::Unknown(_) | Self::Store(_) => 500,
         }
     }

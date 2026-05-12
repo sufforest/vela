@@ -2582,6 +2582,82 @@ impl Database {
         self.db.write(batch)
     }
 
+    /// MSC4306 thread subscription state for one user/room/thread.
+    /// `state`: 0 = unsubscribed (sentinel kept for conflict detection),
+    /// 1 = manual subscription, 2 = automatic subscription.
+    /// `pos`: stream position at last write — automatic-subscribe
+    /// attempts whose cause event predates the last unsubscribe at
+    /// this position must be refused.
+    pub fn get_thread_subscription(
+        &self,
+        user_nid: u64,
+        room_nid: u64,
+        thread_root: &str,
+    ) -> Result<Option<(u8, u64)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("thread_subscriptions").unwrap();
+        let key = keys::encode_u64_pair_bytes(user_nid, room_nid, thread_root.as_bytes());
+        match self.db.get_cf(&cf, &key)? {
+            Some(bytes) if bytes.len() == 9 => {
+                let state = bytes[0];
+                let pos = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
+                Ok(Some((state, pos)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Iterate every thread subscription belonging to `user_nid`.
+    /// Yields `(room_nid, thread_root_event_id, state, pos)`. Used by
+    /// the MSC4308 sliding-sync extension to surface the user's
+    /// per-thread state in the response.
+    pub fn iter_thread_subscriptions(
+        &self,
+        user_nid: u64,
+    ) -> Result<Vec<(u64, String, u8, u64)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("thread_subscriptions").unwrap();
+        let prefix = user_nid.to_be_bytes();
+        let mut out: Vec<(u64, String, u8, u64)> = Vec::new();
+        let iter = self.db.prefix_iterator_cf(&cf, prefix);
+        for item in iter {
+            let (key, val) = item?;
+            if key.len() < 16 || key[..8] != prefix[..] {
+                break;
+            }
+            if val.len() != 9 {
+                continue;
+            }
+            let room_nid = u64::from_be_bytes(key[8..16].try_into().unwrap());
+            let thread_root = match std::str::from_utf8(&key[16..]) {
+                Ok(s) => s.to_string(),
+                Err(_) => continue,
+            };
+            let state = val[0];
+            let pos = u64::from_be_bytes(val[1..9].try_into().unwrap());
+            out.push((room_nid, thread_root, state, pos));
+        }
+        Ok(out)
+    }
+
+    /// Persist a thread subscription state change and return the
+    /// stream position recorded for it. Callers pass `state` as
+    /// 0 (unsubscribed), 1 (manual), or 2 (automatic).
+    pub fn set_thread_subscription(
+        &self,
+        user_nid: u64,
+        room_nid: u64,
+        thread_root: &str,
+        state: u8,
+    ) -> Result<u64, rocksdb::Error> {
+        let cf = self.db.cf_handle("thread_subscriptions").unwrap();
+        let key = keys::encode_u64_pair_bytes(user_nid, room_nid, thread_root.as_bytes());
+        let pos = self.next_stream_position().as_u64();
+        let mut value = [0u8; 9];
+        value[0] = state;
+        value[1..9].copy_from_slice(&pos.to_be_bytes());
+        self.db.put_cf(&cf, &key, value)?;
+        Ok(pos)
+    }
+
     /// Return `(data_type, value)` for account_data entries whose most
     /// recent update is strictly after `since_pos`. Used by incremental
     /// /sync to stream changes since the client's last token.

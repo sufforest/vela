@@ -86,4 +86,13 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // need to invalidate cached device keys for users who left every
     // shared room.
     "device_list_left",
+    // MSC4306 thread subscriptions. Tracks whether a user has
+    // (manually or automatically) subscribed to receive notifications
+    // about a thread. Key layout:
+    //   user_nid (8 BE) | room_nid (8 BE) | thread_root_event_id bytes
+    // Value: `state` byte (1=manual, 2=automatic, 0=unsubscribed) +
+    // 8 BE bytes `last_change_stream_pos`. The pos is used to
+    // detect automatic-subscribe attempts whose cause event predates
+    // the last unsubscribe (MSC4306 conflict check).
+    "thread_subscriptions",
 ];

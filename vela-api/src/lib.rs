@@ -58,6 +58,7 @@ mod state;
 mod sync;
 #[cfg(test)]
 mod test_helpers;
+mod thread_subscriptions;
 pub mod timestamp;
 mod to_device;
 pub mod typing;

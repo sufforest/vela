@@ -108,17 +108,6 @@
 # unauthenticated download endpoint disabled by default).
 ^TestMediaWithoutFileName/parallel/Can_download_without_a_file_name_over_federation$
 
-# URL preview / OpenGraph at /_matrix/media/v3/preview_url. Implementing
-# means an HTTP fetch + HTML parse + OpenGraph extraction + image
-# caching path; sizable feature in its own right and not on the
-# critical path. Skip until we choose to take it on.
-^TestUrlPreview$
-
-# MSC2246 async upload — POST /create + PUT /upload/{server}/{mediaId}
-# in two stages, with the mxc:// returned ahead of the bytes. Not
-# implemented; clients fall back to the synchronous upload path.
-^TestAsyncUpload$
-
 # MSC4297 state-resolution v2.1. The new algorithm ("conflicted
 # subgraph" derivation) materially changes how state res handles
 # auth chains across forks, with fairly subtle convergence

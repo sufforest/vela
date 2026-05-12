@@ -43,6 +43,16 @@ pub fn encode_u64_bytes(nid: u64, suffix: &[u8]) -> Vec<u8> {
     key
 }
 
+/// Encode a (u64, u64, bytes) composite key. Used for thread
+/// subscriptions: (user_nid, room_nid, thread_root_event_id).
+pub fn encode_u64_pair_bytes(n1: u64, n2: u64, suffix: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16 + suffix.len());
+    key.extend_from_slice(&n1.to_be_bytes());
+    key.extend_from_slice(&n2.to_be_bytes());
+    key.extend_from_slice(suffix);
+    key
+}
+
 /// Encode a (u64, bytes, bytes) composite key. Used for (user_nid, device_id, txn_id).
 pub fn encode_u64_bytes_bytes(nid: u64, b1: &[u8], b2: &[u8]) -> Vec<u8> {
     // Use a length prefix for b1 so we can distinguish the boundary

@@ -26,7 +26,7 @@ SKIPLIST="${SKIPLIST:-$(dirname "$0")/skiplist.txt}"
 # Empty list → don't pass -skip (regex of empty would match everything).
 SKIP_REGEX=$(grep -vE '^\s*(#|$)' "$SKIPLIST" | paste -sd '|' -)
 
-PACKAGES=("./tests/csapi" "./tests")
+PACKAGES=("./tests/csapi" "./tests" "./tests/msc4306")
 if [ $# -gt 0 ]; then
     PACKAGES=("$@")
 fi
