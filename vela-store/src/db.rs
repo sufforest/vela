@@ -92,6 +92,54 @@ pub struct Database {
 }
 
 impl Database {
+    /// Open the database as a read-only secondary against a running
+    /// primary. Used by out-of-process inspection tools (`vela-admin`)
+    /// so they can stat / list / dump without bouncing the server.
+    ///
+    /// `secondary_dir` is a scratch path RocksDB uses to materialise
+    /// catch-up SST views; it must be on the same filesystem (or at
+    /// least support hardlinks to the primary's SSTs) and be unique
+    /// per concurrent caller. Returns a Database whose write methods
+    /// will fail at the RocksDB layer — callers are expected to only
+    /// run read paths against it. We deliberately don't statically
+    /// type the read-only-ness; the noise of a `ReadOnlyDatabase`
+    /// wrapper would dwarf the actual surface, and the only caller
+    /// (`vela-admin`) is small enough to audit.
+    pub fn open_secondary(primary: &Path, secondary_dir: &Path) -> Result<Self, rocksdb::Error> {
+        let mut db_opts = Options::default();
+        db_opts.set_max_background_jobs(4);
+        // Secondary mode refuses to create missing CFs (it can't
+        // write anything). Snapshot whatever CFs the primary
+        // currently has on disk so we don't fail just because the
+        // binary's COLUMN_FAMILIES list moved forward of the
+        // running server's.
+        let existing = DB::list_cf(&db_opts, primary)
+            .unwrap_or_else(|_| COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect());
+        let cfs: Vec<ColumnFamilyDescriptor> = existing
+            .iter()
+            .map(|name| {
+                let mut cf_opts = Options::default();
+                configure_cf(&mut cf_opts, name);
+                ColumnFamilyDescriptor::new(name, cf_opts)
+            })
+            .collect();
+        let db = DB::open_cf_descriptors_as_secondary(&db_opts, primary, secondary_dir, cfs)?;
+        Ok(Self {
+            db,
+            // Secondary DBs never allocate ids / stream positions;
+            // pick a dummy non-zero anchor so any accidental
+            // allocator call is at least visible in logs. The
+            // allocator paths would fail at the RocksDB layer
+            // anyway (writes refused on the secondary).
+            nid_counter: AtomicU64::new(1),
+            stream_counter: AtomicU64::new(1),
+            receipts_stream_counter: AtomicU64::new(1),
+            presence_stream_counter: AtomicU64::new(1),
+            snapshot_counter: AtomicU64::new(1),
+            to_device_outbound_counter: AtomicU64::new(1),
+        })
+    }
+
     pub fn open(path: &Path) -> Result<Self, rocksdb::Error> {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
@@ -259,6 +307,24 @@ impl Database {
 
     pub fn user_exists(&self, user_id: &str) -> Result<bool, rocksdb::Error> {
         Ok(self.get_nid(user_id)?.is_some())
+    }
+
+    /// Return every user_id stored in the `users` CF. Used by
+    /// `vela-admin users` to enumerate accounts; iterates the full
+    /// CF, so cost is proportional to user count.
+    pub fn list_local_user_ids(&self) -> Result<Vec<String>, rocksdb::Error> {
+        let cf = self.db.cf_handle("users").unwrap();
+        let mut out = Vec::new();
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+        for item in iter {
+            let (_, val) = item?;
+            if let Ok(json) = serde_json::from_slice::<Value>(&val)
+                && let Some(uid) = json.get("user_id").and_then(|v| v.as_str())
+            {
+                out.push(uid.to_string());
+            }
+        }
+        Ok(out)
     }
 
     /// Replace the stored password hash for an existing user. No-op if the
