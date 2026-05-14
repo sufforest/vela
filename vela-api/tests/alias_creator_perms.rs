@@ -208,6 +208,87 @@ async fn deleting_unknown_alias_returns_404() {
     );
 }
 
+#[tokio::test]
+async fn putting_existing_alias_returns_409() {
+    let harness = Harness::new();
+    let (_alice_id, alice_tok) = harness.register("alice", "pw").await;
+    let (_bob_id, bob_tok) = harness.register("bob", "pw").await;
+    let room_id = harness
+        .create_room(&alice_tok, json!({"preset": "public_chat"}))
+        .await;
+    let alias = format!("#taken:{}", harness.state.config.server_name);
+    assert_eq!(
+        put_alias(&harness, &alice_tok, &alias, &room_id).await,
+        StatusCode::OK
+    );
+    // Second PUT must not silently overwrite — that would let any user
+    // hijack the creator slot. Spec says 409 M_UNKNOWN.
+    assert_eq!(
+        put_alias(&harness, &bob_tok, &alias, &room_id).await,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn legacy_creatorless_alias_falls_back_to_pl_gate() {
+    let harness = Harness::new();
+    let (alice_id, alice_tok) = harness.register("alice", "pw").await;
+    let (bob_id, bob_tok) = harness.register("bob", "pw").await;
+    let room_id = harness
+        .create_room(
+            &alice_tok,
+            json!({
+                "preset": "private_chat",
+                "invite": [bob_id.clone()],
+            }),
+        )
+        .await;
+    harness.join(&bob_tok, &room_id).await;
+
+    // Lock bob to PL 0; alice (v12 creator) stays implicit-infinite.
+    let _ = alice_id;
+    assert_eq!(
+        put_state(
+            &harness,
+            &alice_tok,
+            &room_id,
+            "m.room.power_levels",
+            "",
+            json!({
+                "users": {bob_id.clone(): 0},
+                "events_default": 0,
+                "state_default": 50,
+                "users_default": 0,
+            }),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    // Simulate a row written by an old binary: plain-string room_id, no
+    // creator field. get_room_alias_record migrates this on read into
+    // (room_id, None), which forces the PL path.
+    let alias = format!("#legacy_alias:{}", harness.state.config.server_name);
+    harness
+        .state
+        .db
+        .set_room_alias(&alias, &room_id)
+        .expect("seed legacy alias");
+
+    // Bob (PL 0) cannot delete — even though there's no creator on file,
+    // the PL gate still applies.
+    assert_eq!(
+        delete_alias(&harness, &bob_tok, &alias).await,
+        StatusCode::FORBIDDEN
+    );
+
+    // Alice (room creator, PL infinite) clears the threshold and deletes.
+    assert_eq!(
+        delete_alias(&harness, &alice_tok, &alias).await,
+        StatusCode::OK
+    );
+}
+
 fn urlenc(s: &str) -> String {
     s.replace('#', "%23").replace(':', "%3A")
 }

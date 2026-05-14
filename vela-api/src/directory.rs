@@ -60,6 +60,11 @@ pub struct SetAliasBody {
 }
 
 /// PUT /_matrix/client/v3/directory/room/{roomAlias}
+///
+/// Records the caller as the alias creator so DELETE can authorise the
+/// creator without a PL check. If the alias already exists we return
+/// 409 `M_UNKNOWN` per spec — never overwrite, because that would let any
+/// authenticated user steal someone else's alias-creator status.
 pub async fn set_room_alias(
     State(state): State<AppState>,
     user: AuthenticatedUser,
@@ -72,7 +77,11 @@ pub async fn set_room_alias(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         .is_some()
     {
-        return Err(ApiError(VelaError::BadJson("alias already exists".into())));
+        return Err(ApiError(VelaError::Custom {
+            status: 409,
+            errcode: "M_UNKNOWN",
+            msg: format!("Room alias {room_alias} already exists."),
+        }));
     }
 
     state
@@ -113,7 +122,7 @@ pub async fn delete_room_alias(
         let user_pl = crate::membership::user_power(&state, room_nid, &user.user_id)?;
         if user_pl < needed {
             return Err(VelaError::Forbidden(
-                "alias delete requires alias creator or sufficient power level".into(),
+                "You do not have permission to delete this alias".into(),
             )
             .into());
         }
