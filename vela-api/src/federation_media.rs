@@ -202,4 +202,3 @@ pub struct FederationThumbnailQuery {
     #[allow(dead_code)]
     pub timeout_ms: Option<u64>,
 }
-
