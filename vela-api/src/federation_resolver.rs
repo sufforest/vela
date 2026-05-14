@@ -17,8 +17,25 @@
 //!
 //! This module covers resolution only. Connection setup (how reqwest should
 //! use a `ResolvedServer`) is left to the caller.
+//!
+//! ## SSRF hardening
+//!
+//! A malicious peer can delegate (via `.well-known/matrix/server` or SRV)
+//! to a name that resolves into the operator's internal network — e.g.
+//! `10.0.0.1`, `127.0.0.1`, or a link-local address. Without mitigation,
+//! our outbound federation client would obediently dial that address and
+//! fan out into the LAN.
+//!
+//! [`FederationPolicy`] gates resolution against:
+//!   - A private-IP block list (RFC 1918, loopback, link-local, CGNAT,
+//!     IPv6 ULA + link-local, unspecified, broadcast, multicast).
+//!   - An optional allow-list of acceptable server_names.
+//!
+//! The block is default-on; the only ergonomic carve-out is a self-loop
+//! exception so a server that points its own server_name at `127.0.0.1`
+//! (test harnesses, single-host evaluations) keeps working.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,6 +100,64 @@ pub enum ResolveError {
     WellKnownMalformed,
     #[error("well-known redirect chain too deep")]
     WellKnownTooDeep,
+    #[error("destination {server_name} resolves to private IP {ip}; blocked by policy")]
+    PrivateIpBlocked { server_name: String, ip: IpAddr },
+    #[error("destination {0} is not in the federation allow-list")]
+    NotAllowed(String),
+}
+
+/// Outbound federation safety policy. Defaults to "block private IPs,
+/// no allow-list filter" — the safe production posture. Construct via
+/// [`FederationPolicy::strict`] for production, [`FederationPolicy::permissive`]
+/// for tests that must reach loopback/private addresses without naming the
+/// server explicitly.
+#[derive(Debug, Clone)]
+pub struct FederationPolicy {
+    /// When true, any resolution producing an IP in a private/loopback/
+    /// link-local/multicast/etc. range is rejected unless covered by the
+    /// self-loop exception. Default: true.
+    pub private_ip_block: bool,
+    /// If non-empty, only destinations whose server_name matches an entry
+    /// (exact string match, host-only — the port suffix is stripped before
+    /// comparison) may be reached. Empty = allow any (subject to other
+    /// rules). Default: empty.
+    pub allow_list: Vec<String>,
+    /// Our own server_name, used for the self-loop exception. When the
+    /// destination's host portion matches this, loopback IPs are allowed
+    /// through. Set to empty in tests that don't care.
+    pub our_server_name: String,
+}
+
+impl FederationPolicy {
+    /// Production-safe default: block private IPs, no allow-list filter,
+    /// self-loop exception keyed on `our_server_name`.
+    pub fn strict(our_server_name: String) -> Self {
+        Self {
+            private_ip_block: true,
+            allow_list: Vec::new(),
+            our_server_name,
+        }
+    }
+
+    /// Test-friendly: no blocks, no allow-list. Use for unit tests that
+    /// resolve documentation IPs / loopback without exercising the policy.
+    pub fn permissive() -> Self {
+        Self {
+            private_ip_block: false,
+            allow_list: Vec::new(),
+            our_server_name: String::new(),
+        }
+    }
+}
+
+impl Default for FederationPolicy {
+    fn default() -> Self {
+        Self {
+            private_ip_block: true,
+            allow_list: Vec::new(),
+            our_server_name: String::new(),
+        }
+    }
 }
 
 /// Default `.well-known` cache lifetime (24h per spec recommendation).
@@ -106,10 +181,19 @@ pub struct FederationResolver {
     dns: Arc<TokioResolver>,
     well_known: DashMap<String, CachedWellKnown>,
     http: Client,
+    policy: FederationPolicy,
 }
 
 impl FederationResolver {
+    /// Permissive constructor. Used by tests and historical call sites.
+    /// Production code should call [`FederationResolver::with_policy`] with
+    /// a strict policy carrying the operator's `server_name`.
     pub fn new() -> Result<Self, ResolveError> {
+        Self::with_policy(FederationPolicy::permissive())
+    }
+
+    /// Construct a resolver bound to a specific safety policy.
+    pub fn with_policy(policy: FederationPolicy) -> Result<Self, ResolveError> {
         let mut builder = TokioResolver::builder_with_config(
             ResolverConfig::default(),
             TokioRuntimeProvider::default(),
@@ -127,12 +211,20 @@ impl FederationResolver {
             dns: Arc::new(dns),
             well_known: DashMap::new(),
             http,
+            policy,
         })
     }
 
-    /// Resolve a server name to a target. Implements the 6-step spec algorithm.
+    /// Resolve a server name to a target. Implements the 6-step spec algorithm
+    /// and applies the [`FederationPolicy`] SSRF guard on the resolved IPs.
     pub async fn resolve(&self, server_name: &str) -> Result<ResolvedServer, ResolveError> {
-        self.resolve_inner(server_name, 0).await
+        // Allow-list is keyed on the ORIGINAL server_name (what the operator
+        // configured), not the delegated target — checked once at entry so
+        // .well-known recursion can't smuggle an off-list peer through.
+        self.check_allow_list(server_name)?;
+        let resolved = self.resolve_inner(server_name, 0).await?;
+        self.check_resolved_ips(server_name, &resolved)?;
+        Ok(resolved)
     }
 
     async fn resolve_inner(
@@ -224,6 +316,57 @@ impl FederationResolver {
             host_header: hostname.to_string(),
             resolved_ips: ips,
         })
+    }
+
+    fn check_allow_list(&self, server_name: &str) -> Result<(), ResolveError> {
+        if self.policy.allow_list.is_empty() {
+            return Ok(());
+        }
+        let host = host_only(server_name);
+        if self
+            .policy
+            .allow_list
+            .iter()
+            .any(|entry| host_only(entry) == host)
+        {
+            Ok(())
+        } else {
+            warn!(%server_name, "federation: destination not in allow-list");
+            Err(ResolveError::NotAllowed(server_name.to_string()))
+        }
+    }
+
+    fn check_resolved_ips(
+        &self,
+        server_name: &str,
+        resolved: &ResolvedServer,
+    ) -> Result<(), ResolveError> {
+        if !self.policy.private_ip_block {
+            return Ok(());
+        }
+        // Self-loop exception: a server pointing its own server_name at
+        // loopback (test harness, single-host eval) needs to talk to itself.
+        // Scope it narrowly: only loopback addresses are excused, and only
+        // when the destination's host portion exactly matches ours.
+        let is_self = !self.policy.our_server_name.is_empty()
+            && host_only(server_name) == host_only(&self.policy.our_server_name);
+        for ip in &resolved.resolved_ips {
+            if is_blocked_ip(*ip) {
+                if is_self && ip.is_loopback() {
+                    continue;
+                }
+                warn!(
+                    %server_name,
+                    %ip,
+                    "federation: outbound refused — destination resolves to private/loopback IP"
+                );
+                return Err(ResolveError::PrivateIpBlocked {
+                    server_name: server_name.to_string(),
+                    ip: *ip,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// A/AAAA lookup for a hostname. Returns empty Vec on failure — callers
@@ -412,6 +555,110 @@ fn format_ip_for_url(ip: IpAddr) -> String {
     }
 }
 
+/// Strip a trailing `:port` from a `server_name`, preserving the bracketed
+/// IPv6 literal form. Used for allow-list and self-loop comparison so
+/// `"acme.com"` matches `"acme.com:8448"`.
+fn host_only(server_name: &str) -> &str {
+    if let Some(rest) = server_name.strip_prefix('[')
+        && let Some(idx) = rest.find(']')
+    {
+        // Return through the closing bracket, dropping any `:port` after.
+        return &server_name[..idx + 2];
+    }
+    match server_name.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => h,
+        _ => server_name,
+    }
+}
+
+/// Classify an IP as unsafe for outbound federation. Covers:
+/// - IPv4 RFC 1918 (10/8, 172.16/12, 192.168/16), loopback (127/8),
+///   link-local (169.254/16), CGNAT (100.64/10), broadcast, multicast,
+///   unspecified (0.0.0.0).
+/// - IPv6 loopback (::1), link-local (fe80::/10), ULA (fc00::/7),
+///   unspecified (::), multicast (ff00::/8), IPv4-mapped/-compatible
+///   ranges that wrap any of the above.
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_v4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_blocked_v4(mapped);
+            }
+            // IPv4-compatible addresses (::a.b.c.d, deprecated by RFC 4291
+            // but still parseable) — top 96 bits are zero. An attacker
+            // could otherwise smuggle 127.0.0.1 as `::7f00:1`.
+            let segs = v6.segments();
+            if segs[0] == 0
+                && segs[1] == 0
+                && segs[2] == 0
+                && segs[3] == 0
+                && segs[4] == 0
+                && segs[5] == 0
+                && (segs[6] != 0 || segs[7] > 1)
+            {
+                let v4 = Ipv4Addr::new(
+                    (segs[6] >> 8) as u8,
+                    (segs[6] & 0xff) as u8,
+                    (segs[7] >> 8) as u8,
+                    (segs[7] & 0xff) as u8,
+                );
+                if is_blocked_v4(v4) {
+                    return true;
+                }
+            }
+            is_blocked_v6(v6)
+        }
+    }
+}
+
+fn is_blocked_v4(v4: Ipv4Addr) -> bool {
+    if v4.is_unspecified()
+        || v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || v4.is_documentation()
+    {
+        return true;
+    }
+    // CGNAT (RFC 6598): 100.64.0.0/10. `Ipv4Addr::is_private` covers
+    // RFC 1918 only, so handle this band manually.
+    let [a, b, _, _] = v4.octets();
+    if a == 100 && (64..=127).contains(&b) {
+        return true;
+    }
+    // Benchmarking range (RFC 2544): 198.18.0.0/15.
+    if a == 198 && (b == 18 || b == 19) {
+        return true;
+    }
+    // "This network" reserved 0.0.0.0/8 (other than 0.0.0.0 itself, already
+    // covered by is_unspecified) — refuse anything that names itself.
+    if a == 0 {
+        return true;
+    }
+    false
+}
+
+fn is_blocked_v6(v6: Ipv6Addr) -> bool {
+    if v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() {
+        return true;
+    }
+    let segments = v6.segments();
+    // Unique Local Addresses (RFC 4193): fc00::/7 — first 7 bits are
+    // 1111110, so the top byte is 0xfc or 0xfd.
+    let top_byte = (segments[0] >> 8) as u8;
+    if top_byte & 0xfe == 0xfc {
+        return true;
+    }
+    // Link-local (RFC 4291): fe80::/10 — first 10 bits 1111111010.
+    if segments[0] & 0xffc0 == 0xfe80 {
+        return true;
+    }
+    false
+}
+
 #[derive(Debug, Deserialize)]
 struct WellKnownBody {
     #[serde(rename = "m.server")]
@@ -582,5 +829,191 @@ mod tests {
         let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
         assert!(ips.contains(&"10.0.0.1".parse().unwrap()));
         assert!(ips.contains(&"10.0.0.2".parse().unwrap()));
+    }
+
+    // ----- SSRF policy: IP classifier -----
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn classifier_blocks_ipv4_rfc1918() {
+        for s in [
+            "10.0.0.1",
+            "10.255.255.255",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.0.1",
+            "192.168.1.1",
+        ] {
+            assert!(is_blocked_ip(ip(s)), "should be blocked: {s}");
+        }
+    }
+
+    #[test]
+    fn classifier_blocks_ipv4_loopback_link_local_cgnat() {
+        for s in [
+            "127.0.0.1",
+            "127.255.255.255",
+            "169.254.0.1",
+            "169.254.169.254", // cloud metadata service
+            "100.64.0.1",
+            "100.127.255.255",
+        ] {
+            assert!(is_blocked_ip(ip(s)), "should be blocked: {s}");
+        }
+    }
+
+    #[test]
+    fn classifier_blocks_ipv4_special_ranges() {
+        for s in [
+            "0.0.0.0",
+            "0.1.2.3",
+            "255.255.255.255",
+            "224.0.0.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "192.0.2.1", // TEST-NET-1 (documentation)
+        ] {
+            assert!(is_blocked_ip(ip(s)), "should be blocked: {s}");
+        }
+    }
+
+    #[test]
+    fn classifier_blocks_ipv6_private() {
+        for s in [
+            "::1",
+            "::",
+            "fc00::1",
+            "fd00::1",
+            "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "fe80::1",
+            "febf::1",
+            "ff00::1",
+        ] {
+            assert!(is_blocked_ip(ip(s)), "should be blocked: {s}");
+        }
+    }
+
+    #[test]
+    fn classifier_blocks_ipv4_mapped_and_compat() {
+        // IPv4-mapped (::ffff:127.0.0.1) and IPv4-compatible (::127.0.0.1)
+        // must both be blocked — an attacker shouldn't be able to smuggle
+        // an internal v4 destination through a v6 literal.
+        assert!(is_blocked_ip(ip("::ffff:127.0.0.1")));
+        assert!(is_blocked_ip(ip("::ffff:10.0.0.1")));
+        assert!(is_blocked_ip(ip("::7f00:1"))); // ::127.0.0.1
+    }
+
+    #[test]
+    fn classifier_allows_public_ipv4() {
+        for s in ["1.1.1.1", "8.8.8.8", "140.82.121.4"] {
+            assert!(!is_blocked_ip(ip(s)), "should be allowed: {s}");
+        }
+    }
+
+    #[test]
+    fn classifier_allows_public_ipv6() {
+        for s in ["2001:4860:4860::8888", "2606:4700:4700::1111"] {
+            assert!(!is_blocked_ip(ip(s)), "should be allowed: {s}");
+        }
+    }
+
+    // ----- SSRF policy: resolver gating -----
+
+    #[tokio::test]
+    async fn resolve_blocks_private_ipv4_literal() {
+        let r = FederationResolver::with_policy(FederationPolicy::strict("our.example".into()))
+            .unwrap();
+        let err = r.resolve("10.0.0.1").await.unwrap_err();
+        match err {
+            ResolveError::PrivateIpBlocked { ip, .. } => {
+                assert_eq!(ip, "10.0.0.1".parse::<IpAddr>().unwrap());
+            }
+            other => panic!("expected PrivateIpBlocked, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_blocks_loopback_when_destination_is_not_self() {
+        let r = FederationResolver::with_policy(FederationPolicy::strict("our.example".into()))
+            .unwrap();
+        let err = r.resolve("127.0.0.1:8448").await.unwrap_err();
+        assert!(matches!(err, ResolveError::PrivateIpBlocked { .. }));
+    }
+
+    #[tokio::test]
+    async fn resolve_allows_loopback_for_self_loop() {
+        // A test harness or single-host eval that points its own
+        // server_name at 127.0.0.1 must keep working.
+        let r = FederationResolver::with_policy(FederationPolicy::strict("localhost:8008".into()))
+            .unwrap();
+        let resolved = r.resolve("localhost:8008").await;
+        // DNS for "localhost" resolves to 127.0.0.1 / ::1 in practice; if
+        // the test environment has no resolver, the IP list will be empty
+        // and no IP check fires either. Either path must succeed.
+        assert!(
+            resolved.is_ok(),
+            "self-loop resolution failed: {resolved:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_allows_loopback_for_self_loop_ipv4_literal() {
+        let r = FederationResolver::with_policy(FederationPolicy::strict("127.0.0.1:8008".into()))
+            .unwrap();
+        let resolved = r.resolve("127.0.0.1:8008").await.unwrap();
+        assert_eq!(resolved.target_port, 8008);
+    }
+
+    #[tokio::test]
+    async fn resolve_blocks_via_delegation() {
+        // Malicious peer: well-known points us at an RFC 1918 literal.
+        let r = FederationResolver::with_policy(FederationPolicy::strict("our.example".into()))
+            .unwrap();
+        r.seed_well_known("evil.example", Some("192.168.0.1:8448".into()), 60_000);
+        let err = r.resolve("evil.example").await.unwrap_err();
+        assert!(matches!(err, ResolveError::PrivateIpBlocked { .. }));
+    }
+
+    #[tokio::test]
+    async fn resolve_respects_allow_list_match() {
+        let mut policy = FederationPolicy::strict("our.example".into());
+        policy.private_ip_block = false;
+        policy.allow_list = vec!["good.example".into(), "trusted.example:8090".into()];
+        let r = FederationResolver::with_policy(policy).unwrap();
+        // Explicit-port form: step 2 returns immediately with no DNS data
+        // needed beyond what the allow-list cares about.
+        let resolved = r.resolve("good.example:8090").await.unwrap();
+        assert_eq!(resolved.target_host, "good.example");
+    }
+
+    #[tokio::test]
+    async fn resolve_respects_allow_list_miss() {
+        let policy = FederationPolicy {
+            private_ip_block: false,
+            allow_list: vec!["good.example".into()],
+            our_server_name: "our.example".into(),
+        };
+        let r = FederationResolver::with_policy(policy).unwrap();
+        let err = r.resolve("bad.example").await.unwrap_err();
+        assert!(matches!(err, ResolveError::NotAllowed(_)));
+    }
+
+    #[tokio::test]
+    async fn resolve_permissive_policy_passes_loopback() {
+        let r = FederationResolver::with_policy(FederationPolicy::permissive()).unwrap();
+        let resolved = r.resolve("127.0.0.1:8448").await.unwrap();
+        assert_eq!(resolved.target_port, 8448);
+    }
+
+    #[test]
+    fn host_only_strips_port() {
+        assert_eq!(host_only("acme.com"), "acme.com");
+        assert_eq!(host_only("acme.com:8448"), "acme.com");
+        assert_eq!(host_only("1.2.3.4:8448"), "1.2.3.4");
+        assert_eq!(host_only("[::1]:8448"), "[::1]");
+        assert_eq!(host_only("[::1]"), "[::1]");
     }
 }

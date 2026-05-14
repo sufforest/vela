@@ -486,6 +486,16 @@ struct FederationSection {
     enabled: bool,
     /// `"server_name" = "http://host:port"` pairs.
     http_peers: std::collections::HashMap<String, String>,
+    /// SSRF guard: refuse outbound federation when the destination resolves
+    /// to a private / loopback / link-local / etc. address. Default true.
+    /// Disable only for containerised test environments (Complement,
+    /// docker-compose dev clusters) where peers legitimately live on
+    /// RFC 1918 networks.
+    private_ip_block: bool,
+    /// If non-empty, restrict outbound federation to these `server_name`s.
+    /// Empty disables the filter. Per-room ACLs (`m.room.server_acl`)
+    /// continue to apply on top of this.
+    allow_list: Vec<String>,
 }
 
 impl Default for FederationSection {
@@ -493,6 +503,8 @@ impl Default for FederationSection {
         Self {
             enabled: true,
             http_peers: std::collections::HashMap::new(),
+            private_ip_block: true,
+            allow_list: Vec::new(),
         }
     }
 }
@@ -735,8 +747,25 @@ fn main() -> anyhow::Result<()> {
         let signing_key = Arc::new(signing_key);
         let db = Arc::new(db);
 
+        let fed_policy = vela_api::federation_resolver::FederationPolicy {
+            private_ip_block: config.federation.private_ip_block,
+            allow_list: config.federation.allow_list.clone(),
+            our_server_name: config.server.name.clone(),
+        };
+        if !config.federation.private_ip_block {
+            tracing::warn!(
+                "federation: private-IP block disabled — outbound federation may dial \
+                 internal hosts; only safe in trusted-network deployments"
+            );
+        }
+        if !config.federation.allow_list.is_empty() {
+            tracing::info!(
+                allow_list = ?config.federation.allow_list,
+                "federation: outbound restricted to allow-list"
+            );
+        }
         let resolver = Arc::new(
-            FederationResolver::new()
+            FederationResolver::with_policy(fed_policy)
                 .map_err(|e| anyhow::anyhow!("failed to init DNS resolver: {e}"))?,
         );
         let extra_ca_certs = load_extra_ca_certs(&config.server.extra_ca_certs)?;
