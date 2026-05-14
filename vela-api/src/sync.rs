@@ -620,6 +620,23 @@ fn attach_txn_id_for_user(
     unsigned_obj.insert("transaction_id".to_string(), json!(txn));
 }
 
+/// Load a timeline event with bundled aggregations (reactions, edits,
+/// thread summary), membership-at-event, and local-echo txn_id all
+/// attached. Lifts the per-call-site boilerplate for /sync timelines.
+fn load_timeline_event(
+    state: &AppState,
+    event_nid: u64,
+    room_id: &str,
+    user_nid: Option<u64>,
+    device_id: Option<&str>,
+) -> Result<Option<Value>, ApiError> {
+    let caller = match (user_nid, device_id) {
+        (Some(u), Some(d)) => Some((u, d)),
+        _ => None,
+    };
+    crate::messages::load_client_event_with_relations(state, event_nid, room_id, caller)
+}
+
 fn build_room_sync_for_user(
     state: &AppState,
     room_nid: u64,
@@ -657,9 +674,7 @@ fn build_room_sync_for_user(
                 if first_pos.is_none() {
                     first_pos = Some(*pos);
                 }
-                if let Some(mut ev) = load_client_event(state, *enid, room_id)? {
-                    attach_membership_for_user(state, &mut ev, user_nid, *enid);
-                    attach_txn_id_for_user(state, &mut ev, user_nid, device_id, *enid);
+                if let Some(ev) = load_timeline_event(state, *enid, room_id, user_nid, device_id)? {
                     timeline_events.push(ev);
                 }
             }
@@ -707,7 +722,9 @@ fn build_room_sync_for_user(
                     if first_pos.is_none() {
                         first_pos = Some(*pos);
                     }
-                    if let Some(ev) = load_client_event(state, *enid, room_id)? {
+                    if let Some(ev) =
+                        load_timeline_event(state, *enid, room_id, user_nid, device_id)?
+                    {
                         timeline_events.push(ev);
                     }
                 }
@@ -781,7 +798,9 @@ fn build_room_sync_for_user(
                     if first_pos.is_none() {
                         first_pos = Some(*pos);
                     }
-                    if let Some(ev) = load_client_event(state, *enid, room_id)? {
+                    if let Some(ev) =
+                        load_timeline_event(state, *enid, room_id, user_nid, device_id)?
+                    {
                         timeline_events.push(ev);
                     }
                 }

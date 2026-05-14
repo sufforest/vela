@@ -71,6 +71,10 @@ jsonwebtoken = { version = "9", default-features = false }
 # Media
 uuid = { version = "1", features = ["v4"] }
 tokio-util = { version = "0.7", features = ["io"] }
+# Image decode/resize for /thumbnail. default-features off to drop
+# the avif/exr/farbfeld/qoi/tga/bmp/dds/hdr/ico/openexr/pnm/tiff
+# bag we don't need; PNG/JPEG/WebP/GIF cover ~all chat content.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 async-trait = "0.1"
 bytes = "1"
 # object_store gives us a unified abstraction over S3/GCS/Azure/local
