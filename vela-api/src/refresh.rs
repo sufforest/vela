@@ -24,7 +24,8 @@ pub struct RefreshRequest {
 /// Consumes the supplied refresh token, invalidates the previously paired
 /// access token, and returns a freshly-issued (access, refresh) pair plus
 /// the new access token's lifetime. On unknown/consumed token, returns
-/// 401 `M_UNKNOWN_TOKEN` with `soft_logout: true`.
+/// 401 `M_UNKNOWN_TOKEN` with `soft_logout: false` — the session is gone
+/// and the client must discard any persisted state.
 pub async fn refresh(
     State(state): State<AppState>,
     Json(body): Json<RefreshRequest>,
@@ -41,7 +42,7 @@ pub async fn refresh(
 
     let (access, refresh, user_nid, _device_id) = match pair {
         Some(p) => p,
-        None => return Ok(soft_logout()),
+        None => return Ok(unknown_token()),
     };
 
     // Deactivated users must never get a fresh access token. In normal
@@ -64,14 +65,15 @@ pub async fn refresh(
     .into_response())
 }
 
-/// Build a 401 `M_UNKNOWN_TOKEN` body with `soft_logout: true`. Matches
-/// the shape `/refresh` is required to return when the refresh token is
-/// unknown or already consumed (spec v1.18 §refresh).
-fn soft_logout() -> Response {
+/// Build a 401 `M_UNKNOWN_TOKEN` body for an unknown or already-consumed
+/// refresh token. `soft_logout: false` (the spec default) is the correct
+/// signal here: the refresh token has no paired session left, so the
+/// client must discard persisted state and re-log in.
+fn unknown_token() -> Response {
     let body = json!({
         "errcode": "M_UNKNOWN_TOKEN",
-        "error": "Soft logged out",
-        "soft_logout": true,
+        "error": "Unknown refresh token",
+        "soft_logout": false,
     });
     (StatusCode::UNAUTHORIZED, Json(body)).into_response()
 }
@@ -84,10 +86,10 @@ mod tests {
     use axum::http::StatusCode;
 
     /// In normal flow `deactivate` revokes refresh tokens, so a
-    /// post-deactivation refresh hits the `soft_logout` path. This test
-    /// covers the *racing-refresh* branch: the refresh token survived
-    /// somehow, but the user is flagged deactivated. We must not mint a
-    /// new access token in that case.
+    /// post-deactivation refresh hits the unknown-token 401 path. This
+    /// test covers the *racing-refresh* branch: the refresh token
+    /// survived somehow, but the user is flagged deactivated. We must
+    /// not mint a new access token in that case.
     #[tokio::test]
     async fn refresh_rejects_deactivated_user() {
         let (state, _tmp) = build_test_state();
@@ -112,10 +114,10 @@ mod tests {
     }
 
     /// After a real `deactivate` call the refresh CF entry is gone, so
-    /// the request short-circuits via `soft_logout` before the
+    /// the request short-circuits via the unknown-token 401 before the
     /// deactivation check is even reached. Sanity-check that path too.
     #[tokio::test]
-    async fn refresh_with_unknown_token_returns_soft_logout() {
+    async fn refresh_with_unknown_token_returns_401() {
         let (state, _tmp) = build_test_state();
         let resp = refresh(
             State(state.clone()),
