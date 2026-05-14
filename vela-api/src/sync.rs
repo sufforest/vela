@@ -851,61 +851,10 @@ fn build_room_sync_for_user(
         }));
     }
 
-    // Receipts
-    let receipts = state
-        .db
-        .get_room_receipts(room_nid)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    if !receipts.is_empty() {
-        // Spec: m.receipt content has one user_id entry per (event, type),
-        // so when a user has both an unthreaded receipt and threaded
-        // receipts on the same event, only one survives the JSON shape.
-        // MSC4102 / TestThreadReceiptsInSyncMSC4102: the unthreaded
-        // receipt wins (clients use the unthreaded as the room-wide
-        // anchor). Sort so unthreaded entries are written last and
-        // therefore overwrite any threaded entries for the same key.
-        let mut sorted: Vec<&(String, u64, Option<String>, Value)> = receipts.iter().collect();
-        sorted.sort_by_key(|r| r.2.is_none());
-        let mut content_map = serde_json::Map::new();
-        for (receipt_type, user_nid, thread_id, receipt_val) in sorted {
-            if let (Some(event_id), Some(ts)) = (
-                receipt_val.get("event_id").and_then(|v| v.as_str()),
-                receipt_val.get("ts").and_then(|v| v.as_u64()),
-            ) {
-                let user_id = state
-                    .db
-                    .resolve_nid(*user_nid)
-                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-                    .unwrap_or_default();
-
-                let event_entry = content_map
-                    .entry(event_id.to_string())
-                    .or_insert_with(|| json!({}));
-                let type_entry = event_entry
-                    .as_object_mut()
-                    .unwrap()
-                    .entry(receipt_type.clone())
-                    .or_insert_with(|| json!({}));
-                // Per CS-API §receipts: threaded receipts include
-                // `thread_id` so clients can scope notification dismissal.
-                // Unthreaded receipts omit it.
-                let mut user_entry = serde_json::Map::new();
-                user_entry.insert("ts".into(), json!(ts));
-                if let Some(tid) = thread_id {
-                    user_entry.insert("thread_id".into(), json!(tid));
-                }
-                type_entry
-                    .as_object_mut()
-                    .unwrap()
-                    .insert(user_id, Value::Object(user_entry));
-            }
-        }
-        if !content_map.is_empty() {
-            ephemeral_events.push(json!({
-                "type": "m.receipt",
-                "content": content_map
-            }));
-        }
+    // Receipts. MSC4102/TestThreadReceiptsInSyncMSC4102 contract lives
+    // inside the shared helper (unthreaded entry wins for clients).
+    if let Some(receipts_event) = build_receipts_event(state, room_nid)? {
+        ephemeral_events.push(receipts_event);
     }
 
     let joined_count = state
@@ -940,131 +889,15 @@ fn build_room_sync_for_user(
     // event_id. An event is "in a thread" iff its `m.relates_to`
     // points at a root with `rel_type=m.thread`. The thread root
     // itself counts toward the main timeline, not its own thread.
-    let mut thread_counts: std::collections::BTreeMap<String, (u64, u64)> =
-        std::collections::BTreeMap::new();
-    let (notification_count, highlight_count) = match user_nid {
-        Some(uid) => {
-            // MSC3773 main-timeline receipt resolution: a threaded receipt
-            // with thread_id="main" marks the main-timeline anchor; an
-            // unthreaded receipt is room-wide. Take whichever points at a
-            // newer event in the returned timeline (the one we hit later
-            // in iteration order). Without consulting the threaded "main"
-            // receipt, TestThreadedReceipts sees notification_count=0
-            // after bob posts thread_id=main, instead of the spec-wanted
-            // post-anchor count.
-            // MSC3771/3773 receipt scoping for unread_notifications.
-            // Pull every m.read receipt this user has in the room and
-            // bucket by thread_id; an unthreaded receipt covers events
-            // across all threads; a `"main"` threaded receipt covers
-            // main-timeline events only; a thread-id-keyed receipt
-            // covers events in that specific thread. An event is "read"
-            // if any in-scope receipt sits at or after it in iteration
-            // order. Without this, threaded receipts (eventB scoped to
-            // thread eventA) silently drop bob's count to 0 on /sync
-            // because the previous main-only anchor logic ignored
-            // thread-specific receipts.
-            let user_receipts: Vec<(Option<String>, String)> = state
-                .db
-                .get_room_receipts(room_nid)
-                .ok()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|(rt, un, tid, val)| {
-                    if rt != "m.read" || un != uid {
-                        return None;
-                    }
-                    val.get("event_id")
-                        .and_then(|v| v.as_str())
-                        .map(|eid| (tid, eid.to_string()))
-                })
-                .collect();
-            // Resolve each receipt to the event's index in the batch (or
-            // None if it precedes the batch). A None index for a
-            // receipt that exists in the DB still counts as "covers
-            // everything in this batch up to and including the batch
-            // floor", so we treat it as if the receipt index is +∞.
-            // Concretely: if the receipt event isn't in this batch, the
-            // batch starts after it, so every event in the batch is
-            // covered by that receipt's scope.
-            let receipt_idx: Vec<(Option<String>, Option<usize>)> = user_receipts
-                .iter()
-                .map(|(tid, eid)| {
-                    let idx = timeline_events.iter().position(|ev| {
-                        ev.get("event_id").and_then(|v| v.as_str()) == Some(eid.as_str())
-                    });
-                    (tid.clone(), idx)
-                })
-                .collect();
-            let mut main_count = 0u64;
-            let mut main_highlights = 0u64;
-            let user_id_str = state.db.resolve_nid(uid).ok().flatten().unwrap_or_default();
-            for (idx, ev) in timeline_events.iter().enumerate() {
-                let ev_type = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                let sender = ev.get("sender").and_then(|v| v.as_str()).unwrap_or("");
-                let is_state = ev.get("state_key").is_some();
-                if is_state || sender == user_id_str {
-                    continue;
-                }
-                if !matches!(ev_type, "m.room.message" | "m.room.encrypted") {
-                    continue;
-                }
-                let body = ev
-                    .pointer("/content/body")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let highlights = !user_id_str.is_empty() && body.contains(&user_id_str);
-
-                let thread_root = ev
-                    .pointer("/content/m.relates_to")
-                    .filter(|rel| rel.get("rel_type").and_then(|v| v.as_str()) == Some("m.thread"))
-                    .and_then(|rel| rel.get("event_id"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                // Decide if this event is already read by any receipt.
-                let in_scope = |receipt_thread: Option<&str>| -> bool {
-                    match receipt_thread {
-                        // unthreaded scope: covers everything
-                        None => true,
-                        // "main" scope: covers main-timeline events only
-                        Some("main") => thread_root.is_none(),
-                        // thread-id scope: covers events in that thread
-                        Some(tid) => thread_root.as_deref() == Some(tid),
-                    }
-                };
-                let covered = receipt_idx.iter().any(|(rt, ridx)| {
-                    if !in_scope(rt.as_deref()) {
-                        return false;
-                    }
-                    match ridx {
-                        // receipt event isn't in this batch — batch starts
-                        // after it, so every event here is post-receipt
-                        None => true,
-                        // receipt event IS in this batch — events at or
-                        // before that index are covered
-                        Some(r) => idx <= *r,
-                    }
-                });
-                if covered {
-                    continue;
-                }
-
-                if unread_thread_notifications && let Some(root) = thread_root {
-                    let entry = thread_counts.entry(root).or_insert((0, 0));
-                    entry.0 = entry.0.saturating_add(1);
-                    if highlights {
-                        entry.1 = entry.1.saturating_add(1);
-                    }
-                } else {
-                    main_count = main_count.saturating_add(1);
-                    if highlights {
-                        main_highlights = main_highlights.saturating_add(1);
-                    }
-                }
-            }
-            (main_count, main_highlights)
-        }
-        None => (0, 0),
+    let (notification_count, highlight_count, thread_counts) = match user_nid {
+        Some(uid) => compute_unread_counts(
+            state,
+            room_nid,
+            uid,
+            &timeline_events,
+            unread_thread_notifications,
+        )?,
+        None => (0, 0, std::collections::BTreeMap::new()),
     };
 
     let mut payload = serde_json::Map::new();
@@ -1118,6 +951,176 @@ fn build_room_sync_for_user(
         );
     }
     Ok(Value::Object(payload))
+}
+
+/// Compute `(notification_count, highlight_count, thread_counts)` for a
+/// timeline batch the user is about to see.
+///
+/// Highlights here use the naive "MXID appears in body" heuristic
+/// (matches the spec's `.m.rule.contains_user_name` rule). Display-name
+/// highlights and full push-rule evaluation are separate work.
+///
+/// MSC3771/3773 receipt scoping: every `m.read` receipt the user has in
+/// the room is bucketed by `thread_id` — unthreaded covers all threads,
+/// `"main"` covers main-timeline events only, thread-id-keyed covers
+/// just that thread. An event is "read" if any in-scope receipt sits at
+/// or after it in batch iteration order; a receipt whose target predates
+/// the batch covers everything in the batch under its scope.
+pub(crate) fn compute_unread_counts(
+    state: &AppState,
+    room_nid: u64,
+    user_nid: u64,
+    timeline_events: &[Value],
+    unread_thread_notifications: bool,
+) -> Result<(u64, u64, std::collections::BTreeMap<String, (u64, u64)>), ApiError> {
+    let mut thread_counts: std::collections::BTreeMap<String, (u64, u64)> =
+        std::collections::BTreeMap::new();
+    let user_receipts: Vec<(Option<String>, String)> = state
+        .db
+        .get_room_receipts(room_nid)
+        .ok()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(rt, un, tid, val)| {
+            if rt != "m.read" || un != user_nid {
+                return None;
+            }
+            val.get("event_id")
+                .and_then(|v| v.as_str())
+                .map(|eid| (tid, eid.to_string()))
+        })
+        .collect();
+    let receipt_idx: Vec<(Option<String>, Option<usize>)> = user_receipts
+        .iter()
+        .map(|(tid, eid)| {
+            let idx = timeline_events
+                .iter()
+                .position(|ev| ev.get("event_id").and_then(|v| v.as_str()) == Some(eid.as_str()));
+            (tid.clone(), idx)
+        })
+        .collect();
+    let mut main_count = 0u64;
+    let mut main_highlights = 0u64;
+    let user_id_str = state
+        .db
+        .resolve_nid(user_nid)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    for (idx, ev) in timeline_events.iter().enumerate() {
+        let ev_type = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let sender = ev.get("sender").and_then(|v| v.as_str()).unwrap_or("");
+        let is_state = ev.get("state_key").is_some();
+        if is_state || sender == user_id_str {
+            continue;
+        }
+        if !matches!(ev_type, "m.room.message" | "m.room.encrypted") {
+            continue;
+        }
+        let body = ev
+            .pointer("/content/body")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let highlights = !user_id_str.is_empty() && body.contains(&user_id_str);
+
+        let thread_root = ev
+            .pointer("/content/m.relates_to")
+            .filter(|rel| rel.get("rel_type").and_then(|v| v.as_str()) == Some("m.thread"))
+            .and_then(|rel| rel.get("event_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let in_scope = |receipt_thread: Option<&str>| -> bool {
+            match receipt_thread {
+                None => true,
+                Some("main") => thread_root.is_none(),
+                Some(tid) => thread_root.as_deref() == Some(tid),
+            }
+        };
+        let covered = receipt_idx.iter().any(|(rt, ridx)| {
+            if !in_scope(rt.as_deref()) {
+                return false;
+            }
+            match ridx {
+                None => true,
+                Some(r) => idx <= *r,
+            }
+        });
+        if covered {
+            continue;
+        }
+
+        if unread_thread_notifications && let Some(root) = thread_root {
+            let entry = thread_counts.entry(root).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(1);
+            if highlights {
+                entry.1 = entry.1.saturating_add(1);
+            }
+        } else {
+            main_count = main_count.saturating_add(1);
+            if highlights {
+                main_highlights = main_highlights.saturating_add(1);
+            }
+        }
+    }
+    Ok((main_count, main_highlights, thread_counts))
+}
+
+/// Build the `m.receipt` ephemeral event for a single room, or `None` if
+/// the room has no receipts. MSC4102: when a user has both an unthreaded
+/// and threaded receipt on the same event, the unthreaded entry wins
+/// (clients use it as the room-wide anchor).
+pub(crate) fn build_receipts_event(
+    state: &AppState,
+    room_nid: u64,
+) -> Result<Option<Value>, ApiError> {
+    let receipts = state
+        .db
+        .get_room_receipts(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if receipts.is_empty() {
+        return Ok(None);
+    }
+    let mut sorted: Vec<&(String, u64, Option<String>, Value)> = receipts.iter().collect();
+    sorted.sort_by_key(|r| r.2.is_none());
+    let mut content_map = serde_json::Map::new();
+    for (receipt_type, user_nid, thread_id, receipt_val) in sorted {
+        if let (Some(event_id), Some(ts)) = (
+            receipt_val.get("event_id").and_then(|v| v.as_str()),
+            receipt_val.get("ts").and_then(|v| v.as_u64()),
+        ) {
+            let user_id = state
+                .db
+                .resolve_nid(*user_nid)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                .unwrap_or_default();
+
+            let event_entry = content_map
+                .entry(event_id.to_string())
+                .or_insert_with(|| json!({}));
+            let type_entry = event_entry
+                .as_object_mut()
+                .unwrap()
+                .entry(receipt_type.clone())
+                .or_insert_with(|| json!({}));
+            let mut user_entry = serde_json::Map::new();
+            user_entry.insert("ts".into(), json!(ts));
+            if let Some(tid) = thread_id {
+                user_entry.insert("thread_id".into(), json!(tid));
+            }
+            type_entry
+                .as_object_mut()
+                .unwrap()
+                .insert(user_id, Value::Object(user_entry));
+        }
+    }
+    if content_map.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "type": "m.receipt",
+        "content": content_map
+    })))
 }
 
 /// Gather `m.presence` EDUs for users the caller shares a room with. We

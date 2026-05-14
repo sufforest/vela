@@ -184,6 +184,7 @@ pub async fn sliding_sync(
             since,
             &mut lists_response,
             &mut rooms_response,
+            user.user_nid,
         )?;
 
         // Room subscriptions
@@ -210,7 +211,14 @@ pub async fn sliding_sync(
                     membership: "join".to_string(),
                 };
                 let tl = sub.timeline_limit.unwrap_or(10) as usize;
-                let room_data = build_sliding_room(state, &info, tl, &sub.required_state, since)?;
+                let room_data = build_sliding_room(
+                    state,
+                    &info,
+                    tl,
+                    &sub.required_state,
+                    since,
+                    user.user_nid,
+                )?;
                 rooms_response.insert(room_id.clone(), room_data);
             }
         }
@@ -325,9 +333,23 @@ pub async fn sliding_sync(
         extensions.insert("typing".to_string(), json!({"rooms": typing_rooms}));
     }
 
-    // receipts extension
+    // receipts extension — emit per-room m.receipt events for every
+    // room that appeared in the response. Sliding sync clients can't
+    // see receipts via the room timeline like /sync does, so this
+    // extension is the only way for them to drive read-state UI.
     if body.extensions.receipts.as_ref().is_some_and(|e| e.enabled) {
-        extensions.insert("receipts".to_string(), json!({"rooms": {}}));
+        let mut receipt_rooms: Map<String, Value> = Map::new();
+        for room_id in rooms_response.keys() {
+            if let Some(room_nid) = state
+                .db
+                .get_nid(room_id)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                && let Some(ev) = crate::sync::build_receipts_event(&state, room_nid)?
+            {
+                receipt_rooms.insert(room_id.clone(), ev);
+            }
+        }
+        extensions.insert("receipts".to_string(), json!({"rooms": receipt_rooms}));
     }
 
     // MSC4308 thread subscriptions extension. On initial sync return
@@ -515,6 +537,7 @@ fn build_lists(
     since: Option<u64>,
     lists_response: &mut Map<String, Value>,
     rooms_response: &mut Map<String, Value>,
+    user_nid: u64,
 ) -> Result<(), ApiError> {
     for (list_name, list_config) in lists {
         let filtered = apply_filters(room_infos, &list_config.filters);
@@ -543,6 +566,7 @@ fn build_lists(
                         timeline_limit,
                         &list_config.required_state,
                         since,
+                        user_nid,
                     )?;
                     rooms_response.insert(info.room_id.clone(), room_data);
                 }
@@ -592,12 +616,14 @@ fn apply_filters<'a>(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_sliding_room(
     state: &AppState,
     info: &RoomInfo,
     timeline_limit: usize,
     required_state: &[[String; 2]],
     since: Option<u64>,
+    user_nid: u64,
 ) -> Result<Value, ApiError> {
     let room_nid = info.room_nid;
     let room_id = &info.room_id;
@@ -667,22 +693,34 @@ fn build_sliding_room(
         }
     }
 
-    // Member counts
+    // Member counts. count_room_members_by_membership uses internal
+    // membership encoding: 1 = join, 2 = invite. Falls back to 1/0 so
+    // an empty room (shouldn't happen post-create) doesn't produce a
+    // confusing zero-joined response.
     let joined_count = state
         .db
-        .get_room_members(room_nid)
-        .map(|m| m.len())
+        .count_room_members_by_membership(room_nid, 1)
         .unwrap_or(1);
+    let invited_count = state
+        .db
+        .count_room_members_by_membership(room_nid, 2)
+        .unwrap_or(0);
+
+    // Unread counts mirror /sync semantics. Sliding sync clients show
+    // the same badge on a room tile as /sync clients do, so they need
+    // the same per-batch evaluation against the user's read receipts.
+    let (notification_count, highlight_count, _thread_counts) =
+        crate::sync::compute_unread_counts(state, room_nid, user_nid, &timeline, false)?;
 
     let mut room = json!({
         "initial": is_initial,
         "limited": limited,
         "required_state": state_events,
         "timeline": timeline,
-        "notification_count": 0,
-        "highlight_count": 0,
+        "notification_count": notification_count,
+        "highlight_count": highlight_count,
         "joined_count": joined_count,
-        "invited_count": 0,
+        "invited_count": invited_count,
         "membership": info.membership,
     });
 
