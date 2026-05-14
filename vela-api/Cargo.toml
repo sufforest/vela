@@ -41,6 +41,7 @@ ed25519-dalek = { workspace = true }
 jsonwebtoken = { workspace = true }
 uuid = { workspace = true }
 tokio-util = { workspace = true }
+image = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 hickory-resolver = { workspace = true }

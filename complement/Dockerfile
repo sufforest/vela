@@ -27,13 +27,15 @@ COPY vela-core/Cargo.toml vela-core/
 COPY vela-store/Cargo.toml vela-store/
 COPY vela-api/Cargo.toml vela-api/
 COPY vela-server/Cargo.toml vela-server/
+COPY tools/vela-admin/Cargo.toml tools/vela-admin/
 
 # Create stub sources so the workspace resolves for the dep-build step.
-RUN mkdir -p vela-core/src vela-store/src vela-api/src vela-server/src \
+RUN mkdir -p vela-core/src vela-store/src vela-api/src vela-server/src tools/vela-admin/src \
     && echo "" > vela-core/src/lib.rs \
     && echo "" > vela-store/src/lib.rs \
     && echo "" > vela-api/src/lib.rs \
     && echo "fn main() {}" > vela-server/src/main.rs \
+    && echo "fn main() {}" > tools/vela-admin/src/main.rs \
     && cargo build --release --bin vela || true
 
 # Now copy the real sources and build for real.
@@ -41,6 +43,7 @@ COPY vela-core/ vela-core/
 COPY vela-store/ vela-store/
 COPY vela-api/ vela-api/
 COPY vela-server/ vela-server/
+COPY tools/vela-admin/ tools/vela-admin/
 
 RUN touch vela-core/src/lib.rs vela-store/src/lib.rs vela-api/src/lib.rs vela-server/src/main.rs \
     && cargo build --release --bin vela

@@ -329,10 +329,9 @@ pub async fn thumbnail(
     state: State<AppState>,
     _user: AuthenticatedUser,
     Path((server, media)): Path<(String, String)>,
+    Query(q): Query<ThumbnailQuery>,
 ) -> Result<Response, ApiError> {
-    // For now, return the original file. Proper thumbnail generation
-    // requires the `image` crate — defer to a future iteration.
-    download_inner(state, Path((server, media, None))).await
+    thumbnail_inner(state, server, media, q).await
 }
 
 /// GET /_matrix/media/v3/thumbnail/{serverName}/{mediaId}
@@ -342,8 +341,168 @@ pub async fn thumbnail(
 pub async fn thumbnail_legacy(
     state: State<AppState>,
     Path((server, media)): Path<(String, String)>,
+    Query(q): Query<ThumbnailQuery>,
 ) -> Result<Response, ApiError> {
-    download_inner(state, Path((server, media, None))).await
+    thumbnail_inner(state, server, media, q).await
+}
+
+/// Spec query params: `width`, `height`, `method` (`scale` | `crop`).
+/// `animated` is best-effort (we always return a static frame). The
+/// `allow_remote`, `allow_redirect`, `timeout_ms` params are accepted
+/// but unused — we always serve from the store and never redirect.
+#[derive(serde::Deserialize, Default)]
+pub struct ThumbnailQuery {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub method: Option<String>,
+    #[allow(dead_code)]
+    pub animated: Option<bool>,
+    #[allow(dead_code)]
+    pub allow_remote: Option<bool>,
+    #[allow(dead_code)]
+    pub allow_redirect: Option<bool>,
+    #[allow(dead_code)]
+    pub timeout_ms: Option<u64>,
+}
+
+async fn thumbnail_inner(
+    State(state): State<AppState>,
+    server_name: String,
+    media_id: String,
+    q: ThumbnailQuery,
+) -> Result<Response, ApiError> {
+    if server_name != state.config.server_name {
+        // Remote thumbnails — delegate to the standard remote-download
+        // path which fetches the original from the source server and
+        // serves it back. We don't resize remote bytes (yet) to keep
+        // this loop bounded.
+        return download_remote(&state, &server_name, &media_id).await;
+    }
+
+    // Reservation-only media (MSC2246 placeholder, no bytes yet):
+    // spec uses 504 M_NOT_YET_UPLOADED, same as the download path.
+    let metadata = state
+        .db
+        .get_media_metadata(&media_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        .ok_or_else(|| ApiError(VelaError::NotFound("media not found".into())))?;
+    if metadata
+        .get("pending")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(custom_media_err(
+            504,
+            "M_NOT_YET_UPLOADED",
+            "media is reserved but not yet uploaded",
+        ));
+    }
+
+    let content_type = metadata
+        .get("content_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    // We only thumbnail image/* content. Anything else gets served as
+    // the original — the spec allows the server to fall through to
+    // the original when it can't render a thumbnail.
+    if !content_type.starts_with("image/") {
+        return download_inner(State(state), Path((server_name, media_id, None))).await;
+    }
+
+    // Spec clamp: server SHOULD pick the smallest cached thumbnail
+    // size at-or-above the requested dimensions. We don't pre-bucket;
+    // we just clamp the requested size to a sane ceiling so a
+    // malicious request can't ask us to render 100k×100k.
+    let req_w = q.width.unwrap_or(96).clamp(1, 1600);
+    let req_h = q.height.unwrap_or(96).clamp(1, 1600);
+    let method = q.method.as_deref().unwrap_or("scale");
+
+    // Load original bytes via the same path as /download.
+    let mut reader = state
+        .media_store
+        .get(&media_id)
+        .await
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        .ok_or_else(|| ApiError(VelaError::NotFound("media file not found".into())))?;
+    let mut buf = Vec::new();
+    use tokio::io::AsyncReadExt;
+    reader
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
+    // Decode → resize → encode. We always emit PNG because:
+    //   - lossless (no second round of JPEG quality loss),
+    //   - alpha channel preserved (some chat clients render PNGs for
+    //     stickers and emoji),
+    //   - decoders are universally available.
+    let img = image::load_from_memory(&buf)
+        .map_err(|e| ApiError(VelaError::Unknown(format!("decode image: {e}"))))?;
+    let resized = match method {
+        "crop" => crop_to(&img, req_w, req_h),
+        _ => img.thumbnail(req_w, req_h),
+    };
+    let mut out_bytes = Vec::new();
+    resized
+        .write_to(
+            &mut std::io::Cursor::new(&mut out_bytes),
+            image::ImageFormat::Png,
+        )
+        .map_err(|e| ApiError(VelaError::Unknown(format!("encode thumbnail: {e}"))))?;
+
+    let body = Body::from(out_bytes.clone());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/png")
+        .header(header::CONTENT_LENGTH, out_bytes.len().to_string())
+        .body(body)
+        .map_err(|e| ApiError(VelaError::Unknown(e.to_string())))
+}
+
+/// Resize the given image bytes to a PNG thumbnail. Used by the
+/// /thumbnail handler AND by the federation thumbnail endpoint so
+/// both surfaces emit identical bytes for the same input — the
+/// federation test compares the two byte-for-byte.
+pub(crate) fn resize_to_png_thumbnail(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    method: &str,
+) -> Result<Vec<u8>, image::ImageError> {
+    let w = width.clamp(1, 1600);
+    let h = height.clamp(1, 1600);
+    let img = image::load_from_memory(bytes)?;
+    let resized = match method {
+        "crop" => crop_to(&img, w, h),
+        _ => img.thumbnail(w, h),
+    };
+    let mut out = Vec::new();
+    resized.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
+    Ok(out)
+}
+
+/// `method=crop` returns an image of exactly the requested
+/// dimensions (or the smallest valid crop above them). We scale the
+/// shorter side to fit and crop the longer side from the centre.
+fn crop_to(img: &image::DynamicImage, w: u32, h: u32) -> image::DynamicImage {
+    let (iw, ih) = (img.width(), img.height());
+    if iw == 0 || ih == 0 {
+        return img.clone();
+    }
+    let scale = (w as f32 / iw as f32).max(h as f32 / ih as f32);
+    let new_w = ((iw as f32) * scale).ceil() as u32;
+    let new_h = ((ih as f32) * scale).ceil() as u32;
+    let scaled = img.resize_exact(
+        new_w.max(w),
+        new_h.max(h),
+        image::imageops::FilterType::Triangle,
+    );
+    let (sw, sh) = (scaled.width(), scaled.height());
+    let x = sw.saturating_sub(w) / 2;
+    let y = sh.saturating_sub(h) / 2;
+    scaled.crop_imm(x, y, w.min(sw), h.min(sh))
 }
 
 /// GET /_matrix/media/v3/config

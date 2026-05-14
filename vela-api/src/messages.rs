@@ -674,21 +674,20 @@ pub fn load_client_event_with_relations(
         None => return Ok(None),
     };
     let user_nid = caller.map(|(u, _)| u);
-    if let Some(agg) = compute_thread_aggregation(state, event_nid, room_id, user_nid)? {
+    // Bundle annotation (reactions) + replace (edits) + thread
+    // aggregations in one pass. Element renders reactions and edits
+    // from `unsigned.m.relations`, so skipping this makes a chat
+    // look like a feed of raw events.
+    if let Some(relations) = compute_bundled_relations(state, event_nid, room_id, user_nid)? {
         let unsigned = ev
             .as_object_mut()
             .unwrap()
             .entry("unsigned".to_string())
             .or_insert_with(|| json!({}));
-        let relations = unsigned
+        unsigned
             .as_object_mut()
             .unwrap()
-            .entry("m.relations".to_string())
-            .or_insert_with(|| json!({}));
-        relations
-            .as_object_mut()
-            .unwrap()
-            .insert("m.thread".to_string(), agg);
+            .insert("m.relations".to_string(), Value::Object(relations));
     }
     if let Some(uid) = user_nid {
         let membership =
@@ -722,8 +721,211 @@ pub fn load_client_event_with_relations(
     Ok(Some(ev))
 }
 
+/// Compute the full `unsigned.m.relations` bundle in a single sweep
+/// of `event_relations`. Spec §Aggregations groups child events by
+/// `rel_type`:
+///
+///   - `m.annotation` → grouped by reaction key with counts
+///   - `m.replace` → the latest replacement event
+///   - `m.thread` → count + latest reply + current_user_participated
+///
+/// Returns `None` when the parent has no children, so the caller can
+/// skip writing an empty object.
+fn compute_bundled_relations(
+    state: &AppState,
+    event_nid: u64,
+    room_id: &str,
+    user_nid: Option<u64>,
+) -> Result<Option<serde_json::Map<String, Value>>, ApiError> {
+    // One prefix scan of `event_relations` covers every relation type.
+    // Anything heavier (large reaction sets) is bounded by the 1000-row
+    // cap; clients that need more paginate via /relations.
+    let entries = state
+        .db
+        .list_relations(event_nid, None, None, u64::MAX, true, 1000)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    let mut annotations: Vec<(u64, u64, u64)> = Vec::new(); // (child_nid, rel_nid, child_type_nid)
+    let mut replaces: Vec<(u64, u64, u64)> = Vec::new();
+    let mut threads: Vec<(u64, u64, u64)> = Vec::new();
+    for (_sp, child_nid, rel_type_nid, child_type_nid) in &entries {
+        if let Ok(Some(rel)) = state.db.resolve_nid(*rel_type_nid) {
+            match rel.as_str() {
+                "m.annotation" => annotations.push((*child_nid, *rel_type_nid, *child_type_nid)),
+                "m.replace" => replaces.push((*child_nid, *rel_type_nid, *child_type_nid)),
+                "m.thread" => threads.push((*child_nid, *rel_type_nid, *child_type_nid)),
+                _ => {}
+            }
+        }
+    }
+
+    let mut out = serde_json::Map::new();
+    if let Some(agg) = aggregate_annotations(state, &annotations)? {
+        out.insert("m.annotation".to_string(), agg);
+    }
+    if let Some(agg) = aggregate_replace(state, &replaces, room_id)? {
+        out.insert("m.replace".to_string(), agg);
+    }
+    if !threads.is_empty()
+        && let Some(agg) = thread_summary(state, event_nid, room_id, user_nid, &threads)?
+    {
+        out.insert("m.thread".to_string(), agg);
+    }
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
+}
+
+/// Spec shape for bundled reactions:
+/// `{ chunk: [{type, key, count, origin_server_ts}, ...] }`
+/// Grouped by the reaction's `key` so Element can render
+/// "👍 ×3 ❤ ×1" without scanning the relations endpoint per event.
+fn aggregate_annotations(
+    state: &AppState,
+    annotations: &[(u64, u64, u64)],
+) -> Result<Option<Value>, ApiError> {
+    if annotations.is_empty() {
+        return Ok(None);
+    }
+    use std::collections::HashMap;
+    struct Tally {
+        event_type: String,
+        count: u64,
+        latest_ts: u64,
+    }
+    let mut by_key: HashMap<String, Tally> = HashMap::new();
+    for (child_nid, _, _) in annotations {
+        let Some((header, bytes)) = state
+            .db
+            .get_event(*child_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let Some(key) = json
+            .pointer("/content/m.relates_to/key")
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let event_type = state
+            .db
+            .resolve_nid(header.type_nid)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "m.reaction".to_string());
+        let entry = by_key.entry(key.to_string()).or_insert_with(|| Tally {
+            event_type: event_type.clone(),
+            count: 0,
+            latest_ts: 0,
+        });
+        entry.count += 1;
+        if header.origin_server_ts > entry.latest_ts {
+            entry.latest_ts = header.origin_server_ts;
+        }
+    }
+    if by_key.is_empty() {
+        return Ok(None);
+    }
+    let mut chunk: Vec<Value> = by_key
+        .into_iter()
+        .map(|(key, t)| {
+            json!({
+                "type": t.event_type,
+                "key": key,
+                "count": t.count,
+                "origin_server_ts": t.latest_ts,
+            })
+        })
+        .collect();
+    // Stable deterministic order: by key.
+    chunk.sort_by(|a, b| {
+        a.get("key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .cmp(b.get("key").and_then(|v| v.as_str()).unwrap_or(""))
+    });
+    Ok(Some(json!({ "chunk": chunk })))
+}
+
+/// Spec shape for bundled edits: the latest `m.replace` child event
+/// is exposed verbatim. Clients render the replacement content but
+/// keep the original sender / event_id for permalink references.
+fn aggregate_replace(
+    state: &AppState,
+    replaces: &[(u64, u64, u64)],
+    room_id: &str,
+) -> Result<Option<Value>, ApiError> {
+    if replaces.is_empty() {
+        return Ok(None);
+    }
+    // list_relations returned newest-first; take the head.
+    let (child_nid, _, _) = replaces[0];
+    let Some(ev) = load_client_event(state, child_nid, room_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(json!({ "event": ev })))
+}
+
+/// Thread aggregation. Same shape as the pre-existing
+/// `compute_thread_aggregation` (kept compatible) but now driven by
+/// the same single relations scan as annotations/replaces.
+fn thread_summary(
+    state: &AppState,
+    event_nid: u64,
+    room_id: &str,
+    user_nid: Option<u64>,
+    threads: &[(u64, u64, u64)],
+) -> Result<Option<Value>, ApiError> {
+    if threads.is_empty() {
+        return Ok(None);
+    }
+    let count = threads.len() as u64;
+    let (latest_nid, _, _) = threads[0];
+    let latest = load_client_event(state, latest_nid, room_id)?;
+    let participated = match user_nid {
+        Some(uid) => {
+            let root_sender_is_user = state
+                .db
+                .get_event(event_nid)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                .map(|(h, _)| h.sender_nid == uid)
+                .unwrap_or(false);
+            root_sender_is_user
+                || threads.iter().any(|(child_nid, _, _)| {
+                    state
+                        .db
+                        .get_event(*child_nid)
+                        .ok()
+                        .flatten()
+                        .map(|(h, _)| h.sender_nid == uid)
+                        .unwrap_or(false)
+                })
+        }
+        None => false,
+    };
+    let mut agg = serde_json::Map::new();
+    if let Some(l) = latest {
+        agg.insert("latest_event".to_string(), l);
+    }
+    agg.insert("count".to_string(), json!(count));
+    if user_nid.is_some() {
+        agg.insert("current_user_participated".to_string(), json!(participated));
+    }
+    Ok(Some(Value::Object(agg)))
+}
+
 /// Build the `m.thread` aggregation object per spec §Threading. Returns
 /// `None` when the event has no thread children (the common case).
+#[allow(dead_code)]
 fn compute_thread_aggregation(
     state: &AppState,
     event_nid: u64,
