@@ -728,6 +728,8 @@ pub fn load_client_event_with_relations(
 ///   - `m.annotation` → grouped by reaction key with counts
 ///   - `m.replace` → the latest replacement event
 ///   - `m.thread` → count + latest reply + current_user_participated
+///   - `m.reference` → chunk of `{event_id}` per child (covers poll
+///     responses, key-verification association, etc.)
 ///
 /// Returns `None` when the parent has no children, so the caller can
 /// skip writing an empty object.
@@ -751,12 +753,14 @@ fn compute_bundled_relations(
     let mut annotations: Vec<(u64, u64, u64)> = Vec::new(); // (child_nid, rel_nid, child_type_nid)
     let mut replaces: Vec<(u64, u64, u64)> = Vec::new();
     let mut threads: Vec<(u64, u64, u64)> = Vec::new();
+    let mut references: Vec<u64> = Vec::new();
     for (_sp, child_nid, rel_type_nid, child_type_nid) in &entries {
         if let Ok(Some(rel)) = state.db.resolve_nid(*rel_type_nid) {
             match rel.as_str() {
                 "m.annotation" => annotations.push((*child_nid, *rel_type_nid, *child_type_nid)),
                 "m.replace" => replaces.push((*child_nid, *rel_type_nid, *child_type_nid)),
                 "m.thread" => threads.push((*child_nid, *rel_type_nid, *child_type_nid)),
+                "m.reference" => references.push(*child_nid),
                 _ => {}
             }
         }
@@ -774,11 +778,37 @@ fn compute_bundled_relations(
     {
         out.insert("m.thread".to_string(), agg);
     }
+    if let Some(agg) = aggregate_references(state, &references)? {
+        out.insert("m.reference".to_string(), agg);
+    }
     if out.is_empty() {
         Ok(None)
     } else {
         Ok(Some(out))
     }
+}
+
+/// Spec shape for bundled references (m.reference relation):
+/// `{ chunk: [{event_id}, ...] }`. Only the child event_id is included
+/// per matrix-spec v1.5 §Reference relations.
+fn aggregate_references(state: &AppState, references: &[u64]) -> Result<Option<Value>, ApiError> {
+    if references.is_empty() {
+        return Ok(None);
+    }
+    let mut chunk = Vec::with_capacity(references.len());
+    for child_nid in references {
+        if let Some(eid) = state
+            .db
+            .resolve_nid(*child_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        {
+            chunk.push(json!({"event_id": eid}));
+        }
+    }
+    if chunk.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(json!({"chunk": chunk})))
 }
 
 /// Spec shape for bundled reactions:
