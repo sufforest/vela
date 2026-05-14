@@ -879,10 +879,10 @@ fn build_room_sync_for_user(
 
     // Approximate unread_notifications by counting non-state events
     // newer than the user's m.read receipt that aren't from the user
-    // themselves. Highlights cover .m.rule.contains_user_name (body
-    // contains the user's MXID); display-name highlights would need
-    // profile lookup and proper push-rule evaluation, which is a
-    // separate effort.
+    // themselves. Highlights run the full push-rule evaluator and
+    // flag any event whose matched rule emits a `highlight` tweak —
+    // covers display-name mentions, custom content/keyword rules, and
+    // user-defined overrides.
     //
     // When `unread_thread_notifications` is requested via the timeline
     // filter, also produce per-thread counts keyed by thread root
@@ -956,9 +956,13 @@ fn build_room_sync_for_user(
 /// Compute `(notification_count, highlight_count, thread_counts)` for a
 /// timeline batch the user is about to see.
 ///
-/// Highlights here use the naive "MXID appears in body" heuristic
-/// (matches the spec's `.m.rule.contains_user_name` rule). Display-name
-/// highlights and full push-rule evaluation are separate work.
+/// Highlights run the user's merged push-rule set (server defaults plus
+/// any `m.push_rules` account_data) through `vela_core::push_rules` and
+/// flag any event whose first matching rule emits a `highlight` tweak —
+/// covers `.m.rule.contains_display_name`, custom content/keyword rules,
+/// and any user override. The evaluator context (rules + displayname +
+/// joined_member_count) is built once per call; the per-event hot loop
+/// only does the evaluate.
 ///
 /// MSC3771/3773 receipt scoping: every `m.read` receipt the user has in
 /// the room is bucketed by `thread_id` — unthreaded covers all threads,
@@ -1007,6 +1011,23 @@ pub(crate) fn compute_unread_counts(
         .ok()
         .flatten()
         .unwrap_or_default();
+
+    // Build the push-rule evaluator inputs once. The hot loop calls
+    // `evaluate` per event, which is cheap, but rule loading and member-
+    // state lookups are not — keep them out of the loop.
+    let rules = crate::pushrules::load_user_rules(state, user_nid)
+        .unwrap_or_else(|_| vela_core::push_rules::default_global_rules());
+    let displayname = recipient_room_displayname(state, room_nid, user_nid, &user_id_str);
+    let joined_member_count = state
+        .db
+        .count_room_members_by_membership(room_nid, 1)
+        .unwrap_or(0);
+    let push_ctx = vela_core::push_rules::RoomContext {
+        joined_member_count,
+        recipient_display_name: displayname,
+        recipient_user_id: user_id_str.clone(),
+    };
+
     for (idx, ev) in timeline_events.iter().enumerate() {
         let ev_type = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let sender = ev.get("sender").and_then(|v| v.as_str()).unwrap_or("");
@@ -1017,11 +1038,12 @@ pub(crate) fn compute_unread_counts(
         if !matches!(ev_type, "m.room.message" | "m.room.encrypted") {
             continue;
         }
-        let body = ev
-            .pointer("/content/body")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let highlights = !user_id_str.is_empty() && body.contains(&user_id_str);
+        let action = vela_core::push_rules::evaluate(ev, &rules, &push_ctx);
+        let highlights = action
+            .tweaks
+            .get("highlight")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let thread_root = ev
             .pointer("/content/m.relates_to")
@@ -1064,6 +1086,47 @@ pub(crate) fn compute_unread_counts(
         }
     }
     Ok((main_count, main_highlights, thread_counts))
+}
+
+/// Resolve the recipient's display name for use in `contains_display_name`
+/// push-rule evaluation. Prefer the per-room `m.room.member` event (so
+/// per-room nicknames like "alice (oncall)" highlight when called by name),
+/// then fall back to the user's profile. Returns `None` when neither is
+/// set, which skips the rule rather than risk a false positive on empty.
+fn recipient_room_displayname(
+    state: &AppState,
+    room_nid: u64,
+    user_nid: u64,
+    user_id_str: &str,
+) -> Option<String> {
+    let type_nid = state.db.get_nid("m.room.member").ok().flatten();
+    let skey_nid = if !user_id_str.is_empty() {
+        state.db.get_nid(user_id_str).ok().flatten()
+    } else {
+        None
+    };
+    if let (Some(tn), Some(sn)) = (type_nid, skey_nid)
+        && let Ok(Some(event_nid)) = state.db.get_state_event_nid(room_nid, tn, sn)
+        && let Ok(Some((_, bytes))) = state.db.get_event(event_nid)
+        && let Ok(ev) = serde_json::from_slice::<Value>(&bytes)
+        && let Some(name) = ev
+            .pointer("/content/displayname")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    {
+        return Some(name.to_string());
+    }
+    state
+        .db
+        .get_user(user_nid)
+        .ok()
+        .flatten()
+        .and_then(|u| {
+            u.get("displayname")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .filter(|s| !s.is_empty())
 }
 
 /// Build the `m.receipt` ephemeral event for a single room, or `None` if
@@ -2188,5 +2251,265 @@ mod tests {
             invites.contains_key("!fresh:example.com"),
             "fresh invite must appear after since={since}"
         );
+    }
+
+    // ---- highlight_count via push-rule evaluation ----
+    //
+    // Scenario: alice + bob in a room, both joined. Bob sends one or more
+    // messages; we check what alice's `compute_unread_counts` says about
+    // notification_count and highlight_count.
+
+    /// Build the minimal world: create+joins for alice & bob, return their
+    /// nids and the room_nid. Caller decides what messages to add.
+    fn build_alice_bob_room(
+        state: &AppState,
+    ) -> (u64, u64, u64, &'static str, &'static str, &'static str) {
+        let db = state.db.clone();
+        let room_id = "!hl:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice = "@alice:example.com";
+        let bob = "@bob:example.com";
+        let alice_nid = db.create_user(alice, "x").unwrap();
+        let bob_nid = db.create_user(bob, "x").unwrap();
+
+        persist_state(
+            &db,
+            100,
+            "$create",
+            room_nid,
+            room_id,
+            "m.room.create",
+            alice_nid,
+            alice,
+            "",
+            serde_json::json!({"room_version": "12"}),
+            1,
+            1,
+            &[],
+        );
+        persist_state(
+            &db,
+            101,
+            "$alice_join",
+            room_nid,
+            room_id,
+            "m.room.member",
+            alice_nid,
+            alice,
+            alice,
+            serde_json::json!({"membership": "join"}),
+            2,
+            2,
+            &[100],
+        );
+        persist_state(
+            &db,
+            102,
+            "$bob_join",
+            room_nid,
+            room_id,
+            "m.room.member",
+            bob_nid,
+            bob,
+            bob,
+            serde_json::json!({"membership": "join"}),
+            3,
+            3,
+            &[101],
+        );
+        db.set_membership(room_nid, alice_nid, 1).unwrap();
+        db.set_membership(room_nid, bob_nid, 1).unwrap();
+        (room_nid, alice_nid, bob_nid, room_id, alice, bob)
+    }
+
+    /// Persist a non-state `m.room.message` from `sender` with `body`,
+    /// then return the same JSON shape `build_sync_response` would emit
+    /// in the timeline (a `Value` with `type`/`sender`/`content`/etc).
+    fn persist_message(
+        db: &vela_store::db::Database,
+        nid: u64,
+        eid: &str,
+        room_nid: u64,
+        room_id: &str,
+        sender_nid: u64,
+        sender_id: &str,
+        body: &str,
+        ts: u64,
+        depth: u64,
+    ) -> serde_json::Value {
+        let type_nid = db.get_or_create_nid("m.room.message").unwrap();
+        let event = serde_json::json!({
+            "event_id": eid,
+            "type": "m.room.message",
+            "sender": sender_id,
+            "room_id": room_id,
+            "content": {"msgtype": "m.text", "body": body},
+            "origin_server_ts": ts, "depth": depth,
+            "prev_events": [], "auth_events": [],
+        });
+        db.persist_event(
+            nid,
+            eid,
+            room_nid,
+            type_nid,
+            sender_nid,
+            0,
+            ts,
+            depth,
+            &serde_json::to_vec(&event).unwrap(),
+            &[],
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+        event
+    }
+
+    #[test]
+    fn highlight_count_fires_on_room_member_displayname_mention() {
+        let (state, _tmp) = build_test_state();
+        let (room_nid, alice_nid, bob_nid, room_id, alice, bob) = build_alice_bob_room(&state);
+
+        // Alice's per-room displayname: "Alice Wonder". Push-rule
+        // contains_display_name should match a body containing it.
+        persist_state(
+            &state.db,
+            110,
+            "$alice_profile",
+            room_nid,
+            room_id,
+            "m.room.member",
+            alice_nid,
+            alice,
+            alice,
+            serde_json::json!({"membership": "join", "displayname": "Alice Wonder"}),
+            10,
+            10,
+            &[102],
+        );
+
+        let ev = persist_message(
+            &state.db,
+            200,
+            "$m1",
+            room_nid,
+            room_id,
+            bob_nid,
+            bob,
+            "hey Alice Wonder",
+            20,
+            20,
+        );
+
+        let (notif, hl, _) =
+            compute_unread_counts(&state, room_nid, alice_nid, &[ev], false).unwrap();
+        assert_eq!(notif, 1, "underride rule should count bob's message");
+        assert_eq!(hl, 1, "displayname mention should highlight");
+    }
+
+    #[test]
+    fn highlight_count_fires_on_custom_content_rule() {
+        // Mirrors the spec's `.m.rule.contains_user_name`: user has a
+        // content rule whose pattern is their MXID, action notify+highlight.
+        let (state, _tmp) = build_test_state();
+        let (room_nid, alice_nid, bob_nid, room_id, _alice, bob) = build_alice_bob_room(&state);
+
+        // Install a user-level content rule on top of the defaults.
+        state
+            .db
+            .set_account_data(
+                alice_nid,
+                "m.push_rules",
+                &serde_json::json!({
+                    "global": {
+                        "content": [{
+                            "rule_id": ".m.rule.contains_user_name",
+                            "default": true,
+                            "enabled": true,
+                            // Matrix content rules glob-match; users
+                            // wrap their MXID with wildcards so the
+                            // pattern fires anywhere in the body.
+                            "pattern": "*@alice:example.com*",
+                            "actions": ["notify", {"set_tweak": "highlight"}],
+                        }],
+                    }
+                }),
+            )
+            .unwrap();
+
+        let ev = persist_message(
+            &state.db,
+            201,
+            "$m2",
+            room_nid,
+            room_id,
+            bob_nid,
+            bob,
+            "hey @alice:example.com",
+            21,
+            21,
+        );
+
+        let (notif, hl, _) =
+            compute_unread_counts(&state, room_nid, alice_nid, &[ev], false).unwrap();
+        assert_eq!(notif, 1);
+        assert_eq!(hl, 1, "MXID mention via content rule should highlight");
+    }
+
+    #[test]
+    fn highlight_count_zero_for_plain_message() {
+        // No displayname set, no custom rules. Bob's plain message
+        // should bump notification_count via the default underride
+        // .m.rule.message but NOT highlight.
+        let (state, _tmp) = build_test_state();
+        let (room_nid, alice_nid, bob_nid, room_id, _alice, bob) = build_alice_bob_room(&state);
+
+        let ev = persist_message(
+            &state.db,
+            202,
+            "$m3",
+            room_nid,
+            room_id,
+            bob_nid,
+            bob,
+            "good morning",
+            22,
+            22,
+        );
+
+        let (notif, hl, _) =
+            compute_unread_counts(&state, room_nid, alice_nid, &[ev], false).unwrap();
+        assert_eq!(notif, 1, "plain message still notifies under defaults");
+        assert_eq!(hl, 0, "no rule emits highlight → highlight_count = 0");
+    }
+
+    #[test]
+    fn highlight_count_falls_back_to_profile_displayname() {
+        // No per-room member displayname, but a global profile one.
+        // contains_display_name should still match.
+        let (state, _tmp) = build_test_state();
+        let (room_nid, alice_nid, bob_nid, room_id, _alice, bob) = build_alice_bob_room(&state);
+        state
+            .db
+            .update_user_profile(alice_nid, Some("Alice Profile"), None)
+            .unwrap();
+
+        let ev = persist_message(
+            &state.db,
+            203,
+            "$m4",
+            room_nid,
+            room_id,
+            bob_nid,
+            bob,
+            "ping Alice Profile please",
+            23,
+            23,
+        );
+
+        let (_notif, hl, _) =
+            compute_unread_counts(&state, room_nid, alice_nid, &[ev], false).unwrap();
+        assert_eq!(hl, 1, "profile displayname should still drive highlight");
     }
 }
