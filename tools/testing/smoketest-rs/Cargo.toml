@@ -1,0 +1,41 @@
+# Standalone (intentionally not in vela's workspace `members`). The
+# empty `[workspace]` table stops cargo from walking up and inheriting
+# the parent workspace's lockfile/target dir — that's what keeps the
+# heavy ruma-client dep tree off the homeserver's regular `cargo check`.
+[workspace]
+
+[package]
+name = "vela-smoketest-rs"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+# Intentionally outside the default workspace `members` array — the
+# ruma-client dependency adds a non-trivial number of proc-macro crates
+# that we don't want gating every `cargo check` of the homeserver. Run
+# this suite with `cargo test -p vela-smoketest-rs --locked`.
+publish = false
+
+[dependencies]
+# Library deps — used by src/lib.rs to boot the in-process server.
+# `test-harness` re-exports the same `build_test_state_with_name` the
+# in-crate unit tests use, so the listener serves the same AppState
+# shape Complement exercises minus Complement's Docker overhead.
+vela-api = { path = "../../../vela-api", features = ["test-harness"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tempfile = "3"
+url = "2"
+
+[dev-dependencies]
+# Test-only deps. ruma-client gives us real `Client::send_request()`
+# over reqwest with `ruma-common`-typed requests/responses. Lighter
+# than matrix-rust-sdk (no sled/sqlite, no olm) — just the wire layer,
+# which is exactly what catches the sync field-name / presence-default
+# / state-ordering regressions Complement misses.
+ruma-client = { version = "0.18", default-features = false, features = ["client-api", "reqwest-rustls"] }
+ruma = { version = "0.15", default-features = false, features = ["client-api-c", "rand"] }
+# Used only inside the test to pluck `unsigned.age` out of the raw
+# event JSON — ruma's typed accessors expose `unsigned` as an opaque
+# struct, and we want the raw integer so a wire-shape regression
+# surfaces here verbatim.
+serde_json = "1"

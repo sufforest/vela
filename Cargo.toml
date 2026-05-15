@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
 members = ["vela-server", "vela-core", "vela-store", "vela-api", "tools/vela-admin"]
+# `tools/testing/smoketest-rs` is deliberately NOT a workspace member.
+# Its ruma-client dep tree (proc-macros, additional rustls plumbing) is
+# heavy enough that gating every `cargo check` of the homeserver on it
+# would hurt the dev loop. Run that suite explicitly with
+# `cargo test -p vela-smoketest-rs --manifest-path tools/testing/smoketest-rs/Cargo.toml --locked`.
+exclude = ["tools/testing/smoketest-rs"]
 
 [workspace.package]
 edition = "2024"
