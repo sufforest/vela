@@ -73,6 +73,12 @@ path = "$DATA_DIR"
 # production rate-limit defaults would cascade-fail unrelated tests.
 [rate_limit]
 enabled = false
+
+# Complement runs both homeservers inside a Docker bridge network on
+# RFC 1918 addresses (172.17.x or similar). Vela's default outbound
+# SSRF guard would refuse those — disable it inside the test runner.
+[federation]
+private_ip_block = false
 EOF
 
 echo "[vela-complement] starting vela with config $CONF_DIR/vela.toml"
