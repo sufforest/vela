@@ -5,6 +5,12 @@
 //! qualifying local user for us). We sign the template as-is and send_join.
 //! This test stubs a remote with wiremock and inspects the body we PUT to
 //! `/send_join/`, asserting the authoriser field survives signing.
+//!
+//! Inbound restricted-room handling (sender-sig + authoriser-locality +
+//! authoriser-sig verification by our own key) is covered by
+//! `vela-api/src/federation_join.rs::tests::send_join_rejects_non_local_authoriser`
+//! — a unit test that drives `send_join_v2` directly so it can stub
+//! signing keys without standing up a full wiremock remote.
 
 mod common;
 
