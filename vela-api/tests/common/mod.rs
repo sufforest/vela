@@ -40,6 +40,7 @@ pub struct ConfigOverrides {
     pub registration_token: Option<String>,
     pub max_upload_size: u64,
     pub encrypt_by_default: vela_api::router::EncryptByDefault,
+    pub oidc: vela_api::router::OidcConfig,
 }
 
 impl Default for ConfigOverrides {
@@ -51,6 +52,7 @@ impl Default for ConfigOverrides {
             registration_token: None,
             max_upload_size: 50 * 1024 * 1024,
             encrypt_by_default: vela_api::router::EncryptByDefault::Off,
+            oidc: vela_api::router::OidcConfig::default(),
         }
     }
 }
@@ -136,6 +138,7 @@ impl Harness {
                 minimum_room_version: vela_core::events::room_version::RoomVersion::V6,
                 voip: vela_api::router::VoipConfig::default(),
                 rtc: vela_api::router::RtcConfig::default(),
+                oidc: overrides.oidc,
             }),
             room_locks: Arc::new(DashMap::new()),
             user_locks: Arc::new(DashMap::new()),

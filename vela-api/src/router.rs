@@ -91,6 +91,12 @@ pub struct ServerConfig {
     /// configured; clients then either piggy-back on another
     /// participant's focus or fall back to classic VoIP.
     pub rtc: RtcConfig,
+    /// MSC3861 / OAuth 2.0 authentication-API discovery posture.
+    /// Phase 1 surface only: when `enabled`, `/auth_issuer` and the
+    /// `/versions` capability bit advertise that vela is configured
+    /// to delegate auth to an external IdP. Token validation against
+    /// the IdP is NOT wired up yet — phase 2.
+    pub oidc: OidcConfig,
 }
 
 /// Classic `/voip/turnServer` configuration.
@@ -108,6 +114,23 @@ pub struct RtcConfig {
     pub livekit_api_key: String,
     pub livekit_secret: String,
     pub jwt_ttl_seconds: u32,
+}
+
+/// MSC3861 OIDC discovery posture (phase 1: discovery + capability
+/// advertisement only). When `enabled = false` (default), vela behaves
+/// exactly as before: `/auth_issuer` 404s with `M_NOT_FOUND` and the
+/// `/versions` response does not advertise `org.matrix.msc3861`.
+#[derive(Clone, Default)]
+pub struct OidcConfig {
+    pub enabled: bool,
+    /// The OIDC issuer URL (e.g. `https://auth.example.com/`).
+    pub issuer: String,
+    /// `Some` when vela's registered client_id should be exposed to
+    /// clients that need it pre-IdP-flow. Phase 1 doesn't consume it
+    /// internally; the field is plumbed through for phase 2.
+    pub client_id: Option<String>,
+    /// Optional account-management URL surfaced to clients per MSC3861.
+    pub account_management_url: Option<String>,
 }
 
 /// Server policy for auto-injecting `m.room.encryption` on
@@ -196,6 +219,15 @@ pub fn build_router(state: AppState) -> Router {
         // Discovery (no auth)
         .route("/.well-known/matrix/client", get(discovery::well_known))
         .route("/_matrix/client/versions", get(discovery::versions))
+        // MSC3861 phase 1 — clients probe this to learn whether vela
+        // delegates auth to an external OIDC issuer. Returns 200 with
+        // the issuer/account URLs when `[auth.oidc] enabled = true`,
+        // otherwise 404 M_NOT_FOUND (the spec way of saying "this
+        // server runs legacy auth").
+        .route(
+            "/_matrix/client/v1/auth_issuer",
+            get(discovery::auth_issuer),
+        )
         // Ops — Prometheus scrape (no auth; front with reverse proxy in prod).
         .route("/_vela/metrics", get(crate::metrics::scrape))
         // Ops — health/liveness probe (no auth, intentionally outside
