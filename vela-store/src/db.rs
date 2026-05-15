@@ -2053,9 +2053,10 @@ impl Database {
         self.db.put_cf(&cf, alias.as_bytes(), room_id.as_bytes())
     }
 
-    /// Stores `alias → {room_id, creator}` so DELETE can verify the
-    /// requester. JSON-encoded to keep parsing tolerant of future fields
-    /// (e.g. created-at timestamp) without a schema migration.
+    /// Stores `alias → {room_id, creator, created_at}` so DELETE can verify
+    /// the requester. JSON-encoded so future fields can be added without a
+    /// schema migration — readers tolerate unknown keys and missing values
+    /// (see `get_room_alias_record`).
     pub fn set_room_alias_with_creator(
         &self,
         alias: &str,
@@ -2066,6 +2067,7 @@ impl Database {
         let payload = serde_json::json!({
             "room_id": room_id,
             "creator": creator,
+            "created_at": now_ms(),
         })
         .to_string();
         self.db.put_cf(&cf, alias.as_bytes(), payload.as_bytes())
@@ -2078,7 +2080,9 @@ impl Database {
     /// Returns `(room_id, creator_user_id)` if the alias exists. Falls back
     /// to `(room_id, None)` for legacy raw-bytes entries written before
     /// creator tracking landed — those aliases are deletable only by users
-    /// with sufficient power level.
+    /// with sufficient power level. We don't auto-migrate legacy rows: the
+    /// next PUT against the alias (which only succeeds after a DELETE)
+    /// transitions to the JSON shape, so the data heals lazily.
     pub fn get_room_alias_record(
         &self,
         alias: &str,
