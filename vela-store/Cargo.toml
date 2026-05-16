@@ -23,6 +23,7 @@ bytes = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
 tokio-util = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -3584,6 +3584,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
  "vela-core",
 ]
 

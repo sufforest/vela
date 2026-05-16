@@ -17,3 +17,4 @@ docs/
 
 # Environment
 .env
+.claude/
