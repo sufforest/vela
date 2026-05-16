@@ -3886,6 +3886,104 @@ impl Database {
             .put_cf(&cf, b"signing_key", json.to_string().as_bytes())
     }
 
+    /// Rotate the active server signing key in a single atomic batch:
+    /// records the outgoing key under `old_verify_keys` with
+    /// `expired_ts = expired_ts_ms`, then overwrites the active key
+    /// with `new_key_id` / `new_secret`. The outgoing key's public
+    /// component (`outgoing_public_b64`) is the caller's responsibility
+    /// because reconstructing it here would require an ed25519 dep in
+    /// vela-store. Atomic so peers never observe a half-rotated state.
+    pub fn rotate_signing_key(
+        &self,
+        outgoing_key_id: &str,
+        outgoing_public_b64: &str,
+        expired_ts_ms: u64,
+        new_key_id: &str,
+        new_secret: &[u8; 32],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use base64::Engine;
+        let cf = self.db.cf_handle("server_keys").unwrap();
+        let mut list: Vec<serde_json::Value> = match self.db.get_cf(&cf, b"old_verify_keys")? {
+            Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        list.push(serde_json::json!({
+            "key_id": outgoing_key_id,
+            "public_key": outgoing_public_b64,
+            "expired_ts": expired_ts_ms,
+        }));
+        let new_active = serde_json::json!({
+            "key_id": new_key_id,
+            "secret": base64::engine::general_purpose::STANDARD.encode(new_secret),
+        });
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(&cf, b"old_verify_keys", serde_json::to_vec(&list)?);
+        batch.put_cf(&cf, b"signing_key", new_active.to_string().as_bytes());
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Append a rotated-out signing key to the historical list. The
+    /// `public_key_b64` is the standard-alphabet base64 of the 32-byte
+    /// ed25519 public; `expired_ts_ms` is when the rotation took effect
+    /// (so peers can decide whether a signature predating that ts is
+    /// still acceptable per their own freshness policy).
+    pub fn record_rotated_signing_key(
+        &self,
+        key_id: &str,
+        public_key_b64: &str,
+        expired_ts_ms: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let cf = self.db.cf_handle("server_keys").unwrap();
+        let mut list: Vec<serde_json::Value> = match self.db.get_cf(&cf, b"old_verify_keys")? {
+            Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        list.push(serde_json::json!({
+            "key_id": key_id,
+            "public_key": public_key_b64,
+            "expired_ts": expired_ts_ms,
+        }));
+        self.db
+            .put_cf(&cf, b"old_verify_keys", serde_json::to_vec(&list)?)?;
+        Ok(())
+    }
+
+    /// Load all rotated-out signing keys. Returned as
+    /// `Vec<(key_id, public_key_b64, expired_ts_ms)>` in insertion order.
+    /// An absent or unparseable record is treated as "no rotated keys".
+    pub fn load_rotated_signing_keys(
+        &self,
+    ) -> Result<Vec<(String, String, u64)>, Box<dyn std::error::Error + Send + Sync>> {
+        let cf = self.db.cf_handle("server_keys").unwrap();
+        let Some(bytes) = self.db.get_cf(&cf, b"old_verify_keys")? else {
+            return Ok(Vec::new());
+        };
+        let raw: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap_or_default();
+        let mut out = Vec::with_capacity(raw.len());
+        for entry in raw {
+            let key_id = entry
+                .get("key_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let public_key = entry
+                .get("public_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let expired_ts = entry
+                .get("expired_ts")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if key_id.is_empty() || public_key.is_empty() {
+                continue;
+            }
+            out.push((key_id, public_key, expired_ts));
+        }
+        Ok(out)
+    }
+
     // --- Remote server keys (federation key cache) ---
 
     /// Store remote server keys by server_name.
@@ -4498,6 +4596,58 @@ mod stream_recovery_tests {
         assert!(
             !db.is_event_rejected("$other:example.com").unwrap(),
             "non-marked event_id stays clean"
+        );
+    }
+
+    /// Rotating a signing key atomically replaces the active key and
+    /// records the outgoing one under old_verify_keys with the
+    /// supplied expiry. Reopening must see the new active key and the
+    /// full historical list.
+    #[test]
+    fn rotate_signing_key_records_outgoing_and_replaces_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path();
+        let db = Database::open(path).unwrap();
+
+        db.store_signing_key("ed25519:v1", &[1u8; 32]).unwrap();
+        db.rotate_signing_key(
+            "ed25519:v1",
+            "PUBV1",
+            1_700_000_000_000,
+            "ed25519:v2",
+            &[2u8; 32],
+        )
+        .unwrap();
+        db.rotate_signing_key(
+            "ed25519:v2",
+            "PUBV2",
+            1_750_000_000_000,
+            "ed25519:v3",
+            &[3u8; 32],
+        )
+        .unwrap();
+
+        let (active_id, active_secret) = db.load_signing_key().unwrap().unwrap();
+        assert_eq!(active_id, "ed25519:v3");
+        assert_eq!(active_secret, [3u8; 32]);
+
+        let history = db.load_rotated_signing_keys().unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history[0],
+            (
+                "ed25519:v1".to_string(),
+                "PUBV1".to_string(),
+                1_700_000_000_000u64
+            )
+        );
+        assert_eq!(
+            history[1],
+            (
+                "ed25519:v2".to_string(),
+                "PUBV2".to_string(),
+                1_750_000_000_000u64
+            )
         );
     }
 }

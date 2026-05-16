@@ -17,11 +17,15 @@ use crate::middleware::federation_auth::{VerifiedBody, XMatrixOrigin};
 use crate::router::AppState;
 
 /// Build the `/_matrix/key/v2/server` response body, self-signed.
+/// `old_verify_keys` is a list of `(key_id, public_key_b64, expired_ts_ms)`
+/// for keys vela has rotated out — peers use these to validate
+/// signatures on events authored before the rotation.
 /// Extracted for testability; `get_server_keys` is a thin axum wrapper.
 pub fn build_server_key_response(
     signing_key: &ServerSigningKey,
     server_name: &str,
     now_ms: u64,
+    old_verify_keys: &[(String, String, u64)],
 ) -> Map<String, Value> {
     // valid_until_ts: 7 days from now (spec maximum that servers will trust)
     let valid_until_ts = now_ms + 7 * 24 * 60 * 60 * 1000;
@@ -39,7 +43,17 @@ pub fn build_server_key_response(
             }
         }),
     );
-    response.insert("old_verify_keys".into(), json!({}));
+    let mut old_map = Map::new();
+    for (kid, pub_b64, expired_ts) in old_verify_keys {
+        old_map.insert(
+            kid.clone(),
+            json!({
+                "key": pub_b64,
+                "expired_ts": expired_ts,
+            }),
+        );
+    }
+    response.insert("old_verify_keys".into(), Value::Object(old_map));
     response.insert("valid_until_ts".into(), json!(valid_until_ts));
 
     signing_key.sign_json(&mut response, server_name);
@@ -55,7 +69,13 @@ pub async fn get_server_keys(State(state): State<AppState>) -> Json<Value> {
         .unwrap()
         .as_millis() as u64;
 
-    let response = build_server_key_response(&state.signing_key, &state.config.server_name, now_ms);
+    let old_keys = state.db.load_rotated_signing_keys().unwrap_or_default();
+    let response = build_server_key_response(
+        &state.signing_key,
+        &state.config.server_name,
+        now_ms,
+        &old_keys,
+    );
 
     Json(Value::Object(response))
 }
@@ -75,19 +95,60 @@ pub async fn version() -> Json<Value> {
 
 /// GET /_matrix/key/v2/query/{serverName}
 ///
-/// Notary single-server key query. vela doesn't act as a notary —
-/// returns an empty `server_keys` array so peers know the route
-/// exists but get no notarised data.
-pub async fn query_keys_single() -> Json<Value> {
+/// Notary single-server key query per spec §key management. When the
+/// caller asks about a server we ARE, return the same content as
+/// `/key/v2/server` wrapped in `{server_keys: [...]}`. For any other
+/// server we don't act as a notary (we'd need to proxy-fetch their
+/// keys with peer-cache freshness; deferred).
+pub async fn query_keys_single(
+    State(state): State<AppState>,
+    Path(server_name): Path<String>,
+) -> Json<Value> {
+    if server_name == state.config.server_name {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let old_keys = state.db.load_rotated_signing_keys().unwrap_or_default();
+        let entry = build_server_key_response(
+            &state.signing_key,
+            &state.config.server_name,
+            now_ms,
+            &old_keys,
+        );
+        return Json(json!({ "server_keys": [Value::Object(entry)] }));
+    }
     Json(json!({ "server_keys": [] }))
 }
 
 /// POST /_matrix/key/v2/query
 ///
-/// Notary batch key query. Same stance as the single variant — empty
-/// results, well-formed shape.
-pub async fn query_keys_batch() -> Json<Value> {
-    Json(json!({ "server_keys": [] }))
+/// Notary batch key query. Request body shape per spec:
+/// `{ "server_keys": { "<server>": { "<key_id>": { ... } } } }`. We
+/// only return entries for ourselves; queries for other servers go
+/// unanswered (we'd need a live notary fetch path).
+pub async fn query_keys_batch(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> Json<Value> {
+    let mut server_keys = Vec::new();
+    if let Some(asked) = req.get("server_keys").and_then(|v| v.as_object())
+        && asked.contains_key(&state.config.server_name)
+    {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let old_keys = state.db.load_rotated_signing_keys().unwrap_or_default();
+        let entry = build_server_key_response(
+            &state.signing_key,
+            &state.config.server_name,
+            now_ms,
+            &old_keys,
+        );
+        server_keys.push(Value::Object(entry));
+    }
+    Json(json!({ "server_keys": server_keys }))
 }
 
 /// Parsed X-Matrix Authorization header parameters.
@@ -316,7 +377,7 @@ mod tests {
     #[test]
     fn server_key_response_is_self_signed() {
         let key = ServerSigningKey::generate();
-        let response = build_server_key_response(&key, "example.com", 1_700_000_000_000);
+        let response = build_server_key_response(&key, "example.com", 1_700_000_000_000, &[]);
 
         // Required fields per spec
         assert_eq!(response["server_name"], json!("example.com"));
@@ -330,11 +391,46 @@ mod tests {
         let entry = verify_keys.get(key.key_id()).unwrap();
         assert_eq!(entry["key"], json!(key.public_key_base64()));
 
+        // No rotated keys → old_verify_keys is an empty object
+        assert_eq!(response["old_verify_keys"], json!({}));
+
         // valid_until_ts = now + 7 days
         let expected_vut = 1_700_000_000_000u64 + 7 * 24 * 60 * 60 * 1000;
         assert_eq!(response["valid_until_ts"], json!(expected_vut));
 
         // Signature verifies with our key
+        let result =
+            verify_json_signature(&response, "example.com", key.key_id(), &key.verifying_key());
+        assert!(result.is_ok(), "self-signature should verify: {result:?}");
+    }
+
+    #[test]
+    fn server_key_response_emits_old_verify_keys() {
+        let key = ServerSigningKey::generate();
+        let old = vec![
+            (
+                "ed25519:retired1".to_string(),
+                "AAAA".to_string(),
+                1_600_000_000_000u64,
+            ),
+            (
+                "ed25519:retired2".to_string(),
+                "BBBB".to_string(),
+                1_650_000_000_000u64,
+            ),
+        ];
+        let response = build_server_key_response(&key, "example.com", 1_700_000_000_000, &old);
+
+        let old_map = response["old_verify_keys"].as_object().unwrap();
+        assert_eq!(old_map.len(), 2);
+        let r1 = old_map.get("ed25519:retired1").unwrap();
+        assert_eq!(r1["key"], json!("AAAA"));
+        assert_eq!(r1["expired_ts"], json!(1_600_000_000_000u64));
+        let r2 = old_map.get("ed25519:retired2").unwrap();
+        assert_eq!(r2["key"], json!("BBBB"));
+        assert_eq!(r2["expired_ts"], json!(1_650_000_000_000u64));
+
+        // Response is still self-signed by the CURRENT key only.
         let result =
             verify_json_signature(&response, "example.com", key.key_id(), &key.verifying_key());
         assert!(result.is_ok(), "self-signature should verify: {result:?}");
