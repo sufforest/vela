@@ -17,9 +17,14 @@
 
 use std::collections::HashSet;
 
+use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+use ed25519_dalek::{Signature, Verifier};
 use serde_json::Value;
 
+use crate::canonical::canonical_json_object;
 use crate::events::pdu::Pdu;
+use crate::federation::keys::decode_public_key;
 
 /// State lookup function: (type, state_key) → Some(&Pdu) if present.
 pub type StateFn<'a> = &'a dyn Fn(&str, &str) -> Option<&'a Pdu>;
@@ -484,35 +489,127 @@ fn check_third_party_invite(
         ));
     }
 
-    // 5.4.1.7: check any signature in signed matches any public key in the tpi event → allow
-    // Full signature check requires cryptographic verification of the token signature.
-    // We structurally check that the public keys exist; cryptographic verification
-    // is performed by the PDU receipt pipeline before auth check is invoked.
-    let has_keys = tpi_event.content.get("public_key").is_some()
-        || tpi_event
-            .content
-            .get("public_keys")
-            .and_then(|v| v.as_array())
-            .map(|a| !a.is_empty())
-            .unwrap_or(false);
-    if !has_keys {
-        return Err(AuthError::reject(
-            "third_party_invite event has no public keys",
-        ));
+    // 5.4.1.7: any signature in `signed` MUST verify against any public key
+    // advertised in the matching m.room.third_party_invite event. The keys
+    // come from the room's own state — not a live identity-server lookup —
+    // so this rule is the only thing standing between a malicious sender
+    // and a forged 3pid invite acceptance.
+    verify_third_party_signed(signed, tpi_event)?;
+
+    Ok(())
+}
+
+/// Collect the ed25519 public keys advertised by an `m.room.third_party_invite`
+/// state event. Both the legacy `content.public_key` (single key) and the
+/// `content.public_keys` array (per matrix-spec v1.18 §m.room.third_party_invite)
+/// are accepted.
+fn collect_tpi_public_keys(tpi_event: &Pdu) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(k) = tpi_event.content.get("public_key").and_then(|v| v.as_str()) {
+        keys.push(k.to_string());
     }
-    let has_signatures = signed
+    if let Some(arr) = tpi_event
+        .content
+        .get("public_keys")
+        .and_then(|v| v.as_array())
+    {
+        for entry in arr {
+            if let Some(k) = entry.get("public_key").and_then(|v| v.as_str()) {
+                keys.push(k.to_string());
+            }
+        }
+    }
+    keys
+}
+
+/// Decode an ed25519 signature in any of the base64 alphabets matrix peers
+/// have been observed to use. Mirrors `federation::keys::decode_signature_b64`.
+fn decode_signature_b64(s: &str) -> Option<[u8; 64]> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(s)
+        .or_else(|_| URL_SAFE.decode(s))
+        .or_else(|_| STANDARD_NO_PAD.decode(s))
+        .or_else(|_| STANDARD.decode(s))
+        .ok()?;
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut arr = [0u8; 64];
+    arr.copy_from_slice(&bytes);
+    Some(arr)
+}
+
+/// Verify the identity server's ed25519 signature over the `signed` block of
+/// an `m.room.member` third-party invite.
+///
+/// Per matrix-spec v1.18 §5.4.1 + appendix "Signing JSON": the signed bytes are
+/// the canonical-JSON encoding of `signed` MINUS its own `signatures` (and
+/// `unsigned`) fields. We re-canonicalise here rather than trust any pre-baked
+/// bytes from the caller — anything else would let a sender substitute the
+/// canonical form. At least one (public_key, signature) pair must verify;
+/// otherwise reject.
+fn verify_third_party_signed(signed: &Value, tpi_event: &Pdu) -> AuthResult {
+    let signed_obj = signed
+        .as_object()
+        .ok_or_else(|| AuthError::reject("third_party_invite.signed is not an object"))?;
+
+    let signatures = signed_obj
         .get("signatures")
         .and_then(|v| v.as_object())
-        .map(|o| !o.is_empty())
-        .unwrap_or(false);
-    if !has_signatures {
+        .ok_or_else(|| AuthError::reject("third_party_invite.signed has no signatures"))?;
+    if signatures.is_empty() {
         return Err(AuthError::reject(
             "third_party_invite.signed has no signatures",
         ));
     }
 
-    // 5.4.1.8: otherwise reject — covered by falling through structural checks.
-    Ok(())
+    let public_keys = collect_tpi_public_keys(tpi_event);
+    if public_keys.is_empty() {
+        return Err(AuthError::reject(
+            "third_party_invite event has no public keys",
+        ));
+    }
+
+    // Canonicalise signed minus signatures/unsigned exactly once — this is the
+    // byte string ed25519 verification runs against.
+    let mut to_canonicalise = signed_obj.clone();
+    to_canonicalise.remove("signatures");
+    to_canonicalise.remove("unsigned");
+    let canonical = canonical_json_object(&to_canonicalise);
+
+    for (_server, server_sigs) in signatures.iter() {
+        let Some(sig_map) = server_sigs.as_object() else {
+            continue;
+        };
+        for (key_id, sig_val) in sig_map.iter() {
+            // Spec restricts third-party-invite signing to ed25519 (appendix
+            // "Signing Algorithms"). Silently skip any other algorithm — a
+            // mixed signatures block where the only ed25519 entry verifies
+            // must still pass.
+            if !key_id.starts_with("ed25519:") {
+                continue;
+            }
+            let Some(sig_str) = sig_val.as_str() else {
+                continue;
+            };
+            let Some(sig_bytes) = decode_signature_b64(sig_str) else {
+                continue;
+            };
+            let signature = Signature::from_bytes(&sig_bytes);
+            for pub_b64 in &public_keys {
+                let Ok(verifying_key) = decode_public_key(pub_b64) else {
+                    continue;
+                };
+                if verifying_key.verify(&canonical, &signature).is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    Err(AuthError::reject(
+        "third_party_invite: no signature verified against any advertised public key",
+    ))
 }
 
 fn check_member_leave(event: &Pdu, state: StateFn<'_>, target: &str, create: &Pdu) -> AuthResult {
@@ -1421,5 +1518,348 @@ mod tests {
             &sf,
             &create,
         ));
+    }
+
+    // ========================================================================
+    // Third-party invite signature verification (rule 5.4.1.7)
+    // ========================================================================
+
+    use crate::events::sign::ServerSigningKey;
+    use serde_json::Map;
+
+    /// Build the four ingredients for a 3pid-invite auth check:
+    /// state map, the signed bundle (already signed by `id_key`),
+    /// the m.room.member event under test, and the create event.
+    ///
+    /// The state contains: create, alice's join, the m.room.third_party_invite
+    /// event (sender alice, state_key = token, advertising `id_key`'s public
+    /// key), and a public join_rules so we don't accidentally trip an
+    /// unrelated rule.
+    fn build_tpi_fixture(
+        id_key: &ServerSigningKey,
+        token: &str,
+        target: &str,
+        tpi_public_keys_form: TpiKeysForm,
+    ) -> (HashMap<(String, String), Pdu>, Map<String, Value>) {
+        let create = pdu(
+            "$create",
+            "m.room.create",
+            Some(""),
+            "@alice:example.com",
+            json!({"room_version": "12"}),
+            "",
+        );
+        let alice_member = pdu(
+            "$alice_member",
+            "m.room.member",
+            Some("@alice:example.com"),
+            "@alice:example.com",
+            json!({"membership": "join"}),
+            "!create",
+        );
+        let join_rules = pdu(
+            "$jr",
+            "m.room.join_rules",
+            Some(""),
+            "@alice:example.com",
+            json!({"join_rule": "invite"}),
+            "!create",
+        );
+
+        let pub_b64 = id_key.public_key_base64();
+        let tpi_content = match tpi_public_keys_form {
+            TpiKeysForm::Legacy => json!({
+                "display_name": "bob",
+                "key_validity_url": "https://identity.example/_matrix/identity/v2/pubkey/isvalid",
+                "public_key": pub_b64,
+            }),
+            TpiKeysForm::Array => json!({
+                "display_name": "bob",
+                "key_validity_url": "https://identity.example/_matrix/identity/v2/pubkey/isvalid",
+                "public_keys": [{
+                    "public_key": pub_b64,
+                    "key_validity_url": "https://identity.example/_matrix/identity/v2/pubkey/isvalid",
+                }],
+            }),
+            TpiKeysForm::ArrayWithBogusFirst { ref bogus } => json!({
+                "display_name": "bob",
+                "public_keys": [
+                    {"public_key": bogus},
+                    {"public_key": pub_b64},
+                ],
+            }),
+            TpiKeysForm::OnlyBogus { ref bogus } => json!({
+                "display_name": "bob",
+                "public_key": bogus,
+            }),
+        };
+        let tpi_event = pdu(
+            "$tpi",
+            "m.room.third_party_invite",
+            Some(token),
+            "@alice:example.com",
+            tpi_content,
+            "!create",
+        );
+
+        let state = make_state(vec![
+            (("m.room.create", ""), create),
+            (("m.room.member", "@alice:example.com"), alice_member),
+            (("m.room.join_rules", ""), join_rules),
+            (("m.room.third_party_invite", token), tpi_event),
+        ]);
+
+        // The `signed` block whose canonical form the identity server signs.
+        // Per matrix-spec v1.18 §5.4.1 the block carries mxid + token; signing
+        // is over canonical JSON of the bundle minus `signatures`/`unsigned`.
+        let mut signed = serde_json::Map::new();
+        signed.insert("mxid".into(), json!(target));
+        signed.insert("token".into(), json!(token));
+        id_key.sign_json(&mut signed, "identity.example");
+
+        (state, signed)
+    }
+
+    #[derive(Clone)]
+    enum TpiKeysForm {
+        /// content.public_key = "<base64>"
+        Legacy,
+        /// content.public_keys = [{public_key: "<base64>"}]
+        Array,
+        /// content.public_keys = [{public_key: "<bogus>"}, {public_key: "<good>"}]
+        ArrayWithBogusFirst { bogus: String },
+        /// content.public_key = "<bogus>" only — no good key advertised
+        OnlyBogus { bogus: String },
+    }
+
+    fn make_member_with_tpi(target: &str, _token: &str, signed: Value) -> Pdu {
+        pdu(
+            "$bob_invite",
+            "m.room.member",
+            Some(target),
+            "@alice:example.com",
+            json!({
+                "membership": "invite",
+                "third_party_invite": {
+                    "display_name": "bob",
+                    "signed": signed,
+                },
+            }),
+            "!create",
+        )
+    }
+
+    #[test]
+    fn third_party_invite_valid_signature_accepted() {
+        let id_key = ServerSigningKey::generate();
+        let target = "@bob:example.com";
+        let token = "tok-abc";
+        let (state, signed) = build_tpi_fixture(&id_key, token, target, TpiKeysForm::Legacy);
+        let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+
+        let member = make_member_with_tpi(target, token, Value::Object(signed));
+        let result = check_auth(&member, &sf);
+        assert!(result.is_ok(), "valid sig must accept: {result:?}");
+    }
+
+    #[test]
+    fn third_party_invite_array_public_keys_accepted() {
+        let id_key = ServerSigningKey::generate();
+        let target = "@bob:example.com";
+        let token = "tok-array";
+        let (state, signed) = build_tpi_fixture(&id_key, token, target, TpiKeysForm::Array);
+        let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+
+        let member = make_member_with_tpi(target, token, Value::Object(signed));
+        assert!(check_auth(&member, &sf).is_ok());
+    }
+
+    #[test]
+    fn third_party_invite_multiple_keys_accepts_if_any_verifies() {
+        // First key in the array is junk, second is the real one. The verify
+        // loop must try every advertised key, not bail on the first failure.
+        let id_key = ServerSigningKey::generate();
+        let bogus = ServerSigningKey::generate().public_key_base64();
+        let target = "@bob:example.com";
+        let token = "tok-any";
+        let (state, signed) = build_tpi_fixture(
+            &id_key,
+            token,
+            target,
+            TpiKeysForm::ArrayWithBogusFirst { bogus },
+        );
+        let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+
+        let member = make_member_with_tpi(target, token, Value::Object(signed));
+        assert!(check_auth(&member, &sf).is_ok());
+    }
+
+    #[test]
+    fn third_party_invite_no_matching_key_rejected() {
+        // The signed bundle is genuinely signed, but the room state advertises
+        // a different (bogus) public key. Must reject.
+        let id_key = ServerSigningKey::generate();
+        let attacker_key = ServerSigningKey::generate();
+        let target = "@bob:example.com";
+        let token = "tok-mismatch";
+        let (state, signed) = build_tpi_fixture(
+            &id_key,
+            token,
+            target,
+            TpiKeysForm::OnlyBogus {
+                bogus: attacker_key.public_key_base64(),
+            },
+        );
+        let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+
+        let member = make_member_with_tpi(target, token, Value::Object(signed));
+        let result = check_auth(&member, &sf);
+        match result {
+            Err(AuthError::Rejected(reason)) => {
+                assert!(
+                    reason.contains("no signature verified"),
+                    "expected verify-failure reason, got: {reason}"
+                );
+            }
+            other => panic!("expected rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn third_party_invite_tampered_signed_block_rejected() {
+        // Take a valid signed bundle, then tamper with `mxid` after signing.
+        // The canonical bytes diverge → verify fails.
+        let id_key = ServerSigningKey::generate();
+        let target = "@bob:example.com";
+        let token = "tok-tamper";
+        let (state, mut signed) = build_tpi_fixture(&id_key, token, target, TpiKeysForm::Legacy);
+        let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+
+        // Tamper: change mxid in the signed bundle to a different user.
+        signed.insert("mxid".into(), json!("@eve:example.com"));
+
+        // The auth rule also checks mxid==state_key; align state_key to the
+        // tampered mxid so we exercise the *crypto* failure, not the structural
+        // mismatch.
+        let member = make_member_with_tpi("@eve:example.com", token, Value::Object(signed));
+        assert!(matches!(
+            check_auth(&member, &sf),
+            Err(AuthError::Rejected(_))
+        ));
+    }
+
+    #[test]
+    fn third_party_invite_mismatched_token_rejected() {
+        // Member event claims token B; the m.room.third_party_invite in state
+        // is keyed by token A. Structural rule 5.4.1.5 rejects.
+        let id_key = ServerSigningKey::generate();
+        let target = "@bob:example.com";
+        let real_token = "tok-A";
+        let (state, signed) = build_tpi_fixture(&id_key, real_token, target, TpiKeysForm::Legacy);
+        let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+
+        // Reuse the signed-with-real_token bundle but swap the token in the
+        // member event to one that isn't in state.
+        let mut wrong_signed = signed.clone();
+        wrong_signed.insert("token".into(), json!("tok-B"));
+        let member = make_member_with_tpi(target, "tok-B", Value::Object(wrong_signed));
+        let result = check_auth(&member, &sf);
+        match result {
+            Err(AuthError::Rejected(reason)) => {
+                assert!(
+                    reason.contains("no matching m.room.third_party_invite"),
+                    "expected structural rejection, got: {reason}"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn third_party_invite_missing_signed_rejected() {
+        // No `signed` field at all in third_party_invite content. We must
+        // refuse — not silently accept on missing signatures.
+        let id_key = ServerSigningKey::generate();
+        let target = "@bob:example.com";
+        let token = "tok-missing-signed";
+        let (state, _signed) = build_tpi_fixture(&id_key, token, target, TpiKeysForm::Legacy);
+        let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+
+        let member = pdu(
+            "$bob_invite",
+            "m.room.member",
+            Some(target),
+            "@alice:example.com",
+            json!({
+                "membership": "invite",
+                "third_party_invite": {
+                    "display_name": "bob",
+                    // no `signed` field
+                },
+            }),
+            "!create",
+        );
+        let result = check_auth(&member, &sf);
+        match result {
+            Err(AuthError::Rejected(reason)) => {
+                assert!(
+                    reason.contains("no signed property"),
+                    "expected structural rejection, got: {reason}"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn third_party_invite_empty_signatures_block_rejected() {
+        // `signed.signatures` exists but is an empty object — must reject.
+        let id_key = ServerSigningKey::generate();
+        let target = "@bob:example.com";
+        let token = "tok-empty-sigs";
+        let (state, _signed) = build_tpi_fixture(&id_key, token, target, TpiKeysForm::Legacy);
+        let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+
+        let member = make_member_with_tpi(
+            target,
+            token,
+            json!({
+                "mxid": target,
+                "token": token,
+                "signatures": {},
+            }),
+        );
+        let result = check_auth(&member, &sf);
+        assert!(matches!(result, Err(AuthError::Rejected(_))));
+    }
+
+    #[test]
+    fn third_party_invite_non_ed25519_only_rejected() {
+        // Only signatures with non-ed25519 key IDs present. We skip them all
+        // (spec restricts 3pid signing to ed25519) → no signature verifies.
+        let id_key = ServerSigningKey::generate();
+        let target = "@bob:example.com";
+        let token = "tok-non-ed25519";
+        let (state, signed) = build_tpi_fixture(&id_key, token, target, TpiKeysForm::Legacy);
+        let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+
+        // Rebuild signatures under a foo: key_id instead of ed25519:.
+        let real_sig = signed["signatures"]["identity.example"][id_key.key_id()]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let member = make_member_with_tpi(
+            target,
+            token,
+            json!({
+                "mxid": target,
+                "token": token,
+                "signatures": {
+                    "identity.example": { "foo:bar": real_sig },
+                },
+            }),
+        );
+        let result = check_auth(&member, &sf);
+        assert!(matches!(result, Err(AuthError::Rejected(_))));
     }
 }
