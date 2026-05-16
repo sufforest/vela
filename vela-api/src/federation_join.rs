@@ -449,11 +449,14 @@ pub async fn send_join_v2(
         ));
     }
 
-    // Restricted-join extra check: when the event carries
+    // Restricted-join extra check (MSC3083 / server-server-api §"Restricted
+    // rooms" / auth rule 4.2): when the event carries
     // `join_authorised_via_users_server`, the spec requires a signature
-    // from the authoriser's server in addition to the sender's. This is
-    // the cryptographic proof that a qualifying user on the authorising
-    // server actually approved the join.
+    // from the authoriser's homeserver in addition to the sender's. This
+    // is the cryptographic proof that a qualifying user on the authorising
+    // server actually approved the join. PL + joined-membership of the
+    // authoriser are enforced later via `check_auth` (rule 5.3.5) against
+    // the event's claimed auth_events.
     if let Some(authoriser) = event_obj
         .get("content")
         .and_then(|c| c.get("join_authorised_via_users_server"))
@@ -467,54 +470,40 @@ pub async fn send_join_v2(
                 "join_authorised_via_users_server has no domain",
             ));
         }
-        // Skip the duplicate verify when sender and authoriser are the
-        // same domain — the sender check above already covered it.
+        // The named authoriser must be on this server. We only ever
+        // produce restricted-join templates referencing a local user
+        // (see make_join: pick_local_authoriser walks our own members),
+        // so any inbound send_join naming a non-local authoriser is
+        // either a forged event or was minted against a different
+        // resident — either way, refuse. This guard closes the gap
+        // where a sender could otherwise dictate an arbitrary
+        // authoriser MXID and rely on the auth rule alone.
+        let our_server = state.config.server_name.as_str();
+        if authoriser_domain != our_server {
+            return Err(err_response(
+                StatusCode::FORBIDDEN,
+                "M_FORBIDDEN",
+                "join_authorised_via_users_server must be a local user",
+            ));
+        }
+        // Skip the duplicate verify when sender and authoriser share a
+        // domain (the sender check above covered it). When the
+        // authoriser is local but the sender is remote (the normal
+        // case for restricted federation), verify against OUR own
+        // server signing key — fetching our own keys over HTTPS would
+        // either loop back or fail entirely depending on bind config.
         if authoriser_domain != sender_domain {
-            let auth_keys = state
-                .remote_keys
-                .get_or_fetch(authoriser_domain)
-                .await
-                .map_err(|_| {
-                    err_response(
-                        StatusCode::UNAUTHORIZED,
-                        "M_UNAUTHORIZED",
-                        "cannot fetch authoriser keys",
-                    )
-                })?;
-            let auth_sigs = event_obj
-                .get("signatures")
-                .and_then(|v| v.as_object())
-                .and_then(|s| s.get(authoriser_domain))
-                .and_then(|v| v.as_object())
-                .ok_or_else(|| {
-                    err_response(
-                        StatusCode::UNAUTHORIZED,
-                        "M_UNAUTHORIZED",
-                        "missing signature from authoriser server",
-                    )
-                })?;
-            let mut auth_verified = false;
-            for (key_id, _) in auth_sigs {
-                let Some(pub_b64) = auth_keys.verify_keys.get(key_id) else {
-                    continue;
-                };
-                let Ok(public_key) = decode_public_key(pub_b64) else {
-                    continue;
-                };
-                if verify_event_signature(
-                    event_obj,
-                    authoriser_domain,
-                    key_id,
-                    &public_key,
-                    send_join_room_version,
-                )
-                .is_ok()
-                {
-                    auth_verified = true;
-                    break;
-                }
-            }
-            if !auth_verified {
+            let our_key_id = state.signing_key.key_id();
+            let our_pub = state.signing_key.verifying_key();
+            if verify_event_signature(
+                event_obj,
+                authoriser_domain,
+                our_key_id,
+                &our_pub,
+                send_join_room_version,
+            )
+            .is_err()
+            {
                 return Err(err_response(
                     StatusCode::UNAUTHORIZED,
                     "M_UNAUTHORIZED",
@@ -1073,5 +1062,312 @@ mod tests {
         .await
         .expect_err("invite rooms reject make_join");
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    /// Restricted room + bob qualifies via allow-list, BUT no local user
+    /// in the restricted room has invite power → 400
+    /// M_UNABLE_TO_GRANT_JOIN per server-server-api §"Restricted rooms".
+    /// The joining server should retry against a different resident.
+    #[tokio::test]
+    async fn make_join_unable_to_grant_when_no_local_authoriser() {
+        // Build a restricted room where the only joined member is a
+        // REMOTE user with invite power — there's no local user we can
+        // sign on behalf of, so we must emit M_UNABLE_TO_GRANT_JOIN.
+        let (state, _tmp) = crate::test_helpers::build_test_state_with_name("example.com");
+        let db = &state.db;
+
+        let gate_room = "!gate:example.com";
+        let gate_nid = db.get_or_create_nid(gate_room).unwrap();
+        db.create_room_meta(gate_nid, gate_room, "12").unwrap();
+        let charlie_nid = db.get_or_create_nid("@charlie:remote.example").unwrap();
+        db.set_membership(gate_nid, charlie_nid, 1).unwrap();
+        // Plant a local member in the gate room so the stale-state
+        // guard (has_local_joined_member) accepts our cached view.
+        // We make this user a NON-member of the restricted room so it
+        // can't double as an authoriser.
+        let lurker_nid = db.get_or_create_nid("@lurker:example.com").unwrap();
+        db.set_membership(gate_nid, lurker_nid, 1).unwrap();
+
+        let restricted = "!restricted:example.com";
+        let restricted_nid = db.get_or_create_nid(restricted).unwrap();
+        db.create_room_meta(restricted_nid, restricted, "12")
+            .unwrap();
+
+        // The restricted room's create event is by a REMOTE user, so
+        // no local user has the v12 creator-power short-circuit. Power
+        // levels are absent → users_default = 0, invite_level = 0;
+        // any local joined member would qualify, so we must NOT seed
+        // any local members in the restricted room itself.
+        let bob_nid = db.get_or_create_nid("@bob:remote.example").unwrap();
+        let create_type = db.get_or_create_nid("m.room.create").unwrap();
+        let member_type = db.get_or_create_nid("m.room.member").unwrap();
+        let join_rules_type = db.get_or_create_nid("m.room.join_rules").unwrap();
+        let empty_skey = db.get_or_create_nid("").unwrap();
+
+        db.persist_event(
+            200,
+            "$create_r",
+            restricted_nid,
+            create_type,
+            bob_nid,
+            empty_skey,
+            1,
+            1,
+            &serde_json::to_vec(&json!({
+                "type": "m.room.create", "sender": "@bob:remote.example",
+                "state_key": "", "room_id": restricted,
+                "content": {"room_version": "12"},
+                "origin_server_ts": 1, "depth": 1,
+                "prev_events": [], "auth_events": [],
+            }))
+            .unwrap(),
+            &[],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+        db.persist_event(
+            201,
+            "$bob_join_r",
+            restricted_nid,
+            member_type,
+            bob_nid,
+            bob_nid,
+            2,
+            2,
+            &serde_json::to_vec(&json!({
+                "type": "m.room.member", "sender": "@bob:remote.example",
+                "state_key": "@bob:remote.example", "room_id": restricted,
+                "content": {"membership": "join"},
+                "origin_server_ts": 2, "depth": 2,
+                "prev_events": [], "auth_events": [],
+            }))
+            .unwrap(),
+            &[200],
+            &[200],
+            true,
+            false,
+        )
+        .unwrap();
+        db.set_membership(restricted_nid, bob_nid, 1).unwrap();
+        db.persist_event(
+            202,
+            "$rules_r",
+            restricted_nid,
+            join_rules_type,
+            bob_nid,
+            empty_skey,
+            3,
+            3,
+            &serde_json::to_vec(&json!({
+                "type": "m.room.join_rules", "sender": "@bob:remote.example",
+                "state_key": "", "room_id": restricted,
+                "content": {
+                    "join_rule": "restricted",
+                    "allow": [{"type": "m.room_membership", "room_id": gate_room}],
+                },
+                "origin_server_ts": 3, "depth": 3,
+                "prev_events": [], "auth_events": [],
+            }))
+            .unwrap(),
+            &[201],
+            &[200, 201],
+            true,
+            false,
+        )
+        .unwrap();
+
+        // charlie qualifies via gate (joined there), but the restricted
+        // room has no local joined member with invite power.
+        let origin = axum::Extension(XMatrixOrigin("remote.example".into()));
+        let err = make_join(
+            axum::extract::State(state.clone()),
+            Path((
+                restricted.to_string(),
+                "@charlie:remote.example".to_string(),
+            )),
+            RawQuery(Some("ver=12".to_string())),
+            origin,
+        )
+        .await
+        .expect_err("expected M_UNABLE_TO_GRANT_JOIN");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let errcode = err.1.0.get("errcode").and_then(|v| v.as_str());
+        assert_eq!(errcode, Some("M_UNABLE_TO_GRANT_JOIN"));
+    }
+
+    /// send_join MUST refuse an event whose
+    /// `join_authorised_via_users_server` names a user that's not on
+    /// THIS server. Per MSC3083, vela picks the authoriser at make_join
+    /// time and only picks local users — so a remote-named authoriser
+    /// is either a forgery or was minted by a different resident, and
+    /// either way carries no proof we'd recognise.
+    ///
+    /// The sender signature must clear verification first (otherwise
+    /// the structural check would reject at the wrong step), so we
+    /// sign the event with a stub remote key installed via
+    /// `remote_keys.insert_for_test`.
+    #[tokio::test]
+    async fn send_join_rejects_non_local_authoriser() {
+        use crate::federation_client::RemoteKeys;
+        use crate::middleware::federation_auth::VerifiedBody;
+        use std::collections::HashMap;
+        use vela_core::events::sign::ServerSigningKey;
+
+        let (state, _tmp) = crate::test_helpers::build_test_state_with_name("example.com");
+        let db = &state.db;
+
+        // Restricted room with alice as local creator + authoriser
+        // candidate. The room must exist locally for send_join to
+        // get past the room-lookup step.
+        let restricted = "!restricted:example.com";
+        let restricted_nid = db.get_or_create_nid(restricted).unwrap();
+        db.create_room_meta(restricted_nid, restricted, "12")
+            .unwrap();
+        let alice = "@alice:example.com";
+        let alice_nid = db.get_or_create_nid(alice).unwrap();
+        let create_type = db.get_or_create_nid("m.room.create").unwrap();
+        let member_type = db.get_or_create_nid("m.room.member").unwrap();
+        let join_rules_type = db.get_or_create_nid("m.room.join_rules").unwrap();
+        let empty_skey = db.get_or_create_nid("").unwrap();
+        db.persist_event(
+            300,
+            "$c",
+            restricted_nid,
+            create_type,
+            alice_nid,
+            empty_skey,
+            1,
+            1,
+            &serde_json::to_vec(&json!({
+                "type": "m.room.create", "sender": alice, "state_key": "",
+                "room_id": restricted, "content": {"room_version": "12"},
+                "origin_server_ts": 1, "depth": 1,
+                "prev_events": [], "auth_events": [],
+            }))
+            .unwrap(),
+            &[],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+        db.persist_event(
+            301,
+            "$aj",
+            restricted_nid,
+            member_type,
+            alice_nid,
+            alice_nid,
+            2,
+            2,
+            &serde_json::to_vec(&json!({
+                "type": "m.room.member", "sender": alice, "state_key": alice,
+                "room_id": restricted, "content": {"membership": "join"},
+                "origin_server_ts": 2, "depth": 2,
+                "prev_events": [], "auth_events": [],
+            }))
+            .unwrap(),
+            &[300],
+            &[300],
+            true,
+            false,
+        )
+        .unwrap();
+        db.set_membership(restricted_nid, alice_nid, 1).unwrap();
+        db.persist_event(
+            302,
+            "$jr",
+            restricted_nid,
+            join_rules_type,
+            alice_nid,
+            empty_skey,
+            3,
+            3,
+            &serde_json::to_vec(&json!({
+                "type": "m.room.join_rules", "sender": alice, "state_key": "",
+                "room_id": restricted,
+                "content": {
+                    "join_rule": "restricted",
+                    "allow": [{"type": "m.room_membership", "room_id": "!gate:example.com"}],
+                },
+                "origin_server_ts": 3, "depth": 3,
+                "prev_events": [], "auth_events": [],
+            }))
+            .unwrap(),
+            &[301],
+            &[300, 301],
+            true,
+            false,
+        )
+        .unwrap();
+
+        // Stub a remote homeserver and install its public key in the
+        // RemoteKeyCache so the sender-sig verify will pass.
+        let remote_sn = "remote.example";
+        let remote_key = ServerSigningKey::generate();
+        let mut verify_keys = HashMap::new();
+        verify_keys.insert(
+            remote_key.key_id().to_string(),
+            remote_key.public_key_base64(),
+        );
+        state.remote_keys.insert_for_test(
+            remote_sn,
+            RemoteKeys {
+                verify_keys,
+                valid_until_ts: u64::MAX / 2,
+                fetched_at: 0,
+            },
+        );
+
+        // Construct a member-join event whose authoriser is on a
+        // THIRD server (not us, not the sender). Sender signs.
+        let bob = format!("@bob:{remote_sn}");
+        let mut event = serde_json::Map::new();
+        event.insert("type".into(), json!("m.room.member"));
+        event.insert("sender".into(), json!(bob));
+        event.insert("state_key".into(), json!(bob));
+        event.insert("room_id".into(), json!(restricted));
+        event.insert(
+            "content".into(),
+            json!({
+                "membership": "join",
+                // Authoriser claims to be on a DIFFERENT server.
+                "join_authorised_via_users_server": "@evil:attacker.example",
+            }),
+        );
+        event.insert("origin".into(), json!(remote_sn));
+        event.insert("origin_server_ts".into(), json!(100u64));
+        event.insert("depth".into(), json!(4u64));
+        event.insert("prev_events".into(), json!(["$jr"]));
+        event.insert("auth_events".into(), json!(["$c", "$jr"]));
+        vela_core::events::hash::add_content_hash(&mut event);
+        remote_key.sign_event_for_version(
+            &mut event,
+            remote_sn,
+            vela_core::events::room_version::RoomVersion::V12,
+        );
+        let event_id = vela_core::events::hash::compute_event_id_for_version(
+            &event,
+            vela_core::events::room_version::RoomVersion::V12,
+        );
+
+        let origin = axum::Extension(XMatrixOrigin(remote_sn.into()));
+        let body = axum::Extension(VerifiedBody(Some(Value::Object(event))));
+        let err = send_join_v2(
+            axum::extract::State(state.clone()),
+            Path((restricted.to_string(), event_id.as_str().to_string())),
+            origin,
+            body,
+        )
+        .await
+        .expect_err("expected non-local authoriser to be rejected");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let msg = err.1.0.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            msg.contains("must be a local user"),
+            "unexpected error message: {msg}"
+        );
     }
 }

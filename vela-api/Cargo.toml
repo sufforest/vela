@@ -15,6 +15,12 @@ description = "Vela's HTTP API surface: client-server, server-server, applicatio
 # tracer provider are installed.
 otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 
+# Re-export `crate::test_helpers::build_test_state*` to out-of-crate
+# consumers (currently `tools/testing/smoketest-rs`). Pulls `tempfile`
+# into the regular dependency graph since the helper returns a TempDir
+# the caller owns. Off by default — no production binary enables this.
+test-harness = ["dep:tempfile"]
+
 [dependencies]
 vela-core = { workspace = true }
 vela-store = { workspace = true }
@@ -49,6 +55,9 @@ futures = { workspace = true }
 form_urlencoded = "1"
 opentelemetry = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
+# Pulled in only when `test-harness` is on. In-crate tests rely on the
+# dev-dependency entry below, which is always available under `cargo test`.
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

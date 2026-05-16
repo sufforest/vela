@@ -56,8 +56,12 @@ mod sliding_sync;
 mod spaces;
 mod state;
 mod sync;
-#[cfg(test)]
-mod test_helpers;
+// Exposed out-of-crate under the `test-harness` feature so the
+// `tools/testing/smoketest-rs` crate can boot a real listener against
+// the same AppState shape the in-crate unit tests use. Inside vela-api,
+// every call site lives under `#[cfg(test)]`.
+#[cfg(any(test, feature = "test-harness"))]
+pub mod test_helpers;
 mod thread_subscriptions;
 pub mod timestamp;
 mod to_device;

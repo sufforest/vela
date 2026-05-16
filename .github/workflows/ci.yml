@@ -150,3 +150,31 @@ jobs:
       # (opentelemetry, tonic). Make sure it builds and tests pass.
       - name: cargo test --features otel
         run: cargo test -p vela-server --features otel --locked
+
+  smoketest:
+    # Real-client smoke test (ruma-client) against vela on an ephemeral
+    # TCP port. Standalone crate (not in workspace members), so it
+    # caches separately and stays out of the default workspace test
+    # graph. Catches wire-shape regressions Complement misses.
+    name: cargo test smoketest-rs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: smoketest-rs
+          workspaces: tools/testing/smoketest-rs
+
+      - name: cargo test smoketest-rs
+        run: cargo test --manifest-path tools/testing/smoketest-rs/Cargo.toml --locked

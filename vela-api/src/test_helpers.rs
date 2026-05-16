@@ -71,6 +71,7 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
             minimum_room_version: vela_core::events::room_version::RoomVersion::V6,
             voip: crate::router::VoipConfig::default(),
             rtc: crate::router::RtcConfig::default(),
+            oidc: crate::router::OidcConfig::default(),
         }),
         room_locks: Arc::new(DashMap::new()),
         user_locks: Arc::new(DashMap::new()),

@@ -65,6 +65,39 @@ struct Config {
     voip: VoipSection,
     #[serde(default)]
     rtc: RtcSection,
+    #[serde(default)]
+    auth: AuthSection,
+}
+
+/// `[auth]` section. Container for authentication-mode configuration.
+/// Today only houses `[auth.oidc]` (MSC3861 phase 1 discovery posture);
+/// future auth-related blocks (e.g. SAML, LDAP) would slot in alongside.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct AuthSection {
+    oidc: OidcSection,
+}
+
+/// `[auth.oidc]` section. MSC3861 phase 1: discovery + capability
+/// advertisement only. When `enabled = true`, vela tells clients via
+/// `/auth_issuer` and `/versions` that it's configured to delegate
+/// auth to an external OIDC issuer — but token validation against that
+/// IdP is NOT wired up yet (phase 2). Leaving `enabled = false`
+/// preserves the legacy `/login` + `/register` flow exactly.
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(default)]
+struct OidcSection {
+    enabled: bool,
+    /// The OIDC issuer URL, e.g. `https://auth.example.com/`. Required
+    /// when `enabled = true`; surfaced verbatim to clients.
+    issuer: String,
+    /// vela's registered client_id at the issuer. Optional — only
+    /// needed for clients that read it from discovery rather than
+    /// learning it through dynamic client registration.
+    client_id: Option<String>,
+    /// Account-management URL per MSC3861. Optional; when set, clients
+    /// show it to end users as the place to manage their identity.
+    account_management_url: Option<String>,
 }
 
 /// `[voip]` section. Drives the classic 1-to-1 `m.call.*` path by
@@ -848,6 +881,12 @@ fn main() -> anyhow::Result<()> {
                         config.rtc.jwt_ttl
                     },
                 },
+                oidc: vela_api::router::OidcConfig {
+                    enabled: config.auth.oidc.enabled,
+                    issuer: config.auth.oidc.issuer.clone(),
+                    client_id: config.auth.oidc.client_id.clone(),
+                    account_management_url: config.auth.oidc.account_management_url.clone(),
+                },
             }),
             room_locks: Arc::new(DashMap::new()),
             user_locks: Arc::new(DashMap::new()),
@@ -1200,6 +1239,7 @@ fn print_config_summary(path: &std::path::Path, config: &Config) {
     println!("  backup.enabled          = {}", config.backup.enabled);
     println!("  retention.enabled       = {}", config.retention.enabled);
     println!("  rate_limit.enabled      = {}", config.rate_limit.enabled);
+    println!("  auth.oidc.enabled       = {}", config.auth.oidc.enabled);
 }
 
 /// Validate config before we touch the database. Failures here return
@@ -1253,6 +1293,13 @@ fn validate_config(config: &Config) -> anyhow::Result<()> {
                 "config: [federation] http_peers[{peer}] must start with http:// or https:// (got {url:?})"
             );
         }
+    }
+    // OIDC discovery: when delegation is on the issuer URL is what
+    // clients consume verbatim. An empty value would let `/auth_issuer`
+    // serve `{"issuer": ""}`, which is worse than 404 — Element X would
+    // try to talk to an unresolvable IdP. Fail early instead.
+    if config.auth.oidc.enabled && config.auth.oidc.issuer.trim().is_empty() {
+        anyhow::bail!("config: [auth.oidc] issuer must be set when enabled = true");
     }
     Ok(())
 }
