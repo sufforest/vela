@@ -1,10 +1,14 @@
+use std::pin::Pin;
+
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
+use futures::TryStreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 use vela_core::error::VelaError;
@@ -24,12 +28,8 @@ pub async fn upload(
     user: AuthenticatedUser,
     Query(query): Query<UploadQuery>,
     headers: axum::http::HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Json<Value>, ApiError> {
-    if body.len() as u64 > state.config.max_upload_size {
-        return Err(VelaError::Unknown("file too large".into()).into());
-    }
-
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -38,12 +38,18 @@ pub async fn upload(
 
     let media_id = Uuid::new_v4().to_string().replace('-', "");
 
-    // Async write — doesn't block tokio workers
-    state
+    let max = state.config.max_upload_size;
+    let reader = body_to_capped_reader(body, max);
+
+    // Stream straight into the backend — no double buffering. Bytes
+    // pass through the size-cap adapter, then `put_stream` writes
+    // them to the FS temp file or S3 multipart parts. On overflow
+    // the adapter yields an `io::Error` tagged with our 413 marker.
+    let written = state
         .media_store
-        .put(&media_id, &body)
+        .put_stream(&media_id, reader)
         .await
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        .map_err(stream_io_to_api_err)?;
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -53,7 +59,7 @@ pub async fn upload(
     let metadata = json!({
         "content_type": content_type,
         "filename": query.filename.as_deref().unwrap_or(""),
-        "size": body.len(),
+        "size": written,
         "uploader": user.user_id,
         "created_at": now_ms,
     });
@@ -116,7 +122,7 @@ pub async fn upload_to_id(
     Path((server_name, media_id)): Path<(String, String)>,
     Query(query): Query<UploadQuery>,
     headers: axum::http::HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Json<Value>, ApiError> {
     if server_name != state.config.server_name {
         return Err(custom_media_err(
@@ -124,9 +130,6 @@ pub async fn upload_to_id(
             "M_NOT_FOUND",
             "this server does not own that media id",
         ));
-    }
-    if body.len() as u64 > state.config.max_upload_size {
-        return Err(VelaError::Unknown("file too large".into()).into());
     }
     let Some(meta) = state
         .db
@@ -171,11 +174,13 @@ pub async fn upload_to_id(
         .unwrap_or("application/octet-stream")
         .to_string();
 
-    state
+    let max = state.config.max_upload_size;
+    let reader = body_to_capped_reader(body, max);
+    let written = state
         .media_store
-        .put(&media_id, &body)
+        .put_stream(&media_id, reader)
         .await
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        .map_err(stream_io_to_api_err)?;
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -184,7 +189,7 @@ pub async fn upload_to_id(
     let metadata = json!({
         "content_type": content_type,
         "filename": query.filename.as_deref().unwrap_or(""),
-        "size": body.len(),
+        "size": written,
         "uploader": user.user_id,
         "created_at": now_ms,
     });
@@ -202,6 +207,54 @@ fn custom_media_err(status: u16, errcode: &'static str, msg: &str) -> ApiError {
         errcode,
         msg: msg.to_string(),
     })
+}
+
+/// Sentinel string carried inside `io::Error` when the request body
+/// crosses the configured upload cap. Picked at the boundary instead
+/// of an `io::ErrorKind` because we need to distinguish "client sent
+/// too much" (413) from "disk write failed" (500) at the trait return
+/// site without inventing a new error variant on `MediaStore`.
+const TOO_LARGE_TAG: &str = "vela:media:too-large";
+
+/// Build an `AsyncRead` over the request body that errors as soon as
+/// the cumulative byte count crosses `max`. The byte count is checked
+/// chunk-by-chunk on the read path so the failure surfaces BEFORE the
+/// last bytes hit the storage backend — i.e. before `complete()` on
+/// S3 multipart, before the FS rename — letting the abort/cleanup
+/// path in `put_stream` reclaim partial uploads.
+fn body_to_capped_reader(body: Body, max: u64) -> Pin<Box<dyn AsyncRead + Send + Unpin>> {
+    let mut seen: u64 = 0;
+    let stream = body.into_data_stream().map_err(std::io::Error::other);
+    let stream = stream.and_then(move |chunk| {
+        let len = chunk.len() as u64;
+        let next = seen.saturating_add(len);
+        let res = if next > max {
+            Err(std::io::Error::other(TOO_LARGE_TAG))
+        } else {
+            seen = next;
+            Ok(chunk)
+        };
+        std::future::ready(res)
+    });
+    Box::pin(tokio_util::io::StreamReader::new(stream))
+}
+
+/// Convert an `io::Error` returned by `MediaStore::put_stream` into an
+/// `ApiError`. The 413 path is signalled in-band by the size-cap
+/// adapter via `TOO_LARGE_TAG`; the tower-http `RequestBodyLimitLayer`
+/// uses `http_body_util::LengthLimitError` (`"length limit exceeded"`)
+/// when the inbound body crosses its own ceiling — both map to 413.
+/// Everything else is an internal store failure.
+fn stream_io_to_api_err(e: std::io::Error) -> ApiError {
+    let msg = e.to_string();
+    if msg.contains(TOO_LARGE_TAG) || msg.contains("length limit exceeded") {
+        return custom_media_err(
+            413,
+            "M_TOO_LARGE",
+            "upload exceeds the homeserver size limit",
+        );
+    }
+    ApiError(VelaError::Store(msg))
 }
 
 /// GET /_matrix/client/v1/media/download/{serverName}/{mediaId}
