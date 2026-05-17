@@ -72,6 +72,7 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
             voip: crate::router::VoipConfig::default(),
             rtc: crate::router::RtcConfig::default(),
             oidc: crate::router::OidcConfig::default(),
+            admin_bot_localpart: crate::admin::DEFAULT_BOT_LOCALPART.to_string(),
         }),
         room_locks: Arc::new(DashMap::new()),
         user_locks: Arc::new(DashMap::new()),

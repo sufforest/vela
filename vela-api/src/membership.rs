@@ -977,6 +977,29 @@ pub async fn invite_user_internal(
     .await
 }
 
+/// Internal entry point used by the admin bot to kick a target out of
+/// the admin room. Bypasses the public-API `check_sender_joined` and
+/// "target must currently be joined/invited/knocking" guards: the bot
+/// caller has already validated membership-state for the demote case.
+pub async fn kick_target_for_admin(
+    state: AppState,
+    sender: AuthenticatedUser,
+    room_nid: u64,
+    room_id: RoomId,
+    target_user_id: String,
+) -> Result<(), ApiError> {
+    emit_membership_event_for_target(
+        &state,
+        &sender,
+        room_nid,
+        &room_id,
+        &target_user_id,
+        "leave",
+        None,
+    )
+    .await
+}
+
 /// POST /_matrix/client/v3/rooms/{roomId}/kick
 pub async fn kick_user(
     State(state): State<AppState>,

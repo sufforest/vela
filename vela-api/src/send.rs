@@ -230,6 +230,22 @@ pub async fn send_message(
         user.user_nid,
     );
 
+    // Admin-bot hook: if this message landed in the admin room and is
+    // an `!command`, dispatch it. Short-circuits cheaply when the
+    // common path (any non-admin-room message) doesn't match. Runs
+    // off the response path: the bot's reply is its own send call.
+    let content_for_dispatch = event
+        .get("content")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    crate::admin::maybe_dispatch_admin_command(
+        &state,
+        room_nid,
+        user.user_nid,
+        &event_type,
+        &content_for_dispatch,
+    );
+
     Ok(Json(json!({"event_id": event_id.as_str()})))
 }
 

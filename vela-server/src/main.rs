@@ -67,6 +67,27 @@ struct Config {
     rtc: RtcSection,
     #[serde(default)]
     auth: AuthSection,
+    #[serde(default)]
+    admin: AdminSection,
+}
+
+/// `[admin]` section. Configures the server-internal admin bot + admin
+/// room. The bot's localpart defaults to `"admin"` (full MXID
+/// `@admin:<server_name>`). Operators can pick a different localpart if
+/// `admin` is already taken on their deployment — but the chosen
+/// localpart is then reserved on `/register` for safety.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+struct AdminSection {
+    bot_localpart: String,
+}
+
+impl Default for AdminSection {
+    fn default() -> Self {
+        Self {
+            bot_localpart: vela_api::admin::DEFAULT_BOT_LOCALPART.to_string(),
+        }
+    }
 }
 
 /// `[auth]` section. Container for authentication-mode configuration.
@@ -887,6 +908,11 @@ fn main() -> anyhow::Result<()> {
                     client_id: config.auth.oidc.client_id.clone(),
                     account_management_url: config.auth.oidc.account_management_url.clone(),
                 },
+                admin_bot_localpart: if config.admin.bot_localpart.trim().is_empty() {
+                    vela_api::admin::DEFAULT_BOT_LOCALPART.to_string()
+                } else {
+                    config.admin.bot_localpart.trim().to_string()
+                },
             }),
             room_locks: Arc::new(DashMap::new()),
             user_locks: Arc::new(DashMap::new()),
@@ -918,6 +944,16 @@ fn main() -> anyhow::Result<()> {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
         };
+
+        // Admin bot + admin room bootstrap. Idempotent: creates the
+        // bot user + private "Admins" room on first boot, no-ops on
+        // subsequent boots. Also seeds the static `[registration]
+        // token` into the dynamic-tokens CF when no admin exists yet,
+        // so the same lookup path covers bootstrap and post-bootstrap.
+        // See `vela_api::admin` for the full design.
+        if let Err(e) = vela_api::admin::bootstrap(&state).await {
+            anyhow::bail!("admin bootstrap failed: {:?}", e.0);
+        }
 
         let app = vela_api::router::build_router(state);
 
