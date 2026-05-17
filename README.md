@@ -14,7 +14,21 @@ embedded storage.
 0.1.0. See [`CHANGELOG.md`](CHANGELOG.md) for what's in this release
 and what's known to be missing.
 
-## Building
+## Quickstart (Docker)
+
+```sh
+docker pull ghcr.io/sufforest/vela:main
+docker run -v $PWD/vela.toml:/etc/vela/vela.toml:ro \
+           -v vela_data:/data \
+           -p 8008:8008 \
+           ghcr.io/sufforest/vela:main
+```
+
+Images are published on every push to `main` (rolling, may break)
+and on every `vX.Y.Z` Git tag (`:X.Y.Z` / `:X.Y` / `:X` / `:latest`,
+all immutable once published).
+
+## Building from source
 
 ```sh
 cargo build --workspace --release
