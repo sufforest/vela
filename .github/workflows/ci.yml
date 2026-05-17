@@ -178,3 +178,56 @@ jobs:
 
       - name: cargo test smoketest-rs
         run: cargo test --manifest-path tools/testing/smoketest-rs/Cargo.toml --locked
+
+  s3-integration:
+    # Run the S3 MediaStore tests against a real MinIO container.
+    # Unit tests cover our trait surface; this catches S3 wire-protocol
+    # bugs that only surface against a real implementation —
+    # multipart-upload boundary semantics, auth/signing edge cases, the
+    # abort() path actually firing the right wire op on stream failure.
+    #
+    # MinIO image is pinned to a specific release tag so MinIO Inc.
+    # roadmap changes can't surprise us mid-deploy. License note: the
+    # AGPL on MinIO server affects redistribution, not CI sidecars —
+    # we run it unmodified in a container, vela never links to it.
+    name: cargo test --features s3-integration
+    runs-on: ubuntu-latest
+    services:
+      minio:
+        image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+        env:
+          MINIO_ROOT_USER: vela
+          MINIO_ROOT_PASSWORD: vela-test-secret
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -fs http://localhost:9000/minio/health/live"
+          --health-interval 5s
+          --health-timeout 2s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-s3
+
+      # MinIO doesn't pre-create the bucket; do it via mc inside the
+      # service container before the tests need it.
+      - name: Create test bucket
+        run: |
+          docker run --rm --network host \
+            -e MC_HOST_local=http://vela:vela-test-secret@localhost:9000 \
+            minio/mc:RELEASE.2025-04-08T15-39-49Z mb local/vela-test
+
+      - name: cargo test --features s3-integration
+        env:
+          VELA_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          VELA_TEST_S3_ACCESS_KEY: vela
+          VELA_TEST_S3_SECRET_KEY: vela-test-secret
+          VELA_TEST_S3_BUCKET: vela-test
+        run: cargo test -p vela-store --features s3-integration --locked
