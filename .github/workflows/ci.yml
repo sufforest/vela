@@ -178,3 +178,66 @@ jobs:
 
       - name: cargo test smoketest-rs
         run: cargo test --manifest-path tools/testing/smoketest-rs/Cargo.toml --locked
+
+  s3-integration:
+    # Run the S3 MediaStore tests against a real MinIO container.
+    # Unit tests cover our trait surface; this catches S3 wire-protocol
+    # bugs that only surface against a real implementation —
+    # multipart-upload boundary semantics, auth/signing edge cases, the
+    # abort() path actually firing the right wire op on stream failure.
+    #
+    # MinIO image is pinned to a specific release tag so MinIO Inc.
+    # roadmap changes can't surprise us mid-deploy. License note: the
+    # AGPL on MinIO server affects redistribution, not CI sidecars —
+    # we run it unmodified in a container, vela never links to it.
+    #
+    # MinIO is started via an explicit `docker run` rather than GHA's
+    # `services:` block because services can't pass the `server /data`
+    # argument the minio image needs.
+    name: cargo test --features s3-integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-s3
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=vela \
+            -e MINIO_ROOT_PASSWORD=vela-test-secret \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          # Wait up to 60s for /minio/health/live.
+          for i in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:9000/minio/health/live; then
+              echo "minio healthy after ${i} tries"
+              break
+            fi
+            sleep 2
+            if [ "$i" = "30" ]; then
+              echo "minio did not become healthy in time"
+              docker logs minio
+              exit 1
+            fi
+          done
+
+      - name: Create test bucket
+        run: |
+          docker run --rm --network host \
+            -e MC_HOST_local=http://vela:vela-test-secret@127.0.0.1:9000 \
+            minio/mc:RELEASE.2025-04-08T15-39-49Z mb local/vela-test
+
+      - name: cargo test --features s3-integration
+        env:
+          VELA_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          VELA_TEST_S3_ACCESS_KEY: vela
+          VELA_TEST_S3_SECRET_KEY: vela-test-secret
+          VELA_TEST_S3_BUCKET: vela-test
+        run: cargo test -p vela-store --features s3-integration --locked

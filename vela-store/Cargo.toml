@@ -28,5 +28,12 @@ uuid = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 
+[features]
+# Opt-in CI test that exercises the S3 MediaStore against a real
+# MinIO container. Off by default — the default test loop stays
+# RocksDB-only and stays fast. Enable in CI via
+# `cargo test -p vela-store --features s3-integration`.
+s3-integration = []
+
 [lints]
 workspace = true
