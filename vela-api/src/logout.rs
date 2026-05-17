@@ -10,7 +10,7 @@
 //! attached the `AuthenticatedUser` extractor, so we just delete the
 //! tokens from storage.
 
-use axum::Json;
+use crate::middleware::json::Json;
 use axum::extract::State;
 use serde_json::{Value, json};
 use vela_core::error::VelaError;

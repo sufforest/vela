@@ -7,7 +7,7 @@
 //! starts with `{`). Inline-JSON filters (`?filter={...}`) are parsed in
 //! the sync handler — see `apply_filter_to_room`.
 
-use axum::Json;
+use crate::middleware::json::Json;
 use axum::extract::{Path, State};
 use serde_json::{Value, json};
 

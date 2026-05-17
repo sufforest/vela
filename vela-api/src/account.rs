@@ -7,7 +7,7 @@
 //! token is required — proof of session ownership. Adding a full UIA flow is
 //! future work.
 
-use axum::Json;
+use crate::middleware::json::Json;
 use axum::extract::State;
 use serde::Deserialize;
 use serde_json::{Value, json};

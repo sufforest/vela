@@ -2,7 +2,7 @@
 //!
 //! Spec: `references/matrix-spec/data/api/client-server/device_management.yaml`.
 
-use axum::Json;
+use crate::middleware::json::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use serde_json::{Value, json};

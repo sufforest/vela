@@ -8,7 +8,7 @@
 //! and push-gateway delivery are still deferred — these endpoints make the
 //! shape work for clients that want to view/modify their own rules.
 
-use axum::Json;
+use crate::middleware::json::Json;
 use axum::extract::{Path, State};
 use serde::Deserialize;
 use serde_json::{Value, json};

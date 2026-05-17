@@ -8,7 +8,7 @@
 //! requires a background worker that reads push rules + matches events
 //! + POSTs to `{pusher.data.url}/_matrix/push/v1/notify`.
 
-use axum::Json;
+use crate::middleware::json::Json;
 use axum::extract::State;
 use serde::Deserialize;
 use serde_json::{Value, json};
