@@ -294,6 +294,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         // Account
         .route("/_matrix/client/v3/account/whoami", get(whoami::whoami))
+        // 3PID list — stubbed empty since vela doesn't track email /
+        // phone associations. Suppresses Element's "Unable to load
+        // email addresses" error in account settings.
+        .route("/_matrix/client/v3/account/3pid", get(account::get_3pids))
         // Classic 1-to-1 VoIP: TURN credentials for clients that
         // still drive m.call.* events over Matrix. Group calls use
         // matrix-rtc below instead.

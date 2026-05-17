@@ -28,6 +28,33 @@ Images are published on every push to `main` (rolling, may break)
 and on every `vX.Y.Z` Git tag (`:X.Y.Z` / `:X.Y` / `:X` / `:latest`,
 all immutable once published).
 
+## Admin bootstrap
+
+Vela administers via a server-internal bot in a private Admins room
+— no `/_synapse/admin/*` HTTP surface, no `is_admin` user flag.
+Membership in the Admins room IS the admin permission. First boot:
+
+1. In `vela.toml` set a one-shot bootstrap token:
+   ```toml
+   [registration]
+   enabled = true
+   token   = "pick-any-random-string"
+   ```
+2. Register your account against vela in any Matrix client (Element
+   recommended) using that token. The first registrant is
+   auto-invited to the Admins room.
+3. Accept the invite, send `!help` in the Admins room. The bot
+   replies with the command list.
+4. Mint a fresh registration token + revoke the bootstrap one:
+   ```
+   !token create uses=10 expires=7d
+   !token revoke pick-any-random-string
+   ```
+
+The static `[registration] token` field is seeded into the registration
+tokens table as single-use; subsequent invites are managed dynamically
+through the bot.
+
 ## Building from source
 
 ```sh
