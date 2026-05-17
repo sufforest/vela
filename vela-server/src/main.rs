@@ -1209,17 +1209,24 @@ fn install_metrics_recorder() -> Option<vela_api::metrics::MetricsRenderer> {
     None
 }
 
-/// Load the TOML config file plus `VELA_` environment overrides. A
-/// missing or malformed file produces `Config::default()` — same
-/// behaviour the binary has had since day one. Extracted so
-/// `--validate-config` can call it without copy-pasting the figment
-/// chain.
+/// Load the TOML config file plus `VELA_` environment overrides.
+/// A parse error (unknown field, type mismatch, malformed TOML) is
+/// surfaced to stderr and the process exits 1 — previously these
+/// errors were silently swallowed and the binary booted with full
+/// defaults, leaving operators wondering why `server.bind = "..."`
+/// didn't take effect. Missing file remains a soft default: figment's
+/// `Toml::file()` is best-effort on absence, so a server with no
+/// config file boots on `0.0.0.0:8008` as before.
 fn load_config(path: &std::path::Path) -> Config {
     Figment::new()
         .merge(Toml::file(path))
         .merge(Env::prefixed("VELA_").split("_"))
         .extract()
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            eprintln!("error: failed to parse {}: {e}", path.display());
+            eprintln!("hint: run with `--validate-config` to inspect parser output");
+            std::process::exit(1);
+        })
 }
 
 /// Run the field-level parsers (size, duration, retention lifetime)

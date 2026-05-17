@@ -105,3 +105,12 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] 
 vela-core = { path = "vela-core", version = "0.1.0" }
 vela-store = { path = "vela-store", version = "0.1.0" }
 vela-api = { path = "vela-api", version = "0.1.0" }
+
+# Dev-profile override: line-table-only debuginfo. Backtraces still
+# show file:line (good enough for nearly all triage); variable
+# inspection in a debugger does not work. Trade-off: ~30-50% smaller
+# `target/` per workspace + per-agent-worktree, ~5-10% faster compile.
+# Flip to `debug = 2` (full DWARF) locally if you need rust-gdb /
+# rust-lldb value-level inspection.
+[profile.dev]
+debug = 1

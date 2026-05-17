@@ -68,8 +68,13 @@ COPY --from=builder /build/target/release/vela-backup /usr/local/bin/vela-backup
 EXPOSE 8008
 VOLUME /data
 
+# Honour $VELA_PORT so operators with a non-default [server] port don't
+# end up with a permanently "(unhealthy)" container. Defaults to 8008
+# (the image bake-in default) when unset. Shell form is required for
+# env-var expansion at runtime — exec form would treat ${VELA_PORT:-8008}
+# as a literal.
 HEALTHCHECK --interval=10s --timeout=2s --retries=3 \
-    CMD curl -fs http://localhost:8008/_matrix/client/versions || exit 1
+    CMD sh -c 'curl -fs "http://localhost:${VELA_PORT:-8008}/_matrix/client/versions"' || exit 1
 
 ENTRYPOINT ["/usr/local/bin/vela"]
 CMD ["--config", "/etc/vela/vela.toml"]
