@@ -594,6 +594,14 @@ struct ServerSection {
     name: String,
     bind: String,
     port: u16,
+    /// Public-facing URL for the client API, advertised in
+    /// `.well-known/matrix/client`. Set to e.g.
+    /// `"https://matrix.example.com"` when vela sits behind a TLS
+    /// terminator (Caddy / Cloudflare / nginx). When unset, vela
+    /// publishes `http://<bind>:<port>` — correct only for a
+    /// directly-internet-reachable vela, wrong for any reverse-proxied
+    /// deploy.
+    public_base_url: Option<String>,
     /// Optional TLS listener. When present, Vela additionally serves HTTPS on
     /// `tls.port` using the provided cert/key files. Absent → plain HTTP only
     /// (development and unit-test default).
@@ -614,6 +622,7 @@ impl Default for ServerSection {
             name: "localhost".to_string(),
             bind: "0.0.0.0".to_string(),
             port: 8008,
+            public_base_url: None,
             tls: None,
             extra_ca_certs: Vec::new(),
             minimum_room_version: "6".to_string(),
@@ -870,6 +879,7 @@ fn main() -> anyhow::Result<()> {
                 server_name: config.server.name.clone(),
                 bind_host: config.server.bind.clone(),
                 bind_port: config.server.port,
+                public_base_url: config.server.public_base_url.clone(),
                 search_all_users: config.user_directory.search_all_users,
                 federation_enabled: config.federation.enabled,
                 registration_enabled: config.registration.enabled,

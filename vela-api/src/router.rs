@@ -31,6 +31,14 @@ pub struct ServerConfig {
     pub server_name: String,
     pub bind_host: String,
     pub bind_port: u16,
+    /// Public-facing base URL for the client API, as advertised in
+    /// `.well-known/matrix/client`. When `None`, vela synthesises
+    /// `http://<bind_host>:<bind_port>` — which is wrong for any
+    /// reverse-proxied deployment. Operators behind a TLS terminator
+    /// (Caddy, Cloudflare, nginx) MUST set this to the public URL
+    /// (e.g. `"https://matrix.example.com"`) or clients will follow
+    /// the well-known to localhost and fail.
+    pub public_base_url: Option<String>,
     /// When true, `/user_directory/search` may return users the caller
     /// doesn't share a room with. Default is `false`: unrestricted user
     /// enumeration is a privacy leak and an abuse vector (spam, targeted
