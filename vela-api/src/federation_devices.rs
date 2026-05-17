@@ -10,7 +10,7 @@
 //! own server; queries for users on other domains return 404 to
 //! avoid implying we're authoritative for someone else.
 
-use axum::Json;
+use crate::middleware::json::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde_json::{Value, json};

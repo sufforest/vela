@@ -25,7 +25,7 @@
 //!   construction. Stable across uptime queries — useful for "did the
 //!   process restart?" checks.
 
-use axum::Json;
+use crate::middleware::json::Json;
 use axum::extract::State;
 use serde_json::{Value, json};
 

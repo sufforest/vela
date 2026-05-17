@@ -10,7 +10,7 @@
 //!   unauthenticated — the access_token IS the auth, so the
 //!   request bypasses the X-Matrix federation auth middleware.
 
-use axum::Json;
+use crate::middleware::json::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use base64::Engine;

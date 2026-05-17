@@ -13,7 +13,7 @@
 //! server can't usefully match against the encrypted body. Clients are
 //! expected to do their own local index for E2EE rooms.
 
-use axum::Json;
+use crate::middleware::json::Json;
 use axum::extract::{Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};

@@ -9,7 +9,7 @@
 //! Out of scope this iteration: `recurse` (depth-first traversal of children
 //! of children) and `unsigned.m.relations` bundling on the parent.
 
-use axum::Json;
+use crate::middleware::json::Json;
 use axum::extract::{Path, Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};

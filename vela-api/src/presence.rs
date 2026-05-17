@@ -8,7 +8,7 @@
 //! server see each others' presence via the sync bundle; cross-server
 //! presence surfaces as the default `offline`.
 
-use axum::Json;
+use crate::middleware::json::Json;
 use axum::extract::{Path, State};
 use serde::Deserialize;
 use serde_json::{Value, json};

@@ -58,6 +58,10 @@ enum Cmd {
         #[arg(long, default_value = "100")]
         limit: usize,
     },
+    /// Compare `memberships` and `room_state` for one (room, user) —
+    /// flags the kind of drift that surfaces as 403 "sender is not
+    /// joined" while the pre-check passes.
+    DiagnoseMembership { room_id: String, user_id: String },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -73,6 +77,9 @@ fn main() -> anyhow::Result<()> {
         Cmd::Rooms => cmd::rooms::run(&db),
         Cmd::Room { room_id } => cmd::rooms::run_one(&db, &room_id),
         Cmd::Media { limit } => cmd::media::run(&db, limit),
+        Cmd::DiagnoseMembership { room_id, user_id } => {
+            cmd::membership::run(&db, &room_id, &user_id)
+        }
     }
 }
 
