@@ -108,44 +108,40 @@ pub async fn register(
     // OR a bare `auth.token` (lenient for clients that don't model the
     // registration_token UIA stage explicitly).
     //
-    // Lookup order:
-    //   1. dynamic tokens in `registration_tokens` CF (admin-bot-minted,
-    //      plus the static bootstrap token after `admin::bootstrap`
-    //      seeds it — so `!token revoke` works uniformly post-bootstrap);
-    //   2. fall back to a literal match against the static
-    //      `[registration] token` from vela.toml — covers the very first
-    //      boot before `admin::bootstrap` runs, and integration tests
-    //      that build AppState without calling bootstrap.
+    // The `registration_tokens` CF is the single source of truth.
+    // `admin::bootstrap` seeds the static `[registration] token` (if
+    // present) into the CF on first boot when no admin exists — so the
+    // operator-configured token participates in the same lifecycle as
+    // tokens minted later via `!token create`. After bootstrap the
+    // toml entry is decorative; `!token revoke` against that token
+    // works correctly and is not bypassed by a static fallback.
     //
-    // The static token loses its special status as soon as an admin
-    // exists AND the bootstrap helper has seeded it: at that point the
-    // dynamic path owns it, and `!token revoke <static>` removes it.
-    if any_token_exists {
+    // Two-phase to avoid burning a token when registration would have
+    // failed anyway: validate (read-only) up front so a wrong token
+    // is rejected before we hash the password, then consume (write)
+    // right before user creation.
+    let provided_token = if any_token_exists {
         let provided = body
             .auth
             .as_ref()
             .and_then(|a| a.get("token"))
             .and_then(|t| t.as_str())
-            .unwrap_or("");
-        let mut consumed = false;
-        if !provided.is_empty() {
-            consumed = state
+            .unwrap_or("")
+            .to_string();
+        if provided.is_empty()
+            || !state
                 .db
-                .consume_registration_token(provided)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-            if !consumed
-                && let Some(static_token) = state.config.registration_token.as_deref()
-                && provided == static_token
-            {
-                consumed = true;
-            }
-        }
-        if !consumed {
+                .validate_registration_token(&provided)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        {
             return Err(ApiError(VelaError::Forbidden(
                 "registration requires a valid token".into(),
             )));
         }
-    }
+        Some(provided)
+    } else {
+        None
+    };
 
     let username = body.username.as_deref().unwrap_or("").to_lowercase();
 
@@ -186,6 +182,22 @@ pub async fn register(
     // Hash password with argon2
     let salt: [u8; 16] = rand::random();
     let password_hash = hash_password(password, &salt);
+
+    // Consume the registration token atomically before creating the
+    // user. If a concurrent registrant already consumed the last use
+    // between our `validate_registration_token` peek and now, fail
+    // here — same 403 surface as the early validation, no half-state
+    // left behind.
+    if let Some(token) = &provided_token
+        && !state
+            .db
+            .consume_registration_token(token)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    {
+        return Err(ApiError(VelaError::Forbidden(
+            "registration requires a valid token".into(),
+        )));
+    }
 
     // Create user
     let user_nid = state

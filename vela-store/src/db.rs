@@ -3855,6 +3855,33 @@ impl Database {
         self.db.delete_cf(&cf, token.as_bytes())
     }
 
+    /// Read-only "is this token currently usable?" check. Same rules as
+    /// `consume_registration_token` (existence + not-expired + not-exhausted)
+    /// without the write. Used to fail registration early — before
+    /// expensive validation (password hashing) — so a wrong token doesn't
+    /// waste CPU. The actual consume happens later, atomically with user
+    /// creation, so a failed registration doesn't burn the token.
+    pub fn validate_registration_token(&self, token: &str) -> Result<bool, rocksdb::Error> {
+        let cf = self.db.cf_handle("registration_tokens").unwrap();
+        let Some(bytes) = self.db.get_cf(&cf, token.as_bytes())? else {
+            return Ok(false);
+        };
+        let record: Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
+        let uses_allowed = record["uses_allowed"].as_u64().unwrap_or(0);
+        let uses_used = record["uses_used"].as_u64().unwrap_or(0);
+        let expires_at_ms = record["expires_at_ms"].as_u64().unwrap_or(0);
+        if expires_at_ms != 0 && now_ms() >= expires_at_ms {
+            return Ok(false);
+        }
+        if uses_allowed != 0 && uses_used >= uses_allowed {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// Validate + consume one use of a registration token, atomically.
     /// Returns `Ok(true)` if the token was accepted (and its `uses_used`
     /// incremented), `Ok(false)` if the token is unknown / expired /

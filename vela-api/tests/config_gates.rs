@@ -165,6 +165,15 @@ async fn registration_token_required_accepts_correct_token() {
         registration_token: Some("hunter2".into()),
         ..Default::default()
     });
+    // The static fallback was removed: the [registration] token in the
+    // config only matters when admin::bootstrap seeds it into the CF.
+    // Tests skip bootstrap, so we seed the token here ourselves to
+    // exercise the "valid token presented" path.
+    harness
+        .state
+        .db
+        .create_registration_token("hunter2", 0, 0, 0)
+        .expect("seed registration_token CF for test");
     let resp = harness
         .request(
             Request::post("/_matrix/client/v3/register")
@@ -190,6 +199,120 @@ async fn registration_token_required_accepts_correct_token() {
     );
     let body = read_json(resp).await;
     assert!(body["access_token"].is_string());
+}
+
+#[tokio::test]
+async fn single_use_token_is_consumed_after_one_registration() {
+    // Bootstrap-shaped token: uses_allowed = 1. First registrant succeeds;
+    // second attempt with the same token fails because the CF row is gone.
+    // Locks in the design where the static bootstrap token, once seeded
+    // single-use, can't be re-used as a back-door even if the operator
+    // leaves it in vela.toml.
+    let harness = Harness::with_config(ConfigOverrides {
+        registration_token: Some("bootstrap-once".into()),
+        ..Default::default()
+    });
+    harness
+        .state
+        .db
+        .create_registration_token("bootstrap-once", 1, 0, 0)
+        .expect("seed single-use token");
+
+    let register = |username: &'static str| {
+        let h = &harness;
+        async move {
+            h.request(
+                Request::post("/_matrix/client/v3/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "username": username,
+                            "password": "pw",
+                            "auth": {
+                                "type": "m.login.registration_token",
+                                "token": "bootstrap-once",
+                            },
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+        }
+    };
+
+    let r1 = register("first").await;
+    assert_eq!(r1.status(), StatusCode::OK, "first registrant: {r1:?}");
+
+    let r2 = register("second").await;
+    assert_eq!(
+        r2.status(),
+        StatusCode::FORBIDDEN,
+        "second use of single-use token must be rejected: {r2:?}"
+    );
+}
+
+#[tokio::test]
+async fn failed_registration_does_not_consume_token() {
+    // Two-phase consume: validate up front (read-only), commit-consume
+    // late. A registration that fails before user creation (e.g. invalid
+    // username) must leave the token usable. Otherwise a typo would burn
+    // the bootstrap token and lock the operator out.
+    let harness = Harness::with_config(ConfigOverrides {
+        registration_token: Some("survive-typo".into()),
+        ..Default::default()
+    });
+    harness
+        .state
+        .db
+        .create_registration_token("survive-typo", 1, 0, 0)
+        .expect("seed single-use token");
+
+    // First attempt: invalid username (empty). Must 4xx WITHOUT consuming.
+    let r1 = harness
+        .request(
+            Request::post("/_matrix/client/v3/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "username": "",
+                        "password": "pw",
+                        "auth": {
+                            "type": "m.login.registration_token",
+                            "token": "survive-typo",
+                        },
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_ne!(r1.status(), StatusCode::OK, "invalid username must fail");
+
+    // Token should still be usable: second attempt with valid username succeeds.
+    let r2 = harness
+        .request(
+            Request::post("/_matrix/client/v3/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "username": "alice",
+                        "password": "pw",
+                        "auth": {
+                            "type": "m.login.registration_token",
+                            "token": "survive-typo",
+                        },
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(
+        r2.status(),
+        StatusCode::OK,
+        "token must still be valid after failed-registration: {r2:?}"
+    );
 }
 
 // --- max_upload_size ------------------------------------------------------
