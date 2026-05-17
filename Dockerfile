@@ -50,7 +50,8 @@ COPY vela-server/ vela-server/
 COPY tools/vela-admin/ tools/vela-admin/
 
 RUN touch vela-core/src/lib.rs vela-store/src/lib.rs vela-api/src/lib.rs vela-server/src/main.rs \
-    && cargo build --release --bin vela --bin vela-backup
+              tools/vela-admin/src/main.rs \
+    && cargo build --release --bin vela --bin vela-backup --bin vela-admin
 
 # --- Runtime stage -------------------------------------------------------
 
@@ -64,6 +65,7 @@ RUN apt-get update \
 
 COPY --from=builder /build/target/release/vela        /usr/local/bin/vela
 COPY --from=builder /build/target/release/vela-backup /usr/local/bin/vela-backup
+COPY --from=builder /build/target/release/vela-admin  /usr/local/bin/vela-admin
 
 EXPOSE 8008
 VOLUME /data

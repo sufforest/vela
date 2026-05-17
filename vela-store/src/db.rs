@@ -190,6 +190,13 @@ impl Database {
             }
         }
 
+        // One-time repair for `room_state` entries left dangling by
+        // the recover_max_nid bug fixed in this release. Cheap on a
+        // clean DB (one iterator pass, no writes). Logs at warn level
+        // when it actually fixes anything so operators see what the
+        // upgrade did.
+        repair_room_state_orphans(&db)?;
+
         // Recover counters from existing data
         let nid_counter = recover_max_nid(&db).unwrap_or(1);
         let stream_counter = recover_max_stream(&db);
@@ -4722,12 +4729,174 @@ fn num_cpus() -> usize {
 }
 
 /// Recover max NID from nid_reverse CF (keys are u64 BE, so last key = max).
+/// Recover the next NID by scanning every CF whose keys carry a NID
+/// allocated from the shared `nid_counter`. Two distinct sources share
+/// this counter:
+///
+///   - `get_or_create_nid()` for **strings** (user_id, room_id, event
+///     type, state_key) — writes the new NID into `nid_reverse` and
+///     `nid_map`.
+///   - `next_nid()` for **events** — writes the NID into `events`
+///     (and `event_state`, `event_depth`, `event_id_reverse`, ...).
+///
+/// The original implementation scanned only `nid_reverse`, missing
+/// every event NID. After restart the counter then reset to
+/// `max_string_nid + 1`, **far below** `max_event_nid`, and the next
+/// `next_nid()` allocations silently collided with already-persisted
+/// events — the new event's `put_cf(events, encode_u64(nid), …)`
+/// overwrote the old event in place. From that point onwards any
+/// reference holding the original event_nid (notably `room_state`'s
+/// `(room, type, state_key) → event_nid` mapping) resolved to a
+/// completely unrelated event. For a state event reference this
+/// surfaced as "sender is not joined": auth_check loaded the
+/// overwritten event, found `state_key.is_none()`, skipped inserting
+/// it into the state view, and the rule engine concluded the user had
+/// no membership.
+///
+/// Fix: take the max across `nid_reverse` AND `events`. Both keys are
+/// big-endian u64, so `IteratorMode::End` is the lex-largest key.
+/// One-time repair for `room_state` entries that point at events
+/// whose actual (type, state_key) doesn't match the key.
+///
+/// Background: the `recover_max_nid` bug (now fixed) let `next_nid()`
+/// allocate event NIDs that collided with already-persisted events.
+/// New writes overwrote the old event row in place. Any reference
+/// still holding the original NID — most importantly
+/// `room_state`'s `(room, type, state_key) → event_nid` map —
+/// dereferenced to a different event from that point on. For state
+/// references the user-visible symptom was 403 "sender is not joined"
+/// because the rule engine loaded the overwritten event, found no
+/// matching state_key in its header, and excluded it from the state
+/// view.
+///
+/// This pass walks `room_state` once, verifies each entry's event
+/// has the expected (type, state_key) in its persisted header, and
+/// for each mismatch scans the room's timeline for the latest event
+/// that does match. If found, the room_state entry is rewritten to
+/// point at the replacement.
+///
+/// Idempotent: a clean DB does no writes; a previously-repaired DB
+/// finds no orphans on the next startup.
+fn repair_room_state_orphans(db: &DB) -> Result<(), rocksdb::Error> {
+    let cf_state = db.cf_handle("room_state").unwrap();
+    let cf_events = db.cf_handle("events").unwrap();
+    let cf_timeline = db.cf_handle("room_timeline").unwrap();
+
+    let mut scanned: u64 = 0;
+    let mut orphans: u64 = 0;
+    let mut repaired: u64 = 0;
+    let mut unrepairable: u64 = 0;
+    let mut repairs: Vec<(Vec<u8>, u64)> = Vec::new();
+
+    for entry in db.iterator_cf(&cf_state, IteratorMode::Start) {
+        let (key, val) = entry?;
+        // room_state key shape: (room_nid_be:8, type_nid_be:8, state_key_nid_be:8)
+        if key.len() != 24 || val.len() != 8 {
+            continue;
+        }
+        scanned += 1;
+
+        let room_nid = keys::decode_u64(&key[0..8]);
+        let expected_type_nid = keys::decode_u64(&key[8..16]);
+        let expected_skey_nid = keys::decode_u64(&key[16..24]);
+        let event_nid = keys::decode_u64(&val);
+
+        let event_bytes = match db.get_cf(&cf_events, keys::encode_u64(event_nid))? {
+            Some(b) if b.len() > 40 => b,
+            _ => {
+                // Event row missing or truncated. Unrepairable from
+                // here — leave the entry alone.
+                orphans += 1;
+                unrepairable += 1;
+                continue;
+            }
+        };
+
+        // events CF row header layout: type_nid:8, sender_nid:8,
+        // state_key_nid:8, ts:8, depth:8, then JSON.
+        let actual_type_nid = keys::decode_u64(&event_bytes[0..8]);
+        let actual_skey_nid = keys::decode_u64(&event_bytes[16..24]);
+
+        if actual_type_nid == expected_type_nid && actual_skey_nid == expected_skey_nid {
+            continue;
+        }
+
+        orphans += 1;
+
+        // Walk room_timeline for this room and find the event NID
+        // with the highest stream_pos whose header matches the
+        // expected (type, state_key). Forward iteration; the later
+        // entry (higher stream_pos) wins.
+        let room_prefix = keys::encode_u64(room_nid);
+        let mut best: Option<u64> = None;
+        for tl_entry in db.prefix_iterator_cf(&cf_timeline, room_prefix) {
+            let (tl_key, tl_val) = match tl_entry {
+                Ok(kv) => kv,
+                Err(_) => continue,
+            };
+            if tl_key.len() < 16 || tl_key[..8] != room_prefix[..] || tl_val.len() != 8 {
+                break;
+            }
+            let candidate_nid = keys::decode_u64(&tl_val);
+            let candidate_bytes = match db.get_cf(&cf_events, keys::encode_u64(candidate_nid))? {
+                Some(b) if b.len() > 40 => b,
+                _ => continue,
+            };
+            let c_type_nid = keys::decode_u64(&candidate_bytes[0..8]);
+            let c_skey_nid = keys::decode_u64(&candidate_bytes[16..24]);
+            if c_type_nid == expected_type_nid && c_skey_nid == expected_skey_nid {
+                best = Some(candidate_nid);
+            }
+        }
+
+        if let Some(replacement) = best {
+            repairs.push((key.to_vec(), replacement));
+            repaired += 1;
+        } else {
+            unrepairable += 1;
+        }
+    }
+
+    if !repairs.is_empty() {
+        let mut batch = WriteBatch::default();
+        for (k, replacement_nid) in &repairs {
+            batch.put_cf(&cf_state, k, keys::encode_u64(*replacement_nid));
+        }
+        db.write(batch)?;
+    }
+
+    if orphans > 0 {
+        tracing::warn!(
+            scanned,
+            orphans,
+            repaired,
+            unrepairable,
+            "room_state orphan repair completed — legacy damage from the \
+             recover_max_nid bug fixed in this release"
+        );
+    } else {
+        tracing::debug!(scanned, "room_state orphan scan: clean");
+    }
+
+    Ok(())
+}
+
 fn recover_max_nid(db: &DB) -> Option<u64> {
-    let cf = db.cf_handle("nid_reverse")?;
-    let mut iter = db.iterator_cf(&cf, IteratorMode::End);
-    iter.next()
-        .and_then(|r| r.ok())
-        .map(|(key, _)| keys::decode_u64(&key) + 1)
+    let mut max_nid: Option<u64> = None;
+
+    for cf_name in ["nid_reverse", "events"] {
+        let Some(cf) = db.cf_handle(cf_name) else {
+            continue;
+        };
+        if let Some(Ok((key, _))) = db.iterator_cf(&cf, IteratorMode::End).next()
+            && key.len() == 8
+        {
+            let nid = keys::decode_u64(&key);
+            max_nid = Some(max_nid.map_or(nid, |m| m.max(nid)));
+        }
+    }
+
+    max_nid.map(|m| m + 1)
 }
 
 /// Recover max stream position from room_timeline CF.
@@ -5409,5 +5578,205 @@ mod stream_recovery_tests {
             None,
             "different user — not affected"
         );
+    }
+
+    /// Auto-repair: a `room_state` entry pointing at an overwritten
+    /// event (one whose actual header type / state_key no longer
+    /// matches the room_state key) is detected on startup and
+    /// repaired to point at the latest valid matching event from
+    /// the room's timeline.
+    #[test]
+    fn repair_room_state_orphans_replaces_corrupted_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path();
+
+        let (room_nid, member_type_nid, alice_skey_nid, replacement_event_nid) = {
+            let db = Database::open(path).unwrap();
+            let _ = db.get_or_create_nid("@alice:example.com").unwrap();
+            let room_nid = db.get_or_create_nid("!room:example.com").unwrap();
+            let member_type_nid = db.get_or_create_nid("m.room.member").unwrap();
+            let msg_type_nid = db.get_or_create_nid("m.room.message").unwrap();
+            let alice_nid = db.get_nid("@alice:example.com").unwrap().unwrap();
+
+            // Persist Alice's first join member event. Goes into events
+            // CF + room_state CF + room_timeline CF.
+            let join_nid_1 = db.next_nid();
+            let join_json_1 = serde_json::json!({
+                "type": "m.room.member",
+                "sender": "@alice:example.com",
+                "state_key": "@alice:example.com",
+                "content": {"membership": "join"},
+            });
+            db.persist_event(
+                join_nid_1,
+                "$j1:example.com",
+                room_nid,
+                member_type_nid,
+                alice_nid,
+                alice_nid,
+                1000,
+                1,
+                serde_json::to_vec(&join_json_1).unwrap().as_slice(),
+                &[],
+                &[],
+                true,
+                false,
+            )
+            .unwrap();
+
+            // Persist a SECOND join member event (e.g. a profile update —
+            // same (type, state_key), newer event). This is the "valid
+            // replacement" the repair should find.
+            let join_nid_2 = db.next_nid();
+            let join_json_2 = serde_json::json!({
+                "type": "m.room.member",
+                "sender": "@alice:example.com",
+                "state_key": "@alice:example.com",
+                "content": {"membership": "join", "displayname": "Alice"},
+            });
+            db.persist_event(
+                join_nid_2,
+                "$j2:example.com",
+                room_nid,
+                member_type_nid,
+                alice_nid,
+                alice_nid,
+                2000,
+                2,
+                serde_json::to_vec(&join_json_2).unwrap().as_slice(),
+                &[],
+                &[],
+                true,
+                false,
+            )
+            .unwrap();
+            // join_nid_2 is now the room_state entry for Alice.
+
+            // Simulate the recover_max_nid corruption: overwrite the
+            // events row at join_nid_2 with a totally unrelated event
+            // (a message with no state_key), as if a post-restart
+            // next_nid() collision had landed there. This is the exact
+            // damage pattern: room_state still points to join_nid_2,
+            // but events[join_nid_2] now decodes as something else.
+            let cf_events = db.db.cf_handle("events").unwrap();
+            let mut bad_value = Vec::new();
+            bad_value.extend_from_slice(&keys::encode_u64(msg_type_nid)); // type
+            bad_value.extend_from_slice(&keys::encode_u64(alice_nid)); // sender
+            bad_value.extend_from_slice(&keys::encode_u64(0)); // state_key_nid = 0
+            bad_value.extend_from_slice(&keys::encode_u64(3000)); // ts
+            bad_value.extend_from_slice(&keys::encode_u64(3)); // depth
+            bad_value.extend_from_slice(b"{\"corrupted\": true}");
+            db.db
+                .put_cf(&cf_events, keys::encode_u64(join_nid_2), &bad_value)
+                .unwrap();
+
+            // Confirm room_state is now broken: dereferences to a
+            // type-mismatched event.
+            assert_eq!(
+                db.get_state_event_nid(room_nid, member_type_nid, alice_nid)
+                    .unwrap(),
+                Some(join_nid_2)
+            );
+
+            // `join_nid_1` is the only valid m.room.member event left
+            // in the timeline. Repair must find it.
+            (room_nid, member_type_nid, alice_nid, join_nid_1)
+        };
+
+        // Reopen triggers the auto-repair pass. room_state should now
+        // point at join_nid_1 (the valid, unoverwritten member event).
+        let db = Database::open(path).unwrap();
+        let after = db
+            .get_state_event_nid(room_nid, member_type_nid, alice_skey_nid)
+            .unwrap();
+        assert_eq!(
+            after,
+            Some(replacement_event_nid),
+            "auto-repair must replace the corrupted room_state entry"
+        );
+    }
+
+    /// Regression: `next_nid()` after a restart must be strictly
+    /// greater than every NID ever stored in the `events` CF.
+    ///
+    /// The `nid_counter` is shared between two allocation paths —
+    /// `get_or_create_nid()` for string NIDs (user_id, room_id, etc.)
+    /// and `next_nid()` for event NIDs. Recovery used to scan only
+    /// `nid_reverse`, missing every event NID. After restart the
+    /// counter then reset below `max_event_nid` and the next allocation
+    /// silently collided with an existing event row in `events`, the
+    /// `put_cf(events, encode_u64(nid), …)` overwriting the old event
+    /// in place. The flow-on damage: every reference holding the old
+    /// `event_nid` (notably the `room_state` (room, type, state_key)
+    /// → event_nid map) now resolves to a different event. For state
+    /// references this manifests as 403 "sender is not joined" in
+    /// `vela-api::send::send_message`, because the auth-rule engine
+    /// loads the overwritten event, finds no `state_key`, and
+    /// excludes it from the state view.
+    #[test]
+    fn next_nid_after_reopen_exceeds_max_event_nid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path();
+
+        // First open: allocate several event NIDs and persist a row
+        // under each in the `events` CF. Use the persist helper rather
+        // than touching the CF directly so the test exercises the
+        // actual write path.
+        let last_event_nid = {
+            let db = Database::open(path).unwrap();
+            // Burn a few string NIDs first so the `nid_reverse` max
+            // sits below the event-NID max — the configuration the
+            // bug actually appeared under.
+            for s in ["@alice:example.com", "!room:example.com", "m.room.message"] {
+                let _ = db.get_or_create_nid(s).unwrap();
+            }
+            let room_nid = db.get_or_create_nid("!room:example.com").unwrap();
+            let type_nid = db.get_or_create_nid("m.room.message").unwrap();
+            let sender_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+
+            let mut last = 0u64;
+            for i in 0..10 {
+                let event_nid = db.next_nid();
+                last = event_nid;
+                let event_id = format!("$ev{i}:example.com");
+                let json = serde_json::json!({
+                    "type": "m.room.message",
+                    "sender": "@alice:example.com",
+                    "content": {"body": format!("msg {i}")},
+                });
+                db.persist_event(
+                    event_nid,
+                    &event_id,
+                    room_nid,
+                    type_nid,
+                    sender_nid,
+                    0,
+                    1000 + i,
+                    i + 1,
+                    serde_json::to_vec(&json).unwrap().as_slice(),
+                    &[],
+                    &[],
+                    false,
+                    false,
+                )
+                .unwrap();
+            }
+            last
+        };
+
+        // Second open: every fresh allocation must be strictly above
+        // every previously-persisted event NID. Before the fix the
+        // counter resumed below `last_event_nid` and the next 10
+        // allocations would collide with existing event rows.
+        let db = Database::open(path).unwrap();
+        let n1 = db.next_nid();
+        let n2 = db.next_nid();
+        let n3 = db.next_nid();
+        for n in [n1, n2, n3] {
+            assert!(
+                n > last_event_nid,
+                "next_nid()={n} must be > max_event_nid={last_event_nid} after restart",
+            );
+        }
     }
 }
