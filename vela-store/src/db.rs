@@ -2884,7 +2884,15 @@ impl Database {
         key.extend_from_slice(&keys::encode_u64(user_nid));
         key.extend_from_slice(&keys::encode_u64(room_nid));
         key.extend_from_slice(data_type.as_bytes());
-        self.db.put_cf(&cf, &key, value.to_string().as_bytes())
+        let pos = self.next_stream_position().as_u64();
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&cf, &key, value.to_string().as_bytes());
+        self.batch_put_stream_pos(
+            &mut batch,
+            &room_account_data_pos_key(user_nid, room_nid),
+            pos,
+        );
+        self.db.write(batch)
     }
 
     // --- Media metadata ---
@@ -2943,7 +2951,56 @@ impl Database {
         let cf = self.db.cf_handle("receipts").unwrap();
         let key = receipt_key(room_nid, receipt_type, user_nid, thread_id);
         let val = serde_json::json!({"event_id": event_id, "ts": timestamp});
-        self.db.put_cf(&cf, &key, val.to_string().as_bytes())
+        let pos = self.next_stream_position().as_u64();
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&cf, &key, val.to_string().as_bytes());
+        self.batch_put_stream_pos(&mut batch, &receipts_room_pos_key(room_nid), pos);
+        self.db.write(batch)
+    }
+
+    /// Highest stream position at which any receipt has been written
+    /// for `room_nid`. `/sync` uses this to skip emitting the receipt
+    /// snapshot on incremental syncs whose `since` cursor already
+    /// covers every receipt update — turning what was a 0ms response
+    /// into a real long-poll wait.
+    pub fn get_room_receipts_max_pos(&self, room_nid: u64) -> Result<Option<u64>, rocksdb::Error> {
+        self.get_stream_pos(&receipts_room_pos_key(room_nid))
+    }
+
+    /// Highest stream position at which any room-scoped account_data
+    /// has been written for `(user_nid, room_nid)`. Same role as
+    /// `get_room_receipts_max_pos` but for `m.fully_read` and room tags.
+    pub fn get_room_account_data_max_pos(
+        &self,
+        user_nid: u64,
+        room_nid: u64,
+    ) -> Result<Option<u64>, rocksdb::Error> {
+        self.get_stream_pos(&room_account_data_pos_key(user_nid, room_nid))
+    }
+
+    /// Write a u64 stream position into the generic `stream_positions`
+    /// CF, scoped by the caller-supplied prefixed key. Helper so the
+    /// receipt and room-account-data paths share the same encoding
+    /// machinery without duplicating put-CF boilerplate.
+    fn batch_put_stream_pos(&self, batch: &mut WriteBatch, key: &[u8], pos: u64) {
+        let cf = self.db.cf_handle("stream_positions").unwrap();
+        batch.put_cf(&cf, key, pos.to_be_bytes());
+    }
+
+    /// Read a u64 stream position from the generic `stream_positions`
+    /// CF. Returns `None` when the key is absent (no write has ever
+    /// happened for this scope) or when the stored value is malformed.
+    fn get_stream_pos(&self, key: &[u8]) -> Result<Option<u64>, rocksdb::Error> {
+        let cf = self.db.cf_handle("stream_positions").unwrap();
+        let Some(bytes) = self.db.get_cf(&cf, key)? else {
+            return Ok(None);
+        };
+        if bytes.len() != 8 {
+            return Ok(None);
+        }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes);
+        Ok(Some(u64::from_be_bytes(buf)))
     }
 
     /// Locally-originated receipt write. Atomically updates the
@@ -2983,9 +3040,17 @@ impl Database {
         })
         .to_string();
 
+        // Also record the room-level max receipt stream position so
+        // /sync can skip emitting the receipt snapshot on incremental
+        // syncs whose `since` already covers it. We use the global
+        // stream counter (not the federation receipts_stream counter)
+        // because `since` cursors are global-stream-pos values.
+        let global_pos = self.next_stream_position().as_u64();
+
         let mut batch = WriteBatch::default();
         batch.put_cf(&receipts_cf, &receipts_key, receipts_val.as_bytes());
         batch.put_cf(&stream_cf, stream_key, stream_val.as_bytes());
+        self.batch_put_stream_pos(&mut batch, &receipts_room_pos_key(room_nid), global_pos);
         self.db.write(batch)?;
         Ok(pos)
     }
@@ -4587,6 +4652,26 @@ fn receipt_key(
     k
 }
 
+/// `stream_positions` key for "max receipt stream pos in this room".
+/// Prefix `r:` so future use-cases can occupy `f:` (fully_read), etc.
+/// — single CF, scoped by prefix, no schema growth per gap.
+fn receipts_room_pos_key(room_nid: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + 8);
+    k.extend_from_slice(b"r:");
+    k.extend_from_slice(&keys::encode_u64(room_nid));
+    k
+}
+
+/// `stream_positions` key for "max room-account-data stream pos for
+/// this (user, room)". Prefix `a:` to coexist with other purposes.
+fn room_account_data_pos_key(user_nid: u64, room_nid: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + 16);
+    k.extend_from_slice(b"a:");
+    k.extend_from_slice(&keys::encode_u64(user_nid));
+    k.extend_from_slice(&keys::encode_u64(room_nid));
+    k
+}
+
 /// To-device outbound prefix: `<destination> 0xff`. Same trick as the
 /// PDU outbox — `<dest>+0xff` ensures `"a"` doesn't collide with `"ab"`.
 fn to_device_outbound_prefix(destination: &str) -> Vec<u8> {
@@ -4862,6 +4947,115 @@ mod stream_recovery_tests {
                 "PUBV2".to_string(),
                 1_750_000_000_000u64
             )
+        );
+    }
+
+    /// `set_receipt` MUST bump the room's max-receipt stream position
+    /// in the generic `stream_positions` CF. Without this, /sync can't
+    /// tell whether anything new happened in the room and emits the
+    /// full receipt snapshot on every poll — the 0.5s storm we saw on
+    /// the first real deployment.
+    #[test]
+    fn set_receipt_bumps_room_max_pos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+
+        let room_nid = 42;
+        let user_nid = 7;
+
+        // Fresh: no receipt has ever been written here.
+        assert_eq!(db.get_room_receipts_max_pos(room_nid).unwrap(), None);
+
+        db.set_receipt(room_nid, "m.read", user_nid, "$e1", 1_000, None)
+            .unwrap();
+        let pos1 = db.get_room_receipts_max_pos(room_nid).unwrap();
+        assert!(pos1.is_some(), "first write must populate the position");
+
+        // Second write strictly advances the position so the
+        // `since >= max_pos` check on /sync sees the change.
+        db.set_receipt(room_nid, "m.read", user_nid, "$e2", 2_000, None)
+            .unwrap();
+        let pos2 = db.get_room_receipts_max_pos(room_nid).unwrap();
+        assert!(
+            pos2.unwrap() > pos1.unwrap(),
+            "second write must advance: pos1={pos1:?} pos2={pos2:?}"
+        );
+
+        // Other rooms stay at their original (None) — the bump is
+        // scoped per-room, not global.
+        assert_eq!(db.get_room_receipts_max_pos(999).unwrap(), None);
+    }
+
+    /// `set_local_receipt` (the locally-originated write path) must
+    /// also bump the room max-pos, otherwise outbound receipts wouldn't
+    /// wake other devices' long-polls and Element on the sender's
+    /// other devices would not see the read marker update.
+    #[test]
+    fn set_local_receipt_bumps_room_max_pos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+
+        let room_nid = 99;
+        assert_eq!(db.get_room_receipts_max_pos(room_nid).unwrap(), None);
+
+        let _ = db
+            .set_local_receipt(room_nid, "m.read", 7, "$e1", 1_000, None)
+            .unwrap();
+        let pos = db.get_room_receipts_max_pos(room_nid).unwrap();
+        assert!(pos.is_some(), "set_local_receipt must populate room pos");
+    }
+
+    /// `set_room_account_data` MUST bump the per-(user, room) max-pos
+    /// in `stream_positions`. Without this, m.fully_read / room-tag
+    /// snapshots leak into every incremental /sync.
+    #[test]
+    fn set_room_account_data_bumps_per_user_room_max_pos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+
+        let user_nid = 7;
+        let room_nid = 42;
+
+        assert_eq!(
+            db.get_room_account_data_max_pos(user_nid, room_nid)
+                .unwrap(),
+            None
+        );
+
+        db.set_room_account_data(
+            user_nid,
+            room_nid,
+            "m.fully_read",
+            &serde_json::json!({"event_id": "$e1"}),
+        )
+        .unwrap();
+        let pos1 = db
+            .get_room_account_data_max_pos(user_nid, room_nid)
+            .unwrap();
+        assert!(pos1.is_some());
+
+        db.set_room_account_data(
+            user_nid,
+            room_nid,
+            "m.fully_read",
+            &serde_json::json!({"event_id": "$e2"}),
+        )
+        .unwrap();
+        let pos2 = db
+            .get_room_account_data_max_pos(user_nid, room_nid)
+            .unwrap();
+        assert!(pos2.unwrap() > pos1.unwrap(), "second write must advance");
+
+        // Scope: another (user, room) is untouched.
+        assert_eq!(
+            db.get_room_account_data_max_pos(7, 9999).unwrap(),
+            None,
+            "different room — not affected"
+        );
+        assert_eq!(
+            db.get_room_account_data_max_pos(9999, room_nid).unwrap(),
+            None,
+            "different user — not affected"
         );
     }
 }

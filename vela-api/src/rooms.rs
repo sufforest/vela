@@ -326,18 +326,50 @@ pub async fn create_room(
     emit!("m.room.power_levels", "", pl_content, Some(&room_id));
 
     // --- 4. Preset events ---
-    emit!(
-        "m.room.join_rules",
-        "",
-        content::join_rules_content(join_rule),
-        Some(&room_id)
-    );
-    emit!(
-        "m.room.history_visibility",
-        "",
-        content::history_visibility_content(history_vis),
-        Some(&room_id)
-    );
+    //
+    // Initial_state overrides preset defaults per spec: when the client
+    // supplies `m.room.history_visibility` / `m.room.guest_access` /
+    // `m.room.join_rules` in initial_state, the preset default for
+    // that (type, state_key) is silently SKIPPED so we don't emit two
+    // state events for the same key. Without this, Element shows two
+    // state-change notices in the room timeline ("made future room
+    // history visible to all room members" AND "from the point they
+    // are invited") and the preset's earlier event is shadowed by the
+    // later one anyway via topological state-res ordering.
+    let initial_state_keys: std::collections::HashSet<(String, String)> = body
+        .initial_state
+        .as_deref()
+        .map(|evs| {
+            evs.iter()
+                .map(|e| {
+                    (
+                        e.event_type.clone(),
+                        e.state_key.clone().unwrap_or_default(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let initial_state_has = |etype: &str, skey: &str| {
+        initial_state_keys.contains(&(etype.to_string(), skey.to_string()))
+    };
+
+    if !initial_state_has("m.room.join_rules", "") {
+        emit!(
+            "m.room.join_rules",
+            "",
+            content::join_rules_content(join_rule),
+            Some(&room_id)
+        );
+    }
+    if !initial_state_has("m.room.history_visibility", "") {
+        emit!(
+            "m.room.history_visibility",
+            "",
+            content::history_visibility_content(history_vis),
+            Some(&room_id)
+        );
+    }
     // Only emit `m.room.guest_access` when the preset diverges from
     // the spec default of `forbidden` — synapse and continuwuity skip
     // the no-op event for public_chat / preset-default rooms. Emitting
@@ -345,7 +377,7 @@ pub async fn create_room(
     // breaks tests counting initial-state events
     // (e.g. TestInboundCanReturnMissingEvents) and is purely
     // redundant with the spec default.
-    if guest_access != "forbidden" {
+    if guest_access != "forbidden" && !initial_state_has("m.room.guest_access", "") {
         emit!(
             "m.room.guest_access",
             "",

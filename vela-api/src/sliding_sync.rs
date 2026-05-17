@@ -344,7 +344,8 @@ pub async fn sliding_sync(
                 .db
                 .get_nid(room_id)
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-                && let Some(ev) = crate::sync::build_receipts_event(&state, room_nid)?
+                && let Some(ev) =
+                    crate::sync::build_receipts_event(&state, room_nid, user.user_nid)?
             {
                 receipt_rooms.insert(room_id.clone(), ev);
             }
