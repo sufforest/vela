@@ -190,21 +190,12 @@ jobs:
     # roadmap changes can't surprise us mid-deploy. License note: the
     # AGPL on MinIO server affects redistribution, not CI sidecars —
     # we run it unmodified in a container, vela never links to it.
+    #
+    # MinIO is started via an explicit `docker run` rather than GHA's
+    # `services:` block because services can't pass the `server /data`
+    # argument the minio image needs.
     name: cargo test --features s3-integration
     runs-on: ubuntu-latest
-    services:
-      minio:
-        image: minio/minio:RELEASE.2025-04-22T22-12-26Z
-        env:
-          MINIO_ROOT_USER: vela
-          MINIO_ROOT_PASSWORD: vela-test-secret
-        ports:
-          - 9000:9000
-        options: >-
-          --health-cmd "curl -fs http://localhost:9000/minio/health/live"
-          --health-interval 5s
-          --health-timeout 2s
-          --health-retries 20
     steps:
       - uses: actions/checkout@v6
 
@@ -216,12 +207,31 @@ jobs:
         with:
           shared-key: workspace-s3
 
-      # MinIO doesn't pre-create the bucket; do it via mc inside the
-      # service container before the tests need it.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=vela \
+            -e MINIO_ROOT_PASSWORD=vela-test-secret \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          # Wait up to 60s for /minio/health/live.
+          for i in $(seq 1 30); do
+            if curl -fs http://127.0.0.1:9000/minio/health/live; then
+              echo "minio healthy after ${i} tries"
+              break
+            fi
+            sleep 2
+            if [ "$i" = "30" ]; then
+              echo "minio did not become healthy in time"
+              docker logs minio
+              exit 1
+            fi
+          done
+
       - name: Create test bucket
         run: |
           docker run --rm --network host \
-            -e MC_HOST_local=http://vela:vela-test-secret@localhost:9000 \
+            -e MC_HOST_local=http://vela:vela-test-secret@127.0.0.1:9000 \
             minio/mc:RELEASE.2025-04-08T15-39-49Z mb local/vela-test
 
       - name: cargo test --features s3-integration
