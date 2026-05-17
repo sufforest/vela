@@ -27,15 +27,16 @@
 
 services:
   vela:
-    build:
-      context: ../..
+    # Pull the published image by default. To build locally from this
+    # checkout (e.g. for testing un-merged changes), replace the
+    # `image:` line with `build: { context: ../.. }`.
+    image: ghcr.io/sufforest/vela:main
     restart: unless-stopped
     volumes:
       - vela_data:/data
       - ./vela.toml:/etc/vela/vela.toml:ro
     expose:
       - "8008"                                # plain HTTP — only Caddy reaches it
-    command: ["/usr/local/bin/vela", "--config", "/etc/vela/vela.toml"]
     environment:
       RUST_LOG: "info,vela=info"
 

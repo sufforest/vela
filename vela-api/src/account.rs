@@ -240,6 +240,17 @@ fn hash_password(password: &str) -> String {
         .to_string()
 }
 
+/// GET /_matrix/client/v3/account/3pid
+///
+/// List third-party identifiers (emails, phone numbers) associated
+/// with this account. Vela doesn't implement 3PID linkage today, so
+/// the answer is always `{"threepids": []}` — spec-compliant for "no
+/// 3PIDs registered." Without this stub, the 404 surfaces in Element
+/// settings as "Unable to load email addresses / phone numbers."
+pub async fn get_3pids(_user: AuthenticatedUser) -> Json<Value> {
+    Json(json!({"threepids": []}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
