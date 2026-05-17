@@ -95,4 +95,13 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // detect automatic-subscribe attempts whose cause event predates
     // the last unsubscribe (MSC4306 conflict check).
     "thread_subscriptions",
+    // Vela admin-bot dynamic registration tokens. Key is the raw token
+    // string (operators copy/paste it), value is JSON:
+    //   { uses_allowed: u64, uses_used: u64, expires_at_ms: u64,
+    //     created_by: u64 (user_nid), created_at_ms: u64 }
+    // `uses_allowed = 0` means unlimited; `expires_at_ms = 0` means
+    // never expires. The static `[registration] token` from vela.toml
+    // is seeded into this CF on first boot when no admin exists, so
+    // the same lookup path covers bootstrap and post-bootstrap.
+    "registration_tokens",
 ];

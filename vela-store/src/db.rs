@@ -2155,6 +2155,48 @@ impl Database {
         Ok(members)
     }
 
+    /// Like `get_room_members` but filters by an arbitrary membership
+    /// byte (1=join, 2=invite, 3=ban, 4=knock, 0=leave). Used by the
+    /// admin module to enumerate invited members without conflating
+    /// with joined ones.
+    pub fn get_room_members_by_membership(
+        &self,
+        room_nid: u64,
+        membership: u8,
+    ) -> Result<Vec<u64>, rocksdb::Error> {
+        let cf = self.db.cf_handle("memberships").unwrap();
+        let prefix = keys::encode_u64(room_nid);
+        let mut members = Vec::new();
+        let iter = self.db.prefix_iterator_cf(&cf, prefix);
+        for item in iter {
+            let (key, val) = item?;
+            if key.len() < 16 || key[..8] != prefix[..] {
+                break;
+            }
+            if !val.is_empty() && val[0] == membership {
+                members.push(keys::decode_u64(&key[8..16]));
+            }
+        }
+        Ok(members)
+    }
+
+    /// List every persisted room_id (full enumeration via `room_meta`).
+    /// Used by the admin `!server` command for a local-room count.
+    pub fn list_room_meta_room_ids(&self) -> Result<Vec<String>, rocksdb::Error> {
+        let cf = self.db.cf_handle("room_meta").unwrap();
+        let mut out = Vec::new();
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+        for item in iter {
+            let (_, val) = item?;
+            if let Ok(json) = serde_json::from_slice::<Value>(&val)
+                && let Some(rid) = json.get("room_id").and_then(|v| v.as_str())
+            {
+                out.push(rid.to_string());
+            }
+        }
+        Ok(out)
+    }
+
     /// Count members with the given membership byte (1=join, 2=invite,
     /// 3=knock, 4=ban, 0=leave). Faster than materialising the full
     /// list when the caller only needs a count (e.g. /sync's room
@@ -3698,6 +3740,151 @@ impl Database {
     pub fn set_meta(&self, key: &str, value: &[u8]) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("meta").unwrap();
         self.db.put_cf(&cf, key.as_bytes(), value)
+    }
+
+    // --- Admin bot / admin room (vela-specific) ---
+
+    /// Persist the user_nid of the server-internal admin bot user.
+    /// Looked up by the bootstrap path on every start to decide whether
+    /// the admin user already exists, and by the command-receive hook
+    /// to short-circuit on bot-authored messages (the bot never
+    /// dispatches commands to itself).
+    pub fn set_admin_bot_user_nid(&self, user_nid: u64) -> Result<(), rocksdb::Error> {
+        self.set_meta("admin_bot_user_nid", &keys::encode_u64(user_nid))
+    }
+
+    pub fn get_admin_bot_user_nid(&self) -> Result<Option<u64>, rocksdb::Error> {
+        Ok(self.get_meta("admin_bot_user_nid")?.and_then(|b| {
+            if b.len() == 8 {
+                Some(keys::decode_u64(&b))
+            } else {
+                None
+            }
+        }))
+    }
+
+    /// Persist the room_id string of the admin room. Stored as the
+    /// string (not nid) so callers can format it back into responses
+    /// without an extra lookup. The room itself is also resolvable via
+    /// `get_nid(room_id)`; `is_admin` uses the nid path.
+    pub fn set_admin_room_id(&self, room_id: &str) -> Result<(), rocksdb::Error> {
+        self.set_meta("admin_room_id", room_id.as_bytes())
+    }
+
+    pub fn get_admin_room_id(&self) -> Result<Option<String>, rocksdb::Error> {
+        Ok(self
+            .get_meta("admin_room_id")?
+            .and_then(|b| String::from_utf8(b).ok()))
+    }
+
+    /// Convenience: resolve the admin room's nid via the recorded
+    /// string. Returns `None` when no admin room exists yet (fresh
+    /// deploy that hasn't booted past the bootstrap step) or when the
+    /// stored string fails to map back to a nid (corruption-only path).
+    pub fn get_admin_room_nid(&self) -> Result<Option<u64>, rocksdb::Error> {
+        let Some(room_id) = self.get_admin_room_id()? else {
+            return Ok(None);
+        };
+        self.get_nid(&room_id)
+    }
+
+    // --- Registration tokens (vela-specific dynamic tokens) ---
+    //
+    // The static `[registration] token` from vela.toml is seeded into
+    // this CF on first boot when no admin exists yet, so the same
+    // lookup path covers bootstrap and post-bootstrap. After the admin
+    // room is up, the admin bot mints / lists / revokes tokens via
+    // `!token *` commands.
+
+    /// Insert a registration token. `uses_allowed = 0` means unlimited;
+    /// `expires_at_ms = 0` means never expires. `created_by = 0` is the
+    /// sentinel for "seeded by the operator's vela.toml" (no admin
+    /// existed yet at the time).
+    pub fn create_registration_token(
+        &self,
+        token: &str,
+        uses_allowed: u64,
+        expires_at_ms: u64,
+        created_by_user_nid: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("registration_tokens").unwrap();
+        let record = serde_json::json!({
+            "uses_allowed": uses_allowed,
+            "uses_used": 0u64,
+            "expires_at_ms": expires_at_ms,
+            "created_by": created_by_user_nid,
+            "created_at_ms": now_ms(),
+        });
+        self.db
+            .put_cf(&cf, token.as_bytes(), record.to_string().as_bytes())
+    }
+
+    /// Snapshot of a registration token, or `None` if unknown.
+    pub fn get_registration_token(&self, token: &str) -> Result<Option<Value>, rocksdb::Error> {
+        let cf = self.db.cf_handle("registration_tokens").unwrap();
+        Ok(self
+            .db
+            .get_cf(&cf, token.as_bytes())?
+            .and_then(|b| serde_json::from_slice(&b).ok()))
+    }
+
+    /// List every stored registration token (token string + record).
+    /// Used by `!tokens`. Full-scan, fine at expected scale (handful of
+    /// tokens per deployment).
+    pub fn list_registration_tokens(&self) -> Result<Vec<(String, Value)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("registration_tokens").unwrap();
+        let mut out = Vec::new();
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+        for item in iter {
+            let (key, val) = item?;
+            let Ok(token) = String::from_utf8(key.to_vec()) else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_slice::<Value>(&val) else {
+                continue;
+            };
+            out.push((token, record));
+        }
+        Ok(out)
+    }
+
+    /// Delete a registration token. Idempotent: deleting an absent
+    /// token is `Ok(())`.
+    pub fn delete_registration_token(&self, token: &str) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("registration_tokens").unwrap();
+        self.db.delete_cf(&cf, token.as_bytes())
+    }
+
+    /// Validate + consume one use of a registration token, atomically.
+    /// Returns `Ok(true)` if the token was accepted (and its `uses_used`
+    /// incremented), `Ok(false)` if the token is unknown / expired /
+    /// exhausted. Caller treats `false` as "registration rejected"
+    /// without distinguishing the reason — same surface every other
+    /// homeserver presents.
+    pub fn consume_registration_token(&self, token: &str) -> Result<bool, rocksdb::Error> {
+        let cf = self.db.cf_handle("registration_tokens").unwrap();
+        let Some(bytes) = self.db.get_cf(&cf, token.as_bytes())? else {
+            return Ok(false);
+        };
+        let mut record: Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
+        let uses_allowed = record["uses_allowed"].as_u64().unwrap_or(0);
+        let uses_used = record["uses_used"].as_u64().unwrap_or(0);
+        let expires_at_ms = record["expires_at_ms"].as_u64().unwrap_or(0);
+        if expires_at_ms != 0 && now_ms() >= expires_at_ms {
+            return Ok(false);
+        }
+        if uses_allowed != 0 && uses_used >= uses_allowed {
+            return Ok(false);
+        }
+        if let Some(obj) = record.as_object_mut() {
+            obj.insert("uses_used".into(), Value::Number((uses_used + 1).into()));
+        }
+        self.db
+            .put_cf(&cf, token.as_bytes(), record.to_string().as_bytes())?;
+        Ok(true)
     }
 
     // --- Federation outbox ---

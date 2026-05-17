@@ -97,6 +97,11 @@ pub struct ServerConfig {
     /// to delegate auth to an external IdP. Token validation against
     /// the IdP is NOT wired up yet — phase 2.
     pub oidc: OidcConfig,
+    /// Localpart of the server-internal admin bot. Defaults to
+    /// `"admin"` (full MXID `@admin:<server_name>`). The localpart is
+    /// reserved on `/register` — operators cannot register an account
+    /// at this localpart even with a valid token. See `crate::admin`.
+    pub admin_bot_localpart: String,
 }
 
 /// Classic `/voip/turnServer` configuration.

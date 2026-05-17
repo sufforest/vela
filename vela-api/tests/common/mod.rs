@@ -139,6 +139,7 @@ impl Harness {
                 voip: vela_api::router::VoipConfig::default(),
                 rtc: vela_api::router::RtcConfig::default(),
                 oidc: overrides.oidc,
+                admin_bot_localpart: vela_api::admin::DEFAULT_BOT_LOCALPART.to_string(),
             }),
             room_locks: Arc::new(DashMap::new()),
             user_locks: Arc::new(DashMap::new()),
