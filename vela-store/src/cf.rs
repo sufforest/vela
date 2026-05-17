@@ -36,6 +36,15 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     "device_key_changes",
     "media_metadata",
     "receipts",
+    // Generic small-value position tracking. Keys are
+    // `<purpose-prefix>:<scope-bytes>`, values are u64 BE-encoded
+    // stream positions. Lets `/sync` skip emitting per-type snapshots
+    // (m.receipt, m.fully_read, room tags) when the client's `since`
+    // cursor already covers every update — without this every
+    // incremental sync re-emits the full snapshot, bypasses the
+    // unchanged-room skip rule, and clients hammer /sync. Single CF
+    // so future tracking gaps don't each become a new CF.
+    "stream_positions",
     "room_aliases",
     "server_keys",
     "sliding_sync_conns",

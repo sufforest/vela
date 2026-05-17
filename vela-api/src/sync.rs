@@ -853,7 +853,24 @@ fn build_room_sync_for_user(
 
     // Receipts. MSC4102/TestThreadReceiptsInSyncMSC4102 contract lives
     // inside the shared helper (unthreaded entry wins for clients).
-    if let Some(receipts_event) = build_receipts_event(state, room_nid)? {
+    // Skip emit on incremental sync when no receipt has been written
+    // since the client's cursor — without this, every /sync re-emits
+    // the full receipt snapshot regardless of whether anything changed,
+    // and the unchanged-room skip rule never fires (rooms.join always
+    // contains every joined room, has_new_data is always true, the
+    // long-poll never sleeps, clients hammer at ~0.5s).
+    let receipts_changed = match (since, user_nid) {
+        (Some(since_pos), Some(_)) => state
+            .db
+            .get_room_receipts_max_pos(room_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            .is_some_and(|max| max > since_pos),
+        _ => true, // initial sync OR unauthenticated: always emit the snapshot
+    };
+    if receipts_changed
+        && let Some(uid) = user_nid
+        && let Some(receipts_event) = build_receipts_event(state, room_nid, uid)?
+    {
         ephemeral_events.push(receipts_event);
     }
 
@@ -866,15 +883,26 @@ fn build_room_sync_for_user(
         .count_room_members_by_membership(room_nid, 2)
         .unwrap_or(0);
 
-    let room_account_data = match user_nid {
-        Some(uid) => state
+    // Same delta-skip as receipts above: on incremental sync, skip the
+    // room_account_data snapshot when nothing has changed in the
+    // `(user, room)` slot since the client's `since` cursor.
+    let room_account_data_changed = match (since, user_nid) {
+        (Some(since_pos), Some(uid)) => state
+            .db
+            .get_room_account_data_max_pos(uid, room_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            .is_some_and(|max| max > since_pos),
+        _ => true,
+    };
+    let room_account_data = match (user_nid, room_account_data_changed) {
+        (Some(uid), true) => state
             .db
             .get_all_room_account_data(uid, room_nid)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
             .into_iter()
             .map(|(dtype, content)| json!({"type": dtype, "content": content}))
             .collect::<Vec<_>>(),
-        None => Vec::new(),
+        _ => Vec::new(),
     };
 
     // Approximate unread_notifications by counting non-state events
@@ -1136,6 +1164,7 @@ fn recipient_room_displayname(
 pub(crate) fn build_receipts_event(
     state: &AppState,
     room_nid: u64,
+    for_user_nid: u64,
 ) -> Result<Option<Value>, ApiError> {
     let receipts = state
         .db
@@ -1148,6 +1177,14 @@ pub(crate) fn build_receipts_event(
     sorted.sort_by_key(|r| r.2.is_none());
     let mut content_map = serde_json::Map::new();
     for (receipt_type, user_nid, thread_id, receipt_val) in sorted {
+        // Spec: `m.read.private` is visible ONLY to the user who set
+        // it — never to other room members, never to remote servers.
+        // Without this filter Element shows two "seen by" entries for
+        // the same reader (their public + private receipts both leak
+        // into other users' sync responses).
+        if receipt_type == "m.read.private" && *user_nid != for_user_nid {
+            continue;
+        }
         if let (Some(event_id), Some(ts)) = (
             receipt_val.get("event_id").and_then(|v| v.as_str()),
             receipt_val.get("ts").and_then(|v| v.as_u64()),
