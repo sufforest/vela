@@ -172,6 +172,12 @@ pub struct AppState {
     pub config: Arc<ServerConfig>,
     pub room_locks: Arc<DashMap<Nid, Arc<tokio::sync::Mutex<()>>>>,
     pub user_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-user lock for `/room_keys/*` mutating handlers. Separate
+    /// from `user_locks` so backup uploads don't serialize with
+    /// device-key uploads. Sessions go to distinct CF rows so cross-
+    /// session writes are inherently race-free; this lock protects
+    /// the (read, modify, write) cycles on version metadata + stats.
+    pub key_backup_user_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
     pub room_senders: Arc<DashMap<Nid, tokio::sync::broadcast::Sender<u64>>>,
     /// In-memory typing state: room_nid → [(user_nid, expires_at_ms)]
     pub typing_state: Arc<DashMap<u64, Vec<(u64, u64)>>>,

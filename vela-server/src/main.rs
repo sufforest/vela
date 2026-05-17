@@ -926,6 +926,7 @@ fn main() -> anyhow::Result<()> {
             }),
             room_locks: Arc::new(DashMap::new()),
             user_locks: Arc::new(DashMap::new()),
+            key_backup_user_locks: Arc::new(DashMap::new()),
             room_senders: Arc::new(DashMap::new()),
             typing_state: Arc::new(DashMap::new()),
             typing_change_pos: Arc::new(DashMap::new()),

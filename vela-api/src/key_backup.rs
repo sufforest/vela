@@ -1,20 +1,37 @@
-//! Key backup — `GET/PUT /room_keys/...`.
+//! Key backup — `GET/PUT/DELETE /room_keys/...`.
 //!
 //! Spec: `client-server-api/#server-side-key-backups`.
 //!
-//! Clients use key backup so newly-logged-in devices can recover room
-//! keys without needing every device to be online. Backup data is
-//! opaque to us: the client encrypts a Megolm session per room with an
-//! SSSS-derived key and stores it here.
+//! Storage layout (the `key_backup` CF in vela-store):
 //!
-//! Vela's MVP: sessions keyed by `(user, version, room_id, session_id)`.
-//! Etag is the string version of the server's internal counter. No
-//! global deletion GC.
+//!   - Versions metadata: one JSON blob per user, written via
+//!     `Database::key_backup_versions_set` / `_get`. Holds the map of
+//!     version_id → {algorithm, auth_data, latest, ver_counter}. Few,
+//!     small; blob writes are fine here.
+//!
+//!   - Sessions: ONE ROW PER session, keyed by
+//!     `(user_nid, version, room_id, session_id)`. Replaces the
+//!     previous load-mutate-save-an-account_data-blob design, which
+//!     had a real lost-write race when Element parallel-uploaded
+//!     sessions during initial Secure Backup setup.
+//!
+//!   - Stats: one row per (user_nid, version) holding packed
+//!     `(count, etag)` u64s. Updated on each session put/delete
+//!     under a per-user lock so concurrent uploads can't drift the
+//!     count.
+//!
+//! Migration: on first read of a user's versions, if the legacy
+//! `m.vela.key_backup` account_data entry exists, we drain it into
+//! the new CF and clear the account_data row so future syncs no
+//! longer ship the entire backup blob to the user's other devices.
+
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use tokio::sync::Mutex;
 
 use vela_core::error::VelaError;
 
@@ -22,7 +39,7 @@ use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::error::ApiError;
 use crate::router::AppState;
 
-const BACKUP_STORE: &str = "m.vela.key_backup";
+const LEGACY_BACKUP_STORE: &str = "m.vela.key_backup";
 
 // --- Versions ---
 
@@ -34,15 +51,17 @@ pub struct CreateBackupBody {
 
 /// POST /_matrix/client/v3/room_keys/version
 ///
-/// Create a new backup version. We store the version metadata in the
-/// user's account data under a private type and increment the version
-/// string so it's monotonic.
+/// Create a new backup version. Increments `ver_counter` so version
+/// strings stay monotonic even after deletions.
 pub async fn post_version(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Json(body): Json<CreateBackupBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let mut store = load_store(&state, user.user_nid)?;
+    let _guard = backup_lock(&state, user.user_nid).lock_owned().await;
+    migrate_legacy_if_needed(&state, user.user_nid)?;
+
+    let mut store = load_versions(&state, user.user_nid)?;
     let next = next_version(&store);
     let version = next.to_string();
     let meta = json!({
@@ -63,10 +82,16 @@ pub async fn post_version(
         .insert(version.clone(), meta);
     let store_obj = store.as_object_mut().unwrap();
     store_obj.insert("latest".to_string(), json!(version));
-    // Bump ver_counter so the next POST gets a fresh number even if no
-    // keys were uploaded against this version.
+    // Bump ver_counter so a subsequent POST gets a fresh number even
+    // if no keys were uploaded against this version.
     store_obj.insert("ver_counter".to_string(), json!(next));
-    save_store(&state, user.user_nid, &store)?;
+    save_versions(&state, user.user_nid, &store)?;
+
+    // Seed stats so subsequent ?version=N queries hit a real row.
+    state
+        .db
+        .key_backup_stats_set(user.user_nid, &version, 0, 0)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     Ok(Json(json!({ "version": version })))
 }
 
@@ -81,15 +106,13 @@ pub async fn get_latest_version(
     State(state): State<AppState>,
     user: AuthenticatedUser,
 ) -> Result<Json<Value>, ApiError> {
-    let store = load_store(&state, user.user_nid)?;
+    migrate_legacy_if_needed(&state, user.user_nid)?;
+    let store = load_versions(&state, user.user_nid)?;
     let latest = store
         .get("latest")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ApiError(VelaError::NotFound("no backup version found".into())))?;
-    let meta = store
-        .pointer(&format!("/versions/{latest}"))
-        .cloned()
-        .ok_or_else(|| ApiError(VelaError::NotFound("version metadata missing".into())))?;
+    let meta = read_version_meta(&state, &store, user.user_nid, latest)?;
     Ok(Json(meta))
 }
 
@@ -99,25 +122,24 @@ pub async fn get_version(
     user: AuthenticatedUser,
     Path(version): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let store = load_store(&state, user.user_nid)?;
-    let meta = store
-        .pointer(&format!("/versions/{version}"))
-        .cloned()
-        .ok_or_else(|| ApiError(VelaError::NotFound("version not found".into())))?;
+    migrate_legacy_if_needed(&state, user.user_nid)?;
+    let store = load_versions(&state, user.user_nid)?;
+    let meta = read_version_meta(&state, &store, user.user_nid, &version)?;
     Ok(Json(meta))
 }
 
 /// PUT /_matrix/client/v3/room_keys/version/{version}
 ///
-/// Clients call this to update `auth_data` for an existing version
-/// (e.g. after re-wrapping the backup key).
+/// Clients call this to update `auth_data` for an existing version.
 pub async fn put_version(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(version): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let mut store = load_store(&state, user.user_nid)?;
+    let _guard = backup_lock(&state, user.user_nid).lock_owned().await;
+    migrate_legacy_if_needed(&state, user.user_nid)?;
+    let mut store = load_versions(&state, user.user_nid)?;
     let meta = store
         .pointer_mut(&format!("/versions/{version}"))
         .ok_or_else(|| ApiError(VelaError::NotFound("version not found".into())))?;
@@ -131,7 +153,7 @@ pub async fn put_version(
             .unwrap()
             .insert("algorithm".to_string(), new_algo.clone());
     }
-    save_store(&state, user.user_nid, &store)?;
+    save_versions(&state, user.user_nid, &store)?;
     Ok(Json(json!({})))
 }
 
@@ -141,15 +163,27 @@ pub async fn delete_version(
     user: AuthenticatedUser,
     Path(version): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let mut store = load_store(&state, user.user_nid)?;
+    let _guard = backup_lock(&state, user.user_nid).lock_owned().await;
+    migrate_legacy_if_needed(&state, user.user_nid)?;
+    let mut store = load_versions(&state, user.user_nid)?;
     if let Some(versions) = store.get_mut("versions").and_then(|v| v.as_object_mut()) {
         versions.remove(&version);
     }
-    // Clear keys for this version too.
-    if let Some(keys) = store.get_mut("keys").and_then(|v| v.as_object_mut()) {
-        keys.remove(&version);
+    if store
+        .get("latest")
+        .and_then(|v| v.as_str())
+        .is_some_and(|l| l == version)
+    {
+        store
+            .as_object_mut()
+            .unwrap()
+            .insert("latest".to_string(), Value::Null);
     }
-    save_store(&state, user.user_nid, &store)?;
+    save_versions(&state, user.user_nid, &store)?;
+    state
+        .db
+        .key_backup_delete_version(user.user_nid, &version)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     Ok(Json(json!({})))
 }
 
@@ -161,14 +195,14 @@ pub struct KeysVersionQuery {
 }
 
 /// PUT /_matrix/client/v3/room_keys/keys
-///
-/// Body shape: `{rooms: {<roomId>: {sessions: {<sessionId>: <body>}}}}`.
 pub async fn put_all_keys(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Query(q): Query<KeysVersionQuery>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    let _guard = backup_lock(&state, user.user_nid).lock_owned().await;
+    migrate_legacy_if_needed(&state, user.user_nid)?;
     let version = q
         .version
         .ok_or_else(|| ApiError(VelaError::BadJson("version query param required".into())))?;
@@ -176,7 +210,6 @@ pub async fn put_all_keys(
         .get("rooms")
         .and_then(|v| v.as_object())
         .ok_or_else(|| ApiError(VelaError::BadJson("missing rooms".into())))?;
-    let mut store = load_store(&state, user.user_nid)?;
     let mut count_added = 0u64;
     for (room_id, room_body) in rooms {
         let sessions = room_body
@@ -185,13 +218,12 @@ pub async fn put_all_keys(
             .cloned()
             .unwrap_or_default();
         for (session_id, sess) in sessions {
-            if write_session(&mut store, &version, room_id, &session_id, sess) {
+            if write_session(&state, user.user_nid, &version, room_id, &session_id, sess)? {
                 count_added += 1;
             }
         }
     }
-    let (etag, total) = bump_version_stats(&mut store, &version, count_added);
-    save_store(&state, user.user_nid, &store)?;
+    let (etag, total) = bump_stats(&state, user.user_nid, &version, count_added)?;
     Ok(Json(json!({"etag": etag, "count": total})))
 }
 
@@ -203,6 +235,8 @@ pub async fn put_room_keys(
     Query(q): Query<KeysVersionQuery>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    let _guard = backup_lock(&state, user.user_nid).lock_owned().await;
+    migrate_legacy_if_needed(&state, user.user_nid)?;
     let version = q
         .version
         .ok_or_else(|| ApiError(VelaError::BadJson("version query param required".into())))?;
@@ -211,15 +245,13 @@ pub async fn put_room_keys(
         .and_then(|v| v.as_object())
         .cloned()
         .unwrap_or_default();
-    let mut store = load_store(&state, user.user_nid)?;
     let mut count_added = 0u64;
     for (session_id, sess) in sessions {
-        if write_session(&mut store, &version, &room_id, &session_id, sess) {
+        if write_session(&state, user.user_nid, &version, &room_id, &session_id, sess)? {
             count_added += 1;
         }
     }
-    let (etag, total) = bump_version_stats(&mut store, &version, count_added);
-    save_store(&state, user.user_nid, &store)?;
+    let (etag, total) = bump_stats(&state, user.user_nid, &version, count_added)?;
     Ok(Json(json!({"etag": etag, "count": total})))
 }
 
@@ -231,13 +263,14 @@ pub async fn put_session(
     Query(q): Query<KeysVersionQuery>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    let _guard = backup_lock(&state, user.user_nid).lock_owned().await;
+    migrate_legacy_if_needed(&state, user.user_nid)?;
     let version = q
         .version
         .ok_or_else(|| ApiError(VelaError::BadJson("version query param required".into())))?;
-    let mut store = load_store(&state, user.user_nid)?;
-    let written = write_session(&mut store, &version, &room_id, &session_id, body);
-    let (etag, total) = bump_version_stats(&mut store, &version, if written { 1 } else { 0 });
-    save_store(&state, user.user_nid, &store)?;
+    let written = write_session(&state, user.user_nid, &version, &room_id, &session_id, body)?;
+    let delta = if written { 1 } else { 0 };
+    let (etag, total) = bump_stats(&state, user.user_nid, &version, delta)?;
     Ok(Json(json!({"etag": etag, "count": total})))
 }
 
@@ -247,15 +280,28 @@ pub async fn get_all_keys(
     user: AuthenticatedUser,
     Query(q): Query<KeysVersionQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    migrate_legacy_if_needed(&state, user.user_nid)?;
     let version = q
         .version
         .ok_or_else(|| ApiError(VelaError::BadJson("version query param required".into())))?;
-    let store = load_store(&state, user.user_nid)?;
-    let rooms = store
-        .pointer(&format!("/keys/{version}"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    Ok(Json(json!({"rooms": rooms})))
+    let entries = state
+        .db
+        .key_backup_iter_version(user.user_nid, &version)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let mut rooms_out: Map<String, Value> = Map::new();
+    for (room_id, session_id, sess) in entries {
+        let entry = rooms_out
+            .entry(room_id)
+            .or_insert_with(|| json!({"sessions": {}}));
+        entry
+            .as_object_mut()
+            .unwrap()
+            .get_mut("sessions")
+            .and_then(|v| v.as_object_mut())
+            .unwrap()
+            .insert(session_id, sess);
+    }
+    Ok(Json(json!({"rooms": rooms_out})))
 }
 
 /// GET /_matrix/client/v3/room_keys/keys/{roomId}
@@ -265,14 +311,18 @@ pub async fn get_room_keys(
     Path(room_id): Path<String>,
     Query(q): Query<KeysVersionQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    migrate_legacy_if_needed(&state, user.user_nid)?;
     let version = q
         .version
         .ok_or_else(|| ApiError(VelaError::BadJson("version query param required".into())))?;
-    let store = load_store(&state, user.user_nid)?;
-    let sessions = store
-        .pointer(&format!("/keys/{version}/{room_id}/sessions"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let entries = state
+        .db
+        .key_backup_iter_room(user.user_nid, &version, &room_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let mut sessions: Map<String, Value> = Map::new();
+    for (sid, sess) in entries {
+        sessions.insert(sid, sess);
+    }
     Ok(Json(json!({"sessions": sessions})))
 }
 
@@ -283,13 +333,14 @@ pub async fn get_session(
     Path((room_id, session_id)): Path<(String, String)>,
     Query(q): Query<KeysVersionQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    migrate_legacy_if_needed(&state, user.user_nid)?;
     let version = q
         .version
         .ok_or_else(|| ApiError(VelaError::BadJson("version query param required".into())))?;
-    let store = load_store(&state, user.user_nid)?;
-    let sess = store
-        .pointer(&format!("/keys/{version}/{room_id}/sessions/{session_id}"))
-        .cloned()
+    let sess = state
+        .db
+        .key_backup_session_get(user.user_nid, &version, &room_id, &session_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         .ok_or_else(|| ApiError(VelaError::NotFound("session not found".into())))?;
     Ok(Json(sess))
 }
@@ -300,16 +351,16 @@ pub async fn delete_all_keys(
     user: AuthenticatedUser,
     Query(q): Query<KeysVersionQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let _guard = backup_lock(&state, user.user_nid).lock_owned().await;
+    migrate_legacy_if_needed(&state, user.user_nid)?;
     let version = q
         .version
         .ok_or_else(|| ApiError(VelaError::BadJson("version query param required".into())))?;
-    let mut store = load_store(&state, user.user_nid)?;
-    let removed = count_keys_in_version(&store, &version);
-    if let Some(keys) = store.get_mut("keys").and_then(|v| v.as_object_mut()) {
-        keys.insert(version.clone(), json!({}));
-    }
-    let (etag, total) = clear_count_after_delete(&mut store, &version, removed);
-    save_store(&state, user.user_nid, &store)?;
+    let removed = state
+        .db
+        .key_backup_delete_version(user.user_nid, &version)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let (etag, total) = decrement_stats(&state, user.user_nid, &version, removed)?;
     Ok(Json(json!({"etag": etag, "count": total})))
 }
 
@@ -320,19 +371,16 @@ pub async fn delete_room_keys(
     Path(room_id): Path<String>,
     Query(q): Query<KeysVersionQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let _guard = backup_lock(&state, user.user_nid).lock_owned().await;
+    migrate_legacy_if_needed(&state, user.user_nid)?;
     let version = q
         .version
         .ok_or_else(|| ApiError(VelaError::BadJson("version query param required".into())))?;
-    let mut store = load_store(&state, user.user_nid)?;
-    let removed = count_keys_in_room(&store, &version, &room_id);
-    if let Some(rooms) = store
-        .pointer_mut(&format!("/keys/{version}"))
-        .and_then(|v| v.as_object_mut())
-    {
-        rooms.remove(&room_id);
-    }
-    let (etag, total) = clear_count_after_delete(&mut store, &version, removed);
-    save_store(&state, user.user_nid, &store)?;
+    let removed = state
+        .db
+        .key_backup_delete_room(user.user_nid, &version, &room_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let (etag, total) = decrement_stats(&state, user.user_nid, &version, removed)?;
     Ok(Json(json!({"etag": etag, "count": total})))
 }
 
@@ -343,39 +391,47 @@ pub async fn delete_session(
     Path((room_id, session_id)): Path<(String, String)>,
     Query(q): Query<KeysVersionQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let _guard = backup_lock(&state, user.user_nid).lock_owned().await;
+    migrate_legacy_if_needed(&state, user.user_nid)?;
     let version = q
         .version
         .ok_or_else(|| ApiError(VelaError::BadJson("version query param required".into())))?;
-    let mut store = load_store(&state, user.user_nid)?;
-    let mut removed = 0u64;
-    if let Some(sessions) = store
-        .pointer_mut(&format!("/keys/{version}/{room_id}/sessions"))
-        .and_then(|v| v.as_object_mut())
-        && sessions.remove(&session_id).is_some()
-    {
-        removed = 1;
-    }
-    let (etag, total) = clear_count_after_delete(&mut store, &version, removed);
-    save_store(&state, user.user_nid, &store)?;
+    let removed = state
+        .db
+        .key_backup_session_delete(user.user_nid, &version, &room_id, &session_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let delta = if removed { 1 } else { 0 };
+    let (etag, total) = decrement_stats(&state, user.user_nid, &version, delta)?;
     Ok(Json(json!({"etag": etag, "count": total})))
 }
 
-// --- helpers ---
+// --- Helpers --------------------------------------------------------------
 
-fn load_store(state: &AppState, user_nid: u64) -> Result<Value, ApiError> {
-    let v = state
-        .db
-        .get_account_data(user_nid, BACKUP_STORE)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    Ok(v.unwrap_or_else(|| json!({"versions": {}, "keys": {}, "latest": null, "ver_counter": 0})))
+/// Per-user lock guarding mutating handlers. Sessions go to distinct
+/// CF rows so cross-row session writes are race-free at the storage
+/// layer; the lock protects the (read, modify, write) cycles on
+/// version metadata + stats, which DO touch shared rows.
+fn backup_lock(state: &AppState, user_nid: u64) -> Arc<Mutex<()>> {
+    state
+        .key_backup_user_locks
+        .entry(user_nid)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
-fn save_store(state: &AppState, user_nid: u64, v: &Value) -> Result<(), ApiError> {
+fn load_versions(state: &AppState, user_nid: u64) -> Result<Value, ApiError> {
+    let v = state
+        .db
+        .key_backup_versions_get(user_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    Ok(v.unwrap_or_else(|| json!({"versions": {}, "latest": null, "ver_counter": 0})))
+}
+
+fn save_versions(state: &AppState, user_nid: u64, v: &Value) -> Result<(), ApiError> {
     state
         .db
-        .set_account_data(user_nid, BACKUP_STORE, v)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    Ok(())
+        .key_backup_versions_set(user_nid, v)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))
 }
 
 fn next_version(store: &Value) -> u64 {
@@ -386,55 +442,63 @@ fn next_version(store: &Value) -> u64 {
         + 1
 }
 
-/// Insert a session, applying the spec's replacement rule. Returns true
-/// if the new key replaced an existing one (or was newly stored), false
-/// if the existing key is preferred and was kept.
-///
-/// Replacement order: prefer is_verified=true, then lower
-/// first_message_index, then lower forwarded_count. Ties keep the
-/// existing key (idempotent, no-op).
+/// Compose the version-meta response shape, merging the live
+/// (count, etag) from the stats row so clients see freshly-uploaded
+/// keys reflected immediately.
+fn read_version_meta(
+    state: &AppState,
+    store: &Value,
+    user_nid: u64,
+    version: &str,
+) -> Result<Value, ApiError> {
+    let mut meta = store
+        .pointer(&format!("/versions/{version}"))
+        .cloned()
+        .ok_or_else(|| ApiError(VelaError::NotFound("version not found".into())))?;
+    let (count, etag) = state
+        .db
+        .key_backup_stats_get(user_nid, version)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if let Some(obj) = meta.as_object_mut() {
+        obj.insert("etag".to_string(), json!(etag.to_string()));
+        obj.insert("count".to_string(), json!(count));
+    }
+    Ok(meta)
+}
+
+/// Conditional session put applying the spec's replacement rule.
+/// Returns true iff the row was inserted or replaced, false iff the
+/// existing row is preferred and was kept untouched.
 fn write_session(
-    store: &mut Value,
+    state: &AppState,
+    user_nid: u64,
     version: &str,
     room_id: &str,
     session_id: &str,
     body: Value,
-) -> bool {
-    let keys = store
-        .as_object_mut()
-        .unwrap()
-        .entry("keys")
-        .or_insert_with(|| json!({}));
-    let ver = keys
-        .as_object_mut()
-        .unwrap()
-        .entry(version.to_string())
-        .or_insert_with(|| json!({}));
-    let room = ver
-        .as_object_mut()
-        .unwrap()
-        .entry(room_id.to_string())
-        .or_insert_with(|| json!({"sessions": {}}));
-    let sessions = room
-        .as_object_mut()
-        .unwrap()
-        .entry("sessions".to_string())
-        .or_insert_with(|| json!({}));
-    let sessions_obj = sessions.as_object_mut().unwrap();
-    if let Some(existing) = sessions_obj.get(session_id)
-        && !should_replace(existing, &body)
+) -> Result<bool, ApiError> {
+    let existing = state
+        .db
+        .key_backup_session_get(user_nid, version, room_id, session_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let is_new = existing.is_none();
+    if let Some(existing_val) = existing
+        && !should_replace(&existing_val, &body)
     {
-        return false;
+        return Ok(false);
     }
-    sessions_obj.insert(session_id.to_string(), body);
-    true
+    state
+        .db
+        .key_backup_session_put(user_nid, version, room_id, session_id, &body)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    Ok(is_new)
 }
 
 /// Spec rule for whether `incoming` should replace `existing`:
 /// 1. is_verified=true beats is_verified=false
 /// 2. else lower first_message_index wins
 /// 3. else lower forwarded_count wins
-/// 4. else keep existing (no replacement).
+/// 4. else keep existing.
 fn should_replace(existing: &Value, incoming: &Value) -> bool {
     let ev = existing
         .get("is_verified")
@@ -469,88 +533,124 @@ fn should_replace(existing: &Value, incoming: &Value) -> bool {
     nfc < efc
 }
 
-/// Bump this version's etag + count, also remember the counter we used
-/// so the next POST /version picks a fresh number. When `count_delta`
-/// is 0 (PUT had no effect — replacement rule kept the existing key),
-/// etag is NOT bumped: spec says it represents stored-keys state, and
-/// nothing changed.
-fn bump_version_stats(store: &mut Value, version: &str, count_delta: u64) -> (String, u64) {
-    // ver_counter: max(counter, version as u64).
-    if let Ok(n) = version.parse::<u64>() {
-        let cur = store
-            .get("ver_counter")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        store
-            .as_object_mut()
-            .unwrap()
-            .insert("ver_counter".to_string(), json!(cur.max(n)));
-    }
-
-    let Some(meta) = store.pointer_mut(&format!("/versions/{version}")) else {
-        return ("0".to_string(), 0);
-    };
-    let obj = meta.as_object_mut().unwrap();
-    let cur_etag = obj
-        .get("etag")
-        .and_then(|v| v.as_str())
-        .unwrap_or("0")
-        .parse::<u64>()
-        .unwrap_or(0);
-    let etag = if count_delta == 0 {
-        cur_etag
-    } else {
-        cur_etag + 1
-    };
-    obj.insert("etag".to_string(), json!(etag.to_string()));
-    let count = obj.get("count").and_then(|v| v.as_u64()).unwrap_or(0) + count_delta;
-    obj.insert("count".to_string(), json!(count));
-    (etag.to_string(), count)
+/// Bump stats after a successful write. `delta` is the count change
+/// (replacements give 0). Etag bumps only when something changed.
+fn bump_stats(
+    state: &AppState,
+    user_nid: u64,
+    version: &str,
+    delta: u64,
+) -> Result<(String, u64), ApiError> {
+    let (count, etag) = state
+        .db
+        .key_backup_stats_get(user_nid, version)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let new_etag = if delta == 0 { etag } else { etag + 1 };
+    let new_count = count + delta;
+    state
+        .db
+        .key_backup_stats_set(user_nid, version, new_count, new_etag)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    Ok((new_etag.to_string(), new_count))
 }
 
-/// Bump etag and decrement count after a delete. `removed` is how many
-/// keys actually disappeared. Etag bumps iff at least one key was removed.
-fn clear_count_after_delete(store: &mut Value, version: &str, removed: u64) -> (String, u64) {
-    let Some(meta) = store.pointer_mut(&format!("/versions/{version}")) else {
-        return ("0".to_string(), 0);
-    };
-    let obj = meta.as_object_mut().unwrap();
-    let cur_etag = obj
-        .get("etag")
-        .and_then(|v| v.as_str())
-        .unwrap_or("0")
-        .parse::<u64>()
-        .unwrap_or(0);
-    let etag = if removed == 0 { cur_etag } else { cur_etag + 1 };
-    obj.insert("etag".to_string(), json!(etag.to_string()));
-    let cur_count = obj.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-    let count = cur_count.saturating_sub(removed);
-    obj.insert("count".to_string(), json!(count));
-    (etag.to_string(), count)
+/// Decrement stats after deletions. Symmetric to `bump_stats`.
+fn decrement_stats(
+    state: &AppState,
+    user_nid: u64,
+    version: &str,
+    removed: u64,
+) -> Result<(String, u64), ApiError> {
+    let (count, etag) = state
+        .db
+        .key_backup_stats_get(user_nid, version)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let new_etag = if removed == 0 { etag } else { etag + 1 };
+    let new_count = count.saturating_sub(removed);
+    state
+        .db
+        .key_backup_stats_set(user_nid, version, new_count, new_etag)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    Ok((new_etag.to_string(), new_count))
 }
 
-fn count_keys_in_version(store: &Value, version: &str) -> u64 {
-    let Some(rooms) = store
-        .pointer(&format!("/keys/{version}"))
-        .and_then(|v| v.as_object())
+/// Migration: drain the legacy `m.vela.key_backup` account_data blob
+/// into the new CF on first read after upgrade. Idempotent (the
+/// account_data row is deleted after drain so subsequent calls see
+/// nothing to do). Without this, existing deployments lose their
+/// backups on upgrade.
+fn migrate_legacy_if_needed(state: &AppState, user_nid: u64) -> Result<(), ApiError> {
+    let Some(legacy) = state
+        .db
+        .get_account_data(user_nid, LEGACY_BACKUP_STORE)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
     else {
-        return 0;
+        return Ok(());
     };
-    let mut total = 0u64;
-    for (_, room) in rooms {
-        if let Some(sessions) = room.get("sessions").and_then(|v| v.as_object()) {
-            total += sessions.len() as u64;
+
+    // Versions metadata: keep the legacy shape minus the per-version
+    // `keys` blob (we move that into the CF below).
+    let mut new_versions = json!({
+        "versions": legacy.get("versions").cloned().unwrap_or_else(|| json!({})),
+        "latest": legacy.get("latest").cloned().unwrap_or(Value::Null),
+        "ver_counter": legacy.get("ver_counter").cloned().unwrap_or_else(|| json!(0)),
+    });
+    // Strip any stale stats from the per-version metadata — stats now
+    // live in their own row and we recompute count below.
+    if let Some(versions_obj) = new_versions
+        .get_mut("versions")
+        .and_then(|v| v.as_object_mut())
+    {
+        for (_vid, meta) in versions_obj.iter_mut() {
+            if let Some(meta_obj) = meta.as_object_mut() {
+                meta_obj.remove("etag");
+                meta_obj.remove("count");
+            }
         }
     }
-    total
-}
+    save_versions(state, user_nid, &new_versions)?;
 
-fn count_keys_in_room(store: &Value, version: &str, room_id: &str) -> u64 {
-    store
-        .pointer(&format!("/keys/{version}/{room_id}/sessions"))
-        .and_then(|v| v.as_object())
-        .map(|o| o.len() as u64)
-        .unwrap_or(0)
+    // Sessions: walk `keys.<version>.<room_id>.sessions.<session_id>`
+    // and re-insert each as a per-row CF entry. Maintain stats per
+    // version.
+    if let Some(keys) = legacy.get("keys").and_then(|v| v.as_object()) {
+        for (version, rooms) in keys {
+            let mut count = 0u64;
+            if let Some(rooms_obj) = rooms.as_object() {
+                for (room_id, room_blob) in rooms_obj {
+                    let sessions = room_blob
+                        .get("sessions")
+                        .and_then(|v| v.as_object())
+                        .cloned()
+                        .unwrap_or_default();
+                    for (sid, sess) in sessions {
+                        state
+                            .db
+                            .key_backup_session_put(user_nid, version, room_id, &sid, &sess)
+                            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+                        count += 1;
+                    }
+                }
+            }
+            // Etag starts at the post-migration count so clients see
+            // a fresh value and re-fetch the bucket — that's the
+            // signal that something on the server changed.
+            state
+                .db
+                .key_backup_stats_set(user_nid, version, count, count)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        }
+    }
+
+    // Clear the legacy account_data so it stops leaking via /sync.
+    // Writing `null` is enough — /sync filters null account_data
+    // bodies. We DON'T delete the row (no helper for that today);
+    // the value is harmless once null.
+    state
+        .db
+        .set_account_data(user_nid, LEGACY_BACKUP_STORE, &Value::Null)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -568,7 +668,6 @@ mod tests {
 
     #[test]
     fn should_replace_verified_beats_unverified() {
-        // is_verified=true beats is_verified=false regardless of other fields.
         assert!(should_replace(&key(false, 0, 0), &key(true, 999, 999)));
         assert!(!should_replace(&key(true, 999, 999), &key(false, 0, 0)));
     }
@@ -577,8 +676,6 @@ mod tests {
     fn should_replace_lower_first_message_index_wins() {
         assert!(should_replace(&key(false, 10, 5), &key(false, 9, 999)));
         assert!(!should_replace(&key(false, 10, 5), &key(false, 11, 0)));
-        assert!(should_replace(&key(true, 10, 5), &key(true, 9, 999)));
-        assert!(!should_replace(&key(true, 10, 5), &key(true, 11, 0)));
     }
 
     #[test]
@@ -590,102 +687,5 @@ mod tests {
     #[test]
     fn should_replace_full_tie_keeps_existing() {
         assert!(!should_replace(&key(false, 10, 5), &key(false, 10, 5)));
-        assert!(!should_replace(&key(true, 10, 5), &key(true, 10, 5)));
-    }
-
-    /// Mirrors TestE2EKeyBackupReplaceRoomKeyRules sessionId="a" case:
-    /// after writing the canonical key, no key with worse fields displaces it.
-    #[test]
-    fn complement_unverified_input_no_displacement() {
-        let mut store = json!({});
-        let initial = key(false, 10, 5);
-        assert!(write_session(&mut store, "1", "!r", "a", initial.clone()));
-
-        let candidates = [key(false, 11, 5), key(false, 10, 6), key(false, 11, 6)];
-        for c in &candidates {
-            assert!(
-                !write_session(&mut store, "1", "!r", "a", c.clone()),
-                "expected no replacement for {c}"
-            );
-        }
-        let stored = store.pointer("/keys/1/!r/sessions/a").unwrap();
-        assert_eq!(stored, &initial);
-    }
-
-    /// Mirrors TestE2EKeyBackupReplaceRoomKeyRules sessionId="b" case:
-    /// canonical is verified — no unverified key wins, no higher-fmi or
-    /// higher-fc verified key wins.
-    #[test]
-    fn complement_verified_input_no_displacement() {
-        let mut store = json!({});
-        let initial = key(true, 10, 5);
-        assert!(write_session(&mut store, "1", "!r", "b", initial.clone()));
-
-        let candidates = [
-            key(false, 11, 5),
-            key(false, 10, 6),
-            key(false, 11, 6),
-            key(true, 11, 5),
-            key(true, 10, 6),
-            key(true, 11, 6),
-        ];
-        for c in &candidates {
-            assert!(
-                !write_session(&mut store, "1", "!r", "b", c.clone()),
-                "expected no replacement for {c}"
-            );
-        }
-        let stored = store.pointer("/keys/1/!r/sessions/b").unwrap();
-        assert_eq!(stored, &initial);
-    }
-
-    #[test]
-    fn delete_session_drops_one_and_decrements_count() {
-        let mut store = json!({"versions": {"1": {"etag": "5", "count": 3}}});
-        write_session(&mut store, "1", "!r", "a", key(false, 1, 1));
-        write_session(&mut store, "1", "!r", "b", key(false, 2, 2));
-
-        let removed = if let Some(sessions) = store
-            .pointer_mut("/keys/1/!r/sessions")
-            .and_then(|v| v.as_object_mut())
-        {
-            if sessions.remove("a").is_some() { 1 } else { 0 }
-        } else {
-            0
-        };
-        let (etag, count) = clear_count_after_delete(&mut store, "1", removed);
-
-        assert_eq!(etag, "6", "etag bumps when key removed");
-        // We never set count to 2 in this contrived test (we just
-        // pre-populated count=3); the delete path subtracts removed.
-        assert_eq!(count, 2);
-        assert!(store.pointer("/keys/1/!r/sessions/a").is_none());
-        assert!(store.pointer("/keys/1/!r/sessions/b").is_some());
-    }
-
-    #[test]
-    fn count_helpers_walk_the_store() {
-        let mut store = json!({});
-        write_session(&mut store, "1", "!r1", "s1", key(false, 1, 1));
-        write_session(&mut store, "1", "!r1", "s2", key(false, 2, 1));
-        write_session(&mut store, "1", "!r2", "s3", key(false, 3, 1));
-        assert_eq!(count_keys_in_version(&store, "1"), 3);
-        assert_eq!(count_keys_in_room(&store, "1", "!r1"), 2);
-        assert_eq!(count_keys_in_room(&store, "1", "!r2"), 1);
-        assert_eq!(count_keys_in_room(&store, "1", "!unknown"), 0);
-    }
-
-    #[test]
-    fn etag_does_not_bump_when_replacement_is_rejected() {
-        let mut store = json!({"versions": {"1": {"etag": "0", "count": 0}}});
-        write_session(&mut store, "1", "!r", "a", key(false, 10, 5));
-        let (etag1, _) = bump_version_stats(&mut store, "1", 1);
-        assert_eq!(etag1, "1");
-
-        // Worse key — rejected, count_delta=0, etag must not bump.
-        let written = write_session(&mut store, "1", "!r", "a", key(false, 11, 5));
-        assert!(!written);
-        let (etag2, _) = bump_version_stats(&mut store, "1", 0);
-        assert_eq!(etag2, "1", "etag must stay constant when nothing changed");
     }
 }

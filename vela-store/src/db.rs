@@ -2694,6 +2694,237 @@ impl Database {
         self.db.write(batch)
     }
 
+    // --- Key backup CF (per-row sessions, per-user versions metadata) -----
+    //
+    // The handlers in vela-api/src/key_backup.rs live on top of these
+    // primitives. Per-session writes are atomic point updates, so two
+    // concurrent PUTs targeting different session_ids never race; the
+    // earlier account_data-blob design suffered a lost-write race
+    // during Element's parallel session upload.
+
+    /// Read the version-metadata JSON blob for `user_nid`. Returns
+    /// `None` when this user has never created a backup version.
+    pub fn key_backup_versions_get(&self, user_nid: u64) -> Result<Option<Value>, rocksdb::Error> {
+        let cf = self.db.cf_handle("key_backup").unwrap();
+        let key = key_backup_versions_key(user_nid);
+        match self.db.get_cf(&cf, &key)? {
+            Some(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+            None => Ok(None),
+        }
+    }
+
+    /// Overwrite the version-metadata JSON blob for `user_nid`.
+    /// Versions are small (max ~handful per user); a blob write is
+    /// fine here. Per-session data is handled separately by
+    /// `key_backup_session_put`.
+    pub fn key_backup_versions_set(
+        &self,
+        user_nid: u64,
+        value: &Value,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("key_backup").unwrap();
+        let key = key_backup_versions_key(user_nid);
+        self.db.put_cf(&cf, &key, value.to_string().as_bytes())
+    }
+
+    /// Store one session blob. Returns true iff the row was written
+    /// (either new or replaced an existing one); false iff the existing
+    /// row was preferred per the spec's replacement rule and the new
+    /// data was discarded. Caller is expected to have evaluated the
+    /// replacement rule via `key_backup::should_replace` and only call
+    /// here when the new row should win.
+    pub fn key_backup_session_put(
+        &self,
+        user_nid: u64,
+        version: &str,
+        room_id: &str,
+        session_id: &str,
+        value: &Value,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("key_backup").unwrap();
+        let key = key_backup_session_key(user_nid, version, room_id, session_id);
+        self.db.put_cf(&cf, &key, value.to_string().as_bytes())
+    }
+
+    /// Look up one session blob. Returns `None` for unknown session_id.
+    pub fn key_backup_session_get(
+        &self,
+        user_nid: u64,
+        version: &str,
+        room_id: &str,
+        session_id: &str,
+    ) -> Result<Option<Value>, rocksdb::Error> {
+        let cf = self.db.cf_handle("key_backup").unwrap();
+        let key = key_backup_session_key(user_nid, version, room_id, session_id);
+        match self.db.get_cf(&cf, &key)? {
+            Some(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+            None => Ok(None),
+        }
+    }
+
+    /// Delete one session. Returns true iff something was actually
+    /// removed (used by the count maintenance).
+    pub fn key_backup_session_delete(
+        &self,
+        user_nid: u64,
+        version: &str,
+        room_id: &str,
+        session_id: &str,
+    ) -> Result<bool, rocksdb::Error> {
+        let cf = self.db.cf_handle("key_backup").unwrap();
+        let key = key_backup_session_key(user_nid, version, room_id, session_id);
+        let existed = self.db.get_cf(&cf, &key)?.is_some();
+        if existed {
+            self.db.delete_cf(&cf, &key)?;
+        }
+        Ok(existed)
+    }
+
+    /// Iterate every session within (user, version, room). Used by
+    /// `GET /room_keys/keys/{roomId}` to construct the per-room
+    /// session map. Order is RocksDB iteration order — caller treats
+    /// the result as an unordered collection.
+    pub fn key_backup_iter_room(
+        &self,
+        user_nid: u64,
+        version: &str,
+        room_id: &str,
+    ) -> Result<Vec<(String, Value)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("key_backup").unwrap();
+        let prefix = key_backup_room_prefix(user_nid, version, room_id);
+        let iter = self.db.prefix_iterator_cf(&cf, &prefix);
+        let mut out = Vec::new();
+        for item in iter {
+            let (key, val) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if let Some((sid, value)) = key_backup_parse_session_row(&prefix, &key, &val) {
+                out.push((sid, value));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Iterate every session within (user, version) across all rooms.
+    /// Used by `GET /room_keys/keys` to construct the full backup map.
+    pub fn key_backup_iter_version(
+        &self,
+        user_nid: u64,
+        version: &str,
+    ) -> Result<Vec<(String, String, Value)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("key_backup").unwrap();
+        let prefix = key_backup_version_prefix(user_nid, version);
+        let iter = self.db.prefix_iterator_cf(&cf, &prefix);
+        let mut out = Vec::new();
+        for item in iter {
+            let (key, val) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if let Some((room_id, session_id, value)) =
+                key_backup_parse_version_row(&prefix, &key, &val)
+            {
+                out.push((room_id, session_id, value));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete all sessions in `(user, version, room_id)`. Returns
+    /// the number of sessions actually removed for count-maintenance.
+    pub fn key_backup_delete_room(
+        &self,
+        user_nid: u64,
+        version: &str,
+        room_id: &str,
+    ) -> Result<u64, rocksdb::Error> {
+        let cf = self.db.cf_handle("key_backup").unwrap();
+        let prefix = key_backup_room_prefix(user_nid, version, room_id);
+        let mut to_delete = Vec::new();
+        let iter = self.db.prefix_iterator_cf(&cf, &prefix);
+        for item in iter {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            to_delete.push(key.to_vec());
+        }
+        let count = to_delete.len() as u64;
+        let mut batch = WriteBatch::default();
+        for k in &to_delete {
+            batch.delete_cf(&cf, k);
+        }
+        self.db.write(batch)?;
+        Ok(count)
+    }
+
+    /// Delete every session in `(user, version)`. Returns the number
+    /// of sessions actually removed.
+    pub fn key_backup_delete_version(
+        &self,
+        user_nid: u64,
+        version: &str,
+    ) -> Result<u64, rocksdb::Error> {
+        let cf = self.db.cf_handle("key_backup").unwrap();
+        let prefix = key_backup_version_prefix(user_nid, version);
+        let mut to_delete = Vec::new();
+        let iter = self.db.prefix_iterator_cf(&cf, &prefix);
+        for item in iter {
+            let (key, _) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            to_delete.push(key.to_vec());
+        }
+        let count = to_delete.len() as u64;
+        let mut batch = WriteBatch::default();
+        for k in &to_delete {
+            batch.delete_cf(&cf, k);
+        }
+        // Also clear the stats row for this version.
+        batch.delete_cf(&cf, key_backup_stats_key(user_nid, version));
+        self.db.write(batch)?;
+        Ok(count)
+    }
+
+    /// Read packed `(count, etag)` for a backup version. Defaults to
+    /// `(0, 0)` when no stats have been written.
+    pub fn key_backup_stats_get(
+        &self,
+        user_nid: u64,
+        version: &str,
+    ) -> Result<(u64, u64), rocksdb::Error> {
+        let cf = self.db.cf_handle("key_backup").unwrap();
+        let key = key_backup_stats_key(user_nid, version);
+        match self.db.get_cf(&cf, &key)? {
+            Some(bytes) if bytes.len() == 16 => {
+                let mut count_buf = [0u8; 8];
+                let mut etag_buf = [0u8; 8];
+                count_buf.copy_from_slice(&bytes[..8]);
+                etag_buf.copy_from_slice(&bytes[8..]);
+                Ok((u64::from_be_bytes(count_buf), u64::from_be_bytes(etag_buf)))
+            }
+            _ => Ok((0, 0)),
+        }
+    }
+
+    /// Write packed `(count, etag)` for a backup version.
+    pub fn key_backup_stats_set(
+        &self,
+        user_nid: u64,
+        version: &str,
+        count: u64,
+        etag: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("key_backup").unwrap();
+        let key = key_backup_stats_key(user_nid, version);
+        let mut val = [0u8; 16];
+        val[..8].copy_from_slice(&count.to_be_bytes());
+        val[8..].copy_from_slice(&etag.to_be_bytes());
+        self.db.put_cf(&cf, &key, val)
+    }
+
     /// MSC4306 thread subscription state for one user/room/thread.
     /// `state`: 0 = unsubscribed (sentinel kept for conflict detection),
     /// 1 = manual subscription, 2 = automatic subscription.
@@ -4670,6 +4901,127 @@ fn room_account_data_pos_key(user_nid: u64, room_nid: u64) -> Vec<u8> {
     k.extend_from_slice(&keys::encode_u64(user_nid));
     k.extend_from_slice(&keys::encode_u64(room_nid));
     k
+}
+
+// --- Key backup: per-row keys for the `key_backup` CF -----------------------
+//
+// Three logical sub-stores share one CF, distinguished by a one-byte
+// prefix:
+//
+//   b"v" + user_nid_be         → versions metadata JSON blob (small,
+//                                 infrequently written; one per user)
+//   b"s" + user_nid_be
+//       + version_len_be:u16 + version_bytes
+//       + room_len_be:u16 + room_id_bytes
+//       + session_id_bytes      → session JSON blob (one per session)
+//   b"c" + user_nid_be
+//       + version_len_be:u16 + version_bytes
+//                               → packed (count_u64_be, etag_u64_be)
+//
+// Length-prefixing version + room_id is required because session_ids
+// contain `/` and other arbitrary bytes — without an explicit length
+// prefix the keys would be ambiguous. With it, prefix scans for "all
+// sessions in (user, version)" or "all sessions in (user, version,
+// room)" work cleanly.
+
+fn key_backup_versions_key(user_nid: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 8);
+    k.push(b'v');
+    k.extend_from_slice(&keys::encode_u64(user_nid));
+    k
+}
+
+fn key_backup_session_key(
+    user_nid: u64,
+    version: &str,
+    room_id: &str,
+    session_id: &str,
+) -> Vec<u8> {
+    let vlen = version.len() as u16;
+    let rlen = room_id.len() as u16;
+    let mut k =
+        Vec::with_capacity(1 + 8 + 2 + version.len() + 2 + room_id.len() + session_id.len());
+    k.push(b's');
+    k.extend_from_slice(&keys::encode_u64(user_nid));
+    k.extend_from_slice(&vlen.to_be_bytes());
+    k.extend_from_slice(version.as_bytes());
+    k.extend_from_slice(&rlen.to_be_bytes());
+    k.extend_from_slice(room_id.as_bytes());
+    k.extend_from_slice(session_id.as_bytes());
+    k
+}
+
+fn key_backup_room_prefix(user_nid: u64, version: &str, room_id: &str) -> Vec<u8> {
+    let vlen = version.len() as u16;
+    let rlen = room_id.len() as u16;
+    let mut k = Vec::with_capacity(1 + 8 + 2 + version.len() + 2 + room_id.len());
+    k.push(b's');
+    k.extend_from_slice(&keys::encode_u64(user_nid));
+    k.extend_from_slice(&vlen.to_be_bytes());
+    k.extend_from_slice(version.as_bytes());
+    k.extend_from_slice(&rlen.to_be_bytes());
+    k.extend_from_slice(room_id.as_bytes());
+    k
+}
+
+fn key_backup_version_prefix(user_nid: u64, version: &str) -> Vec<u8> {
+    let vlen = version.len() as u16;
+    let mut k = Vec::with_capacity(1 + 8 + 2 + version.len());
+    k.push(b's');
+    k.extend_from_slice(&keys::encode_u64(user_nid));
+    k.extend_from_slice(&vlen.to_be_bytes());
+    k.extend_from_slice(version.as_bytes());
+    k
+}
+
+fn key_backup_stats_key(user_nid: u64, version: &str) -> Vec<u8> {
+    let vlen = version.len() as u16;
+    let mut k = Vec::with_capacity(1 + 8 + 2 + version.len());
+    k.push(b'c');
+    k.extend_from_slice(&keys::encode_u64(user_nid));
+    k.extend_from_slice(&vlen.to_be_bytes());
+    k.extend_from_slice(version.as_bytes());
+    k
+}
+
+/// Parse the `(session_id, value)` pair from a `b"s"`-prefixed row
+/// inside a (user, version, room) scope. Returns `None` when the key
+/// doesn't match the expected prefix shape — defensive against stray
+/// bytes in the CF.
+fn key_backup_parse_session_row(
+    expected_prefix: &[u8],
+    key: &[u8],
+    val: &[u8],
+) -> Option<(String, Value)> {
+    let session_bytes = key.strip_prefix(expected_prefix)?;
+    let session_id = std::str::from_utf8(session_bytes).ok()?.to_string();
+    let value: Value = serde_json::from_slice(val).ok()?;
+    Some((session_id, value))
+}
+
+/// Parse the `(room_id, session_id, value)` triple from a `b"s"`-prefixed
+/// row inside a (user, version) scope. Used when iterating ALL sessions
+/// within a version (across rooms).
+fn key_backup_parse_version_row(
+    expected_prefix: &[u8],
+    key: &[u8],
+    val: &[u8],
+) -> Option<(String, String, Value)> {
+    let rest = key.strip_prefix(expected_prefix)?;
+    if rest.len() < 2 {
+        return None;
+    }
+    let room_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+    if rest.len() < 2 + room_len {
+        return None;
+    }
+    let room_id = std::str::from_utf8(&rest[2..2 + room_len])
+        .ok()?
+        .to_string();
+    let session_bytes = &rest[2 + room_len..];
+    let session_id = std::str::from_utf8(session_bytes).ok()?.to_string();
+    let value: Value = serde_json::from_slice(val).ok()?;
+    Some((room_id, session_id, value))
 }
 
 /// To-device outbound prefix: `<destination> 0xff`. Same trick as the
