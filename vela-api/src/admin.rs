@@ -175,6 +175,71 @@ pub fn should_auto_invite_first_admin(
 /// Also seeds the static `[registration] token` from `ServerConfig`
 /// into the `registration_tokens` CF when no admin exists yet — this
 /// lets the same lookup path handle bootstrap and post-bootstrap.
+/// Returns true iff the create event's `sender` field is a user on
+/// `server_name` — i.e. authored by THIS server. Pure function so it
+/// can be unit-tested without DB setup. Used by `bootstrap` to detect
+/// admin rooms left over from a previous server_name (which the
+/// `room_is_locally_hosted` check in the join path would treat as
+/// foreign-owned, and federation-disabled deploys then 403 the
+/// admin's accept-invite click).
+pub(crate) fn create_event_sender_is_local(create_event: &Value, server_name: &str) -> bool {
+    create_event
+        .get("sender")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.split_once(':'))
+        .map(|(_, host)| host == server_name)
+        .unwrap_or(false)
+}
+
+/// Look up the `m.room.create` state event for `room_id` and check
+/// whether its sender is local to `server_name`. Returns `false`
+/// when the room or its create event can't be found (treats "unknown
+/// room state" as a recreation trigger — better to recreate than
+/// leave a half-broken setup).
+fn admin_room_create_sender_is_local(
+    state: &AppState,
+    room_id: &str,
+    server_name: &str,
+) -> Result<bool, ApiError> {
+    let Some(room_nid) = state
+        .db
+        .get_nid(room_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(false);
+    };
+    let Some(create_type_nid) = state
+        .db
+        .get_nid("m.room.create")
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(false);
+    };
+    let Some(empty_skey_nid) = state
+        .db
+        .get_nid("")
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(false);
+    };
+    let Some(event_nid) = state
+        .db
+        .get_state_event_nid(room_nid, create_type_nid, empty_skey_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(false);
+    };
+    let Some((_header, bytes)) = state
+        .db
+        .get_event(event_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(false);
+    };
+    let create_event: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    Ok(create_event_sender_is_local(&create_event, server_name))
+}
+
 pub async fn bootstrap(state: &AppState) -> Result<(), ApiError> {
     let bot_localpart = state.config.admin_bot_localpart.clone();
     let bot_user_id = UserId::new(&bot_localpart, &state.config.server_name);
@@ -221,13 +286,40 @@ pub async fn bootstrap(state: &AppState) -> Result<(), ApiError> {
         }
     };
 
-    // 2. Admin room: create if missing.
-    if state
+    // 2. Admin room: create if missing OR stale.
+    //
+    // Stale = the stored admin room's create event was authored by a
+    // different server_name than the one currently configured. This
+    // happens when operators rename the server (or a misconfigured
+    // first boot left the room's sender as `@admin:localhost` even
+    // though server_name is now e.g. `pwd.wiki`). The
+    // `room_is_locally_hosted` check in membership.rs reads the
+    // create event's sender domain — if it doesn't match the current
+    // server_name, vela tries to federate the join and 403s when
+    // federation is disabled. Symptom: operator gets invited to the
+    // admin room but can't join. Recreating the room fixes it.
+    let existing_room_id = state
         .db
         .get_admin_room_id()
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        .is_none()
-    {
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let should_create = match existing_room_id {
+        None => true,
+        Some(ref room_id) => {
+            !admin_room_create_sender_is_local(state, room_id, &state.config.server_name)?
+        }
+    };
+    if should_create {
+        if let Some(stale_room_id) = existing_room_id {
+            // Don't try to delete the stale room state — invariants
+            // about state event ordering would be hard to preserve.
+            // Just drop the meta-CF pointer so the rest of vela
+            // stops treating it as the admin room.
+            tracing::warn!(
+                stale_room_id = %stale_room_id,
+                server_name = %state.config.server_name,
+                "admin room exists but its create event's sender is not local to current server_name; recreating",
+            );
+        }
         let room_id = create_admin_room(state, bot_user_nid, &bot_user_id).await?;
         state
             .db
@@ -1906,5 +1998,83 @@ mod tests {
             .unwrap();
         assert!(r.text.contains("revoked"));
         assert!(state.db.get_registration_token(&tok).unwrap().is_none());
+    }
+
+    // --- Stale-admin-room detection ----------------------------------------
+    //
+    // Operator changes [server] name from "localhost" → "pwd.wiki" but
+    // forgets to wipe the data dir. The admin bootstrap on next boot
+    // sees the existing admin_room_id from before and the idempotency
+    // check skips creation — but the room's create event was authored
+    // by @admin:localhost, which `room_is_locally_hosted` rejects when
+    // server_name is now pwd.wiki. The admin's accept-invite click
+    // tries to federate the join, hits federation-disabled config,
+    // 403s. We saw this during the first real deployment.
+    //
+    // Fix: bootstrap detects the mismatch via the create event's
+    // sender domain and recreates the room.
+
+    #[test]
+    fn create_event_sender_is_local_returns_true_for_matching_domain() {
+        let ev = json!({"sender": "@admin:pwd.wiki", "type": "m.room.create"});
+        assert!(create_event_sender_is_local(&ev, "pwd.wiki"));
+    }
+
+    #[test]
+    fn create_event_sender_is_local_returns_false_for_mismatched_domain() {
+        let ev = json!({"sender": "@admin:localhost", "type": "m.room.create"});
+        assert!(!create_event_sender_is_local(&ev, "pwd.wiki"));
+    }
+
+    #[test]
+    fn create_event_sender_is_local_handles_missing_sender() {
+        let ev = json!({"type": "m.room.create"});
+        assert!(!create_event_sender_is_local(&ev, "pwd.wiki"));
+    }
+
+    #[test]
+    fn create_event_sender_is_local_handles_malformed_sender() {
+        // No `:` separator — bare `admin` without colon means "no host"
+        let ev = json!({"sender": "admin", "type": "m.room.create"});
+        assert!(!create_event_sender_is_local(&ev, "pwd.wiki"));
+    }
+
+    /// End-to-end: when `admin_room_id` points at a room whose create
+    /// event isn't authored under the current server_name (or which
+    /// no longer exists in this DB at all), bootstrap MUST replace
+    /// it with a fresh one. Simplest reproduction of the deployment
+    /// scenario: simulate the "operator wiped data but forgot to
+    /// clear admin_room_id" leftover by directly setting
+    /// admin_room_id to a fake remote room.
+    #[tokio::test]
+    async fn bootstrap_recreates_admin_room_when_existing_is_stale() {
+        let (state, _tmp) = build_test_state();
+        let current_server = state.config.server_name.clone();
+
+        // Plant a stale pointer — admin_room_id refers to a room that
+        // doesn't exist in this DB. The helper returns false for
+        // "can't find the create event," which is exactly how it'd
+        // behave for a foreign-server room left over from before.
+        let fake_room_id = "!stale-from-old-server:other.example";
+        state.db.set_admin_room_id(fake_room_id).unwrap();
+
+        // Sanity: detector flags it as stale.
+        assert!(
+            !admin_room_create_sender_is_local(&state, fake_room_id, &current_server).unwrap(),
+            "stale-pointer detector should fire for an unknown room id"
+        );
+
+        // Bootstrap must replace the pointer.
+        bootstrap(&state).await.expect("bootstrap with stale id");
+        let fresh_room_id = state.db.get_admin_room_id().unwrap().unwrap();
+        assert_ne!(
+            fresh_room_id, fake_room_id,
+            "stale admin room pointer must be replaced; still pointing at {fake_room_id}"
+        );
+        // And the new room is locally authored.
+        assert!(
+            admin_room_create_sender_is_local(&state, &fresh_room_id, &current_server).unwrap(),
+            "freshly created admin room must be locally authored"
+        );
     }
 }
