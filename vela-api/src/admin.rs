@@ -237,9 +237,11 @@ pub async fn bootstrap(state: &AppState) -> Result<(), ApiError> {
     }
 
     // 3. Seed the static bootstrap token if no admin exists yet AND the
-    //    operator configured one. Idempotent: if the token is already in
-    //    the CF, we just re-overwrite the record (same uses_allowed,
-    //    same expires_at, fresh created_at — harmless).
+    //    operator configured one. Seeded as single-use (uses_allowed = 1)
+    //    so the first successful registration consumes it; further
+    //    registrations need a token minted by the admin via `!token create`.
+    //    Idempotent: if the token is already in the CF, we leave the
+    //    existing record alone (uses_used may already be > 0).
     if let Some(token) = state.config.registration_token.as_deref()
         && !token.is_empty()
     {
@@ -268,9 +270,9 @@ pub async fn bootstrap(state: &AppState) -> Result<(), ApiError> {
         {
             state
                 .db
-                .create_registration_token(token, 0, 0, 0)
+                .create_registration_token(token, 1, 0, 0)
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-            info!("seeded static bootstrap registration token");
+            info!("seeded static bootstrap registration token (single-use)");
         }
     }
 
