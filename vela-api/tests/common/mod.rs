@@ -41,6 +41,7 @@ pub struct ConfigOverrides {
     pub max_upload_size: u64,
     pub encrypt_by_default: vela_api::router::EncryptByDefault,
     pub oidc: vela_api::router::OidcConfig,
+    pub public_base_url: Option<String>,
 }
 
 impl Default for ConfigOverrides {
@@ -53,6 +54,7 @@ impl Default for ConfigOverrides {
             max_upload_size: 50 * 1024 * 1024,
             encrypt_by_default: vela_api::router::EncryptByDefault::Off,
             oidc: vela_api::router::OidcConfig::default(),
+            public_base_url: None,
         }
     }
 }
@@ -84,6 +86,13 @@ impl Harness {
     /// registration open, 50 MiB upload cap).
     pub fn with_config(overrides: ConfigOverrides) -> Self {
         Self::build("localhost:8008", overrides)
+    }
+
+    /// Build a harness with a specific server_name AND specific
+    /// overrides. Use when a test needs both (e.g. well_known
+    /// resolution depends on the server_name shape).
+    pub fn with_overrides(server_name: &str, overrides: ConfigOverrides) -> Self {
+        Self::build(server_name, overrides)
     }
 
     fn build(server_name: &str, overrides: ConfigOverrides) -> Self {
@@ -127,6 +136,7 @@ impl Harness {
                 server_name: server_name.to_string(),
                 bind_host: "127.0.0.1".into(),
                 bind_port: 0,
+                public_base_url: overrides.public_base_url.clone(),
                 search_all_users: overrides.search_all_users,
                 federation_enabled: overrides.federation_enabled,
                 registration_enabled: overrides.registration_enabled,

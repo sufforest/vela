@@ -6,14 +6,51 @@ use serde_json::{Value, json};
 
 use crate::router::AppState;
 
+/// Heuristic: is this server_name a development placeholder rather
+/// than a real public domain? `localhost` is unambiguous; bare IP
+/// literals catch container-only setups; anything else (e.g.
+/// `pwd.wiki`, `matrix.example.com`) is treated as public so that
+/// well-known publishes `https://<name>` by default.
+fn is_local_server_name(name: &str) -> bool {
+    if name == "localhost" || name.starts_with("localhost:") {
+        return true;
+    }
+    // Bare IPv4 literal? (4 dot-separated all-numeric components.)
+    if name.split(':').next().is_some_and(|host| {
+        let parts: Vec<&str> = host.split('.').collect();
+        parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok())
+    }) {
+        return true;
+    }
+    false
+}
+
 pub async fn well_known(State(state): State<AppState>) -> Json<Value> {
     let mut out = serde_json::Map::new();
-    out.insert(
-        "m.homeserver".to_string(),
-        json!({
-            "base_url": format!("http://{}:{}", state.config.bind_host, state.config.bind_port)
-        }),
-    );
+    // Resolution order:
+    //   1. operator-set [server] public_base_url (explicit override)
+    //   2. https://{server_name} (the common case: API host == identity)
+    //   3. http://{bind_host}:{bind_port} (dev fallback for localhost
+    //      or other non-public server_name values)
+    //
+    // Without (2), every reverse-proxied deploy (Caddy / Cloudflare /
+    // nginx — i.e. almost all real ones) saw "http://127.0.0.1:8008"
+    // in well-known and Element fell to the laptop's loopback. (2)
+    // covers the "API is at https://<identity-domain>" case which is
+    // 95% of personal-homeserver setups; (1) is only needed when the
+    // API runs at a different host (e.g. matrix.example.com proxying
+    // for identity domain example.com) or non-default port.
+    let base_url = if let Some(url) = &state.config.public_base_url {
+        url.clone()
+    } else if !is_local_server_name(&state.config.server_name) {
+        format!("https://{}", state.config.server_name)
+    } else {
+        format!(
+            "http://{}:{}",
+            state.config.bind_host, state.config.bind_port
+        )
+    };
+    out.insert("m.homeserver".to_string(), json!({"base_url": base_url}));
     // MSC4143: advertise the matrix-rtc SFU as a "focus" clients can
     // use for group calls. Empty config → no entry; clients then
     // fall back to whatever focus another participant brings or the
