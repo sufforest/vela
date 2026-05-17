@@ -8,9 +8,101 @@ minor versions.
 
 ## [Unreleased]
 
-(Add user-visible changes here as they land. At release time,
-rename to `[X.Y.Z] — YYYY-MM-DD` and start a fresh `[Unreleased]`
-above.)
+### Fixed
+
+- **Critical: `recover_max_nid` recovery bug.** The shared `nid_counter`
+  was recovered by scanning only `nid_reverse` (string NIDs), missing
+  every event NID. After a restart the counter reset below the actual
+  max event NID and the next `next_nid()` allocations silently
+  overwrote existing event rows in `events`, breaking every reference
+  that held the original NID. User-visible symptom: 403 "sender is not
+  joined" on `PUT /send` in rooms whose state-event NIDs happened to
+  collide. Fix scans both `nid_reverse` and `events`. Includes
+  auto-repair on `Database::open` that walks `room_state`, detects
+  entries pointing at events whose actual (type, state_key) doesn't
+  match, and replaces them with the latest valid event from
+  `room_timeline`. (#62)
+- **Verification handshake silently failed.** Element X sent
+  `PUT /sendToDevice/m.key.verification.request/{txn}` without a
+  `Content-Type` header; axum's stock `Json<T>` extractor rejected the
+  request before the body was read. Replaced with a Bytes-then-parse
+  extractor used site-wide that parses JSON regardless of header.
+  Aligns with Synapse, Dendrite, and Continuwuity. (#62)
+- **`/sync` polling storm.** `build_room_sync_for_user` emitted
+  receipts + room account_data unconditionally, so `has_new_data` was
+  always true and the long-poll never slept. Added per-room and
+  per-(user, room) max-stream-position tracking in a new
+  `stream_positions` CF; the two ephemeral types now emit only when
+  their tracked position advanced past `since`. (#59)
+- **`m.read.private` receipts visible to other users.**
+  `build_receipts_event` returned every receipt to every viewer; the
+  m.read.private privacy contract was broken. Now filtered to the
+  receipt's owner only. (#59)
+- **`/v3/createRoom` emitted duplicate state events** when
+  `initial_state` overrode a preset default (e.g.
+  `m.room.history_visibility`). Element rendered two state-change
+  notices and the preset's event was shadowed by the override anyway.
+  Preset emits are now skipped when `initial_state` contains the same
+  `(type, state_key)`. (#59)
+- **Admin bootstrap missed `server_name` drift.** If the admin room
+  had been created under an earlier `server_name`, the
+  `room_is_locally_hosted` check rejected re-bootstrap. Added
+  `admin_room_create_sender_is_local`; bootstrap recreates the admin
+  room when the create sender is no longer local. (#59)
+- **Key backup load-mutate-save race** in `/v3/room_keys/keys`
+  produced lost writes during parallel session upload. Replaced the
+  account_data blob with per-row CF storage in `key_backup`; each
+  session is its own row, atomic. Per-user lock guards the count/etag
+  stats only. (#60)
+- **Key backup blob leaked via `/sync`.** The `m.vela.key_backup`
+  account_data event surfaced to the user's other devices on every
+  receive. Moving the backup off account_data eliminates the leak.
+  Migration drains the legacy blob into the new CF on first read after
+  upgrade. (#60)
+- **Bootstrap token static fallback bypassed revoke.** The
+  `[registration] token` config value used to be a static fallback
+  the operator could not revoke. Now single-use, allocated like any
+  other registration token. (#56)
+- **`well-known` published a localhost URL.** `/.well-known/matrix/*`
+  emitted the bind URL (`http://0.0.0.0:8008/`) instead of the public
+  `server_name` URL, breaking federation discovery for any deployment
+  that wasn't bound directly on its public hostname. (#55)
+- **Config parse errors silently swallowed.** `load_config` ignored
+  TOML parse failures and booted with defaults, hiding the real
+  problem from the operator. Errors now surface and refuse to start.
+  (#58)
+- **`HEALTHCHECK` hardcoded port 8008**, so containers with a
+  non-default `[server] port` reported `(unhealthy)` to the
+  orchestrator. Now reads `$VELA_PORT`. (#58)
+- **`docker-compose` default built from source** instead of using the
+  published image. (#57)
+- **`/account/3pid` returned 404** instead of an empty list; Element
+  rendered "Unable to load" in Settings. Now returns `{"threepids":
+  []}`. (#57)
+
+### Added
+
+- **`vela-admin diagnose-membership <room_id> <user_id>`** — dumps
+  the `memberships` and `room_state` CF entries side-by-side for one
+  (room, user) pair and flags drift. Useful for confirming whether a
+  "sender is not joined" rejection is the recover_max_nid corruption.
+  (#62)
+- **`vela-admin` bundled in the production Docker image** so the
+  operator can run it via `docker compose exec vela vela-admin ...`
+  without a separate install or build. (#62)
+- **CI gate: real S3 wire test against MinIO** behind the
+  `s3-integration` feature flag. Catches multipart-upload, signing,
+  and abort-path bugs that the trait-level unit tests can't reach.
+  (#61)
+- **Operational `[profile.dev]` improvements** — `debug = 1` cuts
+  `target/` size during local dev. (#58)
+
+### Changed
+
+- **Improved `m.room.topic` content shape** to include the structured
+  MSC3765 representation alongside the legacy `topic` string. (Already
+  present at 0.1.0; clarifying for upgraders since downstream clients
+  may now consume the structured form.)
 
 ## [0.1.0] — 2026-04
 
