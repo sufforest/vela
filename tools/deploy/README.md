@@ -162,6 +162,10 @@ docker compose pull vela
 docker compose up -d vela
 ```
 
+If your `image:` line is pinned (e.g. `:0.1.1`), edit it to the new
+tag before `docker compose pull`. Moving tags (`:main`, `:latest`,
+`:0.1`) update on `pull` directly.
+
 If the binary's `SCHEMA_VERSION` doesn't match the on-disk stamp, vela
 refuses to start with a clear error message — that's the contract for
 breaking schema changes shipping with a migrator. Until then, revert

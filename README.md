@@ -11,7 +11,7 @@ embedded storage.
 
 ## Status
 
-0.1.0. See [`CHANGELOG.md`](CHANGELOG.md) for what's in this release
+0.1.1. See [`CHANGELOG.md`](CHANGELOG.md) for what's in this release
 and what's known to be missing.
 
 ## Quickstart (Docker)

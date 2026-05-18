@@ -1,0 +1,45 @@
+name: GitHub Release
+
+# Auto-create a GitHub Release whenever a semver tag is pushed. The
+# release notes come from the matching `## [X.Y.Z]` block in
+# CHANGELOG.md — keep that block populated as PRs land (the file's
+# `[Unreleased]` convention) and tagging is the only manual step.
+#
+# Pairs with .github/workflows/docker.yml (which emits images on the
+# same tag event). The two are deliberately separate jobs: image
+# build failures should not block the GitHub Release entry, and
+# vice versa.
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Extract CHANGELOG block and create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${GITHUB_REF#refs/tags/v}"
+          # Print the [X.Y.Z] section: everything from `## [version]`
+          # up to (but not including) the next `## [` header.
+          awk -v ver="$version" '
+            /^## \[/ && f { exit }
+            $0 ~ "^## \\[" ver "\\]" { f = 1 }
+            f { print }
+          ' CHANGELOG.md > /tmp/notes.md
+          if [ ! -s /tmp/notes.md ]; then
+            echo "::error::No CHANGELOG block found for [$version]"
+            exit 1
+          fi
+          gh release create "v$version" \
+            --title "v$version" \
+            --notes-file /tmp/notes.md
