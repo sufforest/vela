@@ -30,6 +30,10 @@ services:
     # Pull the published image by default. To build locally from this
     # checkout (e.g. for testing un-merged changes), replace the
     # `image:` line with `build: { context: ../.. }`.
+    #
+    # Tag choice: `:main` rolls forward on every push to main (latest
+    # fixes, may break). For stability use `:latest` (latest semver
+    # release) or pin to `:0.1.1` / `:0.1` / `:0` for reproducibility.
     image: ghcr.io/sufforest/vela:main
     restart: unless-stopped
     volumes:
