@@ -81,8 +81,7 @@ pub async fn sweep_once(state: &AppState) -> Result<SweepStats, String> {
             .unwrap_or("offline")
             .to_string();
         let last_active_ms = rec.get("last_active_ms").and_then(|v| v.as_u64());
-        let effective =
-            crate::presence::effective_presence(&stored, last_active_ms, &cfg, now);
+        let effective = crate::presence::effective_presence(&stored, last_active_ms, &cfg, now);
 
         if effective == stored {
             continue;

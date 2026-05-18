@@ -864,9 +864,7 @@ impl Database {
             .get_cf(&presence_cf, keys::encode_u64(user_nid))?
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .and_then(|v| v.get("last_active_ms").and_then(|x| x.as_u64()));
-        let new_activity_ms = record
-            .get("last_active_ms")
-            .and_then(|x| x.as_u64());
+        let new_activity_ms = record.get("last_active_ms").and_then(|x| x.as_u64());
 
         let mut batch = WriteBatch::default();
         batch.put_cf(
@@ -906,9 +904,7 @@ impl Database {
             .get_cf(&presence_cf, keys::encode_u64(user_nid))?
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .and_then(|v| v.get("last_active_ms").and_then(|x| x.as_u64()));
-        let new_activity_ms = record
-            .get("last_active_ms")
-            .and_then(|x| x.as_u64());
+        let new_activity_ms = record.get("last_active_ms").and_then(|x| x.as_u64());
 
         // The stream entry is just the user_nid — readers re-fetch the
         // current `user_presence` record at scan time, so multiple
@@ -943,10 +939,7 @@ impl Database {
     /// scanning `user_presence` instead would be O(local users) per
     /// tick even when only a handful of users are actually due for a
     /// state change.
-    pub fn presence_activity_due(
-        &self,
-        cutoff_ms: u64,
-    ) -> Result<Vec<u64>, rocksdb::Error> {
+    pub fn presence_activity_due(&self, cutoff_ms: u64) -> Result<Vec<u64>, rocksdb::Error> {
         let cf = self.db.cf_handle("presence_activity_index").unwrap();
         let mut out = Vec::new();
         for entry in self.db.iterator_cf(&cf, IteratorMode::Start) {
@@ -965,7 +958,6 @@ impl Database {
         }
         Ok(out)
     }
-
 
     /// Append a per-destination `m.direct_to_device` EDU content to
     /// the outbound queue. Returns the assigned stream position.
@@ -1407,9 +1399,7 @@ impl Database {
         let (mut rec, old_activity_ms) = match self.db.get_cf(&presence_cf, key)? {
             Some(b) => {
                 let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
-                let old = v
-                    .get("last_active_ms")
-                    .and_then(|x| x.as_u64());
+                let old = v.get("last_active_ms").and_then(|x| x.as_u64());
                 (v, old)
             }
             None => (serde_json::json!({"presence": "online"}), None),
@@ -5980,10 +5970,7 @@ mod stream_recovery_tests {
             &serde_json::json!({"presence": "online", "last_active_ms": now - 1_000_000}),
         )
         .unwrap();
-        assert_eq!(
-            db.presence_activity_due(now - 10_000).unwrap(),
-            vec![alice]
-        );
+        assert_eq!(db.presence_activity_due(now - 10_000).unwrap(), vec![alice]);
 
         // Now active again: re-write with a fresh timestamp. The old
         // stale index entry must be deleted in the same batch, else
