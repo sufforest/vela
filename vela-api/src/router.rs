@@ -110,6 +110,48 @@ pub struct ServerConfig {
     /// reserved on `/register` — operators cannot register an account
     /// at this localpart even with a valid token. See `crate::admin`.
     pub admin_bot_localpart: String,
+    /// Presence auto-decay thresholds and sweeper cadence. See
+    /// `PresenceConfig` for the timings. Stored presence (the string a
+    /// client last set via PUT /presence) does not decay on its own;
+    /// vela computes effective presence at read time and a background
+    /// sweeper persists transitions so federation peers see them.
+    pub presence: PresenceConfig,
+}
+
+/// Presence auto-decay configuration.
+///
+/// vela updates `last_active_ms` on every /sync from the user. When the
+/// gap between `last_active_ms` and "now" exceeds `idle_after`, the
+/// user's effective presence transitions `online → unavailable`. After
+/// `offline_after`, it transitions to `offline`. Explicit
+/// client-supplied presence values (`unavailable`, `offline`) are
+/// honoured as-is.
+///
+/// Two layers:
+/// - **Read-time** (every /sync, GET /presence) computes the effective
+///   presence on the fly. Local clients always see the right answer.
+/// - **Sweeper** (background task every `sweep_interval`) persists
+///   transitions and broadcasts the federation EDU. Without it,
+///   remote servers see stale "online" until something else triggers
+///   a fresh EDU.
+#[derive(Debug, Clone, Copy)]
+pub struct PresenceConfig {
+    /// Online → unavailable after this much idle time.
+    pub idle_after_ms: u64,
+    /// (Online | unavailable) → offline after this much idle time.
+    pub offline_after_ms: u64,
+    /// How often the sweeper task wakes up to apply transitions.
+    pub sweep_interval_ms: u64,
+}
+
+impl Default for PresenceConfig {
+    fn default() -> Self {
+        Self {
+            idle_after_ms: 5 * 60 * 1000,
+            offline_after_ms: 30 * 60 * 1000,
+            sweep_interval_ms: 60 * 1000,
+        }
+    }
 }
 
 /// Classic `/voip/turnServer` configuration.

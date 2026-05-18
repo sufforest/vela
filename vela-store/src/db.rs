@@ -197,6 +197,34 @@ impl Database {
         // upgrade did.
         repair_room_state_orphans(&db)?;
 
+        // Populate `presence_activity_index` for any existing
+        // `user_presence` records. v0.1.1 DBs have presence records
+        // but no index; the sweeper relies on the index to do its
+        // prefix-bounded walk. Idempotent — re-running is a series
+        // of put_cf no-ops since every index key is already present.
+        {
+            let presence_cf = db.cf_handle("user_presence").unwrap();
+            let index_cf = db.cf_handle("presence_activity_index").unwrap();
+            let mut batch = WriteBatch::default();
+            let mut count = 0u64;
+            for entry in db.iterator_cf(&presence_cf, IteratorMode::Start) {
+                let (key, val) = entry?;
+                if key.len() != 8 {
+                    continue;
+                }
+                let user_nid = keys::decode_u64(&key);
+                let rec: Value = serde_json::from_slice(&val).unwrap_or(Value::Null);
+                if let Some(ms) = rec.get("last_active_ms").and_then(|x| x.as_u64()) {
+                    batch.put_cf(&index_cf, presence_activity_key(ms, user_nid), []);
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                db.write(batch)?;
+                tracing::debug!(count, "presence_activity_index populated at open");
+            }
+        }
+
         // Recover counters from existing data
         let nid_counter = recover_max_nid(&db).unwrap_or(1);
         let stream_counter = recover_max_stream(&db);
@@ -379,6 +407,26 @@ impl Database {
             .get_user(user_nid)?
             .and_then(|r| r.get("deactivated").and_then(|v| v.as_bool()))
             .unwrap_or(false))
+    }
+
+    /// Reverse of `deactivate_user`: clear the `deactivated` flag so
+    /// the account can log in again. Does NOT restore the password
+    /// hash — `deactivate_user` blanks it, and the operator must run
+    /// `update_user_password` (typically via `!reset-password`) to
+    /// give the user working credentials. No-op when the user record
+    /// is missing or the flag was never set.
+    pub fn reactivate_user(&self, user_nid: u64) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("users").unwrap();
+        let key = keys::encode_u64(user_nid);
+        let mut record: Value = match self.db.get_cf(&cf, key)? {
+            Some(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            None => return Ok(()),
+        };
+        if let Some(obj) = record.as_object_mut() {
+            obj.insert("deactivated".to_string(), Value::Bool(false));
+            self.db.put_cf(&cf, key, record.to_string().as_bytes())?;
+        }
+        Ok(())
     }
 
     // --- Token operations ---
@@ -808,19 +856,40 @@ impl Database {
     // users, /presence/{userId}/status point reads.
 
     pub fn set_presence(&self, user_nid: u64, record: &Value) -> Result<(), rocksdb::Error> {
-        let cf = self.db.cf_handle("user_presence").unwrap();
-        self.db.put_cf(
-            &cf,
+        let presence_cf = self.db.cf_handle("user_presence").unwrap();
+        let index_cf = self.db.cf_handle("presence_activity_index").unwrap();
+
+        let old_activity_ms = self
+            .db
+            .get_cf(&presence_cf, keys::encode_u64(user_nid))?
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|v| v.get("last_active_ms").and_then(|x| x.as_u64()));
+        let new_activity_ms = record
+            .get("last_active_ms")
+            .and_then(|x| x.as_u64());
+
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            &presence_cf,
             keys::encode_u64(user_nid),
             record.to_string().as_bytes(),
-        )
+        );
+        if let Some(old) = old_activity_ms
+            && Some(old) != new_activity_ms
+        {
+            batch.delete_cf(&index_cf, presence_activity_key(old, user_nid));
+        }
+        if let Some(new) = new_activity_ms {
+            batch.put_cf(&index_cf, presence_activity_key(new, user_nid), []);
+        }
+        self.db.write(batch)
     }
 
     /// Locally-originated presence write. Atomically updates
-    /// `user_presence` (so our `/sync` and `/presence/.../status` see
-    /// it) AND appends to `presence_stream` (so the federation sender
-    /// fans it out to peers that share rooms with this user).
-    /// Returns the assigned stream position.
+    /// `user_presence` + the activity index + appends to
+    /// `presence_stream` (so the federation sender fans it out to
+    /// peers that share rooms with this user). Returns the assigned
+    /// stream position.
     ///
     /// Inbound EDUs from federation MUST NOT call this — peers fan
     /// out their own users' presence. Use `set_presence` for inbound
@@ -828,8 +897,18 @@ impl Database {
     pub fn set_local_presence(&self, user_nid: u64, record: &Value) -> Result<u64, rocksdb::Error> {
         let presence_cf = self.db.cf_handle("user_presence").unwrap();
         let stream_cf = self.db.cf_handle("presence_stream").unwrap();
+        let index_cf = self.db.cf_handle("presence_activity_index").unwrap();
 
         let pos = self.presence_stream_counter.fetch_add(1, Ordering::Relaxed);
+
+        let old_activity_ms = self
+            .db
+            .get_cf(&presence_cf, keys::encode_u64(user_nid))?
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|v| v.get("last_active_ms").and_then(|x| x.as_u64()));
+        let new_activity_ms = record
+            .get("last_active_ms")
+            .and_then(|x| x.as_u64());
 
         // The stream entry is just the user_nid — readers re-fetch the
         // current `user_presence` record at scan time, so multiple
@@ -846,9 +925,47 @@ impl Database {
             keys::encode_u64(pos),
             keys::encode_u64(user_nid),
         );
+        if let Some(old) = old_activity_ms
+            && Some(old) != new_activity_ms
+        {
+            batch.delete_cf(&index_cf, presence_activity_key(old, user_nid));
+        }
+        if let Some(new) = new_activity_ms {
+            batch.put_cf(&index_cf, presence_activity_key(new, user_nid), []);
+        }
         self.db.write(batch)?;
         Ok(pos)
     }
+
+    /// Walk the `presence_activity_index` and return user NIDs whose
+    /// `last_active_ms` is strictly older than `cutoff_ms`. This is
+    /// the candidate set for sweeper transitions — exhaustively
+    /// scanning `user_presence` instead would be O(local users) per
+    /// tick even when only a handful of users are actually due for a
+    /// state change.
+    pub fn presence_activity_due(
+        &self,
+        cutoff_ms: u64,
+    ) -> Result<Vec<u64>, rocksdb::Error> {
+        let cf = self.db.cf_handle("presence_activity_index").unwrap();
+        let mut out = Vec::new();
+        for entry in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (key, _) = entry?;
+            if key.len() != 16 {
+                continue;
+            }
+            let activity_ms = keys::decode_u64(&key[0..8]);
+            if activity_ms >= cutoff_ms {
+                // Index is sorted by activity_ms — first non-eligible
+                // entry means every later entry is also non-eligible.
+                break;
+            }
+            let user_nid = keys::decode_u64(&key[8..16]);
+            out.push(user_nid);
+        }
+        Ok(out)
+    }
+
 
     /// Append a per-destination `m.direct_to_device` EDU content to
     /// the outbound queue. Returns the assigned stream position.
@@ -1281,17 +1398,35 @@ impl Database {
     /// Touch `last_active_ms` without changing the state/message. Called
     /// on each `/sync` tick for the syncing user so online-ness decays
     /// accurately even when they never call `/presence/.../status`.
+    /// Maintains the activity index atomically.
     pub fn touch_presence(&self, user_nid: u64, now_ms: u64) -> Result<(), rocksdb::Error> {
-        let cf = self.db.cf_handle("user_presence").unwrap();
+        let presence_cf = self.db.cf_handle("user_presence").unwrap();
+        let index_cf = self.db.cf_handle("presence_activity_index").unwrap();
         let key = keys::encode_u64(user_nid);
-        let mut rec = match self.db.get_cf(&cf, key)? {
-            Some(b) => serde_json::from_slice::<Value>(&b).unwrap_or(Value::Null),
-            None => serde_json::json!({"presence": "online"}),
+
+        let (mut rec, old_activity_ms) = match self.db.get_cf(&presence_cf, key)? {
+            Some(b) => {
+                let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+                let old = v
+                    .get("last_active_ms")
+                    .and_then(|x| x.as_u64());
+                (v, old)
+            }
+            None => (serde_json::json!({"presence": "online"}), None),
         };
         if let Some(obj) = rec.as_object_mut() {
             obj.insert("last_active_ms".into(), Value::from(now_ms));
         }
-        self.db.put_cf(&cf, key, rec.to_string().as_bytes())
+
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&presence_cf, key, rec.to_string().as_bytes());
+        if let Some(old) = old_activity_ms
+            && old != now_ms
+        {
+            batch.delete_cf(&index_cf, presence_activity_key(old, user_nid));
+        }
+        batch.put_cf(&index_cf, presence_activity_key(now_ms, user_nid), []);
+        self.db.write(batch)
     }
 
     // --- User pushers ---
@@ -5026,6 +5161,17 @@ fn outbox_key(destination: &str, stream_pos: u64) -> Vec<u8> {
     k
 }
 
+/// Activity-index key: `<last_active_ms_be:8> <user_nid_be:8>`.
+/// Big-endian on both halves so iterator order matches numeric order
+/// — readers do a prefix-bounded walk to find all users whose
+/// activity is older than a threshold.
+fn presence_activity_key(last_active_ms: u64, user_nid: u64) -> [u8; 16] {
+    let mut k = [0u8; 16];
+    k[0..8].copy_from_slice(&keys::encode_u64(last_active_ms));
+    k[8..16].copy_from_slice(&keys::encode_u64(user_nid));
+    k
+}
+
 /// Receipts CF key:
 /// `<room_nid_be:8> <receipt_type> 0x00 <user_nid_be:8> 0x00 <thread_id?>`.
 ///
@@ -5778,5 +5924,116 @@ mod stream_recovery_tests {
                 "next_nid()={n} must be > max_event_nid={last_event_nid} after restart",
             );
         }
+    }
+
+    /// `presence_activity_due(cutoff)` returns exactly the users whose
+    /// stored `last_active_ms < cutoff`. The activity index is
+    /// maintained atomically with every `set_local_presence` /
+    /// `touch_presence` / `set_presence` write, so newer entries
+    /// supersede older ones — no stale index rows linger.
+    #[test]
+    fn presence_activity_due_walks_only_past_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        let alice = db.get_or_create_nid("@alice:example.com").unwrap();
+        let bob = db.get_or_create_nid("@bob:example.com").unwrap();
+        let carol = db.get_or_create_nid("@carol:example.com").unwrap();
+
+        // Alice: very old activity. Bob: recent. Carol: in between.
+        let now = 100_000_000u64;
+        db.set_local_presence(
+            alice,
+            &serde_json::json!({"presence": "online", "last_active_ms": now - 1_000_000}),
+        )
+        .unwrap();
+        db.set_local_presence(
+            bob,
+            &serde_json::json!({"presence": "online", "last_active_ms": now - 1_000}),
+        )
+        .unwrap();
+        db.set_local_presence(
+            carol,
+            &serde_json::json!({"presence": "online", "last_active_ms": now - 100_000}),
+        )
+        .unwrap();
+
+        // Cutoff between bob's and carol's activity ts.
+        let due = db.presence_activity_due(now - 10_000).unwrap();
+        // Both alice and carol are older than the cutoff. Order is
+        // by ascending last_active_ms (alice first, then carol).
+        assert_eq!(due, vec![alice, carol]);
+    }
+
+    /// Re-writing the record updates the index: the OLD activity-ms
+    /// entry must be cleared so a stale row doesn't make a now-
+    /// recently-active user appear in `due()` queries.
+    #[test]
+    fn presence_activity_index_clears_stale_entries_on_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        let alice = db.get_or_create_nid("@alice:example.com").unwrap();
+        let now = 100_000_000u64;
+
+        // Stale: alice was last active long ago.
+        db.set_local_presence(
+            alice,
+            &serde_json::json!({"presence": "online", "last_active_ms": now - 1_000_000}),
+        )
+        .unwrap();
+        assert_eq!(
+            db.presence_activity_due(now - 10_000).unwrap(),
+            vec![alice]
+        );
+
+        // Now active again: re-write with a fresh timestamp. The old
+        // stale index entry must be deleted in the same batch, else
+        // `due()` would still report her.
+        db.touch_presence(alice, now - 100).unwrap();
+        assert_eq!(
+            db.presence_activity_due(now - 10_000).unwrap(),
+            Vec::<u64>::new(),
+            "stale activity-index entry must clear on touch_presence",
+        );
+    }
+
+    /// Existing v0.1.1 DBs have `user_presence` records but no
+    /// `presence_activity_index` entries. The open-time migration
+    /// populates the index so the sweeper's walk works on upgrade.
+    #[test]
+    fn open_time_migration_populates_activity_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path();
+        let alice;
+        let now = 100_000_000u64;
+        {
+            let db = Database::open(path).unwrap();
+            alice = db.get_or_create_nid("@alice:example.com").unwrap();
+            // Bypass set_local_presence (which would also write the
+            // index) to simulate a v0.1.1 record: write the raw
+            // user_presence CF directly without touching the index.
+            let cf = db.db.cf_handle("user_presence").unwrap();
+            let rec = serde_json::json!({
+                "presence": "online",
+                "last_active_ms": now - 1_000_000
+            });
+            db.db
+                .put_cf(&cf, keys::encode_u64(alice), rec.to_string().as_bytes())
+                .unwrap();
+            // Confirm the index is empty before close.
+            assert_eq!(
+                db.presence_activity_due(now).unwrap(),
+                Vec::<u64>::new(),
+                "no index entries written yet"
+            );
+        }
+
+        // Re-open: open-time migration scans user_presence and
+        // populates the index.
+        let db = Database::open(path).unwrap();
+        assert_eq!(
+            db.presence_activity_due(now).unwrap(),
+            vec![alice],
+            "open-time migration must populate index for legacy records",
+        );
     }
 }

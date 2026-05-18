@@ -8,9 +8,34 @@ minor versions.
 
 ## [Unreleased]
 
-(Add user-visible changes here as they land. At release time,
-rename to `[X.Y.Z] — YYYY-MM-DD` and start a fresh `[Unreleased]`
-above.)
+### Fixed
+
+- **Own presence not visible in /sync.** `collect_presence_events`
+  filtered the requesting user out of the emitted peer set, so
+  clients that draw their own profile indicator from /sync (Element
+  X among them) fell back to "offline" for the requester. Now
+  always included.
+- **Stored presence never decayed.** A user who set themselves
+  online and closed their browser stayed "online" in every other
+  client indefinitely. Effective presence is now computed at read
+  time from `last_active_ms` with `idle_after` → unavailable and
+  `offline_after` → offline transitions; a background sweeper
+  persists those transitions and broadcasts the federation EDU so
+  remote servers see the new state. Thresholds configurable under
+  `[presence]` (defaults: 5min / 30min / 60s sweep).
+
+### Added
+
+- **`!reactivate <mxid>` admin bot command.** Undoes `!deactivate`'s
+  flag — operator must follow with `!reset-password` since
+  `!deactivate` blanks the hash.
+- **`!reset-password <mxid> [password]` admin bot command.**
+  Atomic: sets a fresh argon2 hash, clears the `deactivated` flag,
+  and deletes every existing access token. Without a password
+  argument the bot generates a 16-char random one and replies with
+  it. With a password argument that one is used.
+- `[presence]` config block: `idle_after` / `offline_after` /
+  `sweep_interval`. See `tools/deploy/vela.toml.example`.
 
 ## [0.1.1] — 2026-05-17
 

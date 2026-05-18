@@ -69,6 +69,38 @@ struct Config {
     auth: AuthSection,
     #[serde(default)]
     admin: AdminSection,
+    #[serde(default)]
+    presence: PresenceSection,
+}
+
+/// `[presence]` section. Auto-decay thresholds + sweeper cadence for
+/// the user-presence state machine.
+///
+/// vela updates a user's `last_active_ms` every time they /sync. After
+/// `idle_after` of no activity, the effective presence transitions
+/// `online → unavailable`; after `offline_after`, to `offline`. A
+/// background sweeper task running every `sweep_interval` persists
+/// those transitions and broadcasts the federation EDU so remote
+/// servers see the new state. Local /sync responses always compute the
+/// effective value at read time, so they're correct even between
+/// sweeper ticks.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+struct PresenceSection {
+    /// Same syntax as backup/retention intervals (`5min`, `300s`, `1h`).
+    idle_after: String,
+    offline_after: String,
+    sweep_interval: String,
+}
+
+impl Default for PresenceSection {
+    fn default() -> Self {
+        Self {
+            idle_after: "5min".to_string(),
+            offline_after: "30min".to_string(),
+            sweep_interval: "60s".to_string(),
+        }
+    }
 }
 
 /// `[admin]` section. Configures the server-internal admin bot + admin
@@ -923,6 +955,13 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     config.admin.bot_localpart.trim().to_string()
                 },
+                presence: vela_api::router::PresenceConfig {
+                    idle_after_ms: parse_duration(&config.presence.idle_after)?.as_millis() as u64,
+                    offline_after_ms: parse_duration(&config.presence.offline_after)?.as_millis()
+                        as u64,
+                    sweep_interval_ms: parse_duration(&config.presence.sweep_interval)?.as_millis()
+                        as u64,
+                },
             }),
             room_locks: Arc::new(DashMap::new()),
             user_locks: Arc::new(DashMap::new()),
@@ -965,6 +1004,15 @@ fn main() -> anyhow::Result<()> {
         if let Err(e) = vela_api::admin::bootstrap(&state).await {
             anyhow::bail!("admin bootstrap failed: {:?}", e.0);
         }
+
+        // Presence auto-decay sweeper. Persists transitions from
+        // `online → unavailable → offline` based on idle time and
+        // broadcasts the federation EDU. Local /sync responses already
+        // compute the effective presence at read time; the sweeper
+        // closes the gap for federation peers and the stored CF.
+        // Always on — there's no useful "off" mode (would mean stale
+        // presence survives forever, which is the bug this fixes).
+        let _presence_sweeper_handle = vela_api::presence_sweeper::spawn(state.clone());
 
         let app = vela_api::router::build_router(state);
 

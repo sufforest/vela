@@ -229,7 +229,7 @@ fn federate_device_list_deletes(state: &AppState, user: &AuthenticatedUser, devi
     }
 }
 
-fn hash_password(password: &str) -> String {
+pub(crate) fn hash_password(password: &str) -> String {
     use argon2::password_hash::SaltString;
     use argon2::{Argon2, PasswordHasher};
     let salt: [u8; 16] = rand::random();
