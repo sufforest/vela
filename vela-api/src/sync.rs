@@ -1223,25 +1223,33 @@ pub(crate) fn build_receipts_event(
     })))
 }
 
-/// Gather `m.presence` EDUs for users the caller shares a room with. We
-/// emit one event per distinct peer that has a stored record (self + users
-/// with no record are skipped — `format_status` would fabricate `offline`
-/// but flooding sync with offlines for everyone serves no purpose).
+/// Gather `m.presence` EDUs for users the caller shares a room with,
+/// **including the caller themselves**. We emit one event per
+/// distinct peer that has a stored record (users with no record are
+/// skipped — `format_status` would fabricate `offline` but flooding
+/// sync with offlines for everyone serves no purpose).
+///
+/// Self-inclusion is essential: clients (Element X in particular)
+/// build their own profile presence indicator from the /sync feed,
+/// not from local state. Filtering self out left clients showing
+/// the user as offline even when they were actively sync'ing —
+/// fixed here.
 fn collect_presence_events(
     state: &AppState,
     self_nid: u64,
     joined_room_nids: &[u64],
 ) -> Result<Vec<Value>, ApiError> {
     let mut peers: HashSet<u64> = HashSet::new();
+    // The caller's own presence belongs in their /sync. Insert first
+    // so it's always considered even for users in zero rooms.
+    peers.insert(self_nid);
     for &room_nid in joined_room_nids {
         let members = state
             .db
             .get_room_members(room_nid)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
         for m in members {
-            if m != self_nid {
-                peers.insert(m);
-            }
+            peers.insert(m);
         }
     }
 
@@ -1262,7 +1270,7 @@ fn collect_presence_events(
         events.push(json!({
             "type": "m.presence",
             "sender": user_id,
-            "content": crate::presence::format_status(&rec),
+            "content": crate::presence::format_status(&rec, &state.config.presence),
         }));
     }
     Ok(events)

@@ -381,6 +381,26 @@ impl Database {
             .unwrap_or(false))
     }
 
+    /// Reverse of `deactivate_user`: clear the `deactivated` flag so
+    /// the account can log in again. Does NOT restore the password
+    /// hash — `deactivate_user` blanks it, and the operator must run
+    /// `update_user_password` (typically via `!reset-password`) to
+    /// give the user working credentials. No-op when the user record
+    /// is missing or the flag was never set.
+    pub fn reactivate_user(&self, user_nid: u64) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("users").unwrap();
+        let key = keys::encode_u64(user_nid);
+        let mut record: Value = match self.db.get_cf(&cf, key)? {
+            Some(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            None => return Ok(()),
+        };
+        if let Some(obj) = record.as_object_mut() {
+            obj.insert("deactivated".to_string(), Value::Bool(false));
+            self.db.put_cf(&cf, key, record.to_string().as_bytes())?;
+        }
+        Ok(())
+    }
+
     // --- Token operations ---
 
     pub fn create_token(&self, user_nid: u64, device_id: &str) -> Result<String, rocksdb::Error> {
@@ -1276,6 +1296,30 @@ impl Database {
             Some(bytes) => Ok(Some(serde_json::from_slice(&bytes).unwrap_or(Value::Null))),
             None => Ok(None),
         }
+    }
+
+    /// Scan every `user_presence` record. Yields `(user_nid, record)`
+    /// pairs in CF iteration order. The presence sweeper consumes this
+    /// to apply decay transitions and broadcast federation EDUs.
+    ///
+    /// Returns a collected Vec rather than a streaming iterator because
+    /// (a) the presence CF is bounded by user count which is tiny in
+    /// practice and (b) the sweeper writes back to the same CF, which
+    /// is awkward to do safely while an iterator borrows the DB. For
+    /// any plausible vela deployment the full scan fits in microseconds.
+    pub fn list_presence_records(&self) -> Result<Vec<(u64, Value)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("user_presence").unwrap();
+        let mut out = Vec::new();
+        for entry in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (key, val) = entry?;
+            if key.len() != 8 {
+                continue;
+            }
+            let user_nid = keys::decode_u64(&key);
+            let record: Value = serde_json::from_slice(&val).unwrap_or(Value::Null);
+            out.push((user_nid, record));
+        }
+        Ok(out)
     }
 
     /// Touch `last_active_ms` without changing the state/message. Called
