@@ -3470,7 +3470,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vela-admin"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3481,7 +3481,7 @@ dependencies = [
 
 [[package]]
 name = "vela-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "axum 0.8.9",
@@ -3520,7 +3520,7 @@ dependencies = [
 
 [[package]]
 name = "vela-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -3534,7 +3534,7 @@ dependencies = [
 
 [[package]]
 name = "vela-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -3565,7 +3565,7 @@ dependencies = [
 
 [[package]]
 name = "vela-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "async-trait",

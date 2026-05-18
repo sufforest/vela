@@ -8,6 +8,12 @@ minor versions.
 
 ## [Unreleased]
 
+(Add user-visible changes here as they land. At release time,
+rename to `[X.Y.Z] — YYYY-MM-DD` and start a fresh `[Unreleased]`
+above.)
+
+## [0.1.1] — 2026-05-17
+
 ### Fixed
 
 - **Critical: `recover_max_nid` recovery bug.** The shared `nid_counter`
