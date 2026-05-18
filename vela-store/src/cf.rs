@@ -60,6 +60,12 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     "user_filters",
     "user_pushers",
     "user_presence",
+    // Activity index over `user_presence`. Keyed by
+    // `(last_active_ms_be:8, user_nid_be:8)`. Lets the presence
+    // sweeper walk only the prefix-range of users whose activity is
+    // older than the idle threshold instead of scanning every record.
+    // Maintained atomically with every `user_presence` write.
+    "presence_activity_index",
     "federation_outbox",
     "federation_edu_cursor",
     "receipts_stream",

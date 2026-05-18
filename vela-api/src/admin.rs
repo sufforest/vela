@@ -903,6 +903,8 @@ async fn handle_command(
         "users" => cmd_users(state, rest).await?,
         "user" => cmd_user(state, rest).await?,
         "deactivate" => cmd_deactivate(state, sender_nid, rest).await?,
+        "reactivate" => cmd_reactivate(state, sender_nid, rest).await?,
+        "reset-password" => cmd_reset_password(state, sender_nid, rest).await?,
         "promote" => cmd_promote(state, sender_nid, rest).await?,
         "demote" => cmd_demote(state, sender_nid, rest).await?,
         "token" => cmd_token(state, sender_nid, rest).await?,
@@ -951,6 +953,8 @@ fn cmd_help() -> Reply {
         !users [page]                        list local users (20 per page)\n\
         !user <mxid>                         show user details\n\
         !deactivate <mxid>                   deactivate account; kicks from rooms\n\
+        !reactivate <mxid>                   undo !deactivate (then run !reset-password)\n\
+        !reset-password <mxid> [pw]          set a fresh password; clears deactivated; invalidates sessions\n\
         !promote <mxid>                      invite user to admin room (grant admin)\n\
         !demote <mxid>                       kick user from admin room (revoke admin)\n\
         !token create [uses=N] [expires=24h] mint a registration token\n\
@@ -1155,6 +1159,139 @@ async fn cmd_deactivate(
     )
     .await;
     Ok(Reply::plain(format!("deactivated {mxid}")))
+}
+
+// --- !reactivate <mxid> ---
+//
+// Reverse of !deactivate's `deactivated = true` flag. Does NOT restore
+// the password hash (!deactivate blanked it) — the operator runs
+// !reset-password afterwards to set fresh credentials. Re-joining
+// rooms is up to the user (their devices send fresh join PDUs from
+// the client side); we don't auto-rejoin them anywhere.
+async fn cmd_reactivate(
+    state: &AppState,
+    _sender_nid: u64,
+    args: &[String],
+) -> Result<Reply, ApiError> {
+    let Some(mxid) = args.first() else {
+        return Ok(Reply::plain("usage: !reactivate <@user:server>"));
+    };
+    let nid = match state
+        .db
+        .get_nid(mxid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    {
+        Some(n) => n,
+        None => return Ok(Reply::plain(format!("unknown user: {mxid}"))),
+    };
+    if Some(nid) == state.db.get_admin_bot_user_nid().ok().flatten() {
+        return Ok(Reply::plain("refusing to reactivate the admin bot"));
+    }
+    state
+        .db
+        .reactivate_user(nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    Ok(Reply::plain(format!(
+        "reactivated {mxid}\n\
+         password hash is still blank — run `!reset-password {mxid}` to give them \
+         working credentials, otherwise they cannot log in."
+    )))
+}
+
+// --- !reset-password <mxid> [password] ---
+//
+// Atomic: writes a fresh argon2 hash for the user, clears the
+// `deactivated` flag (so an accidentally-deactivated user is also
+// restored), and deletes every existing access token for the user
+// (so any session that survived the password change can't keep
+// operating with stale credentials).
+//
+// Password handling:
+//   - With a second argument: hash and use that password.
+//   - Without: generate a 16-char random alphanumeric password and
+//     return it in the bot's reply. The operator copies it from the
+//     admin room and communicates it to the user out-of-band.
+//
+// The plaintext password (whether operator-supplied or
+// server-generated) lands in the admin room's message history. The
+// admin room is private + typically e2ee, but the credential is
+// visible to every admin-room member. That's acceptable for a
+// helpdesk reset; operators who need stronger isolation should run
+// `!reset-password` in a single-admin room.
+async fn cmd_reset_password(
+    state: &AppState,
+    _sender_nid: u64,
+    args: &[String],
+) -> Result<Reply, ApiError> {
+    let Some(mxid) = args.first() else {
+        return Ok(Reply::plain(
+            "usage: !reset-password <@user:server> [password]\n\
+             with no password, the bot generates a random one and replies with it.",
+        ));
+    };
+    let nid = match state
+        .db
+        .get_nid(mxid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    {
+        Some(n) => n,
+        None => return Ok(Reply::plain(format!("unknown user: {mxid}"))),
+    };
+    if Some(nid) == state.db.get_admin_bot_user_nid().ok().flatten() {
+        return Ok(Reply::plain("refusing to reset the admin bot's password"));
+    }
+
+    // Pick the password: operator-supplied or server-generated.
+    let (password, generated) = match args.get(1) {
+        Some(p) if !p.is_empty() => (p.clone(), false),
+        _ => (generate_random_password(), true),
+    };
+
+    let hash = crate::account::hash_password(&password);
+
+    state
+        .db
+        .update_user_password(nid, &hash)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    // Un-deactivate so the user isn't refused at login.
+    state
+        .db
+        .reactivate_user(nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    // Invalidate every existing session so any device still holding a
+    // pre-reset access token has to re-login with the new password.
+    state
+        .db
+        .delete_user_tokens(nid, None)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
+    let body = if generated {
+        format!(
+            "password reset for {mxid}\n\
+             temporary password: `{password}`\n\
+             communicate this out-of-band; ask the user to change it via their client \
+             after they log in. all existing sessions invalidated."
+        )
+    } else {
+        format!(
+            "password reset for {mxid}\n\
+             all existing sessions invalidated."
+        )
+    };
+    Ok(Reply::plain(body))
+}
+
+/// 16-char alphanumeric password. ~95 bits of entropy.
+fn generate_random_password() -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut rng = rand::rng();
+    (0..16)
+        .map(|_| {
+            let idx = rng.random_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
+        .collect()
 }
 
 // --- !promote <mxid> ---
@@ -1860,6 +1997,118 @@ mod tests {
             .await
             .unwrap();
         assert!(state.db.user_is_deactivated(alice).unwrap());
+    }
+
+    #[tokio::test]
+    async fn cmd_reactivate_clears_flag() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let alice = state.db.create_user("@alice:example.com", "h").unwrap();
+        cmd_deactivate(&state, 0, &["@alice:example.com".into()])
+            .await
+            .unwrap();
+        assert!(state.db.user_is_deactivated(alice).unwrap());
+
+        let r = cmd_reactivate(&state, 0, &["@alice:example.com".into()])
+            .await
+            .unwrap();
+        assert!(r.text.contains("reactivated"));
+        assert!(!state.db.user_is_deactivated(alice).unwrap());
+    }
+
+    #[tokio::test]
+    async fn cmd_reactivate_refuses_bot() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let r = cmd_reactivate(&state, 0, &["@admin:example.com".into()])
+            .await
+            .unwrap();
+        assert!(r.text.contains("refusing"));
+    }
+
+    #[tokio::test]
+    async fn cmd_reset_password_with_explicit_password() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let alice = state
+            .db
+            .create_user("@alice:example.com", "stale-hash")
+            .unwrap();
+        // Pre-deactivate to also verify the un-deactivate side-effect.
+        cmd_deactivate(&state, 0, &["@alice:example.com".into()])
+            .await
+            .unwrap();
+        // Stash a stale token so we can confirm session invalidation.
+        let stale_tok = state.db.create_token(alice, "DEV1").unwrap();
+        assert!(state.db.validate_token(&stale_tok).unwrap().is_some());
+
+        let r = cmd_reset_password(
+            &state,
+            0,
+            &["@alice:example.com".into(), "newpass123".into()],
+        )
+        .await
+        .unwrap();
+        assert!(r.text.contains("password reset"));
+        // Generated-password marker must NOT appear when caller
+        // supplied a password.
+        assert!(!r.text.contains("temporary password"));
+
+        // Deactivated flag cleared.
+        assert!(!state.db.user_is_deactivated(alice).unwrap());
+        // Pre-reset token gone.
+        assert!(state.db.validate_token(&stale_tok).unwrap().is_none());
+        // Stored hash is fresh (not the original or blank).
+        let user = state.db.get_user(alice).unwrap().unwrap();
+        let new_hash = user.get("password_hash").and_then(|v| v.as_str()).unwrap();
+        assert!(new_hash.starts_with("$argon2"), "expected argon2 hash");
+        assert_ne!(new_hash, "stale-hash");
+        assert!(!new_hash.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cmd_reset_password_generates_when_no_password_arg() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let alice = state
+            .db
+            .create_user("@alice:example.com", "stale-hash")
+            .unwrap();
+
+        let r = cmd_reset_password(&state, 0, &["@alice:example.com".into()])
+            .await
+            .unwrap();
+        // Reply must surface the generated password so the operator
+        // can communicate it out-of-band.
+        assert!(
+            r.text.contains("temporary password"),
+            "reply must announce the generated password: {}",
+            r.text
+        );
+        // Hash on disk is fresh argon2.
+        let user = state.db.get_user(alice).unwrap().unwrap();
+        let h = user.get("password_hash").and_then(|v| v.as_str()).unwrap();
+        assert!(h.starts_with("$argon2"));
+    }
+
+    #[tokio::test]
+    async fn cmd_reset_password_refuses_bot() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let r = cmd_reset_password(&state, 0, &["@admin:example.com".into()])
+            .await
+            .unwrap();
+        assert!(r.text.contains("refusing"));
+    }
+
+    #[tokio::test]
+    async fn cmd_reset_password_unknown_user() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let r = cmd_reset_password(&state, 0, &["@nobody:example.com".into()])
+            .await
+            .unwrap();
+        assert!(r.text.contains("unknown user"));
     }
 
     #[tokio::test]

@@ -99,6 +99,18 @@ allow_public_rooms_over_federation = false
 # local_lifetime  = "forever"
 # remote_lifetime = "30d"
 
+[presence]
+# Auto-decay thresholds for the user-presence state machine. After a
+# user goes idle (no /sync activity) for `idle_after`, effective
+# presence transitions online -> unavailable. After `offline_after`,
+# unavailable -> offline. A background sweeper persists the transition
+# and broadcasts the federation EDU every `sweep_interval`.
+# Defaults match Synapse roughly; raise idle_after if your clients
+# poll /sync infrequently.
+# idle_after     = "5min"
+# offline_after  = "30min"
+# sweep_interval = "60s"
+
 # --- vela-managed TLS (alternative to running Caddy in front) -------------
 # Uncomment if you'd rather vela terminate TLS directly instead of
 # putting a reverse proxy in front. You become responsible for cert
