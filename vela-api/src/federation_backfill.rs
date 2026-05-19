@@ -245,7 +245,7 @@ async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Res
         }
     }
 
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&to_persist);
 
     // BackfillTimeline: events get a stream_pos so /messages can return

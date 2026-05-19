@@ -577,7 +577,7 @@ pub async fn create_room(
             0
         };
 
-        let event_nid = state.db.next_nid();
+        let event_nid = state.db.next_nid()?;
         let json_bytes = canonical_json_object(&pe.event);
 
         let prev_nids = resolve_event_nids_from_json(&state, &pe.event, "prev_events")?;

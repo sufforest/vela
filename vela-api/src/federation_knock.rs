@@ -389,7 +389,7 @@ pub async fn send_knock_v1(
             auth_nids.push(n);
         }
     }
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid().map_err(db_err)?;
     let json_bytes = vela_core::canonical::canonical_json_object(&to_persist);
     let stream_pos = state
         .db

@@ -888,7 +888,7 @@ async fn persist_received_pdu(
         }
     }
 
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid().map_err(|e| format!("db: {e}"))?;
     let json_bytes = canonical_json_object(event_json);
     let is_state = pdu.state_key.is_some();
 
@@ -1046,7 +1046,10 @@ async fn apply_invite_rescind(
         Err(e) => return PduOutcome::Rejected(format!("nid alloc: {e}")),
     };
 
-    let event_nid = state.db.next_nid();
+    let event_nid = match state.db.next_nid() {
+        Ok(n) => n,
+        Err(e) => return PduOutcome::Rejected(format!("nid alloc: {e}")),
+    };
     let json_bytes = canonical_json_object(effective_event_json);
 
     let mut prev_nids: Vec<u64> = Vec::new();
@@ -1670,7 +1673,7 @@ async fn persist_fetched_event_inner(
         }
     }
 
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid().map_err(|e| format!("db: {e}"))?;
     let json_bytes = canonical_json_object(&event_obj_to_persist);
 
     // PersistKind by FetchKind:
@@ -1760,7 +1763,7 @@ pub async fn persist_join_event(
         }
     }
 
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid().map_err(|e| format!("db: {e}"))?;
     let json_bytes = canonical_json_object(event_json);
 
     let stream_pos = state

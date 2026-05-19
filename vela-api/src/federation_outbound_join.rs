@@ -376,7 +376,7 @@ async fn bootstrap_remote_room(
     }
 
     // --- Persist our join event ---
-    let join_event_nid = state.db.next_nid();
+    let join_event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(signed_event);
     let type_nid = state
         .db
@@ -632,7 +632,7 @@ async fn persist_remote_event(
         }
     }
 
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&to_persist);
     state
         .db

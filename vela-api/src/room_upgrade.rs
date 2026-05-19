@@ -317,7 +317,7 @@ pub async fn upgrade_room(
         } else {
             0
         };
-        let event_nid = state.db.next_nid();
+        let event_nid = state.db.next_nid()?;
         let json_bytes = canonical_json_object(&pe.event);
         let prev_nids = resolve_event_nids(&state, &pe.event, "prev_events")?;
         let auth_nids = resolve_event_nids(&state, &pe.event, "auth_events")?;
@@ -726,7 +726,7 @@ async fn send_tombstone(
 
     authorise_event(state, old_room_nid, &event_id, &event, None)?;
 
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&event);
     let type_nid = state
         .db

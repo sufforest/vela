@@ -235,7 +235,7 @@ pub async fn invite_v2(
     let sender_nid = state.db.get_or_create_nid(&sender).map_err(db_err)?;
     let skey_nid = state.db.get_or_create_nid(&state_key).map_err(db_err)?;
 
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid().map_err(db_err)?;
     let json_bytes = canonical_json_object(&event);
     let stream_pos = state
         .db
@@ -294,7 +294,7 @@ async fn persist_stripped(state: &AppState, room_nid: u64, stripped: &Value) -> 
         return Ok(());
     }
 
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid().map_err(|e| format!("db: {e}"))?;
     let obj_map: Map<String, Value> = obj.clone();
     let bytes = canonical_json_object(&obj_map);
     state
