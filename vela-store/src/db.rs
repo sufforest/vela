@@ -6197,4 +6197,62 @@ mod stream_recovery_tests {
         let after = db.next_nid().unwrap();
         assert!(after > last);
     }
+
+    /// Upgrade shape: a 0.1.1-or-older DB has event rows under low
+    /// (u64) NIDs because the pre-HiLo counter started at 1. On first
+    /// boot of a HiLo binary the seed must land above those rows so
+    /// the new allocator never collides with the legacy keyspace —
+    /// that's the whole reason for seeding at `u64::MAX/2` instead of
+    /// scanning the events CF on every open.
+    #[test]
+    fn hilo_first_boot_seeds_above_existing_low_nids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path();
+
+        // Stage 1: open the DB and write three rows to `events` under
+        // raw low NIDs (100, 200, 300) without going through the HiLo
+        // allocator. Mimics the on-disk shape an older binary left
+        // behind. Then *delete* the hilo meta key so the next open
+        // looks like a true first boot of the new binary against legacy
+        // data — Database::open seeds the counter on the first
+        // PersistedCounter::open call only when no key is present.
+        {
+            let db = Database::open(path).unwrap();
+            let cf_events = db.db.cf_handle("events").unwrap();
+            for nid in [100u64, 200, 300] {
+                db.db
+                    .put_cf(&cf_events, keys::encode_u64(nid), b"legacy-row")
+                    .unwrap();
+            }
+            let cf_meta = db.db.cf_handle("meta").unwrap();
+            db.db
+                .delete_cf(&cf_meta, b_meta::EVENT_NID.as_bytes())
+                .unwrap();
+        }
+
+        // Stage 2: reopen — first boot for the HiLo counter. The seed
+        // must be above the legacy rows so next_nid() can't overwrite
+        // them.
+        let db = Database::open(path).unwrap();
+        let first = db.next_nid().unwrap();
+        assert!(
+            first > 300,
+            "first HiLo allocation ({first}) must exceed legacy max NID (300)"
+        );
+        assert_eq!(
+            first,
+            u64::MAX / 2,
+            "first HiLo allocation must equal the documented seed"
+        );
+
+        // And the legacy rows must still be intact — no in-place write
+        // could possibly have hit them.
+        let cf_events = db.db.cf_handle("events").unwrap();
+        for nid in [100u64, 200, 300] {
+            assert_eq!(
+                db.db.get_cf(&cf_events, keys::encode_u64(nid)).unwrap(),
+                Some(b"legacy-row".to_vec())
+            );
+        }
+    }
 }
