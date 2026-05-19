@@ -864,7 +864,7 @@ async fn do_remote_leave(
 
     // Persist our own copy + flip membership locally so the user sees the
     // leave regardless of remote success.
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid()?;
     let json_bytes = vela_core::canonical::canonical_json_object(&signed_event);
     let type_nid = state
         .db
@@ -1296,7 +1296,7 @@ pub async fn knock_room(
     authorise_event(&state, room_nid, &event_id, &event, None)?;
 
     // Persist
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&event);
     let type_nid = state
         .db
@@ -1544,7 +1544,7 @@ async fn emit_join_event(
 
     authorise_event(state, room_nid, &event_id, &event, None)?;
 
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&event);
     let type_nid = state
         .db
@@ -1720,7 +1720,7 @@ async fn emit_self_profile_event(
     );
     authorise_event(state, room_nid, &event_id, &event, None)?;
 
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&event);
     let type_nid = state
         .db
@@ -1862,7 +1862,7 @@ async fn emit_membership_event_for_target(
     authorise_event(state, room_nid, &event_id, &event, None)?;
 
     // Persist
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&event);
     let type_nid = state
         .db
@@ -2298,7 +2298,7 @@ async fn emit_self_leave_with_reason(
 
     authorise_event(state, room_nid, &event_id, &event, None)?;
 
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&event);
     let type_nid = state
         .db

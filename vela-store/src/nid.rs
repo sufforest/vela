@@ -3,13 +3,18 @@
 
 use rocksdb::DB;
 
+use crate::db::PersistedCounter;
 use crate::keys::{decode_u64, encode_u64};
 
 /// Get or create a NID for a string identifier.
-/// Uses global_nids CF for string→NID and nid_reverse CF for NID→string.
+///
+/// Uses `nid_map` CF for string→NID and `nid_reverse` CF for NID→string.
+/// Reads short-circuit on existing entries; allocation goes through
+/// the string-namespace HiLo counter so a fresh NID is durable across
+/// restarts without scanning.
 pub fn get_or_create_nid(
     db: &DB,
-    nid_counter: &std::sync::atomic::AtomicU64,
+    string_nid_counter: &PersistedCounter,
     string: &str,
 ) -> Result<u64, rocksdb::Error> {
     let cf_map = db.cf_handle("nid_map").expect("nid_map CF missing");
@@ -19,8 +24,10 @@ pub fn get_or_create_nid(
         return Ok(decode_u64(&bytes));
     }
 
-    // Allocate new NID
-    let nid = nid_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Allocate new NID via the string-namespace HiLo counter. The
+    // counter persists its high water mark to meta CF as the in-memory
+    // block exhausts, so this NID is guaranteed durable past restart.
+    let nid = string_nid_counter.next(db)?;
     let nid_bytes = encode_u64(nid);
 
     let cf_reverse = db.cf_handle("nid_reverse").expect("nid_reverse CF missing");

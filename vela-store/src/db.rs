@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rocksdb::{ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options, WriteBatch};
@@ -7,6 +8,93 @@ use serde_json::Value;
 use crate::cf::COLUMN_FAMILIES;
 use crate::keys;
 use crate::nid;
+
+/// Persisted monotonic u64 allocator. `next()` is an atomic
+/// fetch_add until the in-memory block is exhausted; then it claims
+/// a new block by persisting a fresh high water mark to
+/// `meta[meta_key]`. On reopen, `next` resumes at the persisted high
+/// water mark — strictly above every NID handed out previously.
+/// Crash-loss is bounded by `block_size` (an unused tail of one
+/// in-flight block).
+pub struct PersistedCounter {
+    meta_key: &'static str,
+    block_size: u64,
+    next: AtomicU64,
+    /// Exclusive upper bound of the currently-claimed range.
+    high_water: AtomicU64,
+    claim_lock: Mutex<()>,
+}
+
+impl PersistedCounter {
+    /// Open the counter against meta CF, seeding `initial_value` on
+    /// first boot. Pick `initial_value` strictly above any NID an
+    /// older binary might have allocated — `u64::MAX / 2` for the
+    /// migration from the original shared-counter scheme.
+    pub fn open(
+        db: &DB,
+        meta_key: &'static str,
+        block_size: u64,
+        initial_value: u64,
+    ) -> Result<Self, rocksdb::Error> {
+        let cf = db.cf_handle("meta").expect("meta CF must exist");
+        let start = match db.get_cf(&cf, meta_key.as_bytes())? {
+            Some(bytes) if bytes.len() == 8 => keys::decode_u64(&bytes),
+            _ => {
+                // First boot — seed the meta key so subsequent opens
+                // skip this branch.
+                db.put_cf(&cf, meta_key.as_bytes(), keys::encode_u64(initial_value))?;
+                initial_value
+            }
+        };
+        Ok(Self {
+            meta_key,
+            block_size,
+            next: AtomicU64::new(start),
+            high_water: AtomicU64::new(start),
+            claim_lock: Mutex::new(()),
+        })
+    }
+
+    /// Counter for read-only secondary DBs — never claims a block
+    /// (high water is `u64::MAX`), so the disk-write path is
+    /// unreachable from a process that can't write anyway.
+    pub fn ephemeral(initial_value: u64) -> Self {
+        Self {
+            meta_key: "<ephemeral>",
+            block_size: u64::MAX,
+            next: AtomicU64::new(initial_value),
+            high_water: AtomicU64::new(u64::MAX),
+            claim_lock: Mutex::new(()),
+        }
+    }
+
+    pub fn next(&self, db: &DB) -> Result<u64, rocksdb::Error> {
+        let v = self.next.fetch_add(1, Ordering::Relaxed);
+        if v < self.high_water.load(Ordering::Acquire) {
+            return Ok(v);
+        }
+        let _g = self.claim_lock.lock().unwrap();
+        if v < self.high_water.load(Ordering::Acquire) {
+            return Ok(v);
+        }
+        // Persist the new high water before updating the in-memory
+        // ceiling: a crash in between can only over-reserve (waste
+        // IDs), never under-reserve (collide on a future reopen).
+        let new_high = v.saturating_add(self.block_size + 1);
+        let cf = db.cf_handle("meta").expect("meta CF must exist");
+        db.put_cf(&cf, self.meta_key.as_bytes(), keys::encode_u64(new_high))?;
+        self.high_water.store(new_high, Ordering::Release);
+        Ok(v)
+    }
+}
+
+/// Meta-CF keys for the HiLo NID counters. Access only via
+/// `PersistedCounter`.
+mod b_meta {
+    pub const EVENT_NID: &str = "hilo:next_event_nid";
+    pub const STRING_NID: &str = "hilo:next_string_nid";
+    pub const SNAPSHOT_NID: &str = "hilo:next_snapshot_nid";
+}
 
 /// On-disk schema version. Bumped whenever a change to a CF layout
 /// (key format, value encoding, new required CF, removed CF) makes
@@ -71,9 +159,10 @@ impl PersistKind {
 
 pub struct Database {
     pub(crate) db: DB,
-    pub(crate) nid_counter: AtomicU64,
+    pub(crate) event_nid_counter: PersistedCounter,
+    pub(crate) string_nid_counter: PersistedCounter,
     pub(crate) stream_counter: AtomicU64,
-    pub(crate) snapshot_counter: AtomicU64,
+    pub(crate) snapshot_nid_counter: PersistedCounter,
     /// Monotonic position into `receipts_stream`, advanced once per
     /// locally-originated receipt write. Recovered from the on-disk CF
     /// at open. Independent from `stream_counter` so receipt EDU
@@ -127,15 +216,16 @@ impl Database {
         Ok(Self {
             db,
             // Secondary DBs never allocate ids / stream positions;
-            // pick a dummy non-zero anchor so any accidental
+            // pick dummy ephemeral counters so any accidental
             // allocator call is at least visible in logs. The
             // allocator paths would fail at the RocksDB layer
             // anyway (writes refused on the secondary).
-            nid_counter: AtomicU64::new(1),
+            event_nid_counter: PersistedCounter::ephemeral(1),
+            string_nid_counter: PersistedCounter::ephemeral(1),
             stream_counter: AtomicU64::new(1),
             receipts_stream_counter: AtomicU64::new(1),
             presence_stream_counter: AtomicU64::new(1),
-            snapshot_counter: AtomicU64::new(1),
+            snapshot_nid_counter: PersistedCounter::ephemeral(1),
             to_device_outbound_counter: AtomicU64::new(1),
         })
     }
@@ -225,8 +315,15 @@ impl Database {
             }
         }
 
-        // Recover counters from existing data
-        let nid_counter = recover_max_nid(&db).unwrap_or(1);
+        // Seed NID counters at u64::MAX/2 on first boot: above any
+        // NID that an older binary might have allocated below that
+        // threshold, so no migration scan is needed.
+        let event_nid_counter = PersistedCounter::open(&db, b_meta::EVENT_NID, 1000, u64::MAX / 2)?;
+        let string_nid_counter =
+            PersistedCounter::open(&db, b_meta::STRING_NID, 100, u64::MAX / 2)?;
+        let snapshot_nid_counter =
+            PersistedCounter::open(&db, b_meta::SNAPSHOT_NID, 100, u64::MAX / 2)?;
+
         let stream_counter = recover_max_stream(&db);
         // Half-max sanity tripwire. At our load-test ceiling (~50k
         // bumps/sec sustained) this triggers in ~5 million years, so
@@ -240,16 +337,16 @@ impl Database {
                  investigate before further writes"
             );
         }
-        let snapshot_counter = recover_max_snapshot(&db).unwrap_or(1);
         let receipts_stream_counter = recover_max_receipts_stream(&db).unwrap_or(1);
         let presence_stream_counter = recover_max_presence_stream(&db).unwrap_or(1);
         let to_device_outbound_counter = recover_max_to_device_outbound(&db).unwrap_or(1);
 
         Ok(Self {
             db,
-            nid_counter: AtomicU64::new(nid_counter),
+            event_nid_counter,
+            string_nid_counter,
             stream_counter: AtomicU64::new(stream_counter),
-            snapshot_counter: AtomicU64::new(snapshot_counter),
+            snapshot_nid_counter,
             receipts_stream_counter: AtomicU64::new(receipts_stream_counter),
             presence_stream_counter: AtomicU64::new(presence_stream_counter),
             to_device_outbound_counter: AtomicU64::new(to_device_outbound_counter),
@@ -258,8 +355,11 @@ impl Database {
 
     // --- Counter operations ---
 
-    pub fn next_nid(&self) -> u64 {
-        self.nid_counter.fetch_add(1, Ordering::Relaxed)
+    /// Allocate the next event NID. Atomic fast path; occasionally
+    /// persists a new range to the `meta` CF when the in-memory
+    /// block is exhausted (see `PersistedCounter`).
+    pub fn next_nid(&self) -> Result<u64, rocksdb::Error> {
+        self.event_nid_counter.next(&self.db)
     }
 
     /// Allocate a fresh stream position. The returned `StreamPosition`
@@ -290,8 +390,8 @@ impl Database {
         checkpoint.create_checkpoint(out_path)
     }
 
-    pub fn next_snapshot_nid(&self) -> u64 {
-        self.snapshot_counter.fetch_add(1, Ordering::Relaxed)
+    pub fn next_snapshot_nid(&self) -> Result<u64, rocksdb::Error> {
+        self.snapshot_nid_counter.next(&self.db)
     }
 
     /// Returns the last allocated stream position (the position of the most recent event).
@@ -304,7 +404,7 @@ impl Database {
     // --- NID operations ---
 
     pub fn get_or_create_nid(&self, string: &str) -> Result<u64, rocksdb::Error> {
-        nid::get_or_create_nid(&self.db, &self.nid_counter, string)
+        nid::get_or_create_nid(&self.db, &self.string_nid_counter, string)
     }
 
     pub fn get_nid(&self, string: &str) -> Result<Option<u64>, rocksdb::Error> {
@@ -1982,7 +2082,7 @@ impl Database {
         event_nid: u64,
         state_event_nids: &[u64],
     ) -> Result<u64, rocksdb::Error> {
-        let snapshot_nid = self.next_snapshot_nid();
+        let snapshot_nid = self.next_snapshot_nid()?;
 
         let mut batch = WriteBatch::default();
 
@@ -5006,24 +5106,6 @@ fn repair_room_state_orphans(db: &DB) -> Result<(), rocksdb::Error> {
     Ok(())
 }
 
-fn recover_max_nid(db: &DB) -> Option<u64> {
-    let mut max_nid: Option<u64> = None;
-
-    for cf_name in ["nid_reverse", "events"] {
-        let Some(cf) = db.cf_handle(cf_name) else {
-            continue;
-        };
-        if let Some(Ok((key, _))) = db.iterator_cf(&cf, IteratorMode::End).next()
-            && key.len() == 8
-        {
-            let nid = keys::decode_u64(&key);
-            max_nid = Some(max_nid.map_or(nid, |m| m.max(nid)));
-        }
-    }
-
-    max_nid.map(|m| m + 1)
-}
-
 /// Recover max stream position from room_timeline CF.
 /// Recover the next stream position from RocksDB's own monotonic
 /// sequence number. RocksDB advances `latest_sequence_number()` once
@@ -5123,15 +5205,6 @@ fn recover_max_to_device_outbound(db: &DB) -> Option<u64> {
         max_pos = Some(max_pos.map_or(pos, |m| m.max(pos)));
     }
     max_pos.map(|m| m + 1)
-}
-
-/// Recover max snapshot NID from state_snapshots CF.
-fn recover_max_snapshot(db: &DB) -> Option<u64> {
-    let cf = db.cf_handle("state_snapshots")?;
-    let mut iter = db.iterator_cf(&cf, IteratorMode::End);
-    iter.next()
-        .and_then(|r| r.ok())
-        .map(|(key, _)| keys::decode_u64(&key) + 1)
 }
 
 /// Outbox key prefix for one destination. Includes the trailing 0xff
@@ -5736,7 +5809,7 @@ mod stream_recovery_tests {
 
             // Persist Alice's first join member event. Goes into events
             // CF + room_state CF + room_timeline CF.
-            let join_nid_1 = db.next_nid();
+            let join_nid_1 = db.next_nid().unwrap();
             let join_json_1 = serde_json::json!({
                 "type": "m.room.member",
                 "sender": "@alice:example.com",
@@ -5763,7 +5836,7 @@ mod stream_recovery_tests {
             // Persist a SECOND join member event (e.g. a profile update —
             // same (type, state_key), newer event). This is the "valid
             // replacement" the repair should find.
-            let join_nid_2 = db.next_nid();
+            let join_nid_2 = db.next_nid().unwrap();
             let join_json_2 = serde_json::json!({
                 "type": "m.room.member",
                 "sender": "@alice:example.com",
@@ -5872,7 +5945,7 @@ mod stream_recovery_tests {
 
             let mut last = 0u64;
             for i in 0..10 {
-                let event_nid = db.next_nid();
+                let event_nid = db.next_nid().unwrap();
                 last = event_nid;
                 let event_id = format!("$ev{i}:example.com");
                 let json = serde_json::json!({
@@ -5905,9 +5978,9 @@ mod stream_recovery_tests {
         // counter resumed below `last_event_nid` and the next 10
         // allocations would collide with existing event rows.
         let db = Database::open(path).unwrap();
-        let n1 = db.next_nid();
-        let n2 = db.next_nid();
-        let n3 = db.next_nid();
+        let n1 = db.next_nid().unwrap();
+        let n2 = db.next_nid().unwrap();
+        let n3 = db.next_nid().unwrap();
         for n in [n1, n2, n3] {
             assert!(
                 n > last_event_nid,
@@ -6022,5 +6095,106 @@ mod stream_recovery_tests {
             vec![alice],
             "open-time migration must populate index for legacy records",
         );
+    }
+
+    /// After reopen, next_nid must exceed every previously-allocated
+    /// NID — that's the whole point of persisting the high water mark.
+    #[test]
+    fn hilo_event_nid_persists_across_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path();
+
+        let last = {
+            let db = Database::open(path).unwrap();
+            let mut last = 0u64;
+            for _ in 0..5 {
+                last = db.next_nid().unwrap();
+            }
+            last
+        };
+
+        let db = Database::open(path).unwrap();
+        let after = db.next_nid().unwrap();
+        assert!(after > last, "next_nid {after} must exceed last={last}");
+    }
+
+    /// First boot seeds the counter at `u64::MAX/2`, above any NID an
+    /// older binary might have allocated below that threshold.
+    #[test]
+    fn hilo_event_nid_first_boot_starts_at_high_water_mark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        assert_eq!(db.next_nid().unwrap(), u64::MAX / 2);
+        assert_eq!(db.next_nid().unwrap(), u64::MAX / 2 + 1);
+    }
+
+    /// Event NIDs and string NIDs come from independent counters — the
+    /// same numeric value can appear in both namespaces because their
+    /// CFs don't share key space.
+    #[test]
+    fn hilo_event_and_string_namespaces_are_independent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        let event_first = db.next_nid().unwrap();
+        let string_first = db.get_or_create_nid("@alice:example.com").unwrap();
+        assert_eq!(event_first, u64::MAX / 2);
+        assert_eq!(string_first, u64::MAX / 2);
+    }
+
+    /// `fetch_add` hands out a unique value per call regardless of how
+    /// many threads cross a block boundary at the same time — only the
+    /// disk write is serialised by the claim lock.
+    #[test]
+    fn hilo_concurrent_allocations_are_unique() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+        let num_threads = 8;
+        let allocs_per_thread = 500;
+
+        let mut handles = Vec::new();
+        for _ in 0..num_threads {
+            let db = db.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut local = Vec::with_capacity(allocs_per_thread);
+                for _ in 0..allocs_per_thread {
+                    local.push(db.next_nid().unwrap());
+                }
+                local
+            }));
+        }
+
+        let mut all: HashSet<u64> = HashSet::new();
+        let mut total = 0usize;
+        for h in handles {
+            for nid in h.join().unwrap() {
+                total += 1;
+                assert!(all.insert(nid), "duplicate NID across threads: {nid}");
+            }
+        }
+        assert_eq!(total, num_threads * allocs_per_thread);
+        assert_eq!(all.len(), total);
+    }
+
+    /// Allocations spanning multiple block claims persist their high
+    /// water mark forward — reopen sees the latest claimed range, not
+    /// just the first.
+    #[test]
+    fn hilo_event_nid_block_claim_persists_new_high_water() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path();
+        let last = {
+            let db = Database::open(path).unwrap();
+            let mut last = 0u64;
+            for _ in 0..2500 {
+                last = db.next_nid().unwrap();
+            }
+            last
+        };
+        let db = Database::open(path).unwrap();
+        let after = db.next_nid().unwrap();
+        assert!(after > last);
     }
 }

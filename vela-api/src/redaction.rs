@@ -194,7 +194,7 @@ pub async fn redact_event(
     // Standard PDU auth (rule 8 + rule 11). Separate from the apply check above.
     authorise_event(&state, room_nid, &event_id, &event, None)?;
 
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&event);
     let type_nid = state
         .db

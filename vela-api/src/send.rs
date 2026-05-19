@@ -150,7 +150,7 @@ pub async fn send_message(
     authorise_event(&state, room_nid, &event_id, &event, None)?;
 
     // Persist
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&event);
     enforce_event_size(&json_bytes)?;
     let type_nid = state
@@ -413,7 +413,7 @@ async fn send_state_inner(
 
     authorise_event(&state, room_nid, &event_id, &event, None)?;
 
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&event);
     enforce_event_size(&json_bytes)?;
     let type_nid = state

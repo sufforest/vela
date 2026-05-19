@@ -612,7 +612,7 @@ async fn create_admin_room(
             0
         };
 
-        let event_nid = state.db.next_nid();
+        let event_nid = state.db.next_nid()?;
         let json_bytes = canonical_json_object(event);
         let prev_nids = resolve_event_nids_in_json(state, event, "prev_events")?;
         let auth_nids = resolve_event_nids_in_json(state, event, "auth_events")?;
@@ -1714,7 +1714,7 @@ async fn send_bot_notice(state: &AppState, room_nid: u64, reply: Reply) -> Resul
         room_version,
     );
     authorise_event(state, room_nid, &event_id, &event, None)?;
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&event);
     let type_nid = state
         .db

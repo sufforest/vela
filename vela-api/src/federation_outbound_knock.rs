@@ -264,7 +264,7 @@ async fn persist_knock(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(signed_event);
     state
         .db
@@ -331,7 +331,7 @@ async fn persist_stripped_state_event(
         let _ = existing;
     }
 
-    let event_nid = state.db.next_nid();
+    let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(obj);
     state
         .db
