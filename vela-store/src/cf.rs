@@ -119,4 +119,20 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // is seeded into this CF on first boot when no admin exists, so
     // the same lookup path covers bootstrap and post-bootstrap.
     "registration_tokens",
+    // User-submitted abuse reports against events, rooms, or users.
+    // Key: `[ts_ns_be:8][reporter_nid_be:8]` — nanosecond timestamp
+    // avoids same-millisecond collisions when one user submits
+    // multiple reports in quick succession. Forward scan = oldest
+    // first, reverse scan = newest first (what !reports wants).
+    // Value: JSON
+    //   { kind: "event"|"room"|"user",
+    //     room_id?: string, room_nid?: u64,
+    //     event_id?: string, event_nid?: u64,
+    //     target_user_id?: string, target_user_nid?: u64,
+    //     reporter_user_id: string, reporter_nid: u64,
+    //     reason: string, ts_ms: u64 }
+    // Read by `!reports` admin bot command. We deliberately don't
+    // index by room or reporter — the volume is low and a full
+    // backward scan from the end is cheap at human-moderator scale.
+    "event_reports",
 ];

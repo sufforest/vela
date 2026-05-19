@@ -1634,6 +1634,41 @@ impl Database {
         Ok(removed)
     }
 
+    /// Append an abuse report into `event_reports`. Key is
+    /// `[ts_ns_be][reporter_nid_be]`. Nanosecond resolution avoids
+    /// same-millisecond collisions when one user submits multiple
+    /// reports in rapid succession; reverse iteration still yields
+    /// newest-first (what the admin bot wants).
+    pub fn insert_event_report(
+        &self,
+        ts_ns: u64,
+        reporter_nid: u64,
+        value: &Value,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("event_reports").unwrap();
+        let mut key = [0u8; 16];
+        key[..8].copy_from_slice(&ts_ns.to_be_bytes());
+        key[8..].copy_from_slice(&reporter_nid.to_be_bytes());
+        self.db.put_cf(&cf, key, value.to_string().as_bytes())
+    }
+
+    /// Return the `limit` most-recent reports, newest first.
+    pub fn list_recent_reports(&self, limit: usize) -> Result<Vec<Value>, rocksdb::Error> {
+        let cf = self.db.cf_handle("event_reports").unwrap();
+        let iter = self.db.iterator_cf(&cf, IteratorMode::End);
+        let mut out = Vec::with_capacity(limit);
+        for item in iter {
+            let (_k, v) = item?;
+            if let Ok(json) = serde_json::from_slice::<Value>(&v) {
+                out.push(json);
+            }
+            if out.len() == limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     pub fn get_filter(
         &self,
         user_nid: u64,

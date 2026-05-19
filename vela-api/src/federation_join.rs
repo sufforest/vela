@@ -122,6 +122,10 @@ pub async fn make_join(
         }
     };
 
+    // m.room.server_acl gate. Block banned origins from getting a join
+    // template at all.
+    crate::server_acl::deny_if_blocked(&state, room_nid, &origin.0)?;
+
     // Accept public + restricted/knock_restricted rooms outright.
     // For invite-only rooms, accept iff the user has a current
     // `m.room.member` invite — the spec lets invited users
@@ -381,6 +385,12 @@ pub async fn send_join_v2(
             "M_FORBIDDEN",
             "sender domain does not match origin",
         ));
+    }
+
+    // m.room.server_acl gate. If room exists locally, deny the join
+    // when the origin is banned by the room's ACL.
+    if let Some(room_nid) = state.db.get_nid(&room_id).ok().flatten() {
+        crate::server_acl::deny_if_blocked(&state, room_nid, &origin.0)?;
     }
 
     // Look up the room version up-front so verify_event_signature
