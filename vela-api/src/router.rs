@@ -16,15 +16,21 @@ use vela_core::identifiers::Nid;
 use vela_store::db::Database;
 use vela_store::media::MediaStore;
 
-use crate::federation_client::{FederationClient, RemoteKeyCache};
-use crate::federation_sender::FederationSender;
+use crate::auth::{account, account_data, devices, login, logout, refresh, register, whoami};
+use crate::directory::{self, discovery, search};
+use crate::e2ee::{key_backup, keys, to_device};
+use crate::federation;
+use crate::federation::federation_client::{FederationClient, RemoteKeyCache};
+use crate::federation::federation_sender::FederationSender;
+use crate::media;
+use crate::membership;
 use crate::middleware::federation_auth::federation_auth;
-use crate::{
-    account, account_data, capabilities, devices, directory, discovery, federation, filters,
-    key_backup, keys, login, logout, media, membership, messages, openid, presence, profile,
-    pushers, pushrules, receipts, redaction, refresh, register, relations, room_upgrade, rooms,
-    search, send, sliding_sync, state, sync, thread_subscriptions, to_device, typing, voip, whoami,
-};
+use crate::presence;
+use crate::profile::{self, capabilities, openid};
+use crate::push::{pushers, pushrules};
+use crate::room::{messages, redaction, relations, room_upgrade, rooms, send, state};
+use crate::sync::{self, filters, receipts, sliding_sync, thread_subscriptions, typing};
+use crate::voip;
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -242,13 +248,13 @@ pub struct AppState {
     /// Federation outbound typing buffer (also registered in the
     /// federation sender's stream list). Held here as a concrete handle
     /// so the local /typing handler can `enqueue()` on every PUT.
-    pub typing_stream: Arc<crate::edu::typing::TypingStream>,
+    pub typing_stream: Arc<crate::federation::edu::typing::TypingStream>,
     pub media_store: Arc<dyn MediaStore>,
     pub signing_key: Arc<ServerSigningKey>,
     pub remote_keys: Arc<RemoteKeyCache>,
     pub federation_sender: Arc<FederationSender>,
     pub federation_client: Arc<FederationClient>,
-    pub uia_sessions: crate::uia::UiaSessions,
+    pub uia_sessions: crate::auth::uia::UiaSessions,
     /// Per-user wake channel: fires whenever the user's membership
     /// changes in ANY room (new invite, join, leave, knock, ban). Sync
     /// long-polls subscribe to this in addition to the per-room channel
@@ -471,15 +477,15 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/report/{event_id}",
-            post(crate::report::report_event),
+            post(crate::admin::report::report_event),
         )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/report",
-            post(crate::report::report_room),
+            post(crate::admin::report::report_room),
         )
         .route(
             "/_matrix/client/v3/users/{user_id}/report",
-            post(crate::report::report_user),
+            post(crate::admin::report::report_user),
         )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/relations/{event_id}",
@@ -547,12 +553,12 @@ pub fn build_router(state: AppState) -> Router {
         // User directory — substring search over local users.
         .route(
             "/_matrix/client/v3/user_directory/search",
-            post(crate::user_directory::search),
+            post(crate::directory::user_directory::search),
         )
         // Spaces hierarchy (MSC2946 / stable v1).
         .route(
             "/_matrix/client/v1/rooms/{room_id}/hierarchy",
-            get(crate::spaces::hierarchy),
+            get(crate::directory::spaces::hierarchy),
         )
         // Push rules (stub)
         .route(
@@ -685,7 +691,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/_matrix/client/v1/rooms/{room_id}/timestamp_to_event",
-            get(crate::timestamp::timestamp_to_event),
+            get(crate::directory::timestamp::timestamp_to_event),
         )
         // Ephemeral
         .route(
@@ -957,7 +963,9 @@ async fn method_not_allowed(
 
 /// Build the sub-router for federation endpoints that require X-Matrix auth.
 fn federation_authed_routes(state: AppState) -> Router<AppState> {
-    use crate::{federation_devices, federation_fetch, federation_media};
+    use crate::e2ee::federation_devices;
+    use crate::federation::federation_fetch;
+    use crate::media::federation_media;
     Router::new()
         .route(
             "/_matrix/federation/v1/send/{txn_id}",
@@ -991,7 +999,7 @@ fn federation_authed_routes(state: AppState) -> Router<AppState> {
         // MSC3030 federation companion to the C2S timestamp_to_event.
         .route(
             "/_matrix/federation/v1/timestamp_to_event/{room_id}",
-            get(crate::timestamp::federation_timestamp_to_event),
+            get(crate::directory::timestamp::federation_timestamp_to_event),
         )
         .route(
             "/_matrix/federation/v1/user/devices/{user_id}",
@@ -1022,7 +1030,7 @@ fn federation_authed_routes(state: AppState) -> Router<AppState> {
         // recurses across servers themselves.
         .route(
             "/_matrix/federation/v1/hierarchy/{room_id}",
-            get(crate::spaces::federation_hierarchy),
+            get(crate::directory::spaces::federation_hierarchy),
         )
         .route(
             "/_matrix/federation/v1/media/download/{media_id}",
@@ -1043,39 +1051,39 @@ fn federation_authed_routes(state: AppState) -> Router<AppState> {
         // Inbound join
         .route(
             "/_matrix/federation/v1/make_join/{room_id}/{user_id}",
-            get(crate::federation_join::make_join),
+            get(crate::membership::federation_join::make_join),
         )
         .route(
             "/_matrix/federation/v1/send_join/{room_id}/{event_id}",
-            put(crate::federation_join::send_join_v1),
+            put(crate::membership::federation_join::send_join_v1),
         )
         .route(
             "/_matrix/federation/v2/send_join/{room_id}/{event_id}",
-            put(crate::federation_join::send_join_v2),
+            put(crate::membership::federation_join::send_join_v2),
         )
         .route(
             "/_matrix/federation/v1/make_leave/{room_id}/{user_id}",
-            get(crate::federation_leave::make_leave),
+            get(crate::membership::federation_leave::make_leave),
         )
         .route(
             "/_matrix/federation/v1/send_leave/{room_id}/{event_id}",
-            put(crate::federation_leave::send_leave_v1),
+            put(crate::membership::federation_leave::send_leave_v1),
         )
         .route(
             "/_matrix/federation/v2/send_leave/{room_id}/{event_id}",
-            put(crate::federation_leave::send_leave_v2),
+            put(crate::membership::federation_leave::send_leave_v2),
         )
         .route(
             "/_matrix/federation/v2/invite/{room_id}/{event_id}",
-            put(crate::federation_invite::invite_v2),
+            put(crate::membership::federation_invite::invite_v2),
         )
         .route(
             "/_matrix/federation/v1/make_knock/{room_id}/{user_id}",
-            get(crate::federation_knock::make_knock),
+            get(crate::membership::federation_knock::make_knock),
         )
         .route(
             "/_matrix/federation/v1/send_knock/{room_id}/{event_id}",
-            put(crate::federation_knock::send_knock_v1),
+            put(crate::membership::federation_knock::send_knock_v1),
         )
         .layer(axum::middleware::from_fn_with_state(state, federation_auth))
 }

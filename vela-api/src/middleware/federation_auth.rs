@@ -21,8 +21,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use crate::federation::federation_client::verify_federation_request;
 use crate::federation::parse_x_matrix_auth;
-use crate::federation_client::verify_federation_request;
 use crate::router::AppState;
 use vela_core::federation::keys::decode_public_key;
 
@@ -196,7 +196,7 @@ mod tests {
         // Our server_name in test state is "example.com"; sign a request
         // claiming destination = "other.example".
         let remote_key = vela_core::events::sign::ServerSigningKey::generate();
-        let header = crate::federation_client::build_x_matrix_header(
+        let header = crate::federation::federation_client::build_x_matrix_header(
             &remote_key,
             "remote.example",
             "GET",
@@ -221,13 +221,13 @@ mod tests {
         // Prepare a remote server's keys and pre-seed the cache so the
         // middleware doesn't attempt an outbound HTTP call.
         let remote_key = vela_core::events::sign::ServerSigningKey::generate();
-        let now = crate::federation_client::now_ms();
+        let now = crate::federation::federation_client::now_ms();
         let mut verify_keys = std::collections::HashMap::new();
         verify_keys.insert(
             remote_key.key_id().to_string(),
             remote_key.public_key_base64(),
         );
-        let remote_keys = crate::federation_client::RemoteKeys {
+        let remote_keys = crate::federation::federation_client::RemoteKeys {
             verify_keys,
             valid_until_ts: now + 60_000,
             fetched_at: now,
@@ -236,7 +236,7 @@ mod tests {
             .remote_keys
             .insert_for_test("remote.example", remote_keys);
 
-        let header = crate::federation_client::build_x_matrix_header(
+        let header = crate::federation::federation_client::build_x_matrix_header(
             &remote_key,
             "remote.example",
             "GET",
@@ -262,7 +262,7 @@ mod tests {
     async fn rejects_valid_header_but_unknown_origin_server() {
         let (state, _tmp) = crate::test_helpers::build_test_state();
         let remote_key = vela_core::events::sign::ServerSigningKey::generate();
-        let header = crate::federation_client::build_x_matrix_header(
+        let header = crate::federation::federation_client::build_x_matrix_header(
             &remote_key,
             "unreachable.example", // we haven't cached keys; fetch will attempt live and fail
             "GET",

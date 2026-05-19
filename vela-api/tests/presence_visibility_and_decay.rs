@@ -222,7 +222,7 @@ async fn explicit_offline_is_visible_to_other_users_as_offline() {
 
 #[tokio::test]
 async fn sweeper_persists_decay_transition_for_federation() {
-    use vela_api::presence_sweeper;
+    use vela_api::presence::presence_sweeper;
 
     let harness = Harness::new();
     let (alice_id, alice_tok) = harness.register("alice", "pw").await;

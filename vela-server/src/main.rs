@@ -11,9 +11,9 @@ use figment::providers::{Env, Format, Toml};
 use serde::Deserialize;
 use tracing::info;
 
-use vela_api::federation_client::{FederationClient, RemoteKeyCache};
-use vela_api::federation_resolver::FederationResolver;
-use vela_api::federation_sender::FederationSender;
+use vela_api::federation::federation_client::{FederationClient, RemoteKeyCache};
+use vela_api::federation::federation_resolver::FederationResolver;
+use vela_api::federation::federation_sender::FederationSender;
 use vela_api::router::{AppState, ServerConfig};
 use vela_core::events::sign::ServerSigningKey;
 use vela_store::db::Database;
@@ -842,7 +842,7 @@ fn main() -> anyhow::Result<()> {
         let signing_key = Arc::new(signing_key);
         let db = Arc::new(db);
 
-        let fed_policy = vela_api::federation_resolver::FederationPolicy {
+        let fed_policy = vela_api::federation::federation_resolver::FederationPolicy {
             private_ip_block: config.federation.private_ip_block,
             allow_list: config.federation.allow_list.clone(),
             our_server_name: config.server.name.clone(),
@@ -887,14 +887,16 @@ fn main() -> anyhow::Result<()> {
             db.clone(),
             (*federation_client).clone(),
         ));
-        let typing_stream =
-            vela_api::edu::typing::TypingStream::new(db.clone(), config.server.name.clone());
-        let edu_streams: vela_api::edu::EduStreams = vec![
-            vela_api::edu::receipts::ReceiptStream::new(config.server.name.clone()),
-            vela_api::edu::presence::PresenceStream::new(config.server.name.clone()),
-            vela_api::edu::to_device::ToDeviceStream::new(),
-            vela_api::edu::device_list::DeviceListStream::new(),
-            vela_api::edu::signing_key::SigningKeyUpdateStream::new(),
+        let typing_stream = vela_api::federation::edu::typing::TypingStream::new(
+            db.clone(),
+            config.server.name.clone(),
+        );
+        let edu_streams: vela_api::federation::edu::EduStreams = vec![
+            vela_api::federation::edu::receipts::ReceiptStream::new(config.server.name.clone()),
+            vela_api::federation::edu::presence::PresenceStream::new(config.server.name.clone()),
+            vela_api::federation::edu::to_device::ToDeviceStream::new(),
+            vela_api::federation::edu::device_list::DeviceListStream::new(),
+            vela_api::federation::edu::signing_key::SigningKeyUpdateStream::new(),
             typing_stream.clone(),
         ];
         let federation_sender = Arc::new(FederationSender::new_with_enabled(
@@ -976,7 +978,7 @@ fn main() -> anyhow::Result<()> {
             remote_keys,
             federation_sender,
             federation_client,
-            uia_sessions: vela_api::uia::new_sessions(),
+            uia_sessions: vela_api::auth::uia::new_sessions(),
             user_senders: Arc::new(DashMap::new()),
             metrics_renderer: metrics_renderer.clone(),
             rate_limiter: if config.rate_limit.enabled {
@@ -1012,7 +1014,7 @@ fn main() -> anyhow::Result<()> {
         // closes the gap for federation peers and the stored CF.
         // Always on — there's no useful "off" mode (would mean stale
         // presence survives forever, which is the bug this fixes).
-        let _presence_sweeper_handle = vela_api::presence_sweeper::spawn(state.clone());
+        let _presence_sweeper_handle = vela_api::presence::presence_sweeper::spawn(state.clone());
 
         let app = vela_api::router::build_router(state);
 
