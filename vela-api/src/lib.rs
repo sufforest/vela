@@ -1,76 +1,32 @@
-pub mod account;
-mod account_data;
-pub mod admin;
-pub mod auth_check;
-mod capabilities;
-mod devices;
-pub mod edu;
-pub mod federation_backfill;
-pub mod federation_client;
-pub mod federation_devices;
-pub mod federation_fetch;
-pub mod federation_invite;
-pub mod federation_join;
-pub mod federation_knock;
-pub mod federation_leave;
-pub mod federation_media;
-pub mod federation_outbound_join;
-pub mod federation_outbound_knock;
-pub mod federation_receive;
-pub mod federation_resolver;
-pub mod federation_sender;
-pub mod federation_state;
-mod filters;
-mod key_backup;
-pub mod trace_context;
+//! HTTP and federation surface of vela. Organised into ~12 domain
+//! modules; cross-cutting concerns (auth_check, rate_limit, metrics,
+//! trace_context, health, voip, middleware, router, test_helpers)
+//! stay at top level because they have no natural home in any one
+//! domain.
 
-mod directory;
-mod discovery;
+pub mod admin;
+pub mod auth;
+pub mod auth_check;
+pub mod directory;
+pub mod e2ee;
 pub mod federation;
 pub mod health;
-mod keys;
-mod login;
-mod logout;
-mod media;
-mod membership;
-pub mod messages;
+pub mod media;
+pub mod membership;
 pub mod metrics;
 pub mod middleware;
-mod openid;
 pub mod presence;
-pub mod presence_sweeper;
-mod profile;
+pub mod profile;
 pub mod push;
-mod pushers;
-mod pushrules;
 pub mod rate_limit;
-mod receipts;
-pub mod redaction;
-mod refresh;
-mod register;
-pub mod relations;
-mod report;
-mod room_upgrade;
-pub mod rooms;
+pub mod room;
 pub mod router;
-mod search;
-mod send;
-mod server_acl;
-mod sliding_sync;
-mod spaces;
-mod state;
-mod sync;
+pub mod sync;
 // Exposed out-of-crate under the `test-harness` feature so the
 // `tools/testing/smoketest-rs` crate can boot a real listener against
 // the same AppState shape the in-crate unit tests use. Inside vela-api,
 // every call site lives under `#[cfg(test)]`.
 #[cfg(any(test, feature = "test-harness"))]
 pub mod test_helpers;
-mod thread_subscriptions;
-pub mod timestamp;
-mod to_device;
-pub mod typing;
-pub mod uia;
-mod user_directory;
+pub mod trace_context;
 mod voip;
-mod whoami;

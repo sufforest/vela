@@ -10,9 +10,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use tempfile::TempDir;
 
-use crate::federation_client::{FederationClient, RemoteKeyCache};
-use crate::federation_resolver::FederationResolver;
-use crate::federation_sender::FederationSender;
+use crate::federation::federation_client::{FederationClient, RemoteKeyCache};
+use crate::federation::federation_resolver::FederationResolver;
+use crate::federation::federation_sender::FederationSender;
 use crate::router::{AppState, ServerConfig};
 use vela_core::events::sign::ServerSigningKey;
 use vela_store::db::Database;
@@ -43,14 +43,15 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
         Vec::new(),
     ));
     let remote_keys = Arc::new(RemoteKeyCache::new(db.clone(), (*client).clone()));
-    let typing_stream = crate::edu::typing::TypingStream::new(db.clone(), server_name.to_string());
+    let typing_stream =
+        crate::federation::edu::typing::TypingStream::new(db.clone(), server_name.to_string());
     let federation_sender = Arc::new(FederationSender::new(
         db.clone(),
         client.clone(),
         server_name.to_string(),
         vec![
-            crate::edu::to_device::ToDeviceStream::new(),
-            crate::edu::device_list::DeviceListStream::new(),
+            crate::federation::edu::to_device::ToDeviceStream::new(),
+            crate::federation::edu::device_list::DeviceListStream::new(),
             typing_stream.clone(),
         ],
     ));
@@ -89,7 +90,7 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
         remote_keys,
         federation_sender,
         federation_client: client,
-        uia_sessions: crate::uia::new_sessions(),
+        uia_sessions: crate::auth::uia::new_sessions(),
         user_senders: Arc::new(DashMap::new()),
         metrics_renderer: None,
         rate_limiter: crate::rate_limit::RateLimiter::defaults(),

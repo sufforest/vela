@@ -100,10 +100,11 @@ impl Harness {
         let db = Arc::new(Database::open(tmp.path()).expect("db open"));
         let media = FilesystemMediaStore::new(&tmp.path().join("media")).expect("media");
         let key = Arc::new(ServerSigningKey::generate());
-        let resolver =
-            Arc::new(vela_api::federation_resolver::FederationResolver::new().expect("resolver"));
+        let resolver = Arc::new(
+            vela_api::federation::federation_resolver::FederationResolver::new().expect("resolver"),
+        );
         let client = Arc::new(
-            vela_api::federation_client::FederationClient::new_with_enabled(
+            vela_api::federation::federation_client::FederationClient::new_with_enabled(
                 key.clone(),
                 server_name.to_string(),
                 resolver,
@@ -111,20 +112,24 @@ impl Harness {
                 overrides.federation_enabled,
             ),
         );
-        let remote_keys = Arc::new(vela_api::federation_client::RemoteKeyCache::new(
+        let remote_keys = Arc::new(
+            vela_api::federation::federation_client::RemoteKeyCache::new(
+                db.clone(),
+                (*client).clone(),
+            ),
+        );
+        let typing_stream = vela_api::federation::edu::typing::TypingStream::new(
             db.clone(),
-            (*client).clone(),
-        ));
-        let typing_stream =
-            vela_api::edu::typing::TypingStream::new(db.clone(), server_name.to_string());
+            server_name.to_string(),
+        );
         let federation_sender = Arc::new(
-            vela_api::federation_sender::FederationSender::new_with_enabled(
+            vela_api::federation::federation_sender::FederationSender::new_with_enabled(
                 db.clone(),
                 client.clone(),
                 server_name.to_string(),
                 vec![
-                    vela_api::edu::to_device::ToDeviceStream::new(),
-                    vela_api::edu::device_list::DeviceListStream::new(),
+                    vela_api::federation::edu::to_device::ToDeviceStream::new(),
+                    vela_api::federation::edu::device_list::DeviceListStream::new(),
                     typing_stream.clone(),
                 ],
                 overrides.federation_enabled,
@@ -165,7 +170,7 @@ impl Harness {
             remote_keys,
             federation_sender,
             federation_client: client,
-            uia_sessions: vela_api::uia::new_sessions(),
+            uia_sessions: vela_api::auth::uia::new_sessions(),
             user_senders: Arc::new(DashMap::new()),
             metrics_renderer: None,
             rate_limiter: vela_api::rate_limit::RateLimiter::defaults(),
@@ -326,7 +331,7 @@ impl StubRemote {
     pub fn install(&self, harness: &Harness) {
         let mut verify_keys = std::collections::HashMap::new();
         verify_keys.insert(self.key.key_id().to_string(), self.key.public_key_base64());
-        let keys = vela_api::federation_client::RemoteKeys {
+        let keys = vela_api::federation::federation_client::RemoteKeys {
             verify_keys,
             valid_until_ts: u64::MAX / 2,
             fetched_at: 0,

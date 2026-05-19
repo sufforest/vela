@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
-use vela_api::federation_client::{FederationClient, FederationClientError};
-use vela_api::federation_resolver::{FederationPolicy, FederationResolver};
+use vela_api::federation::federation_client::{FederationClient, FederationClientError};
+use vela_api::federation::federation_resolver::{FederationPolicy, FederationResolver};
 use vela_core::events::sign::ServerSigningKey;
 
 fn strict_client(our_server_name: &str) -> FederationClient {

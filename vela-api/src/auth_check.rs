@@ -591,8 +591,9 @@ mod tests {
 
         // Caller passes the (unpersisted) join event's auth_events = [$C].
         let unpersisted_auths = vec!["$C".to_string()];
-        let chain = crate::federation_state::auth_chain_including_seeds(db, &unpersisted_auths)
-            .expect("walk succeeds");
+        let chain =
+            crate::federation::federation_state::auth_chain_including_seeds(db, &unpersisted_auths)
+                .expect("walk succeeds");
 
         // Should include $C plus its ancestors $B, $A.
         assert!(
@@ -610,7 +611,8 @@ mod tests {
         assert_eq!(chain.len(), 3);
 
         // Calling with empty roots returns empty chain.
-        let empty = crate::federation_state::auth_chain_including_seeds(db, &[]).unwrap();
+        let empty =
+            crate::federation::federation_state::auth_chain_including_seeds(db, &[]).unwrap();
         assert!(empty.is_empty());
     }
 
@@ -631,7 +633,8 @@ mod tests {
         persist(22, "$Y", &[20]);
 
         let roots = ["$X", "$Y"];
-        let union = crate::federation_state::auth_chain_union_event_ids(db, &roots).unwrap();
+        let union =
+            crate::federation::federation_state::auth_chain_union_event_ids(db, &roots).unwrap();
 
         // Expected: [$Common] only — roots themselves are excluded.
         assert_eq!(union, vec!["$Common".to_string()]);
