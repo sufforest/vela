@@ -1,0 +1,55 @@
+name: Docker PR build
+
+# Build the production image on every PR that touches a path that
+# could affect the build. No push — this is purely a gate to catch
+# Dockerfile breakage, base-image surprises, and source-tree changes
+# that don't compile in the container, before they merge into main.
+#
+# Pairs with docker.yml (which builds + pushes on main + tags). The
+# split keeps PR-time gates cheap (no GHCR storage cost) while
+# pre-merge feedback stays fast.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'vela-server/**'
+      - 'vela-api/**'
+      - 'vela-core/**'
+      - 'vela-store/**'
+      - 'tools/vela-admin/**'
+      - '.github/workflows/docker-pr.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: cargo build (Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          # Reuse the cache the on-main `docker.yml` workflow has
+          # populated, so PR builds amortise their cost against the
+          # baseline.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
