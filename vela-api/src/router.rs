@@ -470,6 +470,18 @@ pub fn build_router(state: AppState) -> Router {
             put(redaction::redact_event),
         )
         .route(
+            "/_matrix/client/v3/rooms/{room_id}/report/{event_id}",
+            post(crate::report::report_event),
+        )
+        .route(
+            "/_matrix/client/v3/rooms/{room_id}/report",
+            post(crate::report::report_room),
+        )
+        .route(
+            "/_matrix/client/v3/users/{user_id}/report",
+            post(crate::report::report_user),
+        )
+        .route(
             "/_matrix/client/v3/rooms/{room_id}/relations/{event_id}",
             get(relations::relations_with_query),
         )

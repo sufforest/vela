@@ -10,6 +10,20 @@ minor versions.
 
 ### Fixed
 
+- **Federated messages didn't trigger push notifications.** The push
+  dispatch path only ran on locally-sent events; when a remote user
+  sent a message to a federated room, every local member's mobile
+  client stayed silent. Inbound federation now calls the same
+  `dispatch_for_event` after persistence, so remote-sender pushes go
+  through identical rule evaluation and gateway POST as local ones.
+- **`m.room.server_acl` was only enforced on inbound /send.** Banned
+  origins could still hit `/make_join`, `/send_join`, `/make_knock`,
+  `/send_knock`, and `/v2/invite` — i.e. join, knock, and invite
+  themselves into rooms whose ACL was supposed to keep them out.
+  All five handlers now run the same ACL check before doing room
+  work. Leave handlers are intentionally exempt per spec: a banned
+  origin must still be able to leave a room it's already in.
+
 - **Own presence not visible in /sync.** `collect_presence_events`
   filtered the requesting user out of the emitted peer set, so
   clients that draw their own profile indicator from /sync (Element
@@ -26,6 +40,15 @@ minor versions.
 
 ### Added
 
+- **`POST /_matrix/client/v3/rooms/{roomId}/report/{eventId}`** plus
+  the v1.13 `/rooms/{roomId}/report` and v1.14
+  `/users/{userId}/report` siblings. v1.18 semantics: optional
+  `reason`, no `score`. Always returns 200 `{}` (privacy mode —
+  doesn't leak whether the target exists or the reporter is in the
+  room). Reports persist into a new `event_reports` CF.
+- **`!reports [N]` admin bot command** — show the last N abuse
+  reports (default 20). Surfaces what users submit through the
+  `/report` endpoints.
 - **`!reactivate <mxid>` admin bot command.** Undoes `!deactivate`'s
   flag — operator must follow with `!reset-password` since
   `!deactivate` blanks the hash.

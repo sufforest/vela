@@ -81,6 +81,9 @@ pub async fn make_knock(
         )
     })?;
 
+    // m.room.server_acl gate.
+    crate::server_acl::deny_if_blocked(&state, room_nid, &origin.0)?;
+
     // Knock requires `join_rule: knock` or `knock_restricted`. Other rules
     // (public, invite, restricted) reject — knocking on a public room makes
     // no sense and on an invite-only room is forbidden by spec.
@@ -229,6 +232,9 @@ pub async fn send_knock_v1(
             "room not known locally",
         )
     })?;
+
+    // m.room.server_acl gate.
+    crate::server_acl::deny_if_blocked(&state, room_nid, &origin.0)?;
 
     // Same join_rule gate as make_knock — defence in depth in case the room
     // changed rules between the two calls.
@@ -618,6 +624,54 @@ mod tests {
         .await
         .expect_err("origin mismatch should reject");
         assert_eq!(err_.0, StatusCode::FORBIDDEN);
+    }
+
+    /// server_acl with `deny: ["banned.example"]` must 403 a knock from
+    /// banned.example before the join-rule check fires. Confirms the
+    /// gate is wired into make_knock (and, by symmetry, the other
+    /// federation handlers it covers).
+    #[tokio::test]
+    async fn make_knock_denies_banned_origin_via_server_acl() {
+        let (state, _tmp, room_id) = setup_room("example.com", json!({"join_rule": "knock"}));
+        let db = &state.db;
+        let room_nid = db.get_nid(&room_id).unwrap().unwrap();
+        let alice_nid = db.get_nid("@alice:example.com").unwrap().unwrap();
+        let acl_t = db.get_or_create_nid("m.room.server_acl").unwrap();
+        let empty_skey = db.get_or_create_nid("").unwrap();
+        db.persist_event(
+            13,
+            "$acl",
+            room_nid,
+            acl_t,
+            alice_nid,
+            empty_skey,
+            4,
+            4,
+            &serde_json::to_vec(&json!({
+                "type":"m.room.server_acl","sender":"@alice:example.com","state_key":"",
+                "room_id":room_id,
+                "content":{"allow":["*"],"deny":["banned.example"]},
+                "origin_server_ts":4,"depth":4,"prev_events":[],"auth_events":[]
+            }))
+            .unwrap(),
+            &[12],
+            &[10, 11],
+            true,
+            false,
+        )
+        .unwrap();
+
+        let err_ = make_knock(
+            axum::extract::State(state.clone()),
+            Path((room_id, "@mallory:banned.example".into())),
+            RawQuery(Some("ver=12".into())),
+            axum::Extension(XMatrixOrigin("banned.example".into())),
+        )
+        .await
+        .expect_err("banned origin must be denied");
+        assert_eq!(err_.0, StatusCode::FORBIDDEN);
+        let body = err_.1.0.to_string();
+        assert!(body.contains("server_acl"), "errcode body: {body}");
     }
 
     #[tokio::test]

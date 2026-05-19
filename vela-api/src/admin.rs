@@ -909,6 +909,7 @@ async fn handle_command(
         "demote" => cmd_demote(state, sender_nid, rest).await?,
         "token" => cmd_token(state, sender_nid, rest).await?,
         "tokens" => cmd_tokens(state).await?,
+        "reports" => cmd_reports(state, rest).await?,
         other => Reply::plain(format!(
             "unknown command: !{other}\ntype `!help` for the list of commands"
         )),
@@ -959,7 +960,8 @@ fn cmd_help() -> Reply {
         !demote <mxid>                       kick user from admin room (revoke admin)\n\
         !token create [uses=N] [expires=24h] mint a registration token\n\
         !tokens                              list registration tokens\n\
-        !token revoke <token>                delete a registration token";
+        !token revoke <token>                delete a registration token\n\
+        !reports [N]                         last N user-submitted abuse reports (default 20)";
     Reply::plain(text)
 }
 
@@ -1548,6 +1550,43 @@ async fn cmd_tokens(state: &AppState) -> Result<Reply, ApiError> {
     Ok(Reply::rich(text, html))
 }
 
+// --- !reports ---
+async fn cmd_reports(state: &AppState, args: &[String]) -> Result<Reply, ApiError> {
+    let limit = args
+        .first()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(20)
+        .clamp(1, 200);
+    let reports = state
+        .db
+        .list_recent_reports(limit)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if reports.is_empty() {
+        return Ok(Reply::plain("no reports"));
+    }
+    let mut text = format!("last {} reports (newest first):\n", reports.len());
+    for r in &reports {
+        let kind = r["kind"].as_str().unwrap_or("?");
+        let ts = r["ts_ms"].as_u64().unwrap_or(0);
+        let reporter = r["reporter_user_id"].as_str().unwrap_or("?");
+        let reason = r["reason"].as_str().unwrap_or("");
+        let subject = match kind {
+            "event" => format!(
+                "{} in {}",
+                r["event_id"].as_str().unwrap_or("?"),
+                r["room_id"].as_str().unwrap_or("?")
+            ),
+            "room" => r["room_id"].as_str().unwrap_or("?").to_string(),
+            "user" => r["target_user_id"].as_str().unwrap_or("?").to_string(),
+            _ => "?".to_string(),
+        };
+        text.push_str(&format!(
+            "  [{kind}] ts={ts} by {reporter}: {subject}\n    reason: {reason}\n"
+        ));
+    }
+    Ok(Reply::plain(text))
+}
+
 // --- Token + duration helpers ---
 
 fn mint_token_string() -> String {
@@ -1986,6 +2025,31 @@ mod tests {
             .unwrap();
         assert!(r.text.contains("@alice:example.com"));
         assert!(r.text.contains("deactivated: false"));
+    }
+
+    #[tokio::test]
+    async fn cmd_reports_lists_what_was_persisted() {
+        let (state, _tmp) = build_test_state();
+        let reporter_nid = state.db.get_or_create_nid("@alice:example.com").unwrap();
+        state
+            .db
+            .insert_event_report(
+                1_000_000_000,
+                reporter_nid,
+                &serde_json::json!({
+                    "kind": "event",
+                    "room_id": "!r:example.com",
+                    "event_id": "$e:example.com",
+                    "reporter_user_id": "@alice:example.com",
+                    "reason": "spam",
+                    "ts_ms": 1u64,
+                }),
+            )
+            .unwrap();
+        let r = cmd_reports(&state, &[]).await.unwrap();
+        assert!(r.text.contains("[event]"));
+        assert!(r.text.contains("$e:example.com"));
+        assert!(r.text.contains("spam"));
     }
 
     #[tokio::test]

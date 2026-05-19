@@ -126,6 +126,12 @@ pub async fn invite_v2(
         ));
     }
 
+    // m.room.server_acl gate. Only enforce when the room already exists
+    // locally — a first-time inbound invite has no prior ACL to apply.
+    if let Some(room_nid) = state.db.get_nid(&room_id).ok().flatten() {
+        crate::server_acl::deny_if_blocked(&state, room_nid, &origin.0)?;
+    }
+
     // Verify the origin's signature.
     let keys = state
         .remote_keys
