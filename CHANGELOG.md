@@ -40,6 +40,29 @@ minor versions.
 
 ### Added
 
+- **Matrix Application Service support.** Bridges (mautrix-telegram,
+  mautrix-discord, mautrix-signal, etc.) and bots can now register
+  with vela. An operator pastes the AS's registration YAML into the
+  admin room via `!as register <yaml>`; vela validates the
+  namespaces, hashes the tokens (cleartext is shown to the operator
+  once, never stored), persists to a new `appservices` CF, and
+  starts a per-AS outbound delivery worker. Every event matching the
+  AS's namespaces is enqueued into the new `appservice_outbox` CF;
+  the worker drains it, posts to `PUT /_matrix/app/v1/transactions/
+  {txnId}` with `Authorization: Bearer <hs_token>`, falls back to
+  the legacy `/transactions/{txnId}` URL on 404/405, and retries
+  with exponential backoff (2s → 5min cap, 24h dead threshold).
+  Inbound `Bearer <as_token>` + `?user_id=` masquerades the request
+  as a user in the AS's namespace — virtual users are provisioned
+  on demand. Admin commands: `!as register/list/unregister/enable/
+  disable`. Interest filter is wired into both the local send path
+  and `federation_receive`, so federated events trigger AS delivery
+  too. **Deferred to follow-ups:** `m.login.application_service`
+  register/login types, `M_EXCLUSIVE` enforcement on non-AS callers,
+  ping protocol, query endpoints, `?ts=` timestamp massaging,
+  ephemeral passthrough (m.presence/m.typing/m.receipt under
+  `receive_ephemeral`), device management UIA bypass, third-party
+  protocols.
 - **`POST /_matrix/client/v3/rooms/{roomId}/report/{eventId}`** plus
   the v1.13 `/rooms/{roomId}/report` and v1.14
   `/users/{userId}/report` siblings. v1.18 semantics: optional

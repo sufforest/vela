@@ -50,6 +50,8 @@ tokio-util = { workspace = true }
 image = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
+regex = { workspace = true }
+serde_yaml = { workspace = true }
 hickory-resolver = { workspace = true }
 futures = { workspace = true }
 form_urlencoded = "1"

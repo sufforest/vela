@@ -1634,6 +1634,114 @@ impl Database {
         Ok(removed)
     }
 
+    // --- Application Service storage ---
+
+    /// Persist (or overwrite) an Application Service record. `value`
+    /// is the JSON-serialised AppService record from vela-api.
+    pub fn put_appservice(&self, appservice_nid: u64, value: &Value) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("appservices").unwrap();
+        self.db.put_cf(
+            &cf,
+            keys::encode_u64(appservice_nid),
+            value.to_string().as_bytes(),
+        )
+    }
+
+    /// Iterate every registered AS. Used at boot to rebuild the
+    /// in-memory registry.
+    pub fn iter_appservices(&self) -> Result<Vec<(u64, Value)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("appservices").unwrap();
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (k, v) = item?;
+            if k.len() != 8 {
+                continue;
+            }
+            let nid = keys::decode_u64(&k);
+            if let Ok(val) = serde_json::from_slice::<Value>(&v) {
+                out.push((nid, val));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn delete_appservice(&self, appservice_nid: u64) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("appservices").unwrap();
+        self.db.delete_cf(&cf, keys::encode_u64(appservice_nid))
+    }
+
+    /// Push one pending transaction onto an AS's outbox.
+    pub fn push_appservice_outbox(
+        &self,
+        appservice_nid: u64,
+        txn_seq: u64,
+        value: &Value,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("appservice_outbox").unwrap();
+        let mut key = [0u8; 16];
+        key[..8].copy_from_slice(&appservice_nid.to_be_bytes());
+        key[8..].copy_from_slice(&txn_seq.to_be_bytes());
+        self.db.put_cf(&cf, key, value.to_string().as_bytes())
+    }
+
+    /// Peek the oldest pending transaction for one AS. Returns
+    /// `(txn_seq, value)` so the caller can delete after delivery.
+    pub fn peek_appservice_outbox(
+        &self,
+        appservice_nid: u64,
+    ) -> Result<Option<(u64, Value)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("appservice_outbox").unwrap();
+        let prefix = keys::encode_u64(appservice_nid);
+        let iter = self.db.prefix_iterator_cf(&cf, prefix);
+        for item in iter {
+            let (k, v) = item?;
+            if k.len() != 16 || k[..8] != prefix[..] {
+                break;
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&k[8..16]);
+            let txn_seq = u64::from_be_bytes(buf);
+            if let Ok(val) = serde_json::from_slice::<Value>(&v) {
+                return Ok(Some((txn_seq, val)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Remove a transaction after successful delivery. Idempotent.
+    pub fn pop_appservice_outbox(
+        &self,
+        appservice_nid: u64,
+        txn_seq: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("appservice_outbox").unwrap();
+        let mut key = [0u8; 16];
+        key[..8].copy_from_slice(&appservice_nid.to_be_bytes());
+        key[8..].copy_from_slice(&txn_seq.to_be_bytes());
+        self.db.delete_cf(&cf, key)
+    }
+
+    /// Highest existing `txn_seq` for one AS. Boot uses this to
+    /// prime the in-memory sequence counter without reusing ids.
+    pub fn max_appservice_outbox_seq(
+        &self,
+        appservice_nid: u64,
+    ) -> Result<Option<u64>, rocksdb::Error> {
+        let cf = self.db.cf_handle("appservice_outbox").unwrap();
+        let prefix = keys::encode_u64(appservice_nid);
+        let mut max = None;
+        for item in self.db.prefix_iterator_cf(&cf, prefix) {
+            let (k, _) = item?;
+            if k.len() != 16 || k[..8] != prefix[..] {
+                break;
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&k[8..16]);
+            max = Some(u64::from_be_bytes(buf));
+        }
+        Ok(max)
+    }
+
     /// Append an abuse report into `event_reports`. Key is
     /// `[ts_ns_be][reporter_nid_be]`. Nanosecond resolution avoids
     /// same-millisecond collisions when one user submits multiple

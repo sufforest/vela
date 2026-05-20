@@ -1029,6 +1029,30 @@ async fn persist_received_pdu(
             event_nid,
             sender_nid,
         );
+
+        // AS interest filter — every registered AS whose namespaces
+        // cover this event gets one transaction. No-op if none.
+        {
+            use crate::appservice::interest::{InterestEvent, matching};
+            let evt = InterestEvent {
+                room_id: &pdu.room_id,
+                sender: &pdu.sender,
+                state_key: pdu.state_key.as_deref(),
+            };
+            for live in matching(&state.appservice_registry, &evt) {
+                if let Err(e) = state.appservice_outbox.enqueue(
+                    live.appservice.nid,
+                    vec![event_nid],
+                    vec![pdu.room_id.clone()],
+                ) {
+                    tracing::warn!(
+                        appservice = %live.appservice.id,
+                        error = %e,
+                        "AS outbox enqueue (federated) failed"
+                    );
+                }
+            }
+        }
     }
 
     Ok(())

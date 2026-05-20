@@ -254,6 +254,13 @@ pub struct AppState {
     pub remote_keys: Arc<RemoteKeyCache>,
     pub federation_sender: Arc<FederationSender>,
     pub federation_client: Arc<FederationClient>,
+    /// Registered Application Services. Cheaply cloneable; admin
+    /// commands, the interest filter, and the masquerading auth
+    /// middleware all reach in via this handle.
+    pub appservice_registry: Arc<crate::appservice::AsRegistry>,
+    /// Per-AS outbound delivery scheduler. The interest filter
+    /// enqueues onto here from the send + federation_receive paths.
+    pub appservice_outbox: crate::appservice::outbox::AsOutbox,
     pub uia_sessions: crate::auth::uia::UiaSessions,
     /// Per-user wake channel: fires whenever the user's membership
     /// changes in ANY room (new invite, join, leave, knock, ban). Sync
