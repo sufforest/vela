@@ -135,6 +135,10 @@ impl Harness {
                 overrides.federation_enabled,
             ),
         );
+        let appservice_registry =
+            Arc::new(vela_api::appservice::AsRegistry::open(db.clone()).expect("as registry"));
+        let appservice_outbox =
+            vela_api::appservice::outbox::AsOutbox::new(db.clone(), appservice_registry.clone());
         let state = AppState {
             db,
             config: Arc::new(ServerConfig {
@@ -170,6 +174,8 @@ impl Harness {
             remote_keys,
             federation_sender,
             federation_client: client,
+            appservice_registry,
+            appservice_outbox,
             uia_sessions: vela_api::auth::uia::new_sessions(),
             user_senders: Arc::new(DashMap::new()),
             metrics_renderer: None,

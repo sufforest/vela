@@ -916,6 +916,7 @@ async fn handle_command(
         "token" => cmd_token(state, sender_nid, rest).await?,
         "tokens" => cmd_tokens(state).await?,
         "reports" => cmd_reports(state, rest).await?,
+        "as" => cmd_appservice(state, body).await,
         other => Reply::plain(format!(
             "unknown command: !{other}\ntype `!help` for the list of commands"
         )),
@@ -967,7 +968,11 @@ fn cmd_help() -> Reply {
         !token create [uses=N] [expires=24h] mint a registration token\n\
         !tokens                              list registration tokens\n\
         !token revoke <token>                delete a registration token\n\
-        !reports [N]                         last N user-submitted abuse reports (default 20)";
+        !reports [N]                         last N user-submitted abuse reports (default 20)\n\
+        !as register <yaml>                  register an Application Service (paste YAML)\n\
+        !as list                             list registered Application Services\n\
+        !as unregister <id>                  remove an Application Service\n\
+        !as enable|disable <id>              halt/resume an AS's delivery";
     Reply::plain(text)
 }
 
@@ -1591,6 +1596,73 @@ async fn cmd_reports(state: &AppState, args: &[String]) -> Result<Reply, ApiErro
         ));
     }
     Ok(Reply::plain(text))
+}
+
+// --- !as <subcmd> dispatch ---
+//
+// Unlike other commands, `!as register` carries a multi-line YAML
+// body, so split_args' whitespace-tokenising would mangle the
+// content. We re-parse `body` directly here: peel off `!as` and the
+// subcommand, hand the rest verbatim to appservice::admin::dispatch.
+async fn cmd_appservice(state: &AppState, body: &str) -> Reply {
+    let stripped = body.trim_start().trim_start_matches('!').trim();
+    // Skip the leading "as" token + whitespace.
+    let after_as = match stripped.split_once(|c: char| c.is_whitespace()) {
+        Some((_, rest)) => rest.trim_start(),
+        None => "",
+    };
+    // Split into subcommand + remainder. The remainder may span
+    // multiple lines (the YAML body for `register`).
+    let (subcmd, remainder) = match after_as.split_once(|c: char| c.is_whitespace()) {
+        Some((sc, rest)) => (sc, rest.trim_start()),
+        None => (after_as, ""),
+    };
+    if subcmd.is_empty() {
+        return Reply::plain("usage: !as <register|list|unregister|enable|disable> [args]");
+    }
+    // For non-register subcommands, the remainder is a single arg
+    // (the id). Pass it as args; body_yaml is empty.
+    let (args, body_yaml) = if subcmd == "register" {
+        // Strip optional markdown code fence around the YAML body —
+        // operators paste from `mautrix-*` which prints a `--- ... ---`
+        // YAML doc or wraps in ``` for chat clients.
+        let body = strip_code_fence(remainder);
+        (Vec::<String>::new(), body)
+    } else {
+        let args: Vec<String> = remainder
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
+        (args, String::new())
+    };
+    let as_reply = crate::appservice::admin::dispatch(
+        &state.appservice_registry,
+        &state.appservice_outbox,
+        &state.db,
+        subcmd,
+        &args,
+        &body_yaml,
+    )
+    .await;
+    Reply {
+        text: as_reply.text,
+        html: as_reply.html,
+    }
+}
+
+/// Strip a leading/trailing ```yaml ... ``` fence and any --- YAML
+/// document marker. Lenient — operators paste from many sources.
+fn strip_code_fence(s: &str) -> String {
+    let mut t = s.trim();
+    if let Some(rest) = t.strip_prefix("```") {
+        // Drop the language identifier on the same line (e.g. ```yaml).
+        let after_lang = rest.find('\n').map(|n| &rest[n + 1..]).unwrap_or("");
+        t = after_lang;
+    }
+    if let Some(rest) = t.strip_suffix("```") {
+        t = rest.trim_end();
+    }
+    t.trim().to_string()
 }
 
 // --- Token + duration helpers ---

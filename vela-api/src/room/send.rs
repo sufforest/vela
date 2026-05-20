@@ -230,6 +230,8 @@ pub async fn send_message(
         user.user_nid,
     );
 
+    dispatch_appservice_interest(&state, &room_id_str, &user.user_id, None, event_nid);
+
     // Admin-bot hook: if this message landed in the admin room and is
     // an `!command`, dispatch it. Short-circuits cheaply when the
     // common path (any non-admin-room message) doesn't match. Runs
@@ -462,7 +464,51 @@ async fn send_state_inner(
         let _ = sender.send(stream_pos);
     }
 
+    dispatch_appservice_interest(
+        &state,
+        &room_id_str,
+        &user.user_id,
+        Some(state_key.as_str()),
+        event_nid,
+    );
+
     Ok(Json(json!({"event_id": event_id.as_str()})))
+}
+
+/// Run the AS interest filter for one persisted event and enqueue
+/// a single-event transaction onto each matching AS's outbox.
+/// Best-effort: log enqueue failures but don't fail the originating
+/// request — AS delivery is a sideline subsystem.
+fn dispatch_appservice_interest(
+    state: &AppState,
+    room_id: &str,
+    sender: &str,
+    state_key: Option<&str>,
+    event_nid: u64,
+) {
+    use crate::appservice::interest::{InterestEvent, matching};
+    let evt = InterestEvent {
+        room_id,
+        sender,
+        state_key,
+    };
+    let hits = matching(&state.appservice_registry, &evt);
+    if hits.is_empty() {
+        return;
+    }
+    for live in hits {
+        if let Err(e) = state.appservice_outbox.enqueue(
+            live.appservice.nid,
+            vec![event_nid],
+            vec![room_id.to_string()],
+        ) {
+            tracing::warn!(
+                appservice = %live.appservice.id,
+                error = %e,
+                "AS outbox enqueue failed"
+            );
+        }
+    }
 }
 
 /// Per-spec maximum size of a single PDU's canonical JSON encoding.

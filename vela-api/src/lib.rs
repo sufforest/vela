@@ -5,6 +5,7 @@
 //! domain.
 
 pub mod admin;
+pub mod appservice;
 pub mod auth;
 pub mod auth_check;
 pub mod directory;

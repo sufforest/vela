@@ -119,6 +119,28 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // is seeded into this CF on first boot when no admin exists, so
     // the same lookup path covers bootstrap and post-bootstrap.
     "registration_tokens",
+    // Registered Matrix Application Services. One row per operator-
+    // added AS. Key: `[appservice_nid_be:8]`. Value: JSON
+    //   { nid, id, config: { url, hs_token_hash, as_token_hash,
+    //                        sender_localpart, receive_ephemeral },
+    //     namespaces: [{ scope, regex, exclusive }],
+    //     enabled, owner_nid, created_at_ms }
+    // Tokens are SHA-256 hashed before storage — cleartext shown to
+    // the operator only at registration time. A secondary index
+    // `as:<id> -> nid` lives in `nid_map` so id-keyed lookups stay
+    // O(1) (admin commands, AS-token masquerade auth lookup).
+    "appservices",
+    // Per-AS outbound transaction queue. One persistent FIFO per
+    // registered AS; one tokio task per FIFO drains and POSTs to the
+    // AS's URL. Architecture mirrors federation_outbox: persistent
+    // CF + per-destination task + exponential backoff + 24h dead
+    // threshold + Notify wake on push.
+    //
+    // Key: `[appservice_nid_be:8][txn_seq_be:8]`. Forward scan within
+    // an AS's prefix = chronological delivery order. Value: serialised
+    // Transaction (event_nids + room_ids — event JSON loaded from
+    // `events` CF on demand at delivery time).
+    "appservice_outbox",
     // User-submitted abuse reports against events, rooms, or users.
     // Key: `[ts_ns_be:8][reporter_nid_be:8]` — nanosecond timestamp
     // avoids same-millisecond collisions when one user submits

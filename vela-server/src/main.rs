@@ -907,6 +907,17 @@ fn main() -> anyhow::Result<()> {
             config.federation.enabled,
         ));
 
+        // Application Service registry + per-AS outbound delivery
+        // scheduler. Workers start in start_all after AppState is
+        // built so they see the cleartext hs_tokens that operators
+        // re-paste via `!as register` (those are in-memory only).
+        let appservice_registry = Arc::new(
+            vela_api::appservice::AsRegistry::open(db.clone())
+                .map_err(|e| anyhow::anyhow!("as registry open: {e}"))?,
+        );
+        let appservice_outbox =
+            vela_api::appservice::outbox::AsOutbox::new(db.clone(), appservice_registry.clone());
+
         let state = AppState {
             db: db.clone(),
             config: Arc::new(ServerConfig {
@@ -978,6 +989,8 @@ fn main() -> anyhow::Result<()> {
             remote_keys,
             federation_sender,
             federation_client,
+            appservice_registry,
+            appservice_outbox,
             uia_sessions: vela_api::auth::uia::new_sessions(),
             user_senders: Arc::new(DashMap::new()),
             metrics_renderer: metrics_renderer.clone(),
@@ -1015,6 +1028,13 @@ fn main() -> anyhow::Result<()> {
         // Always on — there's no useful "off" mode (would mean stale
         // presence survives forever, which is the bug this fixes).
         let _presence_sweeper_handle = vela_api::presence::presence_sweeper::spawn(state.clone());
+
+        // Start per-AS outbound delivery workers for every persisted
+        // registration. Workers exit cleanly when their AS is
+        // unregistered; deliveries that need the cleartext hs_token
+        // (which lives only in process memory) wait until the
+        // operator re-pastes via `!as register`.
+        state.appservice_outbox.start_all();
 
         let app = vela_api::router::build_router(state);
 
