@@ -13,9 +13,12 @@
 pub mod admin;
 pub mod auth;
 pub mod client;
+pub mod ephemeral;
+pub mod exclusive;
 pub mod interest;
 pub mod namespace;
 pub mod outbox;
+pub mod query;
 pub mod registration;
 pub mod registry;
 
@@ -84,6 +87,13 @@ pub struct Transaction {
     /// `room_id` per event, same length as `event_nids`. Embedded in
     /// the AS transaction body alongside each event.
     pub room_ids: Vec<String>,
+    /// Ephemeral EDUs (typing, receipts) to include in the AS
+    /// transaction body's `ephemeral` array. Only populated for ASes
+    /// that opted in via `receive_ephemeral`. `#[serde(default)]` so
+    /// outbox rows written before this field existed continue to
+    /// deserialize.
+    #[serde(default)]
+    pub ephemeral: Vec<serde_json::Value>,
 }
 
 /// SHA-256 hash of a cleartext token, lowercase hex. Used for both

@@ -1703,6 +1703,7 @@ mod tests {
             user_nid,
             user_id: user_id.to_string(),
             device_id: "DEV".into(),
+            appservice_nid: None,
         }
     }
 
@@ -2067,6 +2068,7 @@ mod tests {
             user_nid: alice_nid,
             user_id: alice.into(),
             device_id: "DEV".into(),
+            appservice_nid: None,
         };
 
         persist_state(

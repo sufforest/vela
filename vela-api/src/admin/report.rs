@@ -180,6 +180,7 @@ mod tests {
             user_nid: nid,
             user_id: mxid.to_string(),
             device_id: "DEVICE".to_string(),
+            appservice_nid: None,
         }
     }
 

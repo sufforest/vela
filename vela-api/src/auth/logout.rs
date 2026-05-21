@@ -97,6 +97,7 @@ mod tests {
                 user_nid: alice_nid,
                 user_id: "@alice:example.com".into(),
                 device_id: dev1.clone(),
+                appservice_nid: None,
             },
         )
         .await
@@ -145,6 +146,7 @@ mod tests {
                 user_nid: alice_nid,
                 user_id: "@alice:example.com".into(),
                 device_id: dev1.clone(),
+                appservice_nid: None,
             },
         )
         .await

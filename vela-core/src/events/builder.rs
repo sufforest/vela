@@ -66,11 +66,48 @@ pub fn build_event(
     server_name: &str,
     _room_version: RoomVersion,
 ) -> (Map<String, Value>, EventId) {
+    build_event_at_ts(
+        event_type,
+        state_key,
+        content,
+        sender,
+        room_id,
+        prev_events,
+        auth_events,
+        depth,
+        signing_key,
+        server_name,
+        _room_version,
+        None,
+    )
+}
+
+/// Variant of `build_event` that lets the caller pin
+/// `origin_server_ts`. AS callers use this on PUT /send + PUT /state
+/// with `?ts=`, per the application-service spec: bridges backfilling
+/// historical traffic need the event's timestamp to reflect the
+/// source time, not the moment vela received the request. `None`
+/// preserves the default behaviour (`wall_now_ms()`, or the
+/// monotonic create counter for `m.room.create`).
+pub fn build_event_at_ts(
+    event_type: &str,
+    state_key: Option<&str>,
+    content: Value,
+    sender: &str,
+    room_id: Option<&RoomId>,
+    prev_events: &[EventId],
+    auth_events: &[EventId],
+    depth: u64,
+    signing_key: &ServerSigningKey,
+    server_name: &str,
+    _room_version: RoomVersion,
+    origin_server_ts: Option<u64>,
+) -> (Map<String, Value>, EventId) {
     let is_create = event_type == "m.room.create";
-    let now = if is_create {
-        monotonic_create_ts_ms()
-    } else {
-        wall_now_ms()
+    let now = match origin_server_ts {
+        Some(ts) => ts,
+        None if is_create => monotonic_create_ts_ms(),
+        None => wall_now_ms(),
     };
 
     let mut event = Map::new();
@@ -416,5 +453,54 @@ mod tests {
         assert!(event.contains_key("auth_events"));
         assert!(event.contains_key("room_id"));
         assert!(event_id.as_str().starts_with('$'));
+    }
+
+    #[test]
+    fn build_event_at_ts_honours_explicit_timestamp() {
+        let key = ServerSigningKey::generate();
+        let room_id = RoomId::parse("!hist:example.com").unwrap();
+        let pinned: u64 = 1_500_000_000_000;
+        let (event, _eid) = build_event_at_ts(
+            "m.room.message",
+            None,
+            json!({"msgtype": "m.text", "body": "from 2017"}),
+            "@_irc_alice:example.com",
+            Some(&room_id),
+            &[],
+            &[],
+            1,
+            &key,
+            "example.com",
+            RoomVersion::V12,
+            Some(pinned),
+        );
+        assert_eq!(event["origin_server_ts"].as_u64(), Some(pinned));
+    }
+
+    #[test]
+    fn build_event_at_ts_none_falls_back_to_wall_clock() {
+        let key = ServerSigningKey::generate();
+        let room_id = RoomId::parse("!live:example.com").unwrap();
+        let before = wall_now_ms();
+        let (event, _eid) = build_event_at_ts(
+            "m.room.message",
+            None,
+            json!({"msgtype": "m.text", "body": "now"}),
+            "@alice:example.com",
+            Some(&room_id),
+            &[],
+            &[],
+            1,
+            &key,
+            "example.com",
+            RoomVersion::V12,
+            None,
+        );
+        let after = wall_now_ms();
+        let ts = event["origin_server_ts"].as_u64().unwrap();
+        assert!(
+            ts >= before && ts <= after,
+            "wall-clock fallback {ts} not in [{before}, {after}]"
+        );
     }
 }

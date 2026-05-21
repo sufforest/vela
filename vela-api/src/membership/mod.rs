@@ -957,6 +957,13 @@ pub async fn invite_user(
 
     check_sender_joined(&state, room_nid, user.user_nid)?;
 
+    // AS demand-provisioning: if the invitee lives on this server,
+    // matches an AS user namespace, and doesn't yet exist locally,
+    // ask the owning AS to provision before we emit the invite. The
+    // AS responds 200 once it has called `/register` back to mint
+    // the user; we then re-check existence and proceed.
+    maybe_query_as_for_unknown_user(&state, &body.user_id).await;
+
     emit_membership_event_for_target(
         &state,
         &user,
@@ -969,6 +976,43 @@ pub async fn invite_user(
     .await?;
 
     Ok(Json(json!({})))
+}
+
+/// If `user_id` is local, falls in an AS user namespace, and has no
+/// row yet, ping the owning AS so it can provision. Best-effort: any
+/// failure (no AS owns it, AS unreachable, AS 404) is silently
+/// ignored — downstream code handles "user still missing" with the
+/// usual M_FORBIDDEN/M_INVALID_USERNAME.
+async fn maybe_query_as_for_unknown_user(state: &AppState, user_id: &str) {
+    // Local-only: skip when the invitee is hosted on another server.
+    let server = match user_id.rsplit_once(':') {
+        Some((_, s)) => s,
+        None => return,
+    };
+    if server != state.config.server_name {
+        return;
+    }
+    // Already exists → nothing to provision.
+    match state.db.user_exists(user_id) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(_) => return,
+    }
+    let Some(live) =
+        crate::appservice::query::find_as_owning_user(&state.appservice_registry, user_id)
+    else {
+        return;
+    };
+    let Some(hs_token) = state.appservice_outbox.hs_token(live.appservice.nid) else {
+        return;
+    };
+    let _ = crate::appservice::query::query_user(
+        state.appservice_outbox.http_client(),
+        &hs_token,
+        &live,
+        user_id,
+    )
+    .await;
 }
 
 /// Internal entry point used by `createRoom` to dispatch a federated invite
@@ -2183,6 +2227,7 @@ pub(crate) async fn force_leave_all_rooms_for_deactivation(
                 user_nid: user.user_nid,
                 user_id: user.user_id.clone(),
                 device_id: user.device_id.clone(),
+                appservice_nid: None,
             };
             let room_id_owned = room_id.clone();
             let resident_owned = rs.clone();
@@ -2553,6 +2598,7 @@ mod tests {
             user_nid: nid,
             user_id: user_id.into(),
             device_id: "DEV".into(),
+            appservice_nid: None,
         }
     }
 

@@ -52,6 +52,27 @@ pub async fn post_receipt(
     // m.receipt EDU rides out without waiting for the idle poll.
     state.federation_sender.notify_room(room_nid);
 
+    // AS ephemeral push: each AS with `receive_ephemeral` + interest
+    // in this room gets a minimal m.receipt EDU describing just this
+    // change. `m.read.private` is owner-only by spec, so we skip the
+    // dispatch — the owning user's AS view runs through /sync, not
+    // ephemeral push.
+    if receipt_type != "m.read.private" {
+        crate::appservice::ephemeral::dispatch_ephemeral_to_room(
+            &state,
+            &room_id_str,
+            room_nid,
+            &user.user_id,
+            crate::appservice::ephemeral::receipt_edu(
+                &event_id,
+                &receipt_type,
+                &user.user_id,
+                now_ms,
+                thread_id,
+            ),
+        );
+    }
+
     Ok(Json(json!({})))
 }
 
@@ -105,10 +126,26 @@ pub async fn post_read_markers(
             .set_local_receipt(room_nid, "m.read", user.user_nid, &event_id, now_ms, None)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
         state.federation_sender.notify_room(room_nid);
+        // AS ephemeral push: same as /receipt — interested ASes that
+        // opted into receive_ephemeral see the m.read change.
+        crate::appservice::ephemeral::dispatch_ephemeral_to_room(
+            &state,
+            &room_id_str,
+            room_nid,
+            &user.user_id,
+            crate::appservice::ephemeral::receipt_edu(
+                &event_id,
+                "m.read",
+                &user.user_id,
+                now_ms,
+                None,
+            ),
+        );
     }
     if let Some(event_id) = body.read_private {
         // Spec note: `m.read.private` is intentionally NOT federated —
         // it's a per-user-per-server marker. Persist locally only.
+        // Same reason it's not dispatched to ASes: owner-only.
         state
             .db
             .set_receipt(
@@ -137,6 +174,7 @@ mod tests {
             user_nid: nid,
             user_id: "@alice:example.com".into(),
             device_id: "DEV".into(),
+            appservice_nid: None,
         }
     }
 

@@ -445,6 +445,22 @@ pub async fn create_room(
     let mut canonical_alias: Option<String> = None;
     if let Some(localpart) = body.room_alias_name.as_deref().filter(|s| !s.is_empty()) {
         let alias = format!("#{localpart}:{server_name}");
+        // M_EXCLUSIVE: a non-AS caller (or an AS not owning this
+        // namespace) cannot claim an alias inside an AS's exclusive
+        // alias namespace. Same rule as /directory/room/{alias}.
+        if let crate::appservice::exclusive::ExclusiveCheck::Refused(reason) =
+            crate::appservice::exclusive::check_alias(
+                &state.appservice_registry,
+                &alias,
+                user.appservice_nid,
+            )
+        {
+            return Err(ApiError(VelaError::Custom {
+                status: 400,
+                errcode: "M_EXCLUSIVE",
+                msg: reason,
+            }));
+        }
         if state
             .db
             .get_room_alias(&alias)
@@ -695,6 +711,7 @@ pub async fn create_room(
             user_nid: user.user_nid,
             user_id: user.user_id.clone(),
             device_id: user.device_id.clone(),
+            appservice_nid: None,
         };
         if let Err(e) = crate::membership::invite_user_internal(
             state.clone(),

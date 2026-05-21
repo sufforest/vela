@@ -83,6 +83,22 @@ pub async fn set_typing(
             .typing_stream
             .enqueue(&room_id_str, &user.user_id, room_nid, body.typing);
         state.federation_sender.notify_room(room_nid);
+
+        // AS ephemeral push: every AS with `receive_ephemeral` +
+        // interest in this room gets an `m.typing` EDU with the full
+        // current typing set. Mirrors the shape /sync emits.
+        let typer_nids = get_typing_users(&state, room_nid);
+        let typer_mxids: Vec<String> = typer_nids
+            .into_iter()
+            .filter_map(|nid| state.db.resolve_nid(nid).ok().flatten())
+            .collect();
+        crate::appservice::ephemeral::dispatch_ephemeral_to_room(
+            &state,
+            &room_id_str,
+            room_nid,
+            &user.user_id,
+            crate::appservice::ephemeral::typing_edu(typer_mxids),
+        );
     }
 
     Ok(Json(json!({})))

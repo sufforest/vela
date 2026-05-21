@@ -430,6 +430,7 @@ mod tests {
             user_nid: nid,
             user_id: "@alice:example.com".into(),
             device_id: "DEV".into(),
+            appservice_nid: None,
         }
     }
 
@@ -763,6 +764,7 @@ mod tests {
                 user_nid: bob_nid,
                 user_id: "@bob:example.com".into(),
                 device_id: "DEV".into(),
+                appservice_nid: None,
             },
             Path((room_id, parent_eid)),
             Query(RelationsQuery::default()),

@@ -47,6 +47,21 @@ pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    // Spec v1.17 §"Server admin style permissions": servers that
+    // don't implement the legacy auth API MUST refuse
+    // `m.login.application_service` with M_APPSERVICE_LOGIN_UNSUPPORTED.
+    // Vela never shipped legacy login — AS authentication is via
+    // Bearer + ?user_id= masquerade, not /login.
+    if body.login_type == "m.login.application_service" {
+        return Err(ApiError(VelaError::Custom {
+            status: 400,
+            errcode: "M_APPSERVICE_LOGIN_UNSUPPORTED",
+            msg: "this server does not implement the legacy auth API; \
+                  AS callers use Bearer + ?user_id= masquerade instead"
+                .into(),
+        }));
+    }
+
     if body.login_type != "m.login.password" {
         return Err(VelaError::Unknown("unsupported login type".into()).into());
     }
