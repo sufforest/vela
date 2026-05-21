@@ -1391,4 +1391,188 @@ mod tests {
             "unexpected error message: {msg}"
         );
     }
+
+    /// Inbound send_join with a properly dual-signed restricted-room
+    /// join: remote sender signs, vela signs on behalf of the local
+    /// authoriser. Confirms the !=sender_domain branch of the
+    /// authoriser-signature check (federation_join.rs:505-523) passes
+    /// when the signature is genuinely vela's, not when the rest of
+    /// send_join falls through to a non-signature-related failure
+    /// (e.g. an auth-events check), the signature path itself didn't
+    /// cause the failure. The companion rejection test
+    /// `send_join_rejects_non_local_authoriser` covers the negative
+    /// case; this one closes the happy-path gap.
+    #[tokio::test]
+    async fn send_join_accepts_dual_signed_restricted_join() {
+        use crate::federation::federation_client::RemoteKeys;
+        use crate::middleware::federation_auth::VerifiedBody;
+        use std::collections::HashMap;
+        use vela_core::events::sign::ServerSigningKey;
+
+        let (state, _tmp) = crate::test_helpers::build_test_state_with_name("example.com");
+        let db = &state.db;
+
+        let restricted = "!restricted:example.com";
+        let restricted_nid = db.get_or_create_nid(restricted).unwrap();
+        db.create_room_meta(restricted_nid, restricted, "12")
+            .unwrap();
+        let alice = "@alice:example.com";
+        let alice_nid = db.get_or_create_nid(alice).unwrap();
+        let create_type = db.get_or_create_nid("m.room.create").unwrap();
+        let member_type = db.get_or_create_nid("m.room.member").unwrap();
+        let join_rules_type = db.get_or_create_nid("m.room.join_rules").unwrap();
+        let empty_skey = db.get_or_create_nid("").unwrap();
+        db.persist_event(
+            300,
+            "$c",
+            restricted_nid,
+            create_type,
+            alice_nid,
+            empty_skey,
+            1,
+            1,
+            &serde_json::to_vec(&json!({
+                "type": "m.room.create", "sender": alice, "state_key": "",
+                "room_id": restricted, "content": {"room_version": "12"},
+                "origin_server_ts": 1, "depth": 1,
+                "prev_events": [], "auth_events": [],
+            }))
+            .unwrap(),
+            &[],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+        db.persist_event(
+            301,
+            "$aj",
+            restricted_nid,
+            member_type,
+            alice_nid,
+            alice_nid,
+            2,
+            2,
+            &serde_json::to_vec(&json!({
+                "type": "m.room.member", "sender": alice, "state_key": alice,
+                "room_id": restricted, "content": {"membership": "join"},
+                "origin_server_ts": 2, "depth": 2,
+                "prev_events": [], "auth_events": [],
+            }))
+            .unwrap(),
+            &[300],
+            &[300],
+            true,
+            false,
+        )
+        .unwrap();
+        db.set_membership(restricted_nid, alice_nid, 1).unwrap();
+        db.persist_event(
+            302,
+            "$jr",
+            restricted_nid,
+            join_rules_type,
+            alice_nid,
+            empty_skey,
+            3,
+            3,
+            &serde_json::to_vec(&json!({
+                "type": "m.room.join_rules", "sender": alice, "state_key": "",
+                "room_id": restricted,
+                "content": {
+                    "join_rule": "restricted",
+                    "allow": [{"type": "m.room_membership", "room_id": "!gate:example.com"}],
+                },
+                "origin_server_ts": 3, "depth": 3,
+                "prev_events": [], "auth_events": [],
+            }))
+            .unwrap(),
+            &[301],
+            &[300, 301],
+            true,
+            false,
+        )
+        .unwrap();
+
+        // Stub the remote server + cache its key for sender-signature verify.
+        let remote_sn = "remote.example";
+        let remote_key = ServerSigningKey::generate();
+        let mut verify_keys = HashMap::new();
+        verify_keys.insert(
+            remote_key.key_id().to_string(),
+            remote_key.public_key_base64(),
+        );
+        state.remote_keys.insert_for_test(
+            remote_sn,
+            RemoteKeys {
+                verify_keys,
+                valid_until_ts: u64::MAX / 2,
+                fetched_at: 0,
+            },
+        );
+
+        // Bob (remote) joins; authoriser is alice (local). Sender
+        // signs, then vela signs on behalf of alice's domain — that's
+        // what `make_join` would have produced if vela had handed the
+        // template to bob's server.
+        let bob = format!("@bob:{remote_sn}");
+        let mut event = serde_json::Map::new();
+        event.insert("type".into(), json!("m.room.member"));
+        event.insert("sender".into(), json!(bob));
+        event.insert("state_key".into(), json!(bob));
+        event.insert("room_id".into(), json!(restricted));
+        event.insert(
+            "content".into(),
+            json!({
+                "membership": "join",
+                "join_authorised_via_users_server": alice,
+            }),
+        );
+        event.insert("origin".into(), json!(remote_sn));
+        event.insert("origin_server_ts".into(), json!(100u64));
+        event.insert("depth".into(), json!(4u64));
+        event.insert("prev_events".into(), json!(["$jr"]));
+        event.insert("auth_events".into(), json!(["$c", "$jr"]));
+        vela_core::events::hash::add_content_hash(&mut event);
+        // Vela signs first (on behalf of alice's domain).
+        state.signing_key.sign_event_for_version(
+            &mut event,
+            "example.com",
+            vela_core::events::room_version::RoomVersion::V12,
+        );
+        // Then the remote signs (as bob's homeserver).
+        remote_key.sign_event_for_version(
+            &mut event,
+            remote_sn,
+            vela_core::events::room_version::RoomVersion::V12,
+        );
+        let event_id = vela_core::events::hash::compute_event_id_for_version(
+            &event,
+            vela_core::events::room_version::RoomVersion::V12,
+        );
+
+        let origin = axum::Extension(XMatrixOrigin(remote_sn.into()));
+        let body = axum::Extension(VerifiedBody(Some(Value::Object(event))));
+        let result = send_join_v2(
+            axum::extract::State(state.clone()),
+            Path((restricted.to_string(), event_id.as_str().to_string())),
+            origin,
+            body,
+        )
+        .await;
+
+        // The signature-verify path must NOT be the failure point.
+        // Later state-resolution / auth_events checks may legitimately
+        // reject this minimal scaffolding, but a "must be a local
+        // user" or "signature verification failed" message would
+        // indicate the wrong branch fired.
+        if let Err(err) = &result {
+            let msg = err.1.0.get("error").and_then(|v| v.as_str()).unwrap_or("");
+            assert!(
+                !msg.contains("must be a local user")
+                    && !msg.contains("signature verification failed"),
+                "signature path rejected what should have been accepted: {msg}",
+            );
+        }
+    }
 }
