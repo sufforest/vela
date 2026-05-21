@@ -216,6 +216,62 @@ impl FederationClient {
         client
     }
 
+    /// Like `fetch_server_keys`, but also returns the raw JSON body
+    /// alongside the parsed `RemoteKeys`. The notary endpoint
+    /// (`/_matrix/key/v2/query`) needs the raw bundle so it can
+    /// preserve the origin server's signatures and add its own;
+    /// the parsed form alone is lossy (no signatures, no tls
+    /// fingerprints, no extra fields).
+    pub async fn fetch_server_keys_with_raw(
+        &self,
+        server_name: &str,
+    ) -> Result<(RemoteKeys, Value), FederationClientError> {
+        let body = self.fetch_server_keys_raw_body(server_name).await?;
+        let now_ms = now_ms();
+        let parsed = validate_key_response(&body, server_name, now_ms)?;
+        Ok((parsed, body))
+    }
+
+    async fn fetch_server_keys_raw_body(
+        &self,
+        server_name: &str,
+    ) -> Result<Value, FederationClientError> {
+        let (url, host_header, client) =
+            if let Some(base) = self.base_url_overrides.get(server_name) {
+                (
+                    format!("{}/_matrix/key/v2/server", base.value()),
+                    server_name.to_string(),
+                    self.default_http.clone(),
+                )
+            } else {
+                let resolved = self
+                    .resolver
+                    .resolve(server_name)
+                    .await
+                    .map_err(|e| FederationClientError::Http(format!("resolve: {e}")))?;
+                (
+                    format!("{}/_matrix/key/v2/server", resolved.base_url()),
+                    resolved.host_header.clone(),
+                    self.client_for(&resolved),
+                )
+            };
+        let resp = client
+            .get(&url)
+            .header("host", &host_header)
+            .send()
+            .await
+            .map_err(|e| FederationClientError::Http(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(FederationClientError::Http(format!(
+                "status {}",
+                resp.status()
+            )));
+        }
+        resp.json()
+            .await
+            .map_err(|e| FederationClientError::BadJson(e.to_string()))
+    }
+
     /// Fetch `GET /_matrix/key/v2/server` from `server_name` and validate.
     pub async fn fetch_server_keys(
         &self,
