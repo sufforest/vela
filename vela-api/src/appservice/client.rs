@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use thiserror::Error;
 
 use vela_store::db::Database;
@@ -74,7 +74,16 @@ pub async fn deliver(
         events.push(ev);
     }
 
-    let body = json!({ "events": events });
+    // Per AS spec, the transaction body carries `events` (PDUs) and
+    // `ephemeral` (EDUs typing/receipts) alongside each other. Omit
+    // the `ephemeral` key when empty so legacy bridges that reject
+    // unknown fields aren't poked needlessly.
+    let mut body_map = serde_json::Map::new();
+    body_map.insert("events".into(), Value::Array(events));
+    if !txn.ephemeral.is_empty() {
+        body_map.insert("ephemeral".into(), Value::Array(txn.ephemeral.clone()));
+    }
+    let body = Value::Object(body_map);
     let primary = format!(
         "{}/_matrix/app/v1/transactions/{}",
         appservice.config.url.trim_end_matches('/'),

@@ -293,6 +293,7 @@ mod tests {
                 user_nid,
                 user_id: "@alice:example.com".into(),
                 device_id: device_id.clone(),
+                appservice_nid: None,
             },
             Json(PasswordChangeBody {
                 new_password: "new_secret".into(),
@@ -330,6 +331,7 @@ mod tests {
                 user_nid,
                 user_id: "@alice:example.com".into(),
                 device_id,
+                appservice_nid: None,
             },
             Json(PasswordChangeBody {
                 new_password: "new".into(),
@@ -353,6 +355,7 @@ mod tests {
                 user_nid,
                 user_id: "@alice:example.com".into(),
                 device_id,
+                appservice_nid: None,
             },
             Json(PasswordChangeBody {
                 new_password: String::new(),
@@ -378,6 +381,7 @@ mod tests {
                 user_nid,
                 user_id: "@alice:example.com".into(),
                 device_id,
+                appservice_nid: None,
             },
             Json(pw_auth("@alice:example.com", "pw")),
         )
@@ -406,6 +410,7 @@ mod tests {
                 user_nid,
                 user_id: "@alice:example.com".into(),
                 device_id,
+                appservice_nid: None,
             },
             Json(json!({})),
         )
@@ -455,6 +460,7 @@ mod tests {
                 user_nid,
                 user_id: "@alice:example.com".into(),
                 device_id,
+                appservice_nid: None,
             },
             Json(pw_auth("@alice:example.com", "pw")),
         )
@@ -504,6 +510,7 @@ mod tests {
                 user_nid,
                 user_id: "@alice:example.com".into(),
                 device_id,
+                appservice_nid: None,
             },
             Json(pw_auth("@alice:example.com", "pw")),
         )
@@ -545,6 +552,7 @@ mod tests {
                 user_nid,
                 user_id: "@alice:example.com".into(),
                 device_id: device_id.clone(),
+                appservice_nid: None,
             },
             Json(pw_auth("@alice:example.com", "pw")),
         )
@@ -584,6 +592,7 @@ mod tests {
                 user_nid,
                 user_id: "@alice:example.com".into(),
                 device_id,
+                appservice_nid: None,
             },
             Json(body),
         )
@@ -613,6 +622,7 @@ mod tests {
                 user_nid,
                 user_id: "@alice:example.com".into(),
                 device_id,
+                appservice_nid: None,
             },
             Json(pw_auth("@alice:example.com", "pw")),
         )
@@ -638,6 +648,7 @@ mod tests {
                 user_nid,
                 user_id: "@alice:example.com".into(),
                 device_id,
+                appservice_nid: None,
             },
             Json(pw_auth("@alice:example.com", "WRONG")),
         )

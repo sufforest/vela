@@ -526,6 +526,7 @@ mod tests {
             user_nid,
             user_id: "@alice:example.com".into(),
             device_id: "ALICE_DEV".into(),
+            appservice_nid: None,
         }
     }
 
@@ -535,6 +536,7 @@ mod tests {
             user_nid,
             user_id: "@bob:other.com".into(),
             device_id: "BOB_DEV".into(),
+            appservice_nid: None,
         }
     }
 
@@ -687,6 +689,7 @@ mod tests {
                 user_nid: charlie_nid,
                 user_id: "@charlie:example.com".into(),
                 device_id: "CHARLIE".into(),
+                appservice_nid: None,
             },
             Path(("!room12".into(), msg_eid, "txn_c".into())),
             Json(RedactBody::default()),

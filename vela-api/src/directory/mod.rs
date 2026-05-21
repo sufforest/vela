@@ -26,25 +26,54 @@ pub async fn get_room_alias(
 ) -> Result<Json<Value>, ApiError> {
     if let Some(server) = alias_server(&room_alias) {
         if server == state.config.server_name {
-            return resolve_local_alias(&state, &room_alias);
+            return resolve_local_alias(&state, &room_alias).await;
         }
         return resolve_remote_alias(&state, &room_alias, server).await;
     }
 
-    resolve_local_alias(&state, &room_alias)
+    resolve_local_alias(&state, &room_alias).await
 }
 
-fn resolve_local_alias(state: &AppState, alias: &str) -> Result<Json<Value>, ApiError> {
-    let room_id = state
+async fn resolve_local_alias(state: &AppState, alias: &str) -> Result<Json<Value>, ApiError> {
+    if let Some(room_id) = state
         .db
         .get_room_alias(alias)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        .ok_or_else(|| ApiError(VelaError::NotFound("alias not found".into())))?;
+    {
+        return Ok(Json(json!({
+            "room_id": room_id,
+            "servers": [state.config.server_name],
+        })));
+    }
 
-    Ok(Json(json!({
-        "room_id": room_id,
-        "servers": [state.config.server_name],
-    })))
+    // Local miss: ask the AS that owns this alias namespace to
+    // provision on demand. The AS is expected to PUT the alias
+    // mapping back during the handshake; we re-read after the call.
+    if let Some(live) =
+        crate::appservice::query::find_as_owning_alias(&state.appservice_registry, alias)
+        && let Some(hs_token) = state.appservice_outbox.hs_token(live.appservice.nid)
+    {
+        let outcome = crate::appservice::query::query_alias(
+            state.appservice_outbox.http_client(),
+            &hs_token,
+            &live,
+            alias,
+        )
+        .await;
+        if matches!(outcome, crate::appservice::query::QueryOutcome::Owned)
+            && let Some(room_id) = state
+                .db
+                .get_room_alias(alias)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        {
+            return Ok(Json(json!({
+                "room_id": room_id,
+                "servers": [state.config.server_name],
+            })));
+        }
+    }
+
+    Err(ApiError(VelaError::NotFound("alias not found".into())))
 }
 
 async fn resolve_remote_alias(
@@ -92,6 +121,22 @@ pub async fn set_room_alias(
             status: 409,
             errcode: "M_UNKNOWN",
             msg: format!("Room alias {room_alias} already exists."),
+        }));
+    }
+
+    // M_EXCLUSIVE: callers cannot claim aliases inside an AS's
+    // exclusive alias namespace, unless the caller is that AS itself.
+    if let crate::appservice::exclusive::ExclusiveCheck::Refused(reason) =
+        crate::appservice::exclusive::check_alias(
+            &state.appservice_registry,
+            &room_alias,
+            user.appservice_nid,
+        )
+    {
+        return Err(ApiError(VelaError::Custom {
+            status: 400,
+            errcode: "M_EXCLUSIVE",
+            msg: reason,
         }));
     }
 
@@ -449,4 +494,113 @@ fn read_simple_state(
         .get(content_key)?
         .as_str()
         .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod as_query_tests {
+    use super::*;
+    use crate::appservice::namespace::{Namespace, NamespaceScope};
+    use crate::appservice::{AppService, AppServiceConfig, hash_token};
+    use crate::test_helpers::build_test_state;
+
+    fn seed_as_with_alias_ns(
+        state: &AppState,
+        as_id: &str,
+        url: &str,
+        hs_token_cleartext: &str,
+    ) -> u64 {
+        let asv = AppService {
+            nid: 0,
+            id: as_id.into(),
+            config: AppServiceConfig {
+                url: url.into(),
+                hs_token_hash: hash_token(hs_token_cleartext),
+                as_token_hash: hash_token(&format!("as-{as_id}")),
+                sender_localpart: format!("_{as_id}_bot"),
+                receive_ephemeral: false,
+            },
+            namespaces: vec![Namespace {
+                scope: NamespaceScope::Alias,
+                regex: r"^#_irc_.*:example\.com$".into(),
+                exclusive: true,
+            }],
+            enabled: true,
+            owner_nid: None,
+            created_at_ms: 0,
+        };
+        let registered = state.appservice_registry.register(asv).unwrap();
+        state
+            .appservice_outbox
+            .set_hs_token(registered.nid, hs_token_cleartext.into());
+        registered.nid
+    }
+
+    /// Local alias exists → resolves without calling the AS.
+    #[tokio::test]
+    async fn resolve_skips_as_query_when_alias_present_locally() {
+        let server = wiremock::MockServer::start().await;
+        // Expect zero calls.
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (state, _tmp) = build_test_state();
+        seed_as_with_alias_ns(&state, "irc", &server.uri(), "hs-tok");
+        // Pre-populate the alias.
+        state
+            .db
+            .set_room_alias_with_creator(
+                "#_irc_chan:example.com",
+                "!room0:example.com",
+                "@admin:example.com",
+            )
+            .unwrap();
+        let resp = resolve_local_alias(&state, "#_irc_chan:example.com")
+            .await
+            .expect("resolves");
+        assert_eq!(resp.0["room_id"], "!room0:example.com");
+    }
+
+    /// Local alias missing + AS owns namespace → vela calls the AS.
+    /// AS returns 200 here without provisioning; the test verifies
+    /// the call happened. (The DB-write side of the handshake is the
+    /// AS's responsibility; we just prove the query is wired.)
+    #[tokio::test]
+    async fn resolve_queries_as_when_alias_missing_and_in_namespace() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path_regex(r"^/_matrix/app/v1/rooms/.*"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (state, _tmp) = build_test_state();
+        seed_as_with_alias_ns(&state, "irc", &server.uri(), "hs-tok");
+
+        let err = resolve_local_alias(&state, "#_irc_chan:example.com")
+            .await
+            .expect_err("still 404 because AS didn't provision in the test");
+        assert!(matches!(err.0, VelaError::NotFound(_)));
+        // Wiremock's drop impl panics if expect(1) wasn't met.
+        drop(server);
+    }
+
+    /// Local alias missing + alias NOT in any AS namespace → no AS
+    /// query, returns 404.
+    #[tokio::test]
+    async fn resolve_skips_as_query_when_alias_outside_namespace() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (state, _tmp) = build_test_state();
+        seed_as_with_alias_ns(&state, "irc", &server.uri(), "hs-tok");
+        let err = resolve_local_alias(&state, "#random:example.com")
+            .await
+            .expect_err("404");
+        assert!(matches!(err.0, VelaError::NotFound(_)));
+    }
 }

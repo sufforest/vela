@@ -1,6 +1,7 @@
 use crate::middleware::json::Json;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use vela_core::error::VelaError;
@@ -19,6 +20,13 @@ pub struct RegisterRequest {
     pub inhibit_login: bool,
     #[allow(dead_code)]
     pub auth: Option<Value>,
+    /// Top-level login type. The only value vela honours here is
+    /// `"m.login.application_service"`, used by AS spec §"Server admin
+    /// style permissions" to create namespaced users without a
+    /// password or UIA flow. Other values are ignored (the standard
+    /// UIA flow runs instead).
+    #[serde(rename = "type")]
+    pub login_type: Option<String>,
     /// MSC2918 / spec v1.3+: client opts in to refresh tokens.
     #[serde(default)]
     pub refresh_token: bool,
@@ -26,18 +34,9 @@ pub struct RegisterRequest {
 
 pub async fn register(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body_bytes: Bytes,
 ) -> Result<Json<Value>, ApiError> {
-    // Closed registration: refuse before parsing. Operators flip this
-    // flag for invite-only deployments; spec doesn't define an exact
-    // errcode for "the server doesn't accept registrations" but
-    // M_FORBIDDEN with a clear message is the de-facto convention.
-    if !state.config.registration_enabled {
-        return Err(ApiError(VelaError::Forbidden(
-            "registration is disabled on this server".into(),
-        )));
-    }
-
     // Spec mandates `M_NOT_JSON` (status 400) when the body is not
     // valid JSON, including non-UTF-8 byte sequences inside what
     // looks-like-a-JSON-string. Empty body is treated as `{}` so the
@@ -50,6 +49,7 @@ pub async fn register(
             initial_device_display_name: None,
             inhibit_login: false,
             auth: None,
+            login_type: None,
             refresh_token: false,
         }
     } else {
@@ -69,6 +69,30 @@ pub async fn register(
             )))
         })?
     };
+
+    // Application Service register: `type: m.login.application_service`
+    // + `Authorization: Bearer <as_token>` shortcuts the UIA flow,
+    // creates a passwordless user inside the AS's namespace, returns
+    // only `{user_id}` (no access_token because `inhibit_login` must
+    // be true). Spec: AS API §"Server admin style permissions".
+    //
+    // This branch runs *before* the closed-registration gate: an
+    // operator who closes public registration still wants their
+    // bridges to mint namespaced users, otherwise bridges break on
+    // every invite-only deployment.
+    if body.login_type.as_deref() == Some("m.login.application_service") {
+        return register_as_appservice(&state, &headers, &body).await;
+    }
+
+    // Closed registration: refuse before doing UIA work. Operators
+    // flip this flag for invite-only deployments; spec doesn't define
+    // an exact errcode for "the server doesn't accept registrations"
+    // but M_FORBIDDEN with a clear message is the de-facto convention.
+    if !state.config.registration_enabled {
+        return Err(ApiError(VelaError::Forbidden(
+            "registration is disabled on this server".into(),
+        )));
+    }
 
     // Spec: register MUST use UIA. Any submission without `auth` gets a
     // 401 + flows challenge, regardless of whether username/password are
@@ -162,6 +186,23 @@ pub async fn register(
     // registration token. Otherwise an admin could create a colliding
     // account with their own password and impersonate the bot.
     crate::admin::assert_bot_localpart_not_reserved(&state, &username)?;
+
+    // M_EXCLUSIVE: a non-AS caller cannot create a user whose MXID
+    // falls inside any AS's exclusive user namespace.
+    let candidate_user_id = format!("@{}:{}", username, state.config.server_name);
+    if let crate::appservice::exclusive::ExclusiveCheck::Refused(reason) =
+        crate::appservice::exclusive::check_user(
+            &state.appservice_registry,
+            &candidate_user_id,
+            None,
+        )
+    {
+        return Err(ApiError(VelaError::Custom {
+            status: 400,
+            errcode: "M_EXCLUSIVE",
+            msg: reason,
+        }));
+    }
 
     let password = body.password.as_deref().unwrap_or("");
     if password.is_empty() {
@@ -268,6 +309,124 @@ pub async fn register(
     Ok(Json(response))
 }
 
+/// Application Service register handler. Mints a passwordless user
+/// inside the AS's namespace and returns `{user_id}` — no UIA, no
+/// password, no token, no auto-invite.
+///
+/// Per spec v1.17, `inhibit_login` MUST be `true`. Otherwise we
+/// return `M_APPSERVICE_LOGIN_UNSUPPORTED` (vela doesn't ship the
+/// legacy login API).
+async fn register_as_appservice(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &RegisterRequest,
+) -> Result<Json<Value>, ApiError> {
+    // Spec mandates inhibit_login=true for AS register on servers
+    // that don't implement the legacy auth API.
+    if !body.inhibit_login {
+        return Err(ApiError(VelaError::Custom {
+            status: 400,
+            errcode: "M_APPSERVICE_LOGIN_UNSUPPORTED",
+            msg: "AS register requires `inhibit_login: true` on this server".into(),
+        }));
+    }
+
+    // Extract Bearer as_token from the Authorization header.
+    let as_token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or(ApiError(VelaError::MissingToken))?;
+
+    // Resolve to a registered AS.
+    let live = crate::appservice::auth::lookup_appservice(&state.appservice_registry, as_token)
+        .ok_or(ApiError(VelaError::UnknownToken))?;
+    if !live.appservice.enabled {
+        return Err(ApiError(VelaError::Forbidden("this AS is disabled".into())));
+    }
+
+    // Spec: AS register accepts either a localpart or a full
+    // `@local:server` MXID. Synapse follows the same rule for bridges
+    // that already track their virtual users as MXIDs.
+    let raw = body.username.as_deref().unwrap_or("");
+    let localpart = if let Some(rest) = raw.strip_prefix('@') {
+        // Strip optional `:server` suffix; require it match this server.
+        match rest.split_once(':') {
+            Some((lp, server)) => {
+                if server != state.config.server_name {
+                    return Err(VelaError::InvalidUsername.into());
+                }
+                lp.to_string()
+            }
+            None => rest.to_string(),
+        }
+    } else {
+        raw.to_string()
+    };
+    let username = localpart.to_lowercase();
+    if username.is_empty() || username.len() > 255 {
+        return Err(VelaError::InvalidUsername.into());
+    }
+    if !username
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._-=/+".contains(c))
+    {
+        return Err(VelaError::InvalidUsername.into());
+    }
+    crate::admin::assert_bot_localpart_not_reserved(state, &username)?;
+
+    let user_id = UserId::new(&username, &state.config.server_name);
+
+    // Target user_id MUST fall inside one of the AS's user namespaces.
+    // Refused if it lands inside another AS's exclusive namespace.
+    if let crate::appservice::exclusive::ExclusiveCheck::Refused(reason) =
+        crate::appservice::exclusive::check_user(
+            &state.appservice_registry,
+            user_id.as_str(),
+            Some(live.appservice.nid),
+        )
+    {
+        return Err(ApiError(VelaError::Custom {
+            status: 400,
+            errcode: "M_EXCLUSIVE",
+            msg: reason,
+        }));
+    }
+    if !live
+        .matcher
+        .matches(crate::appservice::NamespaceScope::User, user_id.as_str())
+    {
+        return Err(ApiError(VelaError::Custom {
+            status: 400,
+            errcode: "M_EXCLUSIVE",
+            msg: format!(
+                "user id `{}` is outside appservice `{}`'s user namespaces",
+                user_id.as_str(),
+                live.appservice.id
+            ),
+        }));
+    }
+
+    // Refuse collision with an existing local user.
+    if state
+        .db
+        .user_exists(user_id.as_str())
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    {
+        return Err(VelaError::UserInUse.into());
+    }
+
+    // Create passwordless user. Empty hash makes /login refuse; AS
+    // re-authenticates via Bearer + ?user_id= for every subsequent
+    // call.
+    state
+        .db
+        .create_user(user_id.as_str(), "")
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
+    Ok(Json(json!({ "user_id": user_id.as_str() })))
+}
+
 fn hash_password(password: &str, salt: &[u8; 16]) -> String {
     use argon2::Argon2;
     use argon2::PasswordHasher;
@@ -362,6 +521,7 @@ async fn maybe_auto_invite_first_admin(state: &AppState, new_user_nid: u64, new_
         user_nid: bot_nid,
         user_id: bot_user_id,
         device_id: crate::admin::admin_bot_device_id().to_string(),
+        appservice_nid: None,
     };
     if let Err(e) = crate::membership::invite_user_internal(
         state.clone(),
@@ -383,6 +543,7 @@ mod admin_integration_tests {
     use crate::test_helpers::build_test_state;
     use axum::extract::State;
     use serde_json::json;
+    use std::sync::Arc;
 
     fn body_with(auth: Option<Value>, username: &str, password: &str) -> axum::body::Bytes {
         let mut obj = serde_json::Map::new();
@@ -409,6 +570,7 @@ mod admin_integration_tests {
         let auth = json!({"type": "m.login.registration_token", "token": "tok-a"});
         let err = register(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             body_with(Some(auth), "admin", "secret123"),
         )
         .await
@@ -431,6 +593,7 @@ mod admin_integration_tests {
 
         let _ = register(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             body_with(Some(auth.clone()), "alice", "secret123"),
         )
         .await
@@ -454,6 +617,7 @@ mod admin_integration_tests {
         let auth2 = json!({"type": "m.login.registration_token", "token": "tok-b"});
         let _ = register(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             body_with(Some(auth2), "bob", "secret123"),
         )
         .await
@@ -482,6 +646,7 @@ mod admin_integration_tests {
         let auth = json!({"type": "m.login.registration_token", "token": "tok-once"});
         let _ = register(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             body_with(Some(auth.clone()), "alice", "secret123"),
         )
         .await
@@ -489,10 +654,170 @@ mod admin_integration_tests {
         // Token now exhausted. A second user trying to reuse it gets 403.
         let err = register(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             body_with(Some(auth), "bob", "secret123"),
         )
         .await
         .expect_err("second use refused");
         assert!(matches!(err.0, VelaError::Forbidden(_)));
+    }
+
+    fn seed_as(
+        state: &AppState,
+        as_id: &str,
+        regex: &str,
+        cleartext_token: &str,
+    ) -> crate::appservice::LiveAppService {
+        use crate::appservice::namespace::{Namespace, NamespaceScope};
+        use crate::appservice::{AppService, AppServiceConfig, hash_token};
+        let asv = AppService {
+            nid: 0,
+            id: as_id.into(),
+            config: AppServiceConfig {
+                url: "http://localhost".into(),
+                hs_token_hash: hash_token(&format!("hs-{as_id}")),
+                as_token_hash: hash_token(cleartext_token),
+                sender_localpart: format!("_{as_id}_bot"),
+                receive_ephemeral: false,
+            },
+            namespaces: vec![Namespace {
+                scope: NamespaceScope::User,
+                regex: regex.into(),
+                exclusive: true,
+            }],
+            enabled: true,
+            owner_nid: None,
+            created_at_ms: 0,
+        };
+        state.appservice_registry.register(asv).unwrap();
+        state.appservice_registry.get_by_id(as_id).unwrap()
+    }
+
+    fn as_headers(token: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        h
+    }
+
+    /// AS-mode register: type=m.login.application_service + Bearer
+    /// as_token + a namespaced username succeeds even when public
+    /// registration is closed, returns only `{user_id}` (no access_token).
+    #[tokio::test]
+    async fn as_register_succeeds_inside_namespace_when_public_registration_closed() {
+        let (mut state, _tmp) = build_test_state();
+        // Close public registration. AS register must still work.
+        Arc::make_mut(&mut state.config).registration_enabled = false;
+        seed_as(&state, "irc", r"^@_irc_.*:example\.com$", "as-tok-irc");
+
+        let body = json!({
+            "type": "m.login.application_service",
+            "username": "_irc_alice",
+            "inhibit_login": true,
+        });
+        let resp = register(
+            State(state.clone()),
+            as_headers("as-tok-irc"),
+            axum::body::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .expect("AS register succeeds");
+        assert_eq!(resp.0["user_id"], "@_irc_alice:example.com");
+        assert!(resp.0.get("access_token").is_none());
+        assert!(state.db.user_exists("@_irc_alice:example.com").unwrap());
+    }
+
+    /// AS-mode register accepts a full MXID in `username` (spec: AS
+    /// may send either a localpart or a full MXID).
+    #[tokio::test]
+    async fn as_register_accepts_full_mxid_as_username() {
+        let (state, _tmp) = build_test_state();
+        seed_as(&state, "irc", r"^@_irc_.*:example\.com$", "as-tok-irc");
+        let body = json!({
+            "type": "m.login.application_service",
+            "username": "@_irc_bob:example.com",
+            "inhibit_login": true,
+        });
+        let resp = register(
+            State(state.clone()),
+            as_headers("as-tok-irc"),
+            axum::body::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .expect("AS register with full MXID succeeds");
+        assert_eq!(resp.0["user_id"], "@_irc_bob:example.com");
+    }
+
+    /// AS-mode register with a username outside the AS's namespace is
+    /// refused with M_EXCLUSIVE.
+    #[tokio::test]
+    async fn as_register_refuses_outside_own_namespace() {
+        let (state, _tmp) = build_test_state();
+        seed_as(&state, "irc", r"^@_irc_.*:example\.com$", "as-tok-irc");
+        let body = json!({
+            "type": "m.login.application_service",
+            "username": "alice", // not inside @_irc_.*
+            "inhibit_login": true,
+        });
+        let err = register(
+            State(state.clone()),
+            as_headers("as-tok-irc"),
+            axum::body::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .expect_err("outside namespace refused");
+        match err.0 {
+            VelaError::Custom { errcode, .. } => assert_eq!(errcode, "M_EXCLUSIVE"),
+            other => panic!("expected M_EXCLUSIVE, got {other:?}"),
+        }
+    }
+
+    /// AS-mode register without `inhibit_login: true` is refused.
+    #[tokio::test]
+    async fn as_register_requires_inhibit_login() {
+        let (state, _tmp) = build_test_state();
+        seed_as(&state, "irc", r"^@_irc_.*:example\.com$", "as-tok-irc");
+        let body = json!({
+            "type": "m.login.application_service",
+            "username": "_irc_alice",
+            // inhibit_login not set => default false
+        });
+        let err = register(
+            State(state.clone()),
+            as_headers("as-tok-irc"),
+            axum::body::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .expect_err("inhibit_login required");
+        match err.0 {
+            VelaError::Custom { errcode, .. } => {
+                assert_eq!(errcode, "M_APPSERVICE_LOGIN_UNSUPPORTED")
+            }
+            other => panic!("expected M_APPSERVICE_LOGIN_UNSUPPORTED, got {other:?}"),
+        }
+    }
+
+    /// Non-AS user trying to register inside an AS's exclusive
+    /// namespace is refused with M_EXCLUSIVE — protects bridge users.
+    #[tokio::test]
+    async fn non_as_register_refused_in_exclusive_namespace() {
+        let (state, _tmp) = build_test_state();
+        crate::admin::bootstrap(&state).await.unwrap();
+        seed_as(&state, "irc", r"^@_irc_.*:example\.com$", "as-tok-irc");
+        state
+            .db
+            .create_registration_token("tok-a", 0, 0, 0)
+            .unwrap();
+        let auth = json!({"type": "m.login.registration_token", "token": "tok-a"});
+        let err = register(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            body_with(Some(auth), "_irc_eve", "secret123"),
+        )
+        .await
+        .expect_err("non-AS in exclusive namespace refused");
+        match err.0 {
+            VelaError::Custom { errcode, .. } => assert_eq!(errcode, "M_EXCLUSIVE"),
+            other => panic!("expected M_EXCLUSIVE, got {other:?}"),
+        }
     }
 }

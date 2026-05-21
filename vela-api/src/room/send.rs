@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use crate::middleware::json::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use vela_core::canonical::canonical_json_object;
 use vela_core::error::VelaError;
-use vela_core::events::builder::{build_event, select_auth_events};
+use vela_core::events::builder::{build_event_at_ts, select_auth_events};
 use vela_core::events::view::EventView;
 use vela_core::identifiers::{EventId, Nid, RoomId};
 
@@ -15,13 +16,24 @@ use crate::middleware::error::ApiError;
 use crate::room::rooms::get_or_create_signing_key;
 use crate::router::AppState;
 
+/// AS-spec `?ts=` masquerade. Only honoured when the request is
+/// authenticated as an appservice; ignored otherwise (matches
+/// Synapse, and prevents a regular client from backdating its own
+/// events).
+#[derive(Deserialize)]
+pub struct TsOverride {
+    pub ts: Option<u64>,
+}
+
 /// PUT /_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}
 pub async fn send_message(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path((room_id_str, event_type, txn_id)): Path<(String, String, String)>,
+    Query(ts_query): Query<TsOverride>,
     Json(content): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    let ts_override = ts_query.ts.filter(|_| user.appservice_nid.is_some());
     // Spec: event content MUST be a JSON object. Reject any other
     // shape (string, number, array, null, bool) with M_BAD_JSON
     // before doing any room/membership/idempotency work.
@@ -132,7 +144,7 @@ pub async fn send_message(
     };
 
     // Build event
-    let (event, event_id) = build_event(
+    let (event, event_id) = build_event_at_ts(
         &event_type,
         None,
         content,
@@ -144,6 +156,7 @@ pub async fn send_message(
         &signing_key,
         server_name,
         room_version,
+        ts_override,
     );
 
     // Gate: authorise against current room state before persisting.
@@ -256,9 +269,20 @@ pub async fn send_state_event(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path((room_id_str, event_type, state_key)): Path<(String, String, String)>,
+    Query(ts_query): Query<TsOverride>,
     Json(content): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    send_state_inner(state, user, room_id_str, event_type, state_key, content).await
+    let ts_override = ts_query.ts.filter(|_| user.appservice_nid.is_some());
+    send_state_inner(
+        state,
+        user,
+        room_id_str,
+        event_type,
+        state_key,
+        ts_override,
+        content,
+    )
+    .await
 }
 
 /// PUT /_matrix/client/v3/rooms/{roomId}/state/{eventType}
@@ -266,9 +290,20 @@ pub async fn send_state_event_no_key(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path((room_id_str, event_type)): Path<(String, String)>,
+    Query(ts_query): Query<TsOverride>,
     Json(content): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    send_state_inner(state, user, room_id_str, event_type, String::new(), content).await
+    let ts_override = ts_query.ts.filter(|_| user.appservice_nid.is_some());
+    send_state_inner(
+        state,
+        user,
+        room_id_str,
+        event_type,
+        String::new(),
+        ts_override,
+        content,
+    )
+    .await
 }
 
 async fn send_state_inner(
@@ -277,6 +312,7 @@ async fn send_state_inner(
     room_id_str: String,
     event_type: String,
     state_key: String,
+    ts_override: Option<u64>,
     content: Value,
 ) -> Result<Json<Value>, ApiError> {
     // Same canonical-JSON integer-range guard we apply on /send.
@@ -399,7 +435,7 @@ async fn send_state_inner(
         )
     };
 
-    let (event, event_id) = build_event(
+    let (event, event_id) = build_event_at_ts(
         &event_type,
         Some(&state_key),
         content,
@@ -411,6 +447,7 @@ async fn send_state_inner(
         &signing_key,
         server_name,
         room_version,
+        ts_override,
     );
 
     authorise_event(&state, room_nid, &event_id, &event, None)?;

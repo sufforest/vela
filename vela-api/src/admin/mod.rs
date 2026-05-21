@@ -1164,6 +1164,7 @@ async fn cmd_deactivate(
         user_nid: nid,
         user_id: target_user_id,
         device_id,
+        appservice_nid: None,
     };
     crate::membership::force_leave_all_rooms_for_deactivation(
         state,
@@ -1732,6 +1733,7 @@ fn bot_auth_user(state: &AppState) -> Result<crate::middleware::auth::Authentica
         user_nid: bot_nid,
         user_id,
         device_id: ADMIN_BOT_DEVICE_ID.to_string(),
+        appservice_nid: None,
     })
 }
 

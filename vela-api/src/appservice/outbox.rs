@@ -78,6 +78,20 @@ impl AsOutbox {
         self.hs_tokens.insert(appservice_nid, cleartext);
     }
 
+    /// Cleartext hs_token for this AS, if known. Used by HS→AS
+    /// query callers to sign their GET requests.
+    pub fn hs_token(&self, appservice_nid: u64) -> Option<String> {
+        self.hs_tokens
+            .get(&appservice_nid)
+            .map(|r| r.value().clone())
+    }
+
+    /// Shared HTTP client. Reused for HS→AS queries so we don't spin
+    /// up a fresh connection pool per call.
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http
+    }
+
     pub fn start_all(&self) {
         for live in self.registry.list() {
             self.start_worker(live.appservice.nid);
@@ -123,6 +137,30 @@ impl AsOutbox {
         event_nids: Vec<u64>,
         room_ids: Vec<String>,
     ) -> Result<(), rocksdb::Error> {
+        self.enqueue_inner(appservice_nid, event_nids, room_ids, vec![])
+    }
+
+    /// Enqueue an ephemeral-only transaction (typing / receipt / etc).
+    /// Each EDU is a JSON object with `type` + `room_id` + `content`,
+    /// per the AS transaction spec's `ephemeral` array.
+    pub fn enqueue_ephemeral(
+        &self,
+        appservice_nid: u64,
+        ephemeral: Vec<serde_json::Value>,
+    ) -> Result<(), rocksdb::Error> {
+        if ephemeral.is_empty() {
+            return Ok(());
+        }
+        self.enqueue_inner(appservice_nid, vec![], vec![], ephemeral)
+    }
+
+    fn enqueue_inner(
+        &self,
+        appservice_nid: u64,
+        event_nids: Vec<u64>,
+        room_ids: Vec<String>,
+        ephemeral: Vec<serde_json::Value>,
+    ) -> Result<(), rocksdb::Error> {
         let seq = self
             .inner
             .next_seq
@@ -133,6 +171,7 @@ impl AsOutbox {
             txn_id: format!("vela-{appservice_nid}-{seq}"),
             event_nids,
             room_ids,
+            ephemeral,
         };
         let value = serde_json::to_value(&txn).unwrap_or(json!(null));
         self.db
