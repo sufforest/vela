@@ -107,15 +107,54 @@ pub async fn version() -> Json<Value> {
 
 /// GET /_matrix/key/v2/query/{serverName}
 ///
-/// Notary single-server key query per spec §key management. When the
-/// caller asks about a server we ARE, return the same content as
-/// `/key/v2/server` wrapped in `{server_keys: [...]}`. For any other
-/// server we don't act as a notary (we'd need to proxy-fetch their
-/// keys with peer-cache freshness; deferred).
+/// Notary single-server key query. When the caller asks about a
+/// server we ARE, return our self-signed bundle. For any other
+/// server, fetch their `/key/v2/server` response, add our signature
+/// alongside the origin's (the "notary" assertion: we vouched for
+/// these keys at this time), and return. Fetch failures yield an
+/// empty `server_keys` — the spec leaves it implementation-defined,
+/// and an empty body is friendlier than a 500 to callers that
+/// only need their own keys.
 pub async fn query_keys_single(
     State(state): State<AppState>,
     Path(server_name): Path<String>,
 ) -> Json<Value> {
+    let entry = build_notary_entry_for(&state, &server_name).await;
+    match entry {
+        Some(e) => Json(json!({ "server_keys": [e] })),
+        None => Json(json!({ "server_keys": [] })),
+    }
+}
+
+/// POST /_matrix/key/v2/query
+///
+/// Notary batch key query. Request body shape per spec:
+/// `{ "server_keys": { "<server>": { "<key_id>": { ... } } } }`. We
+/// notary-sign one entry per asked-about server. The per-key map
+/// inside each server entry is currently ignored — `key_v2/server`
+/// returns the full key list, and the spec lets the notary return
+/// more than was strictly asked. The `minimum_valid_until_ts` hint
+/// is also ignored; we rely on the validator's freshness check.
+pub async fn query_keys_batch(
+    State(state): State<AppState>,
+    Json(req): Json<Value>,
+) -> Json<Value> {
+    let mut server_keys = Vec::new();
+    if let Some(asked) = req.get("server_keys").and_then(|v| v.as_object()) {
+        for server in asked.keys() {
+            if let Some(entry) = build_notary_entry_for(&state, server).await {
+                server_keys.push(entry);
+            }
+        }
+    }
+    Json(json!({ "server_keys": server_keys }))
+}
+
+/// Produce one `server_keys[]` entry for `server_name`: self-signed
+/// when it's us, notary-signed when it's anyone else. Returns `None`
+/// when the upstream fetch fails — caller decides whether to drop
+/// or 5xx; today we drop (empty array), matching Synapse.
+async fn build_notary_entry_for(state: &AppState, server_name: &str) -> Option<Value> {
     if server_name == state.config.server_name {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -128,39 +167,42 @@ pub async fn query_keys_single(
             now_ms,
             &old_keys,
         );
-        return Json(json!({ "server_keys": [Value::Object(entry)] }));
+        return Some(Value::Object(entry));
     }
-    Json(json!({ "server_keys": [] }))
-}
-
-/// POST /_matrix/key/v2/query
-///
-/// Notary batch key query. Request body shape per spec:
-/// `{ "server_keys": { "<server>": { "<key_id>": { ... } } } }`. We
-/// only return entries for ourselves; queries for other servers go
-/// unanswered (we'd need a live notary fetch path).
-pub async fn query_keys_batch(
-    State(state): State<AppState>,
-    Json(req): Json<Value>,
-) -> Json<Value> {
-    let mut server_keys = Vec::new();
-    if let Some(asked) = req.get("server_keys").and_then(|v| v.as_object())
-        && asked.contains_key(&state.config.server_name)
+    match state
+        .federation_client
+        .fetch_server_keys_with_raw(server_name)
+        .await
     {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        let old_keys = state.db.load_rotated_signing_keys().unwrap_or_default();
-        let entry = build_server_key_response(
+        Ok((_parsed, raw)) => Some(notary_sign_entry(
+            raw,
             &state.signing_key,
             &state.config.server_name,
-            now_ms,
-            &old_keys,
-        );
-        server_keys.push(Value::Object(entry));
+        )),
+        Err(e) => {
+            tracing::debug!(
+                target = %server_name,
+                error = %e,
+                "notary key fetch failed; returning empty entry"
+            );
+            None
+        }
     }
-    Json(json!({ "server_keys": server_keys }))
+}
+
+/// Insert our signature alongside the origin server's signatures on
+/// a `/key/v2/server` bundle. Per Matrix spec §"Notary queries":
+/// the notary signs the bundle with `signatures` and `unsigned`
+/// stripped (same scheme `sign_json` already implements), and the
+/// resulting signature lives under `signatures.<notary>.<key_id>`
+/// alongside the existing `signatures.<origin>.<their_key_id>`.
+/// Origin signatures are preserved verbatim so callers can verify
+/// the underlying server's claim.
+fn notary_sign_entry(mut bundle: Value, our_key: &ServerSigningKey, our_server: &str) -> Value {
+    if let Some(obj) = bundle.as_object_mut() {
+        our_key.sign_json(obj, our_server);
+    }
+    bundle
 }
 
 /// Parsed X-Matrix Authorization header parameters.
@@ -631,5 +673,150 @@ mod tests {
         let h = r#"X-Matrix origin="first.com",origin="second.com",key="ed25519:x",sig="S""#;
         let parsed = parse_x_matrix_auth(h).unwrap();
         assert_eq!(parsed.origin, "second.com");
+    }
+
+    /// Notary signing preserves the origin server's signature and
+    /// adds the notary's alongside it. Both must verify against
+    /// their respective keys. This is the cryptographic invariant
+    /// the notary path relies on: callers can trust EITHER
+    /// signature (the origin's authoritative claim, or the notary's
+    /// vouching of freshness).
+    #[test]
+    fn notary_sign_entry_preserves_origin_signature() {
+        use base64::Engine;
+        // 1. Build a remote-signed bundle.
+        let remote_key = ServerSigningKey::generate();
+        let remote_bundle =
+            build_server_key_response(&remote_key, "remote.example", 1_700_000_000_000, &[]);
+        // Sanity: the origin signature is present.
+        let origin_sig_b64 = remote_bundle["signatures"]["remote.example"][remote_key.key_id()]
+            .as_str()
+            .expect("origin signature should be set")
+            .to_string();
+
+        // 2. Notary signs the bundle.
+        let our_key = ServerSigningKey::generate();
+        let signed =
+            notary_sign_entry(Value::Object(remote_bundle.clone()), &our_key, "us.example");
+        let signed_obj = signed.as_object().unwrap();
+
+        // 3. Origin signature is untouched.
+        assert_eq!(
+            signed_obj["signatures"]["remote.example"][remote_key.key_id()],
+            json!(origin_sig_b64),
+            "origin's signature must survive notary signing verbatim",
+        );
+
+        // 4. Notary's signature is present and valid.
+        let our_sig_b64 = signed_obj["signatures"]["us.example"][our_key.key_id()]
+            .as_str()
+            .expect("notary signature must be added");
+        assert!(!our_sig_b64.is_empty());
+        let our_pub = our_key.public_key_base64();
+        let pub_bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(&our_pub)
+            .unwrap();
+        let mut pub_arr = [0u8; 32];
+        pub_arr.copy_from_slice(&pub_bytes);
+        let pub_key = ed25519_dalek::VerifyingKey::from_bytes(&pub_arr).unwrap();
+        // The signature is over canonical-JSON-minus-signatures, which
+        // is what verify_json_signature already does.
+        assert!(
+            verify_json_signature(signed_obj, "us.example", our_key.key_id(), &pub_key).is_ok(),
+            "notary signature must verify against our own pubkey",
+        );
+
+        // 5. Origin's signature still verifies too (against its key).
+        let remote_pub = remote_key.public_key_base64();
+        let remote_pub_bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(&remote_pub)
+            .unwrap();
+        let mut remote_pub_arr = [0u8; 32];
+        remote_pub_arr.copy_from_slice(&remote_pub_bytes);
+        let remote_pub_key = ed25519_dalek::VerifyingKey::from_bytes(&remote_pub_arr).unwrap();
+        assert!(
+            verify_json_signature(
+                signed_obj,
+                "remote.example",
+                remote_key.key_id(),
+                &remote_pub_key,
+            )
+            .is_ok(),
+            "origin's signature must still verify after notary signing",
+        );
+    }
+
+    /// End-to-end notary flow: stub a remote homeserver via wiremock,
+    /// route federation_client's HTTPS fetch at it via the test base-URL
+    /// override, and assert `build_notary_entry_for` returns a bundle
+    /// signed by BOTH the remote and us. Catches integration bugs the
+    /// unit test (which constructs the bundle in-process) misses —
+    /// e.g. a JSON-shape mismatch between what `/key/v2/server`
+    /// returns on the wire and what `fetch_server_keys_with_raw`
+    /// hands the notary signer.
+    #[tokio::test]
+    async fn notary_end_to_end_signs_remote_bundle() {
+        use base64::Engine;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let remote_name = "remote.example";
+
+        // The mocked remote returns a bundle self-signed by `remote_key`.
+        let remote_key = ServerSigningKey::generate();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let remote_bundle = build_server_key_response(&remote_key, remote_name, now_ms, &[]);
+        Mock::given(method("GET"))
+            .and(path("/_matrix/key/v2/server"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(Value::Object(remote_bundle.clone())),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _tmp) = crate::test_helpers::build_test_state();
+        // Plumb the wiremock URL through the federation_client's
+        // plaintext base-URL override — same path test_helpers uses for
+        // peer stubs elsewhere.
+        state
+            .federation_client
+            .set_base_url_override(remote_name, &server.uri());
+
+        let entry = build_notary_entry_for(&state, remote_name)
+            .await
+            .expect("notary build must succeed");
+        let obj = entry.as_object().unwrap();
+
+        // Remote's signature survived.
+        assert_eq!(
+            obj["server_name"], remote_name,
+            "server_name preserved from upstream bundle"
+        );
+        assert!(
+            obj["signatures"][remote_name][remote_key.key_id()].is_string(),
+            "remote signature must be present after notary signing",
+        );
+
+        // Vela's signature was added and verifies against vela's key.
+        let our_key_id = state.signing_key.key_id();
+        let our_sig = obj["signatures"]["example.com"][our_key_id]
+            .as_str()
+            .expect("notary signature missing");
+        assert!(!our_sig.is_empty());
+        let our_pub_b64 = state.signing_key.public_key_base64();
+        let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(&our_pub_b64)
+            .unwrap();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        let our_pub = ed25519_dalek::VerifyingKey::from_bytes(&arr).unwrap();
+        assert!(
+            verify_json_signature(obj, "example.com", our_key_id, &our_pub).is_ok(),
+            "notary signature must verify against vela's key",
+        );
     }
 }
