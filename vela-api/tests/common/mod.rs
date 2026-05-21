@@ -175,6 +175,9 @@ impl Harness {
             federation_sender,
             federation_client: client,
             oidc_introspection: None,
+            partial_state_filler: Arc::new(
+                vela_api::federation::partial_state_filler::PartialStateFiller::new(),
+            ),
             appservice_registry,
             appservice_outbox,
             uia_sessions: vela_api::auth::uia::new_sessions(),

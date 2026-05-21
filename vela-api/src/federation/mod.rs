@@ -13,6 +13,7 @@ pub mod federation_receive;
 pub mod federation_resolver;
 pub mod federation_sender;
 pub mod federation_state;
+pub mod partial_state_filler;
 pub mod server_acl;
 
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -90,6 +90,11 @@ pub async fn versions(State(state): State<AppState>) -> Json<Value> {
         ("org.matrix.msc4222".to_string(), json!(true)),
         ("io.element.msc4306".to_string(), json!(true)),
         ("io.element.msc4308".to_string(), json!(true)),
+        // MSC3706 partial-state joins: outbound /send_join sets
+        // `omit_members=true` and inbound honours the same param,
+        // returning partial state when asked. Filler fills the rest
+        // in the background.
+        ("org.matrix.msc3706".to_string(), json!(true)),
     ]);
     // Phase 1 capability bit: only when the operator has actually
     // wired up an OIDC issuer. A bare `true` here would mislead

@@ -1061,6 +1061,9 @@ fn main() -> anyhow::Result<()> {
             federation_sender,
             federation_client,
             oidc_introspection,
+            partial_state_filler: Arc::new(
+                vela_api::federation::partial_state_filler::PartialStateFiller::new(),
+            ),
             appservice_registry,
             appservice_outbox,
             uia_sessions: vela_api::auth::uia::new_sessions(),
@@ -1107,6 +1110,10 @@ fn main() -> anyhow::Result<()> {
         // (which lives only in process memory) wait until the
         // operator re-pastes via `!as register`.
         state.appservice_outbox.start_all();
+
+        // MSC3706 partial-state filler. Cheap no-op if no rooms are
+        // flagged partial.
+        vela_api::federation::partial_state_filler::ensure_running(&state);
 
         let app = vela_api::router::build_router(state);
 

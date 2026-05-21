@@ -95,6 +95,9 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
         federation_sender,
         federation_client: client,
         oidc_introspection: None,
+        partial_state_filler: Arc::new(
+            crate::federation::partial_state_filler::PartialStateFiller::new(),
+        ),
         appservice_registry,
         appservice_outbox,
         uia_sessions: crate::auth::uia::new_sessions(),

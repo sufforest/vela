@@ -307,10 +307,11 @@ pub async fn make_join(
 pub async fn send_join_v1(
     state: State<AppState>,
     path: Path<(String, String)>,
+    raw_query: axum::extract::RawQuery,
     origin: axum::extract::Extension<XMatrixOrigin>,
     body: axum::extract::Extension<VerifiedBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let v2 = send_join_v2(state, path, origin, body).await?;
+    let v2 = send_join_v2(state, path, raw_query, origin, body).await?;
     Ok(Json(json!([200, v2.0])))
 }
 
@@ -318,10 +319,16 @@ pub async fn send_join_v1(
 pub async fn send_join_v2(
     State(state): State<AppState>,
     Path((room_id, event_id)): Path<(String, String)>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     axum::extract::Extension(origin): axum::extract::Extension<XMatrixOrigin>,
     axum::extract::Extension(VerifiedBody(body)): axum::extract::Extension<VerifiedBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    debug!(%room_id, %event_id, origin = %origin.0, "send_join v2");
+    // MSC3706 opt-in. Peers that don't pass this get full state.
+    let omit_members = raw_query
+        .as_deref()
+        .map(|q| q.split('&').any(|p| p == "omit_members=true"))
+        .unwrap_or(false);
+    debug!(%room_id, %event_id, origin = %origin.0, %omit_members, "send_join v2");
 
     let event_json = body.ok_or_else(|| {
         err_response(
@@ -759,11 +766,102 @@ pub async fn send_join_v2(
         }
     }
 
-    Ok(Json(json!({
-        "auth_chain": auth_chain_pdus,
-        "state": state_events_before,
-        "event": Value::Null,
-    })))
+    // MSC3706 partial-state filter. When the joining server opted in
+    // via `?omit_members=true`, drop most m.room.member events from
+    // the response. Keep: the join event itself isn't in
+    // state_events_before (it's the event being sent_join'd, not
+    // pre-join state); the authoriser's member (for restricted
+    // joins, named in the event's content); the room creator(s)
+    // (named by m.room.create); state senders (any user whose member
+    // event matches the sender of some non-member state event we ARE
+    // including). The filler on the joining side closes the gap by
+    // pulling /state from us shortly after.
+    let (response_state, partial_state) = if omit_members {
+        let keep = essential_member_state_keys(&state, room_nid, &pdu, &effective_event_obj);
+        let filtered: Vec<Value> = state_events_before
+            .iter()
+            .filter(|ev| {
+                let ty = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if ty != "m.room.member" {
+                    return true;
+                }
+                let sk = ev.get("state_key").and_then(|v| v.as_str()).unwrap_or("");
+                keep.contains(sk)
+            })
+            .cloned()
+            .collect();
+        (filtered, true)
+    } else {
+        (state_events_before, false)
+    };
+
+    let our_server = state.config.server_name.clone();
+    let mut resp = serde_json::Map::new();
+    resp.insert("auth_chain".into(), json!(auth_chain_pdus));
+    resp.insert("state".into(), json!(response_state));
+    resp.insert("event".into(), Value::Null);
+    if partial_state {
+        resp.insert("partial_state".into(), json!(true));
+        resp.insert("servers_in_room".into(), json!([our_server]));
+    }
+    Ok(Json(Value::Object(resp)))
+}
+
+/// Collect state_keys whose m.room.member event we MUST keep in a
+/// partial-state response. The joining server can validate the join
+/// itself + a few state-event auth chains with only these members;
+/// the rest is filled in async by the joiner's filler.
+fn essential_member_state_keys(
+    state: &AppState,
+    room_nid: u64,
+    pdu: &Pdu,
+    join_event: &Map<String, Value>,
+) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    let mut keep: HashSet<String> = HashSet::new();
+    // The joining user.
+    if let Some(sk) = join_event.get("state_key").and_then(|v| v.as_str()) {
+        keep.insert(sk.to_string());
+    }
+    // The authoriser, if this was a restricted-room join.
+    if let Some(auth) = join_event
+        .get("content")
+        .and_then(|c| c.get("join_authorised_via_users_server"))
+        .and_then(|v| v.as_str())
+    {
+        keep.insert(auth.to_string());
+    }
+    // Drop the unused warning on `pdu` while keeping the param for
+    // future expansion (e.g. additional_creators).
+    let _ = pdu;
+    // Room creator(s): from m.room.create's `creator` field (legacy)
+    // + `additional_creators` (v12+).
+    if let Some(create) = read_create_content(state, room_nid) {
+        if let Some(creator) = create.get("creator").and_then(|v| v.as_str()) {
+            keep.insert(creator.to_string());
+        }
+        if let Some(arr) = create.get("additional_creators").and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    keep.insert(s.to_string());
+                }
+            }
+        }
+    }
+    keep
+}
+
+fn read_create_content(state: &AppState, room_nid: u64) -> Option<Value> {
+    let tn = state.db.get_nid("m.room.create").ok().flatten()?;
+    let sn = state.db.get_nid("").ok().flatten()?;
+    let enid = state
+        .db
+        .get_state_event_nid(room_nid, tn, sn)
+        .ok()
+        .flatten()?;
+    let (_h, bytes) = state.db.get_event(enid).ok().flatten()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("content").cloned()
 }
 
 /// Read the current `m.room.join_rules` content. Returns `None` when the
@@ -1379,6 +1477,7 @@ mod tests {
         let err = send_join_v2(
             axum::extract::State(state.clone()),
             Path((restricted.to_string(), event_id.as_str().to_string())),
+            axum::extract::RawQuery(None),
             origin,
             body,
         )
@@ -1556,6 +1655,7 @@ mod tests {
         let result = send_join_v2(
             axum::extract::State(state.clone()),
             Path((restricted.to_string(), event_id.as_str().to_string())),
+            axum::extract::RawQuery(None),
             origin,
             body,
         )

@@ -892,6 +892,125 @@ impl Database {
             .map(|s| s.to_string()))
     }
 
+    /// MSC3706: flag a room as partial-state and stash the server hints
+    /// the background filler will probe for `/state`. Merges with any
+    /// existing meta record (room_id + version stay intact). Called
+    /// from the outbound send_join path when the remote responded with
+    /// `partial_state: true`.
+    pub fn set_partial_state_join(
+        &self,
+        room_nid: u64,
+        servers_in_room: &[String],
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("room_meta").unwrap();
+        let key = keys::encode_u64(room_nid);
+        let mut record = match self.db.get_cf(&cf, key)? {
+            Some(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            None => serde_json::json!({}),
+        };
+        if let Some(obj) = record.as_object_mut() {
+            obj.insert("partial_state".into(), serde_json::json!(true));
+            obj.insert("servers_in_room".into(), serde_json::json!(servers_in_room));
+        }
+        self.db.put_cf(&cf, key, record.to_string().as_bytes())
+    }
+
+    /// MSC3706: lift the partial-state flag once the filler has merged
+    /// in the rest of the room's state. Idempotent — clearing an
+    /// already-cleared room is fine.
+    pub fn clear_partial_state(&self, room_nid: u64) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("room_meta").unwrap();
+        let key = keys::encode_u64(room_nid);
+        let Some(bytes) = self.db.get_cf(&cf, key)? else {
+            return Ok(());
+        };
+        let mut record: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        if let Some(obj) = record.as_object_mut() {
+            obj.remove("partial_state");
+            obj.remove("servers_in_room");
+        }
+        self.db.put_cf(&cf, key, record.to_string().as_bytes())
+    }
+
+    /// MSC3706: `(partial_state, servers_in_room)`. `partial_state=false`
+    /// when the room is fully-stated (the common case); the servers
+    /// list is empty in that case. Rooms predating MSC3706 always
+    /// decode as full-state.
+    pub fn get_partial_state_info(
+        &self,
+        room_nid: u64,
+    ) -> Result<(bool, Vec<String>), rocksdb::Error> {
+        let cf = self.db.cf_handle("room_meta").unwrap();
+        let Some(bytes) = self.db.get_cf(&cf, keys::encode_u64(room_nid))? else {
+            return Ok((false, Vec::new()));
+        };
+        let record: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return Ok((false, Vec::new())),
+        };
+        let partial = record
+            .get("partial_state")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let servers = record
+            .get("servers_in_room")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((partial, servers))
+    }
+
+    /// List every room currently flagged as partial-state. Returns
+    /// `(room_nid, room_id, servers_in_room)` triples. Called by the
+    /// background filler on boot to bootstrap its work queue.
+    pub fn list_partial_state_rooms(
+        &self,
+    ) -> Result<Vec<(u64, String, Vec<String>)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("room_meta").unwrap();
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (k, v) = item?;
+            if k.len() != 8 {
+                continue;
+            }
+            let nid = keys::decode_u64(&k);
+            let Ok(record) = serde_json::from_slice::<serde_json::Value>(&v) else {
+                continue;
+            };
+            if !record
+                .get("partial_state")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let room_id = record
+                .get("room_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let servers = record
+                .get("servers_in_room")
+                .and_then(|x| x.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|s| s.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push((nid, room_id, servers));
+        }
+        Ok(out)
+    }
+
     /// `get_room_version` decoded straight to the typed enum. Falls back
     /// to v12 when the meta record is missing, malformed, or carries an
     /// unsupported version string — that's safe for vela because v12 is
@@ -6535,5 +6654,84 @@ mod external_id_tests {
             db.get_external_id_mapping("idp-new", "shared-sub").unwrap(),
             Some(2)
         );
+    }
+}
+
+#[cfg(test)]
+mod partial_state_tests {
+    use super::*;
+
+    fn fresh_db() -> (Database, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        (db, tmp)
+    }
+
+    #[test]
+    fn defaults_to_full_state() {
+        let (db, _tmp) = fresh_db();
+        let nid = db.get_or_create_nid("!r:x").unwrap();
+        db.create_room_meta(nid, "!r:x", "12").unwrap();
+        let (partial, servers) = db.get_partial_state_info(nid).unwrap();
+        assert!(!partial);
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn set_and_clear_roundtrip() {
+        let (db, _tmp) = fresh_db();
+        let nid = db.get_or_create_nid("!r:x").unwrap();
+        db.create_room_meta(nid, "!r:x", "12").unwrap();
+        db.set_partial_state_join(nid, &["a.example".into(), "b.example".into()])
+            .unwrap();
+        let (partial, servers) = db.get_partial_state_info(nid).unwrap();
+        assert!(partial);
+        assert_eq!(servers, vec!["a.example".to_string(), "b.example".into()]);
+        db.clear_partial_state(nid).unwrap();
+        let (partial, servers) = db.get_partial_state_info(nid).unwrap();
+        assert!(!partial);
+        assert!(servers.is_empty());
+        // room_id + version must survive the clear.
+        assert_eq!(db.get_room_version(nid).unwrap().as_deref(), Some("12"));
+    }
+
+    #[test]
+    fn set_before_create_meta_still_works() {
+        let (db, _tmp) = fresh_db();
+        let nid = db.get_or_create_nid("!r:x").unwrap();
+        // Caller (outbound join) may set partial state before
+        // create_room_meta in the bootstrap sequence. The function
+        // merges into whatever meta record already exists; absent →
+        // creates a minimal one.
+        db.set_partial_state_join(nid, &["x.example".into()])
+            .unwrap();
+        let (partial, servers) = db.get_partial_state_info(nid).unwrap();
+        assert!(partial);
+        assert_eq!(servers, vec!["x.example".to_string()]);
+    }
+
+    #[test]
+    fn list_partial_state_rooms_only_returns_partial() {
+        let (db, _tmp) = fresh_db();
+        let r1 = db.get_or_create_nid("!r1:x").unwrap();
+        let r2 = db.get_or_create_nid("!r2:x").unwrap();
+        db.create_room_meta(r1, "!r1:x", "12").unwrap();
+        db.create_room_meta(r2, "!r2:x", "12").unwrap();
+        db.set_partial_state_join(r1, &["a.example".into()])
+            .unwrap();
+        let listed = db.list_partial_state_rooms().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, r1);
+        assert_eq!(listed[0].1, "!r1:x");
+        assert_eq!(listed[0].2, vec!["a.example".to_string()]);
+    }
+
+    #[test]
+    fn clear_partial_state_is_idempotent() {
+        let (db, _tmp) = fresh_db();
+        let nid = db.get_or_create_nid("!r:x").unwrap();
+        db.create_room_meta(nid, "!r:x", "12").unwrap();
+        db.clear_partial_state(nid).unwrap();
+        db.clear_partial_state(nid).unwrap();
     }
 }
