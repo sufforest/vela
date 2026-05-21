@@ -74,6 +74,20 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
         }
     };
 
+    // --- Check 1b: numeric ranges ---
+    // Without this gate a peer can send `{"x": 1.5}` — the canonical
+    // encoder substitutes "0" while the stored JSON keeps 1.5, so
+    // signature verify passes on bytes that differ from what
+    // downstream consumers see. Reject up front.
+    if let Some(bad_path) = vela_core::canonical::find_invalid_number_path(pdu_json) {
+        return (
+            "unknown".into(),
+            PduOutcome::Rejected(format!(
+                "PDU contains disallowed numeric value at `{bad_path}` (must be integer in safe range)"
+            )),
+        );
+    }
+
     // v3+ event format derives event_ids from the reference hash. The
     // hash is version-aware (different redaction shapes produce
     // different bytes), so we have to know the room version before

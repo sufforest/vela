@@ -526,18 +526,22 @@ pub(crate) fn build_sync_response_with_filter(
             .db
             .get_device_list_left(user.user_nid, dl_from, current_pos + 1)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-        let our_rooms = state
+        let our_rooms: HashSet<u64> = state
             .db
             .get_user_joined_rooms(user.user_nid)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         let mut out = Vec::new();
         for nid in raw {
             // Drop the change-side dedup: a user may appear in both
             // changed and left within the same window. Spec says left
             // wins for the "no longer shares" semantic.
-            let still_sharing = our_rooms
-                .iter()
-                .any(|&room_nid| state.db.get_membership(room_nid, nid).ok().flatten() == Some(1));
+            //
+            // One get_user_joined_rooms + set intersect per changed
+            // user, vs O(our_rooms) get_membership calls previously.
+            let their_rooms = state.db.get_user_joined_rooms(nid).unwrap_or_default();
+            let still_sharing = their_rooms.iter().any(|r| our_rooms.contains(r));
             if still_sharing {
                 continue;
             }
@@ -551,9 +555,11 @@ pub(crate) fn build_sync_response_with_filter(
         }
         out
     };
+    // O(1) lookup per element vs the previous O(N) Vec::contains.
+    let left_set: HashSet<&str> = device_lists_left.iter().map(String::as_str).collect();
     let device_lists_changed: Vec<String> = device_lists_changed
         .into_iter()
-        .filter(|u| !device_lists_left.contains(u))
+        .filter(|u| !left_set.contains(u.as_str()))
         .collect();
 
     Ok(json!({

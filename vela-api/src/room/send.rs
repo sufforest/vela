@@ -116,7 +116,9 @@ pub async fn send_message(
     }
 
     let prev_events = resolve_nids_to_event_ids(&state, &extremity_nids)?;
-    let depth = max_depth + 1;
+    // Cap at u64::MAX so a prev_event with depth=MAX can't wrap us
+    // to 0 and place the new event "before" the room create.
+    let depth = max_depth.saturating_add(1);
 
     // Select auth events from current room state
     let auth_events = {
@@ -410,7 +412,9 @@ async fn send_state_inner(
     }
 
     let prev_events = resolve_nids_to_event_ids(&state, &extremity_nids)?;
-    let depth = max_depth + 1;
+    // Cap at u64::MAX so a prev_event with depth=MAX can't wrap us
+    // to 0 and place the new event "before" the room create.
+    let depth = max_depth.saturating_add(1);
 
     let auth_events = {
         let lookup = |etype: &str, skey: &str| -> Option<EventId> {
@@ -783,66 +787,10 @@ fn load_room_creators(state: &AppState, room_nid: u64) -> Result<Vec<String>, Ap
 }
 
 /// Walk a JSON value and return the path of the first invalid number
-/// encountered, or `None` if all numbers are integers within the
-/// JavaScript safe-integer range. Matrix canonical JSON only allows
-/// integers in [-(2^53)+1, (2^53)-1]; floats and out-of-range ints
-/// must be rejected at ingest.
+/// encountered. Thin re-export of the vela-core helper so the federation
+/// receive path and the CS-API send path share a single source of truth.
 fn find_invalid_number(value: &Value) -> Option<String> {
-    fn walk(v: &Value, path: &str) -> Option<String> {
-        match v {
-            Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    if !is_safe_int(i) {
-                        return Some(path.to_string());
-                    }
-                } else if let Some(u) = n.as_u64() {
-                    if u > (1u64 << 53) - 1 {
-                        return Some(path.to_string());
-                    }
-                } else {
-                    // Anything not representable as i64/u64 is out of range
-                    // (or it's a float — `as_f64` returns `Some` for those).
-                    return Some(path.to_string());
-                }
-                None
-            }
-            Value::Object(map) => {
-                for (k, child) in map {
-                    let child_path = if path.is_empty() {
-                        k.clone()
-                    } else {
-                        format!("{path}.{k}")
-                    };
-                    if let Some(p) = walk(child, &child_path) {
-                        return Some(p);
-                    }
-                }
-                None
-            }
-            Value::Array(arr) => {
-                for (i, child) in arr.iter().enumerate() {
-                    let child_path = if path.is_empty() {
-                        format!("[{i}]")
-                    } else {
-                        format!("{path}[{i}]")
-                    };
-                    if let Some(p) = walk(child, &child_path) {
-                        return Some(p);
-                    }
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-    walk(value, "")
-}
-
-const SAFE_INT_MAX: i64 = (1i64 << 53) - 1;
-const SAFE_INT_MIN: i64 = -(1i64 << 53) + 1;
-
-fn is_safe_int(i: i64) -> bool {
-    (SAFE_INT_MIN..=SAFE_INT_MAX).contains(&i)
+    vela_core::canonical::find_invalid_number_path(value)
 }
 
 /// If `(event_type, state_key)` is already in the room's current
