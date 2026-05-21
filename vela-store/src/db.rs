@@ -5064,6 +5064,61 @@ impl Database {
         let key = edu_cursor_key(destination, stream_name);
         self.db.put_cf(&cf, &key, keys::encode_u64(cursor))
     }
+
+    /// Lookup the local user_nid mapped to `(provider, sub)`, or
+    /// `None` if no mapping exists yet. The MSC3861 introspection
+    /// flow calls this on every authenticated request to skip the
+    /// slow first-touch provisioning path.
+    pub fn get_external_id_mapping(
+        &self,
+        provider: &str,
+        sub: &str,
+    ) -> Result<Option<u64>, rocksdb::Error> {
+        let cf = self.db.cf_handle("external_ids").unwrap();
+        let key = external_id_key(provider, sub);
+        match self.db.get_cf(&cf, &key)? {
+            Some(bytes) if bytes.len() == 8 => Ok(Some(keys::decode_u64(&bytes))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Persist the `(provider, sub) -> user_nid` mapping. Idempotent;
+    /// callers don't need to check existence first. Writing the same
+    /// pair twice is fine — it's the same value.
+    pub fn put_external_id_mapping(
+        &self,
+        provider: &str,
+        sub: &str,
+        user_nid: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("external_ids").unwrap();
+        let key = external_id_key(provider, sub);
+        self.db.put_cf(&cf, &key, keys::encode_u64(user_nid))
+    }
+
+    /// Remove a `(provider, sub)` mapping. Used when the operator
+    /// detaches an external identity from a vela account. Idempotent.
+    pub fn delete_external_id_mapping(
+        &self,
+        provider: &str,
+        sub: &str,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("external_ids").unwrap();
+        let key = external_id_key(provider, sub);
+        self.db.delete_cf(&cf, &key)
+    }
+}
+
+/// Compose the `external_ids` key as `[provider_len_be:2][provider][sub]`.
+/// The length prefix keeps `(p1="foo", s="barbaz")` and `(p1="foobar",
+/// s="baz")` from colliding when written into the same CF.
+fn external_id_key(provider: &str, sub: &str) -> Vec<u8> {
+    let plen = provider.len() as u16;
+    let mut k = Vec::with_capacity(2 + provider.len() + sub.len());
+    k.extend_from_slice(&plen.to_be_bytes());
+    k.extend_from_slice(provider.as_bytes());
+    k.extend_from_slice(sub.as_bytes());
+    k
 }
 
 #[derive(Debug, Clone)]
@@ -6397,5 +6452,88 @@ mod stream_recovery_tests {
                 Some(b"legacy-row".to_vec())
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod external_id_tests {
+    use super::*;
+
+    fn fresh_db() -> (Database, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        (db, tmp)
+    }
+
+    #[test]
+    fn put_then_get_roundtrip() {
+        let (db, _tmp) = fresh_db();
+        db.put_external_id_mapping("oauth-delegated", "user-abc", 42)
+            .unwrap();
+        assert_eq!(
+            db.get_external_id_mapping("oauth-delegated", "user-abc")
+                .unwrap(),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn get_missing_returns_none() {
+        let (db, _tmp) = fresh_db();
+        assert!(
+            db.get_external_id_mapping("oauth-delegated", "never-seen")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn delete_idempotent() {
+        let (db, _tmp) = fresh_db();
+        db.put_external_id_mapping("oauth-delegated", "user-abc", 42)
+            .unwrap();
+        db.delete_external_id_mapping("oauth-delegated", "user-abc")
+            .unwrap();
+        // Second delete on already-absent key is fine.
+        db.delete_external_id_mapping("oauth-delegated", "user-abc")
+            .unwrap();
+        assert!(
+            db.get_external_id_mapping("oauth-delegated", "user-abc")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The length-prefixed key encoding must keep two providers from
+    /// colliding when their `(provider, sub)` concatenations would
+    /// otherwise produce the same byte string. Without the prefix,
+    /// (`"a", "bc"`) and (`"ab", "c"`) collide; with it they don't.
+    #[test]
+    fn length_prefix_prevents_provider_collisions() {
+        let (db, _tmp) = fresh_db();
+        db.put_external_id_mapping("a", "bc", 1).unwrap();
+        db.put_external_id_mapping("ab", "c", 2).unwrap();
+        assert_eq!(db.get_external_id_mapping("a", "bc").unwrap(), Some(1));
+        assert_eq!(db.get_external_id_mapping("ab", "c").unwrap(), Some(2));
+    }
+
+    /// Two providers can claim the same `sub` for different users.
+    /// Realistic when an operator migrates from one IdP to another
+    /// and keeps both attached briefly.
+    #[test]
+    fn distinct_providers_isolate_subs() {
+        let (db, _tmp) = fresh_db();
+        db.put_external_id_mapping("idp-old", "shared-sub", 1)
+            .unwrap();
+        db.put_external_id_mapping("idp-new", "shared-sub", 2)
+            .unwrap();
+        assert_eq!(
+            db.get_external_id_mapping("idp-old", "shared-sub").unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            db.get_external_id_mapping("idp-new", "shared-sub").unwrap(),
+            Some(2)
+        );
     }
 }

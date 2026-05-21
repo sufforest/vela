@@ -157,4 +157,21 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // index by room or reporter — the volume is low and a full
     // backward scan from the end is cheap at human-moderator scale.
     "event_reports",
+    // Maps external identity-provider subjects (OIDC `sub` claim) to
+    // local user nids. One row per `(provider, sub)` pair. Populated
+    // on first-touch when an OIDC-authenticated request arrives for
+    // a previously-unseen `sub`; subsequent requests with the same
+    // token hit a fast `(provider, sub) -> user_nid` lookup that
+    // bypasses the introspection round trip's user-provisioning logic.
+    //
+    // Key: `[provider_len_be:2][provider_bytes][sub_bytes]`. The
+    // length prefix lets two providers share the CF without collision
+    // (e.g. `("oauth-delegated", "abc")` vs `("saml", "abc")`).
+    // Value: little-endian `u64` user_nid.
+    //
+    // `provider` is operator-controlled and stable per IdP; today the
+    // only writer is the MSC3861 introspection flow with the literal
+    // `"oauth-delegated"`. A future SAML/LDAP/whatever flow would use
+    // its own provider string without touching this schema.
+    "external_ids",
 ];

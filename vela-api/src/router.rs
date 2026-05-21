@@ -177,21 +177,51 @@ pub struct RtcConfig {
     pub jwt_ttl_seconds: u32,
 }
 
-/// MSC3861 OIDC discovery posture (phase 1: discovery + capability
-/// advertisement only). When `enabled = false` (default), vela behaves
-/// exactly as before: `/auth_issuer` 404s with `M_NOT_FOUND` and the
-/// `/versions` response does not advertise `org.matrix.msc3861`.
+/// MSC3861 OIDC delegated-auth posture.
+///
+/// Phase 1 (always available once `enabled = true`): advertise the
+/// issuer via `/auth_issuer`, `.well-known/matrix/client`, and
+/// `versions.unstable_features["org.matrix.msc3861"]`.
+///
+/// Phase 2 (token validation against the IdP via RFC7662
+/// introspection): activates ONLY when `enabled = true` AND
+/// `introspection_endpoint` is set. Operators who already configured
+/// Phase 1 keep discovery-only behaviour; they opt into Phase 2 by
+/// adding the introspection settings.
 #[derive(Clone, Default)]
 pub struct OidcConfig {
     pub enabled: bool,
     /// The OIDC issuer URL (e.g. `https://auth.example.com/`).
     pub issuer: String,
     /// `Some` when vela's registered client_id should be exposed to
-    /// clients that need it pre-IdP-flow. Phase 1 doesn't consume it
-    /// internally; the field is plumbed through for phase 2.
+    /// clients that need it pre-IdP-flow.
     pub client_id: Option<String>,
     /// Optional account-management URL surfaced to clients per MSC3861.
     pub account_management_url: Option<String>,
+    /// RFC7662 introspection endpoint (e.g.
+    /// `https://auth.example.com/oauth2/introspect`). Presence of this
+    /// field is what activates Phase 2 token validation.
+    pub introspection_endpoint: Option<String>,
+    /// Client credentials vela presents to the IdP on every
+    /// introspection request. Both must be `Some` when
+    /// `introspection_endpoint` is set; the validator refuses to boot
+    /// otherwise.
+    pub introspection_client_id: Option<String>,
+    pub introspection_client_secret: Option<String>,
+    /// How those credentials are presented on the wire. Both are
+    /// RFC6749 §2.3 standard; IdPs differ on which they accept.
+    pub introspection_auth_method: IntrospectionAuthMethod,
+}
+
+/// RFC6749 §2.3 client authentication methods supported on
+/// introspection requests. `ClientSecretBasic` is the universal
+/// default; `ClientSecretPost` exists for IdPs that prefer
+/// form-encoded credentials in the body.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IntrospectionAuthMethod {
+    #[default]
+    ClientSecretBasic,
+    ClientSecretPost,
 }
 
 /// Server policy for auto-injecting `m.room.encryption` on
