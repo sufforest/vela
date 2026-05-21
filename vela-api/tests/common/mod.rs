@@ -174,6 +174,7 @@ impl Harness {
             remote_keys,
             federation_sender,
             federation_client: client,
+            oidc_introspection: None,
             appservice_registry,
             appservice_outbox,
             uia_sessions: vela_api::auth::uia::new_sessions(),

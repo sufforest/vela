@@ -94,6 +94,7 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
         remote_keys,
         federation_sender,
         federation_client: client,
+        oidc_introspection: None,
         appservice_registry,
         appservice_outbox,
         uia_sessions: crate::auth::uia::new_sessions(),
