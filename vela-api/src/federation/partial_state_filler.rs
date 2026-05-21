@@ -226,8 +226,6 @@ fn pick_anchor_event_id(state: &AppState, room_nid: u64) -> Result<String, Strin
 }
 
 async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> Result<(), String> {
-    // Same shape send_join uses: { auth_chain: [...], pdus: [...] }.
-    // (Both `pdus` and `state` are seen in the wild; accept either.)
     let auth_chain = resp
         .get("auth_chain")
         .and_then(|v| v.as_array())
@@ -235,10 +233,12 @@ async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> 
         .unwrap_or_default();
     let state_events = resp
         .get("pdus")
-        .or_else(|| resp.get("state"))
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+    if state_events.is_empty() {
+        return Err("peer returned no state PDUs".into());
+    }
     for ev in &auth_chain {
         let _ = crate::membership::federation_outbound_join::persist_remote_event(
             state,
@@ -248,14 +248,30 @@ async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> 
         )
         .await;
     }
+    // Require at least one state event to persist successfully before
+    // declaring the room filled. Without this, an all-fail merge
+    // (signatures mismatch, malformed JSON, etc.) would still clear
+    // the partial-state flag and leave the room permanently incomplete.
+    let mut persisted: usize = 0;
+    let mut last_err = String::new();
     for ev in &state_events {
-        let _ = crate::membership::federation_outbound_join::persist_remote_event(
+        match crate::membership::federation_outbound_join::persist_remote_event(
             state,
             room_nid,
             ev,
             vela_store::db::PersistKind::StateBundleOnly,
         )
-        .await;
+        .await
+        {
+            Ok(_) => persisted += 1,
+            Err(e) => last_err = e,
+        }
+    }
+    if persisted == 0 {
+        return Err(format!(
+            "no state events persisted ({} attempted; last error: {last_err})",
+            state_events.len()
+        ));
     }
     Ok(())
 }

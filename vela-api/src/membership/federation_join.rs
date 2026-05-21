@@ -768,16 +768,17 @@ pub async fn send_join_v2(
 
     // MSC3706 partial-state filter. When the joining server opted in
     // via `?omit_members=true`, drop most m.room.member events from
-    // the response. Keep: the join event itself isn't in
-    // state_events_before (it's the event being sent_join'd, not
-    // pre-join state); the authoriser's member (for restricted
-    // joins, named in the event's content); the room creator(s)
-    // (named by m.room.create); state senders (any user whose member
-    // event matches the sender of some non-member state event we ARE
-    // including). The filler on the joining side closes the gap by
-    // pulling /state from us shortly after.
+    // the response. Keep: the joiner; the authoriser (for restricted);
+    // the room creator(s); and the SENDER of every non-member state
+    // event we're keeping in the response (otherwise the joining
+    // server can't auth-check those state events).
     let (response_state, partial_state) = if omit_members {
-        let keep = essential_member_state_keys(&state, room_nid, &pdu, &effective_event_obj);
+        let keep = essential_member_state_keys(
+            &state,
+            room_nid,
+            &effective_event_obj,
+            &state_events_before,
+        );
         let filtered: Vec<Value> = state_events_before
             .iter()
             .filter(|ev| {
@@ -808,22 +809,22 @@ pub async fn send_join_v2(
 }
 
 /// Collect state_keys whose m.room.member event we MUST keep in a
-/// partial-state response. The joining server can validate the join
-/// itself + a few state-event auth chains with only these members;
-/// the rest is filled in async by the joiner's filler.
+/// partial-state response. Includes: the joiner; the authoriser
+/// (restricted joins); the room creator(s); and the SENDER of every
+/// non-member state event we're returning (otherwise the joining
+/// server can't auth-check those state events against the kept
+/// members). The rest fills asynchronously via the joiner's filler.
 fn essential_member_state_keys(
     state: &AppState,
     room_nid: u64,
-    pdu: &Pdu,
     join_event: &Map<String, Value>,
+    state_events_before: &[Value],
 ) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
     let mut keep: HashSet<String> = HashSet::new();
-    // The joining user.
     if let Some(sk) = join_event.get("state_key").and_then(|v| v.as_str()) {
         keep.insert(sk.to_string());
     }
-    // The authoriser, if this was a restricted-room join.
     if let Some(auth) = join_event
         .get("content")
         .and_then(|c| c.get("join_authorised_via_users_server"))
@@ -831,11 +832,6 @@ fn essential_member_state_keys(
     {
         keep.insert(auth.to_string());
     }
-    // Drop the unused warning on `pdu` while keeping the param for
-    // future expansion (e.g. additional_creators).
-    let _ = pdu;
-    // Room creator(s): from m.room.create's `creator` field (legacy)
-    // + `additional_creators` (v12+).
     if let Some(create) = read_create_content(state, room_nid) {
         if let Some(creator) = create.get("creator").and_then(|v| v.as_str()) {
             keep.insert(creator.to_string());
@@ -846,6 +842,19 @@ fn essential_member_state_keys(
                     keep.insert(s.to_string());
                 }
             }
+        }
+    }
+    // Senders of every non-member state event we're including. Their
+    // m.room.member events are auth-rule inputs for the events they
+    // sent — drop them and the joining server fails check_auth on
+    // join_rules / power_levels / canonical_alias / ... .
+    for ev in state_events_before {
+        let ty = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if ty == "m.room.member" {
+            continue;
+        }
+        if let Some(sender) = ev.get("sender").and_then(|v| v.as_str()) {
+            keep.insert(sender.to_string());
         }
     }
     keep

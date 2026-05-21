@@ -162,6 +162,7 @@ async fn try_join_via(
         &signed_event,
         &event_id,
         &send_join_resp,
+        server,
     )
     .await
     .map_err(|e| format!("bootstrap_remote_room failed: {e}"))?;
@@ -229,6 +230,7 @@ async fn bootstrap_remote_room(
     signed_event: &Map<String, Value>,
     event_id: &EventId,
     send_join_resp: &Value,
+    joining_server: &str,
 ) -> Result<(), String> {
     let room_nid = state
         .db
@@ -258,7 +260,7 @@ async fn bootstrap_remote_room(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if partial_state {
-        let servers: Vec<String> = send_join_resp
+        let mut servers: Vec<String> = send_join_resp
             .get("servers_in_room")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -267,6 +269,14 @@ async fn bootstrap_remote_room(
                     .collect()
             })
             .unwrap_or_default();
+        // Defensive fallback: a misbehaving resident could claim
+        // partial_state with an empty servers_in_room list. Without
+        // at least one target, the filler retries forever. The
+        // joining server we just talked to obviously has the state,
+        // so use it as the lone fallback.
+        if servers.is_empty() {
+            servers.push(joining_server.to_string());
+        }
         if let Err(e) = state.db.set_partial_state_join(room_nid, &servers) {
             warn!(error = %e, room = %room_id.as_str(), "failed to persist partial_state flag");
         } else {
