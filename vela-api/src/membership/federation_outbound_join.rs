@@ -136,6 +136,10 @@ async fn try_join_via(
     );
 
     // --- 3. send_join ---
+    // MSC3706: opt into partial-state response. Servers that don't
+    // implement it ignore the query param and return full state, so
+    // there's no compat cost. bootstrap_remote_room reads
+    // partial_state + servers_in_room from the response.
     let send_join_resp = state
         .federation_client
         .send_join_v2(
@@ -143,6 +147,7 @@ async fn try_join_via(
             room_id.as_str(),
             event_id.as_str(),
             Value::Object(signed_event.clone()),
+            true,
         )
         .await
         .map_err(|e| format!("send_join failed: {e}"))?;
@@ -157,6 +162,7 @@ async fn try_join_via(
         &signed_event,
         &event_id,
         &send_join_resp,
+        server,
     )
     .await
     .map_err(|e| format!("bootstrap_remote_room failed: {e}"))?;
@@ -224,6 +230,7 @@ async fn bootstrap_remote_room(
     signed_event: &Map<String, Value>,
     event_id: &EventId,
     send_join_resp: &Value,
+    joining_server: &str,
 ) -> Result<(), String> {
     let room_nid = state
         .db
@@ -242,6 +249,48 @@ async fn bootstrap_remote_room(
     let _ = state
         .db
         .create_room_meta(room_nid, room_id.as_str(), room_version);
+
+    // MSC3706: when the resident returned partial state, persist the
+    // flag + the server hints. The background filler picks these up
+    // and pulls /state from one of them to finish bootstrapping the
+    // room. A response missing `partial_state` (or with it false) is
+    // a full-state response — no flag set.
+    let partial_state = send_join_resp
+        .get("partial_state")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if partial_state {
+        let mut servers: Vec<String> = send_join_resp
+            .get("servers_in_room")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Defensive fallback: a misbehaving resident could claim
+        // partial_state with an empty servers_in_room list. Without
+        // at least one target, the filler retries forever. The
+        // joining server we just talked to obviously has the state,
+        // so use it as the lone fallback.
+        if servers.is_empty() {
+            servers.push(joining_server.to_string());
+        }
+        if let Err(e) = state.db.set_partial_state_join(room_nid, &servers) {
+            warn!(error = %e, room = %room_id.as_str(), "failed to persist partial_state flag");
+        } else {
+            debug!(
+                room = %room_id.as_str(),
+                servers = ?servers,
+                "joined room with MSC3706 partial state; filler will complete in the background"
+            );
+            // Make sure the filler is running and wake it now so this
+            // room doesn't have to wait for the idle scan tick.
+            crate::federation::partial_state_filler::ensure_running(state);
+            crate::federation::partial_state_filler::notify_new_partial_room(state);
+        }
+    }
 
     // --- Auth chain (historical) ---
     // Outlier: events CF only — auth chain events are ancestors, never on
@@ -483,7 +532,7 @@ async fn bootstrap_remote_room(
 /// signature + hash; skips higher-level auth checks (the resident server
 /// vouches for the chain). Returns the event_nid on success, or None if
 /// the event is already known (idempotent).
-async fn persist_remote_event(
+pub(crate) async fn persist_remote_event(
     state: &AppState,
     room_nid: u64,
     event_json: &Value,

@@ -450,14 +450,25 @@ impl FederationClient {
     /// Submit the signed join event. The resident server validates, accepts,
     /// and returns `{auth_chain, state, event}` — the full state of the room
     /// prior to our join plus all events needed to validate them.
+    ///
+    /// `omit_members = true` opts into MSC3706: the resident may return
+    /// a partial-state response (the `state` array omits most member
+    /// events, with `partial_state: true` and `servers_in_room: [...]`
+    /// flagged in the body). The caller is responsible for handling
+    /// the partial-state bookkeeping; a server that doesn't implement
+    /// MSC3706 ignores the param and returns full state as before.
     pub async fn send_join_v2(
         &self,
         destination: &str,
         room_id: &str,
         event_id: &str,
         signed_event: Value,
+        omit_members: bool,
     ) -> Result<Value, FederationClientError> {
-        let path = format!("/_matrix/federation/v2/send_join/{room_id}/{event_id}");
+        let mut path = format!("/_matrix/federation/v2/send_join/{room_id}/{event_id}");
+        if omit_members {
+            path.push_str("?omit_members=true");
+        }
         self.signed_request(reqwest::Method::PUT, destination, &path, Some(signed_event))
             .await
     }
@@ -621,6 +632,29 @@ impl FederationClient {
             .and_then(|arr| arr.first())
             .cloned()
             .ok_or_else(|| FederationClientError::BadJson("response missing pdus[0]".into()))
+    }
+
+    /// `GET /_matrix/federation/v1/state/{roomId}?event_id=…`
+    ///
+    /// Fetch the room's full state at the given event as PDU arrays —
+    /// heavier than `state_ids` but lets the caller skip a second
+    /// round of `fetch_event_pdu` lookups. Returns the peer's
+    /// `{auth_chain: [...], pdu: [...]}` shape. Used by the MSC3706
+    /// partial-state filler to materialise the rest of the room's
+    /// state after a partial join.
+    pub async fn state(
+        &self,
+        destination: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<Value, FederationClientError> {
+        let path = format!(
+            "/_matrix/federation/v1/state/{}?event_id={}",
+            url_query_encode(room_id),
+            url_query_encode(event_id),
+        );
+        self.signed_request(reqwest::Method::GET, destination, &path, None)
+            .await
     }
 
     /// `GET /_matrix/federation/v1/state_ids/{roomId}?event_id=…`

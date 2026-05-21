@@ -291,6 +291,11 @@ pub struct AppState {
     /// even attempted, so the middleware behaves identically to
     /// pre-MSC3861-Phase-2 vela.
     pub oidc_introspection: Option<Arc<crate::auth::oidc::IntrospectionState>>,
+    /// MSC3706 partial-state filler. Single-process worker that
+    /// closes the gap between a partial-state outbound join and a
+    /// fully-stated room by pulling /state from one of the servers
+    /// the resident named in its send_join response.
+    pub partial_state_filler: Arc<crate::federation::partial_state_filler::PartialStateFiller>,
     /// Registered Application Services. Cheaply cloneable; admin
     /// commands, the interest filter, and the masquerading auth
     /// middleware all reach in via this handle.
