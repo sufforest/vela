@@ -119,3 +119,36 @@ allow_public_rooms_over_federation = false
 # port      = 8448
 # cert_file = "/etc/vela/tls/fullchain.pem"
 # key_file  = "/etc/vela/tls/privkey.pem"
+
+# --- MSC3861 delegated authentication (OAuth 2.0 / OIDC) ------------------
+# When enabled, vela hands the login flow off to an external identity
+# provider (Matrix Authentication Service, Keycloak, Auth0, ...) and
+# validates every incoming Bearer token via RFC 7662 introspection.
+#
+# Phase 1 only (discovery) — uncomment the first three lines:
+#   `enabled = true` + `issuer = ...` makes /_matrix/client/v1/auth_issuer
+#   advertise the IdP. Legacy /login + /register keep working.
+#
+# Phase 2 (full delegated auth) — add the introspection settings.
+#   Once `introspection_endpoint` is set vela refuses m.login.password
+#   and non-AS /register (clients are expected to bounce to the IdP).
+#   Application-service callers + Bearer-token AS masquerade are NOT
+#   affected; bridges keep working under delegated auth.
+#
+# Required IdP setup:
+#   - vela's client_id registered at the IdP with the introspection
+#     scope (`token-introspect` or whatever the IdP calls it).
+#   - IdP must issue tokens whose scope contains
+#     `urn:matrix:client:api:*` (or the unstable
+#     `urn:matrix:org.matrix.msc2967.client:api:*` variant).
+#   - IdP must include a stable `device_id` claim per session, either
+#     top-level or via a `urn:matrix:client:device:<id>` scope token.
+#
+# [auth.oidc]
+# enabled                       = true
+# issuer                        = "https://auth.example.com/"
+# account_management_url        = "https://auth.example.com/account"
+# introspection_endpoint        = "https://auth.example.com/oauth2/introspect"
+# introspection_client_id       = "vela"
+# introspection_client_secret   = "<from your IdP>"
+# introspection_auth_method     = "client_secret_basic"   # or "client_secret_post"
