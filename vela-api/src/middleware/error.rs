@@ -11,9 +11,17 @@ impl IntoResponse for ApiError {
         // `{errcode, error}` shape would clobber.
         if let VelaError::Uia { status, body } = &self.0 {
             let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            let parsed: serde_json::Value =
-                serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-            return (status, Json(parsed)).into_response();
+            // Parse failure means we produced bad JSON ourselves;
+            // pass the original through so the auth flow doesn't
+            // break behind an empty object.
+            match serde_json::from_str::<serde_json::Value>(body) {
+                Ok(parsed) => return (status, Json(parsed)).into_response(),
+                Err(e) => {
+                    tracing::error!(error = %e, body = %body, "UIA body not parseable as JSON; passing through verbatim");
+                    return (status, [("content-type", "application/json")], body.clone())
+                        .into_response();
+                }
+            }
         }
         let body = json!({
             "errcode": self.0.errcode(),

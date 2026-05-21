@@ -316,3 +316,138 @@ mod tests {
         drop(server);
     }
 }
+
+/// Coarse SSRF guard: refuse non-http(s) schemes and any host whose
+/// resolved addresses include a loopback / private / link-local IP.
+/// Doesn't close DNS rebinding (reqwest re-resolves at connect time);
+/// catches the common literal-IP / private-host misconfiguration.
+/// Not wired yet — a follow-up adds the config flag that lets
+/// operators with docker/k8s gateways opt out of strict mode.
+#[allow(dead_code)]
+async fn check_pusher_url_is_public(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("scheme `{scheme}` not allowed"));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
+        if !is_public_ip(&addr) {
+            return Err(format!("host `{host}` is not a public IP"));
+        }
+        return Ok(());
+    }
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let mut any_public = false;
+    let resolved = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("DNS lookup failed: {e}"))?;
+    for sock in resolved {
+        if !is_public_ip(&sock.ip()) {
+            return Err(format!(
+                "host `{host}` resolves to non-public address {}",
+                sock.ip()
+            ));
+        }
+        any_public = true;
+    }
+    if !any_public {
+        return Err(format!("host `{host}` has no resolved addresses"));
+    }
+    Ok(())
+}
+
+/// `is_global` would do this in one call but it's not yet stable;
+/// approximated with the stable predicates plus explicit IPv6 prefix
+/// checks (link-local fe80::/10, unique-local fc00::/7).
+#[allow(dead_code)]
+fn is_public_ip(addr: &std::net::IpAddr) -> bool {
+    if addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() {
+        return false;
+    }
+    match addr {
+        std::net::IpAddr::V4(v4) => !(v4.is_private() || v4.is_link_local() || v4.is_broadcast()),
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            if (s[0] & 0xffc0) == 0xfe80 || (s[0] & 0xfe00) == 0xfc00 {
+                return false;
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_ip(&std::net::IpAddr::V4(v4));
+            }
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn refuses_loopback_literal() {
+        let r = check_pusher_url_is_public("http://127.0.0.1:8000/notify").await;
+        assert!(r.is_err(), "loopback must be refused");
+    }
+
+    #[tokio::test]
+    async fn refuses_rfc1918_literal() {
+        for addr in ["10.0.0.5", "172.16.5.1", "192.168.1.1"] {
+            let url = format!("http://{addr}/notify");
+            assert!(
+                check_pusher_url_is_public(&url).await.is_err(),
+                "{addr} must be refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_link_local() {
+        assert!(
+            check_pusher_url_is_public("http://169.254.169.254/")
+                .await
+                .is_err(),
+            "AWS-metadata IP (link-local) must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_ipv6_loopback() {
+        assert!(
+            check_pusher_url_is_public("http://[::1]/notify")
+                .await
+                .is_err(),
+            "IPv6 loopback must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_non_http_scheme() {
+        assert!(
+            check_pusher_url_is_public("file:///etc/passwd")
+                .await
+                .is_err(),
+            "non-http scheme must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_ipv4_mapped_loopback_in_ipv6() {
+        assert!(
+            check_pusher_url_is_public("http://[::ffff:127.0.0.1]/")
+                .await
+                .is_err(),
+            "IPv4-mapped loopback must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_public_literal() {
+        // 1.1.1.1 (Cloudflare DNS) — example of a routable public address.
+        // Note: this doesn't actually connect; we only resolve + classify.
+        let r = check_pusher_url_is_public("https://1.1.1.1/notify").await;
+        assert!(r.is_ok(), "public IP must be accepted: {r:?}");
+    }
+}

@@ -135,12 +135,17 @@ pub async fn login(
         return Err(VelaError::UserDeactivated.into());
     }
 
-    // Verify password
+    // argon2 verify is CPU-bound; spawn_blocking keeps it off the
+    // tokio worker so a slow login doesn't pile up other requests.
     let stored_hash = user_record["password_hash"]
         .as_str()
-        .ok_or(ApiError(VelaError::Unknown("corrupt user record".into())))?;
-
-    if !verify_password(password, stored_hash) {
+        .ok_or(ApiError(VelaError::Unknown("corrupt user record".into())))?
+        .to_string();
+    let password_owned = password.to_string();
+    let ok = tokio::task::spawn_blocking(move || verify_password(&password_owned, &stored_hash))
+        .await
+        .map_err(|e| ApiError(VelaError::Unknown(format!("verify task: {e}"))))?;
+    if !ok {
         return Err(VelaError::Forbidden("invalid credentials".into()).into());
     }
 
