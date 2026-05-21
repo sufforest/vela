@@ -151,6 +151,37 @@ struct OidcSection {
     /// Account-management URL per MSC3861. Optional; when set, clients
     /// show it to end users as the place to manage their identity.
     account_management_url: Option<String>,
+    /// RFC7662 introspection endpoint. Setting this activates Phase 2:
+    /// vela validates incoming Bearer tokens against the IdP. Leave
+    /// unset for discovery-only Phase 1 posture.
+    introspection_endpoint: Option<String>,
+    /// Credentials vela presents to the IdP on introspection requests.
+    /// Required together when `introspection_endpoint` is set; the
+    /// validator refuses to boot otherwise.
+    introspection_client_id: Option<String>,
+    introspection_client_secret: Option<String>,
+    /// `"client_secret_basic"` (default) or `"client_secret_post"`.
+    /// Both are RFC6749 §2.3 standard methods; pick whichever your
+    /// IdP requires.
+    #[serde(default)]
+    introspection_auth_method: OidcIntrospectionAuthMethod,
+}
+
+#[derive(Debug, Default, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum OidcIntrospectionAuthMethod {
+    #[default]
+    ClientSecretBasic,
+    ClientSecretPost,
+}
+
+impl From<OidcIntrospectionAuthMethod> for vela_api::router::IntrospectionAuthMethod {
+    fn from(m: OidcIntrospectionAuthMethod) -> Self {
+        match m {
+            OidcIntrospectionAuthMethod::ClientSecretBasic => Self::ClientSecretBasic,
+            OidcIntrospectionAuthMethod::ClientSecretPost => Self::ClientSecretPost,
+        }
+    }
 }
 
 /// `[voip]` section. Drives the classic 1-to-1 `m.call.*` path by
@@ -962,6 +993,14 @@ fn main() -> anyhow::Result<()> {
                     issuer: config.auth.oidc.issuer.clone(),
                     client_id: config.auth.oidc.client_id.clone(),
                     account_management_url: config.auth.oidc.account_management_url.clone(),
+                    introspection_endpoint: config.auth.oidc.introspection_endpoint.clone(),
+                    introspection_client_id: config.auth.oidc.introspection_client_id.clone(),
+                    introspection_client_secret: config
+                        .auth
+                        .oidc
+                        .introspection_client_secret
+                        .clone(),
+                    introspection_auth_method: config.auth.oidc.introspection_auth_method.into(),
                 },
                 admin_bot_localpart: if config.admin.bot_localpart.trim().is_empty() {
                     vela_api::admin::DEFAULT_BOT_LOCALPART.to_string()
@@ -1425,6 +1464,35 @@ fn validate_config(config: &Config) -> anyhow::Result<()> {
     if config.auth.oidc.enabled && config.auth.oidc.issuer.trim().is_empty() {
         anyhow::bail!("config: [auth.oidc] issuer must be set when enabled = true");
     }
+    // Phase 2 validity: if introspection_endpoint is set, both client
+    // credentials must be set too. Otherwise the operator would boot a
+    // server that 401s every IdP-authenticated request silently.
+    if config.auth.oidc.introspection_endpoint.is_some() {
+        if !config.auth.oidc.enabled {
+            anyhow::bail!(
+                "config: [auth.oidc] introspection_endpoint set but enabled = false; \
+                 set enabled = true or remove the endpoint"
+            );
+        }
+        let has_id = config
+            .auth
+            .oidc
+            .introspection_client_id
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_secret = config
+            .auth
+            .oidc
+            .introspection_client_secret
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty());
+        if !has_id || !has_secret {
+            anyhow::bail!(
+                "config: [auth.oidc] introspection_endpoint requires \
+                 introspection_client_id + introspection_client_secret"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1492,5 +1560,59 @@ mod validate_config_tests {
         let mut cfg = Config::default();
         cfg.server.name = String::new();
         assert!(validate_config(&cfg).is_err());
+    }
+
+    /// Phase 2: introspection_endpoint without credentials is a boot
+    /// error — otherwise the operator gets silent 401s on every
+    /// IdP-authenticated request.
+    #[test]
+    fn validate_config_rejects_introspection_endpoint_without_credentials() {
+        let mut cfg = Config::default();
+        cfg.auth.oidc.enabled = true;
+        cfg.auth.oidc.issuer = "https://idp.example.com".into();
+        cfg.auth.oidc.introspection_endpoint =
+            Some("https://idp.example.com/oauth2/introspect".into());
+        // client_id + client_secret intentionally missing.
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("introspection_client_id"),
+            "error should name the missing field: {err}",
+        );
+    }
+
+    /// `introspection_endpoint` without `enabled = true` is an
+    /// operator misconfiguration — Phase 2 implies Phase 1.
+    #[test]
+    fn validate_config_rejects_introspection_endpoint_without_enabled() {
+        let mut cfg = Config::default();
+        cfg.auth.oidc.enabled = false;
+        cfg.auth.oidc.introspection_endpoint =
+            Some("https://idp.example.com/oauth2/introspect".into());
+        cfg.auth.oidc.introspection_client_id = Some("vela".into());
+        cfg.auth.oidc.introspection_client_secret = Some("secret".into());
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    /// Phase 1 alone (discovery, no introspection) keeps working:
+    /// `enabled = true` + `issuer` set is the legacy posture.
+    #[test]
+    fn validate_config_accepts_phase1_only() {
+        let mut cfg = Config::default();
+        cfg.auth.oidc.enabled = true;
+        cfg.auth.oidc.issuer = "https://idp.example.com".into();
+        validate_config(&cfg).expect("phase 1 alone must validate");
+    }
+
+    /// Phase 2 with full credentials validates cleanly.
+    #[test]
+    fn validate_config_accepts_phase2_with_credentials() {
+        let mut cfg = Config::default();
+        cfg.auth.oidc.enabled = true;
+        cfg.auth.oidc.issuer = "https://idp.example.com".into();
+        cfg.auth.oidc.introspection_endpoint =
+            Some("https://idp.example.com/oauth2/introspect".into());
+        cfg.auth.oidc.introspection_client_id = Some("vela".into());
+        cfg.auth.oidc.introspection_client_secret = Some("secret".into());
+        validate_config(&cfg).expect("phase 2 with credentials must validate");
     }
 }

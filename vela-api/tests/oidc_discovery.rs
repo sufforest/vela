@@ -89,6 +89,7 @@ fn oidc_overrides() -> ConfigOverrides {
             issuer: "https://idp.example.com".to_string(),
             client_id: Some("vela-client-id".to_string()),
             account_management_url: Some("https://idp.example.com/account".to_string()),
+            ..Default::default()
         },
         ..Default::default()
     }
@@ -118,6 +119,7 @@ async fn auth_issuer_enabled_omits_account_when_unset() {
             issuer: "https://idp.example.com".to_string(),
             client_id: None,
             account_management_url: None,
+            ..Default::default()
         },
         ..Default::default()
     });

@@ -7,6 +7,7 @@ pub mod account_data;
 pub mod devices;
 pub mod login;
 pub mod logout;
+pub mod oidc;
 pub mod refresh;
 pub mod register;
 pub mod uia;
