@@ -16,12 +16,14 @@
 //! fails for 24h the room stays partial; an operator can either
 //! retrigger via a future admin command or re-join.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use serde_json::Value;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
+use vela_core::identifiers::Nid;
 
 use crate::router::AppState;
 
@@ -183,19 +185,32 @@ async fn try_fill_one(
             .state(server, room_id, &event_id)
             .await
         {
-            Ok(resp) => match merge_state_response(state, room_nid, &resp).await {
-                Ok(()) => {
-                    state
-                        .db
-                        .clear_partial_state(room_nid)
-                        .map_err(|e| format!("clear flag: {e}"))?;
-                    return Ok(true);
+            Ok(resp) => {
+                // persist_remote_event reaches into room_state; the
+                // existing federation paths serialise on
+                // state.room_locks per room. Take that here too so
+                // a concurrent federation_receive can't race with
+                // the merge.
+                let lock = state
+                    .room_locks
+                    .entry(Nid(room_nid))
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                    .clone();
+                let _guard = lock.lock().await;
+                match merge_state_response(state, room_nid, &resp).await {
+                    Ok(()) => {
+                        state
+                            .db
+                            .clear_partial_state(room_nid)
+                            .map_err(|e| format!("clear flag: {e}"))?;
+                        return Ok(true);
+                    }
+                    Err(e) => {
+                        last_err = format!("merge from {server}: {e}");
+                        continue;
+                    }
                 }
-                Err(e) => {
-                    last_err = format!("merge from {server}: {e}");
-                    continue;
-                }
-            },
+            }
             Err(e) => {
                 last_err = format!("fetch from {server}: {e}");
                 continue;
