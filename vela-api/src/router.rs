@@ -284,6 +284,13 @@ pub struct AppState {
     pub remote_keys: Arc<RemoteKeyCache>,
     pub federation_sender: Arc<FederationSender>,
     pub federation_client: Arc<FederationClient>,
+    /// MSC3861 Phase 2 introspection plumbing. `Some` when the
+    /// operator configured an `introspection_endpoint`; `None`
+    /// otherwise (Phase 1 discovery only). The auth extractor uses
+    /// this as its gate — `None` means the third OIDC path is not
+    /// even attempted, so the middleware behaves identically to
+    /// pre-MSC3861-Phase-2 vela.
+    pub oidc_introspection: Option<Arc<crate::auth::oidc::IntrospectionState>>,
     /// Registered Application Services. Cheaply cloneable; admin
     /// commands, the interest filter, and the masquerading auth
     /// middleware all reach in via this handle.

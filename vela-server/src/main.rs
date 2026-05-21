@@ -949,6 +949,38 @@ fn main() -> anyhow::Result<()> {
         let appservice_outbox =
             vela_api::appservice::outbox::AsOutbox::new(db.clone(), appservice_registry.clone());
 
+        // MSC3861 Phase 2 plumbing. Only constructed when the operator
+        // supplied an introspection_endpoint; otherwise the extractor's
+        // third OIDC path stays dormant.
+        let oidc_introspection =
+            config
+                .auth
+                .oidc
+                .introspection_endpoint
+                .as_deref()
+                .map(|endpoint| {
+                    let client = vela_api::auth::oidc::IntrospectionClient::new(
+                        endpoint.to_string(),
+                        config
+                            .auth
+                            .oidc
+                            .introspection_client_id
+                            .clone()
+                            .unwrap_or_default(),
+                        config
+                            .auth
+                            .oidc
+                            .introspection_client_secret
+                            .clone()
+                            .unwrap_or_default(),
+                        config.auth.oidc.introspection_auth_method.into(),
+                    );
+                    let cache = vela_api::auth::oidc::IntrospectionCache::new(
+                        vela_api::auth::oidc::DEFAULT_CACHE_TTL,
+                    );
+                    Arc::new(vela_api::auth::oidc::IntrospectionState { client, cache })
+                });
+
         let state = AppState {
             db: db.clone(),
             config: Arc::new(ServerConfig {
@@ -1028,6 +1060,7 @@ fn main() -> anyhow::Result<()> {
             remote_keys,
             federation_sender,
             federation_client,
+            oidc_introspection,
             appservice_registry,
             appservice_outbox,
             uia_sessions: vela_api::auth::uia::new_sessions(),

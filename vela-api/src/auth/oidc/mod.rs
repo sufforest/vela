@@ -30,6 +30,15 @@ pub use introspection::{
     IntrospectionClient, IntrospectionError, IntrospectionOutcome, IntrospectionResult,
 };
 
+/// Phase-2 plumbing bundled together. `AppState` holds an
+/// `Option<Arc<IntrospectionState>>`; the auth extractor takes the
+/// `Some` branch when this is populated. Construction belongs in
+/// `vela-server` boot — we read it from the validated OidcConfig.
+pub struct IntrospectionState {
+    pub client: IntrospectionClient,
+    pub cache: IntrospectionCache,
+}
+
 /// Provider string written into the `external_ids` CF for every
 /// MSC3861-delegated user. Stable so re-launches keep finding
 /// existing mappings. Distinct from any future SAML/LDAP/etc. flow.
