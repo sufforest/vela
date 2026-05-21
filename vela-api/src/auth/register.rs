@@ -84,6 +84,24 @@ pub async fn register(
         return register_as_appservice(&state, &headers, &body).await;
     }
 
+    // MSC3861 Phase 2 active: legacy register is disabled. AS-mode
+    // register above still works (bridges aren't human users), but
+    // human account creation belongs to the IdP. Surface the issuer
+    // URL so the operator's account-management UX has a fighting
+    // chance of guiding the user.
+    if state.config.oidc.introspection_endpoint.is_some() {
+        let account_url = state
+            .config
+            .oidc
+            .account_management_url
+            .clone()
+            .unwrap_or_else(|| state.config.oidc.issuer.clone());
+        return Err(ApiError(VelaError::Forbidden(format!(
+            "this server delegates authentication to {account_url}; \
+             create your account there. See /_matrix/client/v1/auth_issuer."
+        ))));
+    }
+
     // Closed registration: refuse before doing UIA work. Operators
     // flip this flag for invite-only deployments; spec doesn't define
     // an exact errcode for "the server doesn't accept registrations"
@@ -819,5 +837,62 @@ mod admin_integration_tests {
             VelaError::Custom { errcode, .. } => assert_eq!(errcode, "M_EXCLUSIVE"),
             other => panic!("expected M_EXCLUSIVE, got {other:?}"),
         }
+    }
+
+    fn enable_phase2(state: &mut AppState) {
+        let cfg = Arc::make_mut(&mut state.config);
+        cfg.oidc.enabled = true;
+        cfg.oidc.issuer = "https://idp.example.com".into();
+        cfg.oidc.introspection_endpoint = Some("https://idp.example.com/oauth2/introspect".into());
+        cfg.oidc.account_management_url = Some("https://idp.example.com/account".into());
+    }
+
+    /// Phase 2 active: human /register is gone. The error message
+    /// surfaces the IdP's account-management URL so a client UI can
+    /// redirect the user there.
+    #[tokio::test]
+    async fn non_as_register_refused_under_phase2() {
+        let (mut state, _tmp) = build_test_state();
+        enable_phase2(&mut state);
+        let auth = json!({"type": "m.login.registration_token", "token": "tok"});
+        let err = register(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            body_with(Some(auth), "alice", "secret123"),
+        )
+        .await
+        .expect_err("human register must be refused under Phase 2");
+        match err.0 {
+            VelaError::Forbidden(msg) => {
+                assert!(
+                    msg.contains("idp.example.com"),
+                    "error must name the IdP: {msg}",
+                );
+            }
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+    }
+
+    /// AS-mode /register MUST keep working under Phase 2 — bridges
+    /// aren't human users and shouldn't be locked out when the
+    /// operator delegates human auth.
+    #[tokio::test]
+    async fn as_register_still_works_under_phase2() {
+        let (mut state, _tmp) = build_test_state();
+        enable_phase2(&mut state);
+        seed_as(&state, "irc", r"^@_irc_.*:example\.com$", "as-tok-irc");
+        let body = json!({
+            "type": "m.login.application_service",
+            "username": "_irc_alice",
+            "inhibit_login": true,
+        });
+        let resp = register(
+            State(state.clone()),
+            as_headers("as-tok-irc"),
+            axum::body::Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await
+        .expect("AS register succeeds under Phase 2");
+        assert_eq!(resp.0["user_id"], "@_irc_alice:example.com");
     }
 }

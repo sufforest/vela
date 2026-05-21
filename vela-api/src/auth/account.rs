@@ -35,6 +35,23 @@ pub async fn change_password(
     user: AuthenticatedUser,
     Json(body): Json<PasswordChangeBody>,
 ) -> Result<Json<Value>, ApiError> {
+    // MSC3861 Phase 2: passwords live at the IdP. Refuse with
+    // M_UNRECOGNIZED + an issuer hint so an unaware client doesn't
+    // think it succeeded.
+    if state.config.oidc.introspection_endpoint.is_some() {
+        let url = state
+            .config
+            .oidc
+            .account_management_url
+            .clone()
+            .unwrap_or_else(|| state.config.oidc.issuer.clone());
+        return Err(ApiError(VelaError::Custom {
+            status: 400,
+            errcode: "M_UNRECOGNIZED",
+            msg: format!("password change is handled by the identity provider at {url}",),
+        }));
+    }
+
     if body.new_password.is_empty() {
         return Err(VelaError::BadJson("new_password is required".into()).into());
     }
@@ -96,6 +113,26 @@ pub async fn deactivate(
     user: AuthenticatedUser,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    // MSC3861 Phase 2: account lifecycle (delete the account, erase
+    // PII) is the IdP's responsibility. Vela's deactivate is gated on
+    // password-UIA, which delegated users don't have. Refuse with a
+    // pointer at the IdP account-management surface; the operator
+    // can wire up an IdP-driven admin call later if they want
+    // cascading deletes.
+    if state.config.oidc.introspection_endpoint.is_some() {
+        let url = state
+            .config
+            .oidc
+            .account_management_url
+            .clone()
+            .unwrap_or_else(|| state.config.oidc.issuer.clone());
+        return Err(ApiError(VelaError::Custom {
+            status: 400,
+            errcode: "M_UNRECOGNIZED",
+            msg: format!("account deactivation is handled by the identity provider at {url}",),
+        }));
+    }
+
     uia::require_password_auth(&state, &body)?;
 
     let erase = body.get("erase").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -660,6 +697,70 @@ mod tests {
                 assert!(body.contains("M_FORBIDDEN"));
             }
             other => panic!("expected Uia, got {other:?}"),
+        }
+    }
+
+    fn enable_phase2(state: &mut AppState) {
+        use std::sync::Arc;
+        let cfg = Arc::make_mut(&mut state.config);
+        cfg.oidc.enabled = true;
+        cfg.oidc.issuer = "https://idp.example.com".into();
+        cfg.oidc.introspection_endpoint = Some("https://idp.example.com/oauth2/introspect".into());
+        cfg.oidc.account_management_url = Some("https://idp.example.com/account".into());
+    }
+
+    #[tokio::test]
+    async fn change_password_refused_under_phase2() {
+        let (mut state, _tmp) = build_test_state();
+        enable_phase2(&mut state);
+        let user_nid = state
+            .db
+            .create_user("@alice:example.com", "old-hash")
+            .unwrap();
+        let err = change_password(
+            State(state),
+            AuthenticatedUser {
+                user_nid,
+                user_id: "@alice:example.com".into(),
+                device_id: "DEV".into(),
+                appservice_nid: None,
+            },
+            Json(PasswordChangeBody {
+                new_password: "anything".into(),
+                logout_devices: true,
+            }),
+        )
+        .await
+        .expect_err("password change must be refused under Phase 2");
+        match err.0 {
+            VelaError::Custom { errcode, msg, .. } => {
+                assert_eq!(errcode, "M_UNRECOGNIZED");
+                assert!(msg.contains("idp.example.com"), "must reference IdP: {msg}");
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deactivate_refused_under_phase2() {
+        let (mut state, _tmp) = build_test_state();
+        enable_phase2(&mut state);
+        let user_nid = state.db.create_user("@alice:example.com", "h").unwrap();
+        let err = deactivate(
+            State(state),
+            AuthenticatedUser {
+                user_nid,
+                user_id: "@alice:example.com".into(),
+                device_id: "DEV".into(),
+                appservice_nid: None,
+            },
+            Json(serde_json::json!({})),
+        )
+        .await
+        .expect_err("deactivate must be refused under Phase 2");
+        match err.0 {
+            VelaError::Custom { errcode, .. } => assert_eq!(errcode, "M_UNRECOGNIZED"),
+            other => panic!("expected Custom, got {other:?}"),
         }
     }
 }

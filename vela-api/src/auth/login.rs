@@ -9,7 +9,16 @@ use crate::middleware::error::ApiError;
 use crate::router::AppState;
 
 /// GET /_matrix/client/v3/login — returns supported login flows.
-pub async fn get_login_types() -> Json<Value> {
+///
+/// MSC3861 Phase 2 active (introspection_endpoint configured): we
+/// don't advertise `m.login.password`. Clients learn the delegated-
+/// auth posture via `/auth_issuer` + `/.well-known/matrix/client`
+/// and bounce to the IdP instead. Returning an empty flows array is
+/// the spec-correct shape for "no legacy login available."
+pub async fn get_login_types(State(state): State<AppState>) -> Json<Value> {
+    if state.config.oidc.introspection_endpoint.is_some() {
+        return Json(json!({ "flows": [] }));
+    }
     Json(json!({
         "flows": [
             {"type": "m.login.password"}
@@ -59,6 +68,22 @@ pub async fn login(
             msg: "this server does not implement the legacy auth API; \
                   AS callers use Bearer + ?user_id= masquerade instead"
                 .into(),
+        }));
+    }
+
+    // MSC3861 Phase 2 active: legacy password login is disabled.
+    // Refuse with M_UNRECOGNIZED + an issuer hint so a misbehaving
+    // (non-MSC3861-aware) client can surface a clear error to the
+    // operator rather than looping on 401s.
+    if state.config.oidc.introspection_endpoint.is_some() {
+        let issuer = &state.config.oidc.issuer;
+        return Err(ApiError(VelaError::Custom {
+            status: 400,
+            errcode: "M_UNRECOGNIZED",
+            msg: format!(
+                "this server delegates authentication to {issuer}; \
+                 password login is disabled. See /_matrix/client/v1/auth_issuer."
+            ),
         }));
     }
 
@@ -266,5 +291,68 @@ mod tests {
         .expect("login succeeds");
 
         assert!(res.0["access_token"].as_str().is_some());
+    }
+
+    /// Flip Phase 2 on by mutating the AppState's OidcConfig in place.
+    /// Used by the lockdown tests below; no need to plumb a full
+    /// IntrospectionState through since the lockdown checks only
+    /// read the config flag.
+    fn enable_phase2(state: &mut AppState) {
+        use std::sync::Arc;
+        let cfg = Arc::make_mut(&mut state.config);
+        cfg.oidc.enabled = true;
+        cfg.oidc.issuer = "https://idp.example.com".into();
+        cfg.oidc.introspection_endpoint = Some("https://idp.example.com/oauth2/introspect".into());
+    }
+
+    #[tokio::test]
+    async fn get_login_types_advertises_empty_flows_under_phase2() {
+        let (mut state, _tmp) = build_test_state();
+        enable_phase2(&mut state);
+        let res = get_login_types(State(state)).await;
+        let flows = res.0["flows"].as_array().expect("flows array");
+        assert!(flows.is_empty(), "Phase 2 must not advertise legacy flows");
+    }
+
+    #[tokio::test]
+    async fn login_password_refused_under_phase2() {
+        let (mut state, _tmp) = build_test_state();
+        enable_phase2(&mut state);
+        // Seed a real user so we'd otherwise succeed.
+        let hash = hash_password("pw");
+        state.db.create_user("@alice:example.com", &hash).unwrap();
+        let err = login(
+            State(state),
+            Json(LoginRequest {
+                login_type: "m.login.password".into(),
+                identifier: Some(LoginIdentifier {
+                    id_type: "m.id.user".into(),
+                    user: Some("@alice:example.com".into()),
+                }),
+                user: None,
+                password: Some("pw".into()),
+                device_id: None,
+                initial_device_display_name: None,
+                refresh_token: false,
+            }),
+        )
+        .await
+        .expect_err("password login must be refused under Phase 2");
+        match err.0 {
+            VelaError::Custom { errcode, .. } => assert_eq!(errcode, "M_UNRECOGNIZED"),
+            other => panic!("expected M_UNRECOGNIZED, got {other:?}"),
+        }
+    }
+
+    /// Phase 2 off: legacy flow advertised + accepted. Guards against
+    /// the lockdown leaking into the non-delegated default deployment.
+    #[tokio::test]
+    async fn legacy_login_still_works_with_phase2_off() {
+        let (state, _tmp) = build_test_state();
+        assert!(state.config.oidc.introspection_endpoint.is_none());
+        let res = get_login_types(State(state)).await;
+        let flows = res.0["flows"].as_array().expect("flows array");
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0]["type"], "m.login.password");
     }
 }
