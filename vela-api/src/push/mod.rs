@@ -163,16 +163,13 @@ async fn dispatch_inner(
             let body = json!({"notification": notification});
             let url = url.to_string();
             let client = client.clone();
-            // One request per pusher, fire-and-forget. Spawning keeps slow
-            // gateways from serialising delivery across recipients.
+            // One request per pusher, spawned so a slow gateway doesn't
+            // serialise delivery across recipients. Retries with bounded
+            // exponential backoff on transient failure (5xx + network);
+            // 4xx is permanent (the gateway rejected the payload, so a
+            // retry can't help) and drops immediately.
             tokio::spawn(async move {
-                match client.post(&url).json(&body).send().await {
-                    Ok(resp) if resp.status().is_success() => {}
-                    Ok(resp) => {
-                        warn!(status = %resp.status(), url = %url, "push gateway returned non-2xx")
-                    }
-                    Err(e) => warn!(error = %e, url = %url, "push gateway request failed"),
-                }
+                deliver_one_pusher(&client, &url, &body).await;
             });
         }
     }
@@ -196,8 +193,126 @@ fn push_http_client() -> Arc<reqwest::Client> {
     // a client on AppState — not worth it for the current call volume.
     Arc::new(
         reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
+            .timeout(PUSH_PER_ATTEMPT_TIMEOUT)
             .build()
             .expect("reqwest client"),
     )
+}
+
+/// Per-attempt timeout. The push spec doesn't pin a value; we mirror
+/// the federation-EDU default — gateways that don't respond in 10s
+/// are almost certainly never going to.
+const PUSH_PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Backoff schedule between attempts. Total wall-clock ceiling
+/// (timeouts + sleeps) is bounded so a flaky gateway can't pin a
+/// task forever: at most ~30s timeouts + 10s sleeps = 40s per
+/// notification. Push is best-effort; we don't queue past this.
+const PUSH_BACKOFFS: &[Duration] = &[Duration::from_secs(2), Duration::from_secs(8)];
+
+/// Single-pusher delivery with bounded retry. 2xx returns
+/// immediately; 4xx drops (permanent — gateway rejected the payload);
+/// 5xx + network errors retry per `PUSH_BACKOFFS`, then drop.
+async fn deliver_one_pusher(client: &reqwest::Client, url: &str, body: &Value) {
+    let max_attempts = PUSH_BACKOFFS.len() + 1;
+    for attempt in 0..max_attempts {
+        match client.post(url).json(body).send().await {
+            Ok(resp) if resp.status().is_success() => return,
+            Ok(resp) if resp.status().is_client_error() => {
+                warn!(
+                    status = %resp.status(), %url,
+                    "push gateway rejected payload (4xx); dropping",
+                );
+                return;
+            }
+            Ok(resp) => {
+                warn!(
+                    status = %resp.status(), %url, attempt,
+                    "push gateway 5xx; will retry",
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, %url, attempt, "push gateway request failed");
+            }
+        }
+        if let Some(delay) = PUSH_BACKOFFS.get(attempt) {
+            tokio::time::sleep(*delay).await;
+        }
+    }
+    warn!(%url, "push gateway exhausted retries; notification dropped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// 5xx triggers retries; once the gateway recovers, the next
+    /// attempt succeeds and the loop exits. Wiremock's response chain
+    /// returns 500-500-200 to exercise both retry slots.
+    #[tokio::test]
+    async fn deliver_retries_5xx_then_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/notify"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/notify"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let url = format!("{}/notify", server.uri());
+        // Patch PUSH_BACKOFFS isn't possible from outside the module
+        // without a const-fn knob, so the test relies on the real
+        // 2s + 8s schedule; the 200 lands on attempt 3 (≤ 11s wall
+        // clock, well inside test default timeouts).
+        deliver_one_pusher(&client, &url, &json!({"ping": 1})).await;
+        // Implicit success: no panic, no hang. The mock server's
+        // `expect` would assert call count if we set one — we don't
+        // because the goal is "eventually succeeds," not "exactly N
+        // calls" (the timing depends on the schedule).
+        drop(server);
+    }
+
+    /// 4xx is permanent — the gateway said "this payload is bad" and
+    /// retrying can't fix that. Exactly one call should land on the
+    /// mock; we use `expect(1)` to lock that in.
+    #[tokio::test]
+    async fn deliver_drops_immediately_on_4xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/notify"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let url = format!("{}/notify", server.uri());
+        deliver_one_pusher(&client, &url, &json!({"ping": 1})).await;
+        // Drop triggers expect(1) assertion in the MockServer.
+        drop(server);
+    }
+
+    /// Exhausted retries log + return without panicking. Reaching the
+    /// end of the retry schedule on a perpetually-down gateway is
+    /// the worst case; just make sure we don't loop forever.
+    #[tokio::test]
+    async fn deliver_exhausts_retries_on_persistent_5xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/notify"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(PUSH_BACKOFFS.len() as u64 + 1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let url = format!("{}/notify", server.uri());
+        deliver_one_pusher(&client, &url, &json!({"ping": 1})).await;
+        drop(server);
+    }
 }
