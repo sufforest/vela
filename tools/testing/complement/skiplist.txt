@@ -148,6 +148,8 @@
 # is v12-only by design.
 ^TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12$
 ^TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12$
+^TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
+^TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
 
 # --- known bugs, TODO investigate ---
 # TODO(vela): bug. /sync of a third homeserver fails to surface a
