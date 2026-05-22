@@ -233,14 +233,6 @@ pub async fn threads_list(
     let limit = q.limit.unwrap_or(20).clamp(1, 100);
     let from = parse_stream_token(q.from.as_deref()).unwrap_or(u64::MAX);
     let participated_only = matches!(q.include.as_deref(), Some("participated"));
-    let thread_nid = match state
-        .db
-        .get_nid("m.thread")
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-    {
-        Some(n) => n,
-        None => return Ok(Json(json!({"chunk": []}))),
-    };
 
     // `thread_index` is maintained on every m.thread record_relation
     // call: a `(room, !latest_sp, root)` key whose forward iteration
@@ -263,8 +255,7 @@ pub async fn threads_list(
     let mut candidates: Vec<(u64, u64)> = Vec::new(); // (latest_sp, root_nid)
     for (latest_sp, root_nid) in raw_roots {
         if participated_only {
-            let participated =
-                root_or_replied_user(state.db.as_ref(), root_nid, user.user_nid, thread_nid)?;
+            let participated = root_or_replied_user(state.db.as_ref(), root_nid, user.user_nid)?;
             if !participated {
                 continue;
             }
@@ -302,7 +293,6 @@ fn root_or_replied_user(
     db: &vela_store::db::Database,
     root_nid: u64,
     user_nid: u64,
-    thread_nid: u64,
 ) -> Result<bool, ApiError> {
     if let Some((header, _)) = db
         .get_event(root_nid)
@@ -311,19 +301,8 @@ fn root_or_replied_user(
     {
         return Ok(true);
     }
-    let entries = db
-        .list_relations(root_nid, Some(thread_nid), None, u64::MAX, true, 1000)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    for (_, child_nid, _, _) in entries {
-        if let Some((h, _)) = db
-            .get_event(child_nid)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-            && h.sender_nid == user_nid
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    db.user_participated_in_thread(root_nid, user_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))
 }
 
 #[cfg(test)]
@@ -500,6 +479,7 @@ mod tests {
                 rel_type_nid,
                 type_msg,
                 room_nid,
+                sender_nid,
                 rel_type == "m.thread",
             )
             .unwrap();
@@ -868,6 +848,39 @@ mod tests {
             .collect();
         // $c1's position is the exclusive boundary; we get $c3 + $c2 only.
         assert_eq!(ids, vec!["$c3", "$c2"]);
+    }
+
+    #[tokio::test]
+    async fn thread_participants_lookup_is_o1() {
+        // Recording an m.thread relation marks the child sender as
+        // a participant of the root. Lookup is a point read.
+        let (state, _tmp, room_id, room_nid, alice_nid, parent_eid) = setup_room();
+        let bob_nid = state.db.get_or_create_nid("@bob:example.com").unwrap();
+        persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            bob_nid,
+            "@bob:example.com",
+            300,
+            "$reply",
+            "m.thread",
+            &parent_eid,
+        );
+        let parent_nid = state.db.get_event_nid_by_id(&parent_eid).unwrap().unwrap();
+        assert!(
+            state
+                .db
+                .user_participated_in_thread(parent_nid, bob_nid)
+                .unwrap()
+        );
+        // Alice hasn't replied — not a participant.
+        assert!(
+            !state
+                .db
+                .user_participated_in_thread(parent_nid, alice_nid)
+                .unwrap()
+        );
     }
 
     #[tokio::test]

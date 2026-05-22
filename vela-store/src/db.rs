@@ -2868,6 +2868,8 @@ impl Database {
     ///   - `relation_counts[(parent, rel_type)]` for O(1) count reads
     ///   - `thread_index[(room, !latest_sp, root)]` + `thread_root_latest[(room, root)]`
     ///     when `rel_type` is m.thread (so /threads is an ordered scan)
+    ///   - `thread_participants[(root, sender)]` when `rel_type` is m.thread
+    ///     (so `current_user_participated` is an O(1) point lookup)
     pub fn record_relation(
         &self,
         parent_event_nid: u64,
@@ -2876,6 +2878,7 @@ impl Database {
         rel_type_nid: u64,
         child_type_nid: u64,
         room_nid: u64,
+        child_sender_nid: u64,
         is_m_thread: bool,
     ) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("event_relations").unwrap();
@@ -2891,8 +2894,30 @@ impl Database {
         self.bump_relation_count(parent_event_nid, rel_type_nid, 1)?;
         if is_m_thread {
             self.update_thread_index(room_nid, parent_event_nid, child_stream_pos)?;
+            let pcf = self.db.cf_handle("thread_participants").unwrap();
+            self.db.put_cf(
+                &pcf,
+                keys::encode_u64_pair(parent_event_nid, child_sender_nid),
+                [] as [u8; 0],
+            )?;
         }
         Ok(())
+    }
+
+    /// O(1) lookup: has `user_nid` posted any m.thread reply to the
+    /// given thread root? The `thread_participants` CF is
+    /// monotonic — entries are not removed on reply redaction, since
+    /// a redacted reply still counts as participation per spec.
+    pub fn user_participated_in_thread(
+        &self,
+        root_nid: u64,
+        user_nid: u64,
+    ) -> Result<bool, rocksdb::Error> {
+        let cf = self.db.cf_handle("thread_participants").unwrap();
+        Ok(self
+            .db
+            .get_cf(&cf, keys::encode_u64_pair(root_nid, user_nid))?
+            .is_some())
     }
 
     /// Increment (`delta > 0`) or decrement (`delta < 0`) the

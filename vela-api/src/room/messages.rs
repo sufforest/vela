@@ -985,15 +985,14 @@ fn thread_summary(
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
                 .map(|(h, _)| h.sender_nid == uid)
                 .unwrap_or(false);
-            // `count_relations_with_user_check` still does the
-            // child sender scan — replace once we have a
-            // participants set CF.
+            // O(1) point lookup against the thread_participants CF —
+            // maintained on every m.thread record_relation. No
+            // prefix scan even for viral threads.
             root_sender_is_user
                 || state
                     .db
-                    .count_relations_with_user_check(event_nid, thread_nid, Some(uid))
+                    .user_participated_in_thread(event_nid, uid)
                     .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-                    .1
         }
         None => false,
     };

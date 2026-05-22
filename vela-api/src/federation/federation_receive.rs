@@ -1014,7 +1014,9 @@ async fn persist_received_pdu(
         }
 
         // Index any m.relates_to so /relations sees federated children too.
-        try_record_relation(state, pdu, event_nid, stream_pos, type_nid, room_nid);
+        try_record_relation(
+            state, pdu, event_nid, stream_pos, type_nid, room_nid, sender_nid,
+        );
 
         // Notify local sync listeners only for non-soft-failed events.
         if let Some(sender_ch) = state.room_senders.get(&Nid(room_nid)) {
@@ -1175,6 +1177,7 @@ fn try_record_relation(
     stream_pos: u64,
     type_nid: u64,
     room_nid: u64,
+    sender_nid: u64,
 ) {
     let Some(rel) = pdu.content.get("m.relates_to") else {
         return;
@@ -1198,6 +1201,7 @@ fn try_record_relation(
         rel_type_nid,
         type_nid,
         room_nid,
+        sender_nid,
         rel_type == "m.thread",
     ) {
         warn!(parent = %parent_event_id, error = %e, "failed to record federated relation");

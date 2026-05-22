@@ -73,6 +73,13 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // root before writing the new one. Without this, thread_index
     // would accumulate stale (latest_sp, root) tuples.
     "thread_root_latest",
+    // Thread participants set: presence of `(root_nid, user_nid)`
+    // means `user_nid` has at least one m.thread reply to the
+    // root. Lets `current_user_participated` be a single point
+    // lookup instead of a relations-prefix scan. Members are not
+    // removed on reply redaction (a redacted reply still counts
+    // as participation per spec).
+    "thread_participants",
     "user_filters",
     "user_pushers",
     "user_presence",
