@@ -122,6 +122,8 @@ pub struct ServerConfig {
     /// vela computes effective presence at read time and a background
     /// sweeper persists transitions so federation peers see them.
     pub presence: PresenceConfig,
+    /// Outbound push gateway posture. See `PushConfig`.
+    pub push: PushConfig,
 }
 
 /// Presence auto-decay configuration.
@@ -158,6 +160,19 @@ impl Default for PresenceConfig {
             sweep_interval_ms: 60 * 1000,
         }
     }
+}
+
+/// Outbound push behaviour. Currently just an SSRF posture knob;
+/// future flags (per-pusher timeouts, batch size) slot in here.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PushConfig {
+    /// When true, vela posts to push gateway URLs even if they
+    /// resolve to private / loopback / link-local addresses.
+    /// Required for docker/k8s deployments where the gateway is
+    /// on an internal network. Default false: production posture
+    /// refuses private URLs, treating them as SSRF attempts from
+    /// a hostile pusher registration.
+    pub allow_private_pushers: bool,
 }
 
 /// Classic `/voip/turnServer` configuration.

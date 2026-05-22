@@ -45,6 +45,7 @@
 pub mod report;
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 use tracing::{info, warn};
@@ -915,6 +916,8 @@ async fn handle_command(
         "demote" => cmd_demote(state, sender_nid, rest).await?,
         "token" => cmd_token(state, sender_nid, rest).await?,
         "tokens" => cmd_tokens(state).await?,
+        "create-user" => cmd_create_user(state, sender_nid, rest).await?,
+        "rotate-signing-key" => cmd_rotate_signing_key(state).await?,
         "reports" => cmd_reports(state, rest).await?,
         "as" => cmd_appservice(state, body).await,
         other => Reply::plain(format!(
@@ -929,6 +932,7 @@ async fn handle_command(
 /// notices are server-originated and clients don't process them for
 /// notifications — exactly what we want for command output).
 /// Optional HTML body for tabular responses.
+#[derive(Debug)]
 struct Reply {
     text: String,
     html: Option<String>,
@@ -968,6 +972,8 @@ fn cmd_help() -> Reply {
         !token create [uses=N] [expires=24h] mint a registration token\n\
         !tokens                              list registration tokens\n\
         !token revoke <token>                delete a registration token\n\
+        !create-user <localpart> [pw]        force-create a local user (bypasses UIA + tokens)\n\
+        !rotate-signing-key                  generate a new server signing key (restart required)\n\
         !reports [N]                         last N user-submitted abuse reports (default 20)\n\
         !as register <yaml>                  register an Application Service (paste YAML)\n\
         !as list                             list registered Application Services\n\
@@ -1293,6 +1299,124 @@ async fn cmd_reset_password(
         )
     };
     Ok(Reply::plain(body))
+}
+
+// --- !create-user <localpart> [password] ---
+//
+// Force-create a local user, bypassing UIA + registration tokens.
+// Used by operators to seed accounts on a closed-registration server
+// without exposing the public endpoint. Returns the chosen password
+// so the operator can pass it to the user out-of-band.
+async fn cmd_create_user(
+    state: &AppState,
+    _sender_nid: u64,
+    args: &[String],
+) -> Result<Reply, ApiError> {
+    let Some(localpart) = args.first() else {
+        return Ok(Reply::plain(
+            "usage: !create-user <localpart> [password]\n\
+             with no password, the bot generates one and replies with it.",
+        ));
+    };
+    let lp = localpart.to_lowercase();
+    if lp.is_empty() || lp.len() > 255 {
+        return Ok(Reply::plain("invalid localpart"));
+    }
+    if !lp
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._-=/+".contains(c))
+    {
+        return Ok(Reply::plain(
+            "invalid localpart (allowed: 0-9 a-z . _ - = / +)",
+        ));
+    }
+    assert_bot_localpart_not_reserved(state, &lp)?;
+
+    let mxid = format!("@{lp}:{}", state.config.server_name);
+    if state
+        .db
+        .user_exists(&mxid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    {
+        return Ok(Reply::plain(format!("user {mxid} already exists")));
+    }
+
+    let (password, generated) = match args.get(1) {
+        Some(p) if !p.is_empty() => (p.clone(), false),
+        _ => (generate_random_password(), true),
+    };
+    let hash = crate::auth::account::hash_password(&password);
+    state
+        .db
+        .create_user(&mxid, &hash)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
+    let reply = if generated {
+        format!(
+            "created {mxid}\n\
+             temporary password: `{password}`\n\
+             share out-of-band; ask the user to log in and change it.",
+        )
+    } else {
+        format!("created {mxid}")
+    };
+    Ok(Reply::plain(reply))
+}
+
+// --- !rotate-signing-key ---
+//
+// Generate a fresh ed25519 signing keypair, persist the old one as
+// rotated-out, install the new one as active. The IN-MEMORY signing
+// key on AppState is NOT swapped — that would require an atomic
+// handle we don't have today — so the operator must restart vela
+// for the new key to actually be used. Until restart, vela keeps
+// signing with the previous key (which is now in old_verify_keys
+// and so still verifiable by peers).
+async fn cmd_rotate_signing_key(state: &AppState) -> Result<Reply, ApiError> {
+    // Refuse a second rotation before restart. The DB's stored active
+    // key_id will have advanced past the in-memory one in that case.
+    // Letting it through would push the same outgoing public into
+    // old_verify_keys twice, and the running process would still be
+    // signing with a key that's no longer active OR rotated.
+    let stored_active = state
+        .db
+        .load_signing_key()
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if let Some((stored_id, _)) = stored_active.as_ref()
+        && stored_id != state.signing_key.key_id()
+    {
+        return Ok(Reply::plain(format!(
+            "rotation already pending: db active is {stored_id}, \
+             in-memory is {in_mem}. restart vela first.",
+            in_mem = state.signing_key.key_id(),
+        )));
+    }
+
+    let new_key = vela_core::events::sign::ServerSigningKey::generate();
+    let old_key_id = state.signing_key.key_id().to_string();
+    let old_pub_b64 = state.signing_key.public_key_base64();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    state
+        .db
+        .rotate_signing_key(
+            &old_key_id,
+            &old_pub_b64,
+            now,
+            new_key.key_id(),
+            new_key.secret_bytes(),
+        )
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    Ok(Reply::plain(format!(
+        "rotated signing key.\n\
+         outgoing: {old_key_id}\n\
+         active:   {new_key_id}\n\
+         restart vela for the new key to take effect; peers can still verify \
+         signatures made with the outgoing key via old_verify_keys.",
+        new_key_id = new_key.key_id(),
+    )))
 }
 
 /// 16-char alphanumeric password. ~95 bits of entropy.
@@ -2468,6 +2592,74 @@ mod tests {
         assert!(
             admin_room_create_sender_is_local(&state, &fresh_room_id, &current_server).unwrap(),
             "freshly created admin room must be locally authored"
+        );
+    }
+
+    /// !create-user happy path: creates the user with the operator-
+    /// supplied password and the user can subsequently be found in
+    /// the DB.
+    #[tokio::test]
+    async fn cmd_create_user_creates_user_with_password() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let reply = cmd_create_user(&state, 0, &["alice".into(), "secret123".into()])
+            .await
+            .expect("cmd ok");
+        assert!(reply.text.contains("created @alice:example.com"));
+        assert!(state.db.user_exists("@alice:example.com").unwrap());
+    }
+
+    /// !create-user without a password generates one and returns it.
+    #[tokio::test]
+    async fn cmd_create_user_generates_password_when_omitted() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let reply = cmd_create_user(&state, 0, &["bob".into()])
+            .await
+            .expect("cmd ok");
+        assert!(reply.text.contains("temporary password:"));
+        assert!(state.db.user_exists("@bob:example.com").unwrap());
+    }
+
+    /// !create-user refuses the admin bot's reserved localpart.
+    #[tokio::test]
+    async fn cmd_create_user_refuses_bot_localpart() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let err = cmd_create_user(&state, 0, &[DEFAULT_BOT_LOCALPART.into(), "pw".into()])
+            .await
+            .expect_err("must refuse bot localpart");
+        assert!(matches!(err.0, VelaError::Forbidden(_)));
+    }
+
+    /// !create-user refuses an existing user.
+    #[tokio::test]
+    async fn cmd_create_user_refuses_collision() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        state.db.create_user("@alice:example.com", "h").unwrap();
+        let reply = cmd_create_user(&state, 0, &["alice".into(), "pw".into()])
+            .await
+            .expect("cmd ok");
+        assert!(reply.text.contains("already exists"));
+    }
+
+    /// !rotate-signing-key writes a new active key and pushes the old
+    /// one into the rotated-out list. The in-memory state.signing_key
+    /// is intentionally NOT swapped (requires restart), and the
+    /// response surfaces that.
+    #[tokio::test]
+    async fn cmd_rotate_signing_key_persists_new_key() {
+        let (state, _tmp) = build_test_state();
+        let old_key_id = state.signing_key.key_id().to_string();
+        let reply = cmd_rotate_signing_key(&state).await.expect("cmd ok");
+        assert!(reply.text.contains("rotated signing key"));
+        assert!(reply.text.contains("restart vela"));
+        // Old key now appears in load_rotated_signing_keys().
+        let rotated = state.db.load_rotated_signing_keys().unwrap();
+        assert!(
+            rotated.iter().any(|(kid, _, _)| kid == &old_key_id),
+            "rotated list must include the old key: {rotated:?}"
         );
     }
 }

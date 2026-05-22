@@ -163,12 +163,17 @@ async fn dispatch_inner(
             let body = json!({"notification": notification});
             let url = url.to_string();
             let client = client.clone();
+            let allow_private = state.config.push.allow_private_pushers;
             // One request per pusher, spawned so a slow gateway doesn't
             // serialise delivery across recipients. Retries with bounded
             // exponential backoff on transient failure (5xx + network);
             // 4xx is permanent (the gateway rejected the payload, so a
             // retry can't help) and drops immediately.
             tokio::spawn(async move {
+                if !allow_private && let Err(reason) = check_pusher_url_is_public(&url).await {
+                    warn!(%url, reason, "pusher URL rejected (SSRF guard)");
+                    return;
+                }
                 deliver_one_pusher(&client, &url, &body).await;
             });
         }
@@ -323,7 +328,6 @@ mod tests {
 /// catches the common literal-IP / private-host misconfiguration.
 /// Not wired yet — a follow-up adds the config flag that lets
 /// operators with docker/k8s gateways opt out of strict mode.
-#[allow(dead_code)]
 async fn check_pusher_url_is_public(url: &str) -> Result<(), String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
     let scheme = parsed.scheme();
@@ -362,7 +366,6 @@ async fn check_pusher_url_is_public(url: &str) -> Result<(), String> {
 /// `is_global` would do this in one call but it's not yet stable;
 /// approximated with the stable predicates plus explicit IPv6 prefix
 /// checks (link-local fe80::/10, unique-local fc00::/7).
-#[allow(dead_code)]
 fn is_public_ip(addr: &std::net::IpAddr) -> bool {
     if addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() {
         return false;
