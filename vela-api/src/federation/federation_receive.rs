@@ -1330,11 +1330,48 @@ fn fetch_auth_chain<'a>(
         }
 
         let path = format!("/_matrix/federation/v1/event_auth/{room_id}/{target_event_id}");
-        let resp = state
-            .federation_client
-            .signed_request(reqwest::Method::GET, origin, &path, None)
-            .await
-            .map_err(|e| format!("/event_auth call failed: {e}"))?;
+        // MSC3706: when the event's room is partial-state, the
+        // sender's server may not have the missing auth events (we
+        // joined via a third-party resident that filtered members).
+        // Build a fallback list of servers to try from
+        // `servers_in_room`. Order: origin first (most likely to know
+        // recent events), then the resident hints.
+        let mut servers: Vec<String> = vec![origin.to_string()];
+        if let Ok(Some(room_nid)) = state.db.get_nid(room_id) {
+            let (partial, hints) = state
+                .db
+                .get_partial_state_info(room_nid)
+                .unwrap_or((false, Vec::new()));
+            if partial {
+                for s in hints {
+                    if s != origin {
+                        servers.push(s);
+                    }
+                }
+            }
+        }
+        let mut last_err = String::new();
+        let resp = {
+            let mut out: Result<Value, String> = Err("no servers".into());
+            for s in &servers {
+                match state
+                    .federation_client
+                    .signed_request(reqwest::Method::GET, s, &path, None)
+                    .await
+                {
+                    Ok(v) => {
+                        out = Ok(v);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = format!("/event_auth via {s}: {e}");
+                        continue;
+                    }
+                }
+            }
+            out
+        }
+        .map_err(|_| format!("/event_auth call failed: {last_err}"))?;
 
         let chain = resp
             .get("auth_chain")

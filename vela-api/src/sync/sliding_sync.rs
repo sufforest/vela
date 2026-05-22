@@ -151,6 +151,9 @@ pub async fn sliding_sync(
     let build_response = |state: &AppState,
                           since: Option<u64>|
      -> Result<(Map<String, Value>, Map<String, Value>), ApiError> {
+        // MSC4186 is_dm filter needs the user's `m.direct` set. Load
+        // once; the check per room is then a HashSet lookup.
+        let dm_room_ids = load_direct_room_ids(state, user.user_nid)?;
         let mut room_infos: Vec<RoomInfo> = Vec::new();
         for &room_nid in &joined_room_nids {
             let room_id = state
@@ -164,12 +167,18 @@ pub async fn sliding_sync(
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
                 .unwrap_or(0);
             let name = get_room_name(state, room_nid)?;
+            let is_dm = dm_room_ids.contains(&room_id);
+            let is_encrypted = room_is_encrypted(state, room_nid);
+            let room_type = room_create_type(state, room_nid);
             room_infos.push(RoomInfo {
                 room_nid,
                 room_id,
                 bump_ts,
                 name,
                 membership: "join".to_string(),
+                is_dm,
+                is_encrypted,
+                room_type,
             });
         }
         room_infos.sort_by_key(|r| std::cmp::Reverse(r.bump_ts));
@@ -209,6 +218,9 @@ pub async fn sliding_sync(
                     bump_ts,
                     name,
                     membership: "join".to_string(),
+                    is_dm: dm_room_ids.contains(room_id),
+                    is_encrypted: room_is_encrypted(state, room_nid),
+                    room_type: room_create_type(state, room_nid),
                 };
                 let tl = sub.timeline_limit.unwrap_or(10) as usize;
                 let room_data = build_sliding_room(
@@ -285,20 +297,47 @@ pub async fn sliding_sync(
         .as_ref()
         .is_some_and(|e| e.enabled)
     {
+        // Global account_data: always returned in full on initial
+        // sync. Incremental syncs return the full set too — the spec
+        // doesn't have a stream-position story for global data and
+        // re-sending it is cheap (typical user has a handful of
+        // entries). The CS-API /sync handler does the same.
         let all = state
             .db
             .get_all_account_data(user.user_nid)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-        let global: Vec<Value> = if since.is_none() {
-            all.into_iter()
+        let global: Vec<Value> = all
+            .into_iter()
+            .map(|(dtype, content)| json!({"type": dtype, "content": content}))
+            .collect();
+        // Per-room account_data: enumerate every room visible in this
+        // response, dump its per-room account_data entries. Bounded by
+        // the response set the lists/subscriptions just built.
+        let mut rooms_acct_data: Map<String, Value> = Map::new();
+        for (rid, _) in rooms_response.iter() {
+            let Some(room_nid) = state
+                .db
+                .get_nid(rid)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            else {
+                continue;
+            };
+            let entries = state
+                .db
+                .get_all_room_account_data(user.user_nid, room_nid)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+            if entries.is_empty() {
+                continue;
+            }
+            let events: Vec<Value> = entries
+                .into_iter()
                 .map(|(dtype, content)| json!({"type": dtype, "content": content}))
-                .collect()
-        } else {
-            vec![]
-        };
+                .collect();
+            rooms_acct_data.insert(rid.clone(), json!({"events": events}));
+        }
         extensions.insert(
             "account_data".to_string(),
-            json!({"global": global, "rooms": {}}),
+            json!({"global": global, "rooms": rooms_acct_data}),
         );
     }
 
@@ -529,6 +568,13 @@ struct RoomInfo {
     bump_ts: u64,
     name: Option<String>,
     membership: String,
+    /// MSC4186 filter inputs. Populated once per request; the filter
+    /// path is a cheap field check.
+    is_dm: bool,
+    is_encrypted: bool,
+    /// `m.room.create.content.type` (`m.space` for spaces; `None` for
+    /// regular rooms).
+    room_type: Option<String>,
 }
 
 fn build_lists(
@@ -541,23 +587,30 @@ fn build_lists(
     user_nid: u64,
 ) -> Result<(), ApiError> {
     for (list_name, list_config) in lists {
-        let filtered = apply_filters(room_infos, &list_config.filters);
-        let total_count = filtered.len();
+        let mut sorted: Vec<&RoomInfo> = apply_filters(room_infos, &list_config.filters);
+        sort_rooms(&mut sorted, state, user_nid, &list_config.sort);
+        let total_count = sorted.len();
 
-        let range = list_config
-            .range
-            .or_else(|| list_config.ranges.as_ref().and_then(|r| r.first().copied()))
-            .unwrap_or([0, 20]);
-
-        let start = range[0] as usize;
-        let end = (range[1] as usize + 1).min(total_count);
+        // MSC4186 lists support multiple ranges per list (e.g. "show
+        // rows 0-20 AND 100-120"). Collect every range in the request;
+        // emit one SYNC op per range. `range` (singular) is the
+        // legacy single-range field; `ranges` is the plural form.
+        let ranges: Vec<[u64; 2]> = list_config
+            .ranges
+            .clone()
+            .or_else(|| list_config.range.map(|r| vec![r]))
+            .unwrap_or_else(|| vec![[0, 20]]);
         let timeline_limit = list_config.timeline_limit.unwrap_or(10) as usize;
 
         let mut ops = Vec::new();
-        let mut room_ids_in_range = Vec::new();
-
-        if start < total_count {
-            for info in &filtered[start..end] {
+        for range in &ranges {
+            let start = range[0] as usize;
+            let end = (range[1] as usize + 1).min(total_count);
+            if start >= total_count {
+                continue;
+            }
+            let mut room_ids_in_range = Vec::new();
+            for info in &sorted[start..end] {
                 room_ids_in_range.push(Value::String(info.room_id.clone()));
 
                 if !rooms_response.contains_key(&info.room_id) {
@@ -572,7 +625,6 @@ fn build_lists(
                     rooms_response.insert(info.room_id.clone(), room_data);
                 }
             }
-
             ops.push(json!({
                 "op": "SYNC",
                 "range": [start, end.saturating_sub(1)],
@@ -591,6 +643,99 @@ fn build_lists(
     Ok(())
 }
 
+/// Apply the per-list `sort` ordering. Each entry is a tag; the
+/// first entry is the primary sort, subsequent entries are tie-
+/// breakers. Spec recognises `by_recency` (bump_ts DESC) and
+/// `by_name` (name ASC, case-insensitive); empty / unknown entries
+/// degrade to `by_recency`. `by_notification_level` is a Synapse-
+/// specific extension some clients pass; treat it as a no-op stable
+/// sort that callers can layer on top.
+fn sort_rooms(rooms: &mut Vec<&RoomInfo>, _state: &AppState, _user_nid: u64, sort: &[String]) {
+    if sort.is_empty() {
+        rooms.sort_by_key(|r| std::cmp::Reverse(r.bump_ts));
+        return;
+    }
+    // Apply tiebreakers in reverse — Rust's sort is stable, so each
+    // later pass preserves the order from earlier passes when the
+    // current key compares equal.
+    for tag in sort.iter().rev() {
+        match tag.as_str() {
+            "by_name" => rooms.sort_by(|a, b| {
+                let an = a.name.as_deref().unwrap_or("").to_lowercase();
+                let bn = b.name.as_deref().unwrap_or("").to_lowercase();
+                an.cmp(&bn)
+            }),
+            // Default: recency. Anything we don't recognise also
+            // falls back here so a misconfigured client still gets
+            // a sensible ordering.
+            _ => rooms.sort_by_key(|r| std::cmp::Reverse(r.bump_ts)),
+        }
+    }
+}
+
+/// Read the user's `m.direct` global account_data and collect every
+/// room_id flagged as a DM. Spec shape:
+/// `{ "<other_user>": ["!room1", "!room2"], ... }`.
+fn load_direct_room_ids(
+    state: &AppState,
+    user_nid: u64,
+) -> Result<std::collections::HashSet<String>, ApiError> {
+    let mut out = std::collections::HashSet::new();
+    let v = state
+        .db
+        .get_account_data(user_nid, "m.direct")
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let Some(v) = v else { return Ok(out) };
+    if let Some(map) = v.as_object() {
+        for arr in map.values() {
+            if let Some(arr) = arr.as_array() {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        out.insert(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `true` iff the room currently has an `m.room.encryption` state
+/// event. Cheap state-event existence check, doesn't decode the
+/// content.
+fn room_is_encrypted(state: &AppState, room_nid: u64) -> bool {
+    let Ok(Some(tn)) = state.db.get_nid("m.room.encryption") else {
+        return false;
+    };
+    let Ok(Some(sn)) = state.db.get_nid("") else {
+        return false;
+    };
+    state
+        .db
+        .get_state_event_nid(room_nid, tn, sn)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// `m.room.create.content.type` — `"m.space"` for spaces, `None` for
+/// regular rooms. Filters use this for `room_types`/`not_room_types`.
+fn room_create_type(state: &AppState, room_nid: u64) -> Option<String> {
+    let tn = state.db.get_nid("m.room.create").ok().flatten()?;
+    let sn = state.db.get_nid("").ok().flatten()?;
+    let enid = state
+        .db
+        .get_state_event_nid(room_nid, tn, sn)
+        .ok()
+        .flatten()?;
+    let (_h, bytes) = state.db.get_event(enid).ok().flatten()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("content")?
+        .get("type")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
 fn apply_filters<'a>(
     rooms: &'a [RoomInfo],
     filters: &Option<SlidingRoomFilter>,
@@ -604,11 +749,60 @@ fn apply_filters<'a>(
         .iter()
         .filter(|r| {
             if let Some(name_like) = &filters.room_name_like {
-                if let Some(name) = &r.name {
-                    if !name.to_lowercase().contains(&name_like.to_lowercase()) {
-                        return false;
+                match &r.name {
+                    Some(name) => {
+                        if !name.to_lowercase().contains(&name_like.to_lowercase()) {
+                            return false;
+                        }
                     }
-                } else {
+                    None => return false,
+                }
+            }
+            if let Some(want) = filters.is_dm
+                && r.is_dm != want
+            {
+                return false;
+            }
+            if let Some(want) = filters.is_encrypted
+                && r.is_encrypted != want
+            {
+                return false;
+            }
+            // is_invite tri-state. `lists` only gather joined rooms
+            // today, so every entry has `membership == "join"` —
+            // `is_invite=true` always yields empty; `is_invite=false`
+            // is implicitly satisfied by the gathering shape. The
+            // explicit checks below are forward-compatible for when
+            // we extend room_infos to include invite/knock rooms.
+            if filters.is_invite == Some(true) && r.membership != "invite" {
+                return false;
+            }
+            if filters.is_invite == Some(false) && r.membership == "invite" {
+                return false;
+            }
+            if let Some(want) = &filters.room_types {
+                let actual = r.room_type.as_deref();
+                let want_match = want.iter().any(|t| {
+                    if t == "null" {
+                        actual.is_none()
+                    } else {
+                        Some(t.as_str()) == actual
+                    }
+                });
+                if !want_match {
+                    return false;
+                }
+            }
+            if let Some(not_want) = &filters.not_room_types {
+                let actual = r.room_type.as_deref();
+                let blocked = not_want.iter().any(|t| {
+                    if t == "null" {
+                        actual.is_none()
+                    } else {
+                        Some(t.as_str()) == actual
+                    }
+                });
+                if blocked {
                     return false;
                 }
             }

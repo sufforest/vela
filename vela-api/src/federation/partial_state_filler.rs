@@ -197,12 +197,23 @@ async fn try_fill_one(
                     .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                     .clone();
                 let _guard = lock.lock().await;
+                // Capture the membership set BEFORE the merge so we
+                // can diff against the post-merge set and notify
+                // local users about newly-known peers (MSC3706
+                // device_list reconciliation).
+                let members_before: std::collections::HashSet<u64> = state
+                    .db
+                    .get_room_members(room_nid)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
                 match merge_state_response(state, room_nid, &resp).await {
                     Ok(()) => {
                         state
                             .db
                             .clear_partial_state(room_nid)
                             .map_err(|e| format!("clear flag: {e}"))?;
+                        reconcile_device_lists(state, room_nid, &members_before);
                         return Ok(true);
                     }
                     Err(e) => {
@@ -299,4 +310,72 @@ pub fn _reset_for_test(state: &AppState) {
         .partial_state_filler
         .running
         .store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// MSC3706 device_list reconciliation. When the filler completes,
+/// the room may now include peers our local users hadn't seen
+/// before — their /sync responses still report the OLD member set
+/// because the device_list_changes stream wasn't updated when the
+/// filler's state events landed. Iterate the diff and post one
+/// device-key-change notification per newly-known peer, observable
+/// by every local member of the room.
+fn reconcile_device_lists(
+    state: &AppState,
+    room_nid: u64,
+    members_before: &std::collections::HashSet<u64>,
+) {
+    let members_after = match state.db.get_room_members(room_nid) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(error = %e, "device_list reconciliation: members lookup failed");
+            return;
+        }
+    };
+    let new_peers: Vec<u64> = members_after
+        .iter()
+        .copied()
+        .filter(|m| !members_before.contains(m))
+        .collect();
+    if new_peers.is_empty() {
+        return;
+    }
+    // Local observers = every member of this room hosted on us. The
+    // pre-merge members_before contains our local users that were
+    // already joined (creator + invitees we knew about + ourselves);
+    // post-merge members_after may also contain newly-discovered
+    // remote users. Iterate the union and keep only local ones.
+    let our_server = state.config.server_name.as_str();
+    let mut local_observers: Vec<u64> = Vec::new();
+    for m in &members_after {
+        if let Ok(Some(uid)) = state.db.resolve_nid(*m)
+            && uid
+                .split_once(':')
+                .map(|(_, d)| d == our_server)
+                .unwrap_or(false)
+        {
+            local_observers.push(*m);
+        }
+    }
+    if local_observers.is_empty() {
+        return;
+    }
+    for &peer_nid in &new_peers {
+        let stream_pos = state.db.next_stream_position().as_u64();
+        if let Err(e) = state
+            .db
+            .notify_device_key_change(peer_nid, &local_observers, stream_pos)
+        {
+            warn!(error = %e, peer_nid, "device_list reconciliation: notify failed");
+            continue;
+        }
+        for &nid in &local_observers {
+            crate::router::notify_user(state, nid);
+        }
+    }
+    debug!(
+        room_nid,
+        new_peers = new_peers.len(),
+        observers = local_observers.len(),
+        "MSC3706 device_list reconciliation fired",
+    );
 }
