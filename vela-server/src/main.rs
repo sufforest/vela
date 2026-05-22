@@ -1080,6 +1080,7 @@ fn main() -> anyhow::Result<()> {
             partial_state_filler: Arc::new(
                 vela_api::federation::partial_state_filler::PartialStateFiller::new(),
             ),
+            sliding_sync_cache: Arc::new(vela_api::sync::sliding_sync::SlidingSyncCache::new()),
             appservice_registry,
             appservice_outbox,
             uia_sessions: vela_api::auth::uia::new_sessions(),
