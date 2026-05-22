@@ -305,10 +305,24 @@ pub async fn sliding_sync(
     // Per-connection snapshot for DELTA op emission. Only enabled
     // when the client supplies a `conn_id`. Two clients of the same
     // user with different conn_ids each get their own snapshot.
+    //
+    // A request with no `pos` is an initial sync: the client has no
+    // prior state to diff against. If we kept the snapshot we'd
+    // emit DELTAs against state the client no longer holds (e.g.
+    // page refresh, app restart, persistent conn_id across
+    // sessions). Reset the cached snapshot so this request emits
+    // SYNC, and subsequent ones build DELTAs from there.
     let snapshot_arc = body
         .conn_id
         .as_ref()
         .map(|cid| state.sliding_sync_cache.get_or_init(user.user_nid, cid));
+    if since.is_none()
+        && let Some(arc) = &snapshot_arc
+    {
+        let mut snap = arc.lock().unwrap();
+        snap.lists.clear();
+        snap.subscribed_rooms.clear();
+    }
 
     // Get user's joined rooms
     let joined_room_nids = state
@@ -1437,6 +1451,41 @@ mod tests {
         let a = cache.get_or_init(42, "conn-A");
         let b = cache.get_or_init(42, "conn-B");
         assert!(!Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn snapshot_reset_clears_list_and_sub_state() {
+        // Initial-sync request (no pos) with reused conn_id must
+        // wipe prior state so it can't accidentally emit DELTAs
+        // against state the client no longer holds.
+        let cache = SlidingSyncCache::new();
+        let arc = cache.get_or_init(7, "tab-A");
+        {
+            let mut snap = arc.lock().unwrap();
+            snap.lists.insert(
+                "main".to_string(),
+                ListSnapshot {
+                    room_ids: vec!["!a".into(), "!b".into()],
+                    shape_fingerprint: 1,
+                },
+            );
+            snap.subscribed_rooms.insert(
+                "!x".into(),
+                StickySubscription {
+                    required_state: Vec::new(),
+                    timeline_limit: 10,
+                },
+            );
+        }
+        // Simulate the handler's reset path.
+        {
+            let mut snap = arc.lock().unwrap();
+            snap.lists.clear();
+            snap.subscribed_rooms.clear();
+        }
+        let snap = arc.lock().unwrap();
+        assert!(snap.lists.is_empty());
+        assert!(snap.subscribed_rooms.is_empty());
     }
 
     #[test]
