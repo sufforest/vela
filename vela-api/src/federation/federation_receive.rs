@@ -1014,7 +1014,7 @@ async fn persist_received_pdu(
         }
 
         // Index any m.relates_to so /relations sees federated children too.
-        try_record_relation(state, pdu, event_nid, stream_pos, type_nid);
+        try_record_relation(state, pdu, event_nid, stream_pos, type_nid, room_nid);
 
         // Notify local sync listeners only for non-soft-failed events.
         if let Some(sender_ch) = state.room_senders.get(&Nid(room_nid)) {
@@ -1174,6 +1174,7 @@ fn try_record_relation(
     event_nid: u64,
     stream_pos: u64,
     type_nid: u64,
+    room_nid: u64,
 ) {
     let Some(rel) = pdu.content.get("m.relates_to") else {
         return;
@@ -1190,11 +1191,15 @@ fn try_record_relation(
     let Ok(rel_type_nid) = state.db.get_or_create_nid(rel_type) else {
         return;
     };
-    if let Err(e) =
-        state
-            .db
-            .record_relation(parent_nid, stream_pos, event_nid, rel_type_nid, type_nid)
-    {
+    if let Err(e) = state.db.record_relation(
+        parent_nid,
+        stream_pos,
+        event_nid,
+        rel_type_nid,
+        type_nid,
+        room_nid,
+        rel_type == "m.thread",
+    ) {
         warn!(parent = %parent_event_id, error = %e, "failed to record federated relation");
     }
 }
@@ -1250,6 +1255,17 @@ fn try_apply_redaction_marker(state: &AppState, room_nid: u64, pdu: &Pdu, redact
 
     if let Err(e) = state.db.mark_redacted_by(target_nid, redactor_nid) {
         warn!(target = %target_id, error = %e, "failed to record redaction marker");
+    }
+    // Same counter-decrement story as the local redaction path —
+    // keeps the parent's bundled aggregation accurate when a child
+    // relation is redacted by a remote.
+    if let Some(rel) = target_pdu.content.get("m.relates_to")
+        && let Some(parent_event_id) = rel.get("event_id").and_then(|v| v.as_str())
+        && let Some(rel_type) = rel.get("rel_type").and_then(|v| v.as_str())
+        && let Ok(Some(parent_nid)) = state.db.get_event_nid_by_id(parent_event_id)
+        && let Ok(Some(rel_type_nid)) = state.db.get_nid(rel_type)
+    {
+        let _ = state.db.relation_redacted(parent_nid, rel_type_nid);
     }
 }
 

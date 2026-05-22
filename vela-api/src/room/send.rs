@@ -201,7 +201,7 @@ pub async fn send_message(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     // Index `m.relates_to` so the /relations endpoint can find this child.
-    record_relation_if_present(&state, &event, event_nid, stream_pos, type_nid)?;
+    record_relation_if_present(&state, &event, event_nid, stream_pos, type_nid, room_nid)?;
 
     // Federate to remote servers that have joined members in this room.
     state.federation_sender.broadcast(room_nid, event_nid);
@@ -610,6 +610,7 @@ fn record_relation_if_present(
     child_event_nid: u64,
     child_stream_pos: u64,
     child_type_nid: u64,
+    room_nid: u64,
 ) -> Result<(), ApiError> {
     let relates_to = event.get("content").and_then(|c| c.get("m.relates_to"));
     let Some(rel) = relates_to else {
@@ -643,6 +644,8 @@ fn record_relation_if_present(
             child_event_nid,
             rel_type_nid,
             child_type_nid,
+            room_nid,
+            rel_type == "m.thread",
         )
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     Ok(())

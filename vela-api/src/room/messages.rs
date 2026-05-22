@@ -765,6 +765,42 @@ fn compute_bundled_relations(
             }
         }
     }
+    // The 1000-row bundle scan can miss thread or replace children
+    // when a popular event has more reactions newer than its thread
+    // replies / edits. Probe each "we only need the latest one"
+    // aggregation explicitly so it still emits. The thread count
+    // is computed unbounded inside `thread_summary` via
+    // count_relations_with_user_check.
+    //
+    // Gate on `entries.len() >= 1000` so events with a small
+    // relation tail don't pay a per-render full-prefix scan to
+    // confirm "no threads / no edits" — if the bundle wasn't
+    // truncated, an empty `threads` / `replaces` is authoritative.
+    let bundle_truncated = entries.len() >= 1000;
+    if bundle_truncated
+        && threads.is_empty()
+        && let Ok(Some(thread_nid)) = state.db.get_nid("m.thread")
+    {
+        let probe = state
+            .db
+            .list_relations(event_nid, Some(thread_nid), None, u64::MAX, true, 1)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        if let Some(&(_, child_nid, rt, ct)) = probe.first() {
+            threads.push((child_nid, rt, ct));
+        }
+    }
+    if bundle_truncated
+        && replaces.is_empty()
+        && let Ok(Some(replace_nid)) = state.db.get_nid("m.replace")
+    {
+        let probe = state
+            .db
+            .list_relations(event_nid, Some(replace_nid), None, u64::MAX, true, 1)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        if let Some(&(_, child_nid, rt, ct)) = probe.first() {
+            replaces.push((child_nid, rt, ct));
+        }
+    }
 
     let mut out = serde_json::Map::new();
     if let Some(agg) = aggregate_annotations(state, &annotations)? {
@@ -905,11 +941,10 @@ fn aggregate_replace(
     Ok(Some(json!({ "event": ev })))
 }
 
-/// Thread aggregation. Count + current_user_participated come from
-/// a full-index scan via `count_relations_with_user_check` — the
-/// bundled relations scan that feeds the other aggregations is
-/// capped at 1000 entries, which would give a wrong count and a
-/// false-negative participated flag for popular threads.
+/// Thread aggregation. `count` comes from the O(1) `relation_counts`
+/// CF maintained on every record_relation; `current_user_participated`
+/// still needs a per-child sender scan (participants index is a
+/// future optimisation).
 fn thread_summary(
     state: &AppState,
     event_nid: u64,
@@ -930,7 +965,7 @@ fn thread_summary(
         Some(n) => n,
         // Shouldn't happen — we got here because thread children
         // exist, so the nid must have been minted. Fall back to the
-        // bounded count rather than crashing.
+        // bundled count rather than crashing.
         None => {
             return Ok(Some(json!({
                 "count": threads.len() as u64,
@@ -938,9 +973,9 @@ fn thread_summary(
             })));
         }
     };
-    let (count, any_child_is_user) = state
+    let count = state
         .db
-        .count_relations_with_user_check(event_nid, thread_nid, user_nid)
+        .count_relation_for_type(event_nid, thread_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     let participated = match user_nid {
         Some(uid) => {
@@ -950,7 +985,15 @@ fn thread_summary(
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
                 .map(|(h, _)| h.sender_nid == uid)
                 .unwrap_or(false);
-            root_sender_is_user || any_child_is_user
+            // `count_relations_with_user_check` still does the
+            // child sender scan — replace once we have a
+            // participants set CF.
+            root_sender_is_user
+                || state
+                    .db
+                    .count_relations_with_user_check(event_nid, thread_nid, Some(uid))
+                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                    .1
         }
         None => false,
     };

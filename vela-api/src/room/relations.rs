@@ -242,73 +242,42 @@ pub async fn threads_list(
         None => return Ok(Json(json!({"chunk": []}))),
     };
 
-    // Walk the room timeline backwards in batches, collecting thread
-    // roots until we have enough candidates to sort and trim. The
-    // previous one-shot scan of `limit * 50` events silently
-    // truncated rooms with sparse threads — anything older than ~1K
-    // messages was invisible no matter the `from` token.
+    // `thread_index` is maintained on every m.thread record_relation
+    // call: a `(room, !latest_sp, root)` key whose forward iteration
+    // walks roots newest-first. One ordered scan replaces the prior
+    // timeline-walk-with-window approach; rooms with sparse threads
+    // are no longer truncated.
     //
-    // We overscan by `limit * 4` to give the sort meaningful
-    // ordering within the page. Pagination is by the lowest root
-    // stream position seen, not by latest-child activity — that
-    // would require a dedicated `(room, latest_child_sp) -> root`
-    // index, which is left for a follow-up.
-    const BATCH: usize = 200;
-    const HARD_CAP: usize = 20_000; // worst-case bound for huge rooms
-    let target = limit.saturating_mul(4);
-    let mut candidates: Vec<(u64, u64, u64)> = Vec::new(); // (latest_child_sp, root_sp, root_nid)
-    let mut cursor = u64::MAX;
-    let mut scanned = 0usize;
-    while candidates.len() < target && scanned < HARD_CAP {
-        let batch = state
-            .db
-            .get_timeline_before(room_nid, cursor, BATCH)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-        if batch.is_empty() {
-            break;
-        }
-        scanned += batch.len();
-        cursor = batch.last().map(|(sp, _)| *sp).unwrap_or(0);
-        if cursor >= from {
-            // Roots at or past `from` are excluded by pagination
-            // bound; their thread children may still be the latest
-            // we want, but we filter by root position to give a
-            // stable cursor. Skip and continue.
-            continue;
-        }
-        for (root_sp, enid) in &batch {
-            let children = state
-                .db
-                .list_relations(*enid, Some(thread_nid), None, u64::MAX, true, 1)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-            let Some(&(latest_sp, _, _, _)) = children.first() else {
+    // When `participated_only` is set we over-fetch (4x limit) so the
+    // post-filter still produces a full page.
+    let fetch_limit = if participated_only {
+        limit.saturating_mul(4)
+    } else {
+        limit
+    };
+    let raw_roots = state
+        .db
+        .list_thread_roots(room_nid, from, fetch_limit)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
+    let mut candidates: Vec<(u64, u64)> = Vec::new(); // (latest_sp, root_nid)
+    for (latest_sp, root_nid) in raw_roots {
+        if participated_only {
+            let participated =
+                root_or_replied_user(state.db.as_ref(), root_nid, user.user_nid, thread_nid)?;
+            if !participated {
                 continue;
-            };
-            if participated_only {
-                let participated =
-                    root_or_replied_user(state.db.as_ref(), *enid, user.user_nid, thread_nid)?;
-                if !participated {
-                    continue;
-                }
             }
-            candidates.push((latest_sp, *root_sp, *enid));
         }
-        if cursor == 0 {
+        candidates.push((latest_sp, root_nid));
+        if candidates.len() >= limit {
             break;
         }
     }
-    // Sort by latest activity; ties broken by root position so
-    // pagination is deterministic.
-    candidates.sort_by_key(|c| (std::cmp::Reverse(c.0), std::cmp::Reverse(c.1)));
-    candidates.retain(|&(_, root_sp, _)| root_sp < from);
-    candidates.truncate(limit);
-    // For the response `next_batch` we use the lowest root_sp in
-    // the returned chunk so the next call resumes scanning older
-    // root events.
-    let next_root_sp = candidates.iter().map(|c| c.1).min();
+    let next_latest_sp = candidates.last().map(|(sp, _)| *sp);
 
     let mut chunk = Vec::with_capacity(candidates.len());
-    for (_latest_sp, _root_sp, root_nid) in candidates {
+    for (_latest_sp, root_nid) in candidates {
         if let Some(ev) = crate::room::messages::load_client_event_with_relations(
             &state,
             root_nid,
@@ -321,7 +290,9 @@ pub async fn threads_list(
 
     let mut resp = serde_json::Map::new();
     resp.insert("chunk".to_string(), Value::Array(chunk));
-    if let Some(pos) = next_root_sp {
+    if let Some(pos) = next_latest_sp {
+        // Pagination is now by latest-child activity, the spec's
+        // own ordering, instead of root position.
         resp.insert("next_batch".to_string(), Value::String(format!("s{pos}")));
     }
     Ok(Json(Value::Object(resp)))
@@ -522,7 +493,15 @@ mod tests {
         let rel_type_nid = state.db.get_or_create_nid(rel_type).unwrap();
         state
             .db
-            .record_relation(parent_nid, stream_pos, nid, rel_type_nid, type_msg)
+            .record_relation(
+                parent_nid,
+                stream_pos,
+                nid,
+                rel_type_nid,
+                type_msg,
+                room_nid,
+                rel_type == "m.thread",
+            )
             .unwrap();
         stream_pos
     }
@@ -889,6 +868,92 @@ mod tests {
             .collect();
         // $c1's position is the exclusive boundary; we get $c3 + $c2 only.
         assert_eq!(ids, vec!["$c3", "$c2"]);
+    }
+
+    #[tokio::test]
+    async fn threads_list_uses_thread_index() {
+        // Create two parents with threads and verify /threads
+        // returns them newest-activity first via the index — no
+        // reliance on the old timeline scan window.
+        let (state, _tmp, room_id, room_nid, alice_nid, parent_eid) = setup_room();
+        // Second parent in the same room.
+        let type_msg = state.db.get_or_create_nid("m.room.message").unwrap();
+        let parent2_nid = 250u64;
+        state
+            .db
+            .persist_event(
+                parent2_nid,
+                "$parent2",
+                room_nid,
+                type_msg,
+                alice_nid,
+                0,
+                6,
+                6,
+                &serde_json::to_vec(&json!({
+                    "type": "m.room.message",
+                    "sender": "@alice:example.com",
+                    "room_id": room_id,
+                    "content": {"msgtype": "m.text", "body": "p2"},
+                    "origin_server_ts": 6,
+                    "depth": 6,
+                    "prev_events": [&parent_eid],
+                    "auth_events": ["$alice_join"],
+                }))
+                .unwrap(),
+                &[200],
+                &[101],
+                false,
+                false,
+            )
+            .unwrap();
+        // Thread reply to parent1 first, then to parent2 — index
+        // should rank parent2 as more recent activity.
+        persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            400,
+            "$r1",
+            "m.thread",
+            &parent_eid,
+        );
+        persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            401,
+            "$r2",
+            "m.thread",
+            "$parent2",
+        );
+
+        let res = threads_list(
+            State(state.clone()),
+            alice_user(&state),
+            Path(room_id),
+            Query(ThreadsQuery::default()),
+        )
+        .await
+        .unwrap();
+        let ids: Vec<&str> = res
+            .0
+            .get("chunk")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.get("event_id").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["$parent2", "$parent_msg"],
+            "newest activity first"
+        );
     }
 
     #[tokio::test]

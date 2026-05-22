@@ -233,11 +233,15 @@ pub async fn redact_event(
     // target (federated room where the event preceded our join), the
     // redaction is still federated to remote servers; they apply
     // their own copy.
-    if let Some((target_nid, _)) = &target {
+    if let Some((target_nid, target_pdu)) = &target {
         state
             .db
             .mark_redacted_by(*target_nid, event_nid)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        // If the redacted event was itself a relation, decrement
+        // its (parent, rel_type) counter so the parent's bundled
+        // aggregations stay accurate.
+        decrement_relation_count_if_relation(&state, &target_pdu.content);
     }
 
     state.federation_sender.broadcast(room_nid, event_nid);
@@ -268,6 +272,29 @@ pub async fn redact_event(
     }
 
     Ok(Json(json!({"event_id": event_id.as_str()})))
+}
+
+/// When the redacted event carried `m.relates_to`, decrement the
+/// matching counter so the parent's bundled aggregation stays
+/// accurate. Silent on any malformed shape — the relation simply
+/// never decrements.
+fn decrement_relation_count_if_relation(state: &AppState, content: &Value) {
+    let Some(rel) = content.get("m.relates_to") else {
+        return;
+    };
+    let Some(parent_event_id) = rel.get("event_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Some(rel_type) = rel.get("rel_type").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Ok(Some(parent_nid)) = state.db.get_event_nid_by_id(parent_event_id) else {
+        return;
+    };
+    let Ok(Some(rel_type_nid)) = state.db.get_nid(rel_type) else {
+        return;
+    };
+    let _ = state.db.relation_redacted(parent_nid, rel_type_nid);
 }
 
 fn load_target(state: &AppState, event_id: &str) -> Result<(u64, Pdu), ApiError> {
