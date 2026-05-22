@@ -481,6 +481,7 @@ mod tests {
                 room_nid,
                 sender_nid,
                 rel_type == "m.thread",
+                true,
             )
             .unwrap();
         stream_pos

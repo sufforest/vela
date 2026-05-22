@@ -656,6 +656,7 @@ fn record_relation_if_present(
             room_nid,
             child_sender_nid,
             rel_type == "m.thread",
+            true,
         )
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     Ok(())

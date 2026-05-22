@@ -2880,6 +2880,7 @@ impl Database {
         room_nid: u64,
         child_sender_nid: u64,
         is_m_thread: bool,
+        update_thread_recency: bool,
     ) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("event_relations").unwrap();
         let mut value = [0u8; 24];
@@ -2893,7 +2894,13 @@ impl Database {
         )?;
         self.bump_relation_count(parent_event_nid, rel_type_nid, 1)?;
         if is_m_thread {
-            self.update_thread_index(room_nid, parent_event_nid, child_stream_pos)?;
+            // Backfill: skip thread_index update — historical replies
+            // shouldn't masquerade as fresh activity in /threads.
+            // Counts and participants ARE updated since those reflect
+            // set membership, not recency.
+            if update_thread_recency {
+                self.update_thread_index(room_nid, parent_event_nid, child_stream_pos)?;
+            }
             let pcf = self.db.cf_handle("thread_participants").unwrap();
             self.db.put_cf(
                 &pcf,

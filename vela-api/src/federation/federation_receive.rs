@@ -1203,6 +1203,7 @@ fn try_record_relation(
         room_nid,
         sender_nid,
         rel_type == "m.thread",
+        true,
     ) {
         warn!(parent = %parent_event_id, error = %e, "failed to record federated relation");
     }

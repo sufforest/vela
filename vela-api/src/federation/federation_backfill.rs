@@ -254,7 +254,7 @@ async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Res
     // alice events to surface; outliers without stream_pos miss that
     // path). They're still excluded from current room_state and from
     // forward extremities so they don't disrupt live state.
-    state
+    let stream_pos = state
         .db
         .persist_event_kind(
             event_nid,
@@ -272,6 +272,29 @@ async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Res
             vela_store::db::PersistKind::BackfillTimeline,
         )
         .map_err(|e| format!("persist_event: {e}"))?;
+
+    // Index m.relates_to so the parent's count + participants reflect
+    // backfilled children. Recency update is suppressed — historical
+    // replies must not become the "latest activity" in /threads.
+    if let Some(rel) = pdu.content.get("m.relates_to")
+        && let Some(parent_event_id) = rel.get("event_id").and_then(|v| v.as_str())
+        && let Some(rel_type) = rel.get("rel_type").and_then(|v| v.as_str())
+        && let Ok(Some(parent_nid)) = state.db.get_event_nid_by_id(parent_event_id)
+        && let Ok(rel_type_nid) = state.db.get_or_create_nid(rel_type)
+        && let Err(e) = state.db.record_relation(
+            parent_nid,
+            stream_pos,
+            event_nid,
+            rel_type_nid,
+            type_nid,
+            room_nid,
+            sender_nid,
+            rel_type == "m.thread",
+            false,
+        )
+    {
+        debug!(%event_id, error = %e, "backfill: failed to record relation");
+    }
 
     // Silence unused warning; HashSet is imported for potential future use.
     let _: Option<HashSet<String>> = None;
