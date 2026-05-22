@@ -80,6 +80,13 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
             oidc: crate::router::OidcConfig::default(),
             admin_bot_localpart: crate::admin::DEFAULT_BOT_LOCALPART.to_string(),
             presence: crate::router::PresenceConfig::default(),
+            // Tests run wiremock servers on 127.0.0.1, so the SSRF
+            // guard would refuse the localhost push gateway. Default
+            // to permissive in test fixtures; production defaults
+            // strict via PushConfig::default().
+            push: crate::router::PushConfig {
+                allow_private_pushers: true,
+            },
         }),
         room_locks: Arc::new(DashMap::new()),
         user_locks: Arc::new(DashMap::new()),

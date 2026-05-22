@@ -329,6 +329,17 @@ pub(crate) fn build_sync_response_with_filter(
         if since.is_some() && !full_state && room_is_unchanged(&room_data) {
             continue;
         }
+        // MSC3706 client signal: surface `partial_state: true` so the
+        // client knows the membership list is incomplete and can
+        // soft-fail features that depend on full state (e.g. mention
+        // autocomplete) until the filler catches up.
+        let (partial, _servers) = state
+            .db
+            .get_partial_state_info(room_nid)
+            .unwrap_or((false, Vec::new()));
+        if partial && let Some(obj) = room_data.as_object_mut() {
+            obj.insert("partial_state".into(), json!(true));
+        }
         join_rooms.insert(room_id, room_data);
     }
 

@@ -71,6 +71,19 @@ struct Config {
     admin: AdminSection,
     #[serde(default)]
     presence: PresenceSection,
+    #[serde(default)]
+    push: PushSection,
+}
+
+/// `[push]` section. Outbound push gateway posture knobs.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+struct PushSection {
+    /// Allow pusher URLs that resolve to private / loopback /
+    /// link-local addresses. False by default (refuses them as
+    /// SSRF). Flip to true on docker/k8s deployments where the
+    /// gateway lives on an internal network.
+    allow_private_pushers: bool,
 }
 
 /// `[presence]` section. Auto-decay thresholds + sweeper cadence for
@@ -1045,6 +1058,9 @@ fn main() -> anyhow::Result<()> {
                         as u64,
                     sweep_interval_ms: parse_duration(&config.presence.sweep_interval)?.as_millis()
                         as u64,
+                },
+                push: vela_api::router::PushConfig {
+                    allow_private_pushers: config.push.allow_private_pushers,
                 },
             }),
             room_locks: Arc::new(DashMap::new()),

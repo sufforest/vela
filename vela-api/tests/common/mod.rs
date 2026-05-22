@@ -160,6 +160,9 @@ impl Harness {
                 oidc: overrides.oidc,
                 admin_bot_localpart: vela_api::admin::DEFAULT_BOT_LOCALPART.to_string(),
                 presence: vela_api::router::PresenceConfig::default(),
+                push: vela_api::router::PushConfig {
+                    allow_private_pushers: true,
+                },
             }),
             room_locks: Arc::new(DashMap::new()),
             user_locks: Arc::new(DashMap::new()),
