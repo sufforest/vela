@@ -1,8 +1,10 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::middleware::json::Json;
 use axum::extract::{Query, State};
+use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use vela_core::error::VelaError;
@@ -13,6 +15,189 @@ use crate::middleware::error::ApiError;
 use crate::room::messages::load_client_event;
 use crate::router::AppState;
 use crate::sync::typing::get_typing_users;
+
+// --- Per-connection snapshot cache (DELTA op support) ---
+
+/// One client's view of a sliding-sync list, as we last sent it.
+/// Held inside `SlidingSyncCache`. Next request diffs against this
+/// to emit DELETE/INSERT ops instead of always re-sending the full
+/// window with SYNC.
+#[derive(Default)]
+pub struct ListSnapshot {
+    /// Room ids in their previous response order. Index = position
+    /// the client knows them at.
+    pub room_ids: Vec<String>,
+    /// Fingerprint of the request shape (filters + sort + ranges)
+    /// that produced this snapshot. A mismatch on the next request
+    /// means the client changed the query — emit a fresh SYNC.
+    pub shape_fingerprint: u64,
+}
+
+/// Per-(user, conn_id) cache of all lists' snapshots.
+///
+/// `subscribed_rooms` is the MSC4186 sticky subscription set —
+/// rooms the client said it wanted via `room_subscriptions` on a
+/// prior request stay subscribed until explicitly named in
+/// `unsubscribe_rooms`. Without a `conn_id`, subscriptions reset
+/// per request (matches earlier behaviour).
+#[derive(Default)]
+pub struct ConnSnapshot {
+    pub lists: HashMap<String, ListSnapshot>,
+    pub subscribed_rooms: HashMap<String, StickySubscription>,
+    pub last_used: Option<Instant>,
+}
+
+/// What we remember about a sticky subscription. We can't store the
+/// original `RoomSubscription` because it isn't `Clone`; store its
+/// fields directly.
+#[derive(Clone)]
+pub struct StickySubscription {
+    pub required_state: Vec<[String; 2]>,
+    pub timeline_limit: usize,
+}
+
+/// Shared cache held on AppState. Cheap to clone (Arcs); eviction
+/// is lazy on read via `last_used`.
+#[derive(Default)]
+pub struct SlidingSyncCache {
+    inner: DashMap<(u64, String), Arc<std::sync::Mutex<ConnSnapshot>>>,
+}
+
+/// Snapshots idle longer than this are evicted on next access. 30
+/// minutes covers a phone going to sleep then waking; longer would
+/// pile up state for disconnected clients.
+const SNAPSHOT_TTL: Duration = Duration::from_secs(30 * 60);
+
+impl SlidingSyncCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Look up the snapshot for `(user, conn_id)`, evicting it if
+    /// stale. Always returns a clonable handle the caller mutates in
+    /// place. Uses a sync Mutex because the snapshot is only touched
+    /// from synchronous code (diff + write); no `await` is held
+    /// across the guard.
+    pub fn get_or_init(&self, user_nid: u64, conn_id: &str) -> Arc<std::sync::Mutex<ConnSnapshot>> {
+        let key = (user_nid, conn_id.to_string());
+        // Atomic get-or-insert via DashMap's entry API. Two threads
+        // racing on the same key both see the same Arc.
+        let arc = self
+            .inner
+            .entry(key.clone())
+            .or_insert_with(|| {
+                Arc::new(std::sync::Mutex::new(ConnSnapshot {
+                    last_used: Some(Instant::now()),
+                    ..Default::default()
+                }))
+            })
+            .clone();
+        // Stale check + refresh. Hold the snapshot's own lock so an
+        // in-flight long-poll keeps refreshing it; only evict if
+        // genuinely past TTL.
+        let stale = {
+            let mut snap = arc.lock().unwrap();
+            let past_ttl = snap
+                .last_used
+                .map(|t| t.elapsed() > SNAPSHOT_TTL)
+                .unwrap_or(false);
+            if !past_ttl {
+                snap.last_used = Some(Instant::now());
+            }
+            past_ttl
+        };
+        if stale {
+            // Evict only if the map still holds the same Arc — a
+            // concurrent insert could have replaced it.
+            self.inner
+                .remove_if(&key, |_, existing| Arc::ptr_eq(existing, &arc));
+            return self.get_or_init(user_nid, conn_id);
+        }
+        arc
+    }
+}
+
+/// Stable hash over the request shape (filters + sort + ranges) so
+/// the next request can detect whether the client changed the query.
+/// A mismatch invalidates DELTA diffing and forces SYNC.
+fn list_shape_fingerprint(cfg: &SyncListConfig) -> u64 {
+    // serde_json::to_string is stable for our config (HashMap fields
+    // only contain non-key-ordered Vecs/Options). Hash the JSON.
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let blob = json!({
+        "ranges": cfg.ranges,
+        "range": cfg.range,
+        "sort": cfg.sort,
+        "required_state": cfg.required_state,
+        "timeline_limit": cfg.timeline_limit,
+        "filters": cfg.filters.as_ref().map(|f| json!({
+            "is_dm": f.is_dm,
+            "is_encrypted": f.is_encrypted,
+            "is_invite": f.is_invite,
+            "room_types": f.room_types,
+            "not_room_types": f.not_room_types,
+            "room_name_like": f.room_name_like,
+        })),
+    });
+    blob.to_string().hash(&mut h);
+    h.finish()
+}
+
+/// MSC4186 DELTA op computation. Given the previous response's
+/// ordered room_ids for a list-range and the new ordered room_ids,
+/// emit the minimal DELETE/INSERT sequence that transforms one into
+/// the other.
+///
+/// Algorithm — two passes:
+/// 1. DELETE rooms that disappeared (high→low, so positions stay
+///    valid as we apply).
+/// 2. Walk the new list. For each target position, if the working
+///    state's room matches, advance; otherwise emit DELETE+INSERT
+///    for the moved/new room.
+///
+/// This is correct but not always minimal — a pure reorder produces
+/// up to N DELETE/INSERT pairs. For the common case of "one room
+/// jumped to the top" it emits exactly one DELETE + one INSERT.
+fn compute_list_ops(prev: &[String], new: &[String], range_start: usize) -> Vec<Value> {
+    if prev == new {
+        return Vec::new();
+    }
+    let new_set: std::collections::HashSet<&str> = new.iter().map(|s| s.as_str()).collect();
+    let mut working: Vec<String> = prev.to_vec();
+    let mut ops: Vec<Value> = Vec::new();
+
+    // Pass 1: delete rooms not in `new`, high→low.
+    let to_delete: Vec<usize> = working
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| (!new_set.contains(r.as_str())).then_some(i))
+        .collect();
+    for &i in to_delete.iter().rev() {
+        ops.push(json!({"op": "DELETE", "index": range_start + i}));
+        working.remove(i);
+    }
+
+    // Pass 2: walk new[], emit ops to align working with new.
+    for (j, target) in new.iter().enumerate() {
+        match working.get(j) {
+            Some(here) if here == target => continue,
+            _ => {
+                if let Some(pos) = working.iter().position(|r| r == target) {
+                    ops.push(json!({"op": "DELETE", "index": range_start + pos}));
+                    working.remove(pos);
+                }
+                ops.push(json!({
+                    "op": "INSERT",
+                    "index": range_start + j,
+                    "room_id": target,
+                }));
+                working.insert(j, target.clone());
+            }
+        }
+    }
+    ops
+}
 
 // --- Request types ---
 
@@ -117,6 +302,28 @@ pub async fn sliding_sync(
     let since: Option<u64> = body.pos.as_deref().and_then(|s| s.parse().ok());
     let should_longpoll = timeout_ms > 0 && since.is_some();
 
+    // Per-connection snapshot for DELTA op emission. Only enabled
+    // when the client supplies a `conn_id`. Two clients of the same
+    // user with different conn_ids each get their own snapshot.
+    //
+    // A request with no `pos` is an initial sync: the client has no
+    // prior state to diff against. If we kept the snapshot we'd
+    // emit DELTAs against state the client no longer holds (e.g.
+    // page refresh, app restart, persistent conn_id across
+    // sessions). Reset the cached snapshot so this request emits
+    // SYNC, and subsequent ones build DELTAs from there.
+    let snapshot_arc = body
+        .conn_id
+        .as_ref()
+        .map(|cid| state.sliding_sync_cache.get_or_init(user.user_nid, cid));
+    if since.is_none()
+        && let Some(arc) = &snapshot_arc
+    {
+        let mut snap = arc.lock().unwrap();
+        snap.lists.clear();
+        snap.subscribed_rooms.clear();
+    }
+
     // Get user's joined rooms
     let joined_room_nids = state
         .db
@@ -186,6 +393,7 @@ pub async fn sliding_sync(
         let mut lists_response: Map<String, Value> = Map::new();
         let mut rooms_response: Map<String, Value> = Map::new();
 
+        let mut snapshot_guard = snapshot_arc.as_ref().map(|a| a.lock().unwrap());
         build_lists(
             state,
             &body.lists,
@@ -194,10 +402,52 @@ pub async fn sliding_sync(
             &mut lists_response,
             &mut rooms_response,
             user.user_nid,
+            snapshot_guard.as_deref_mut(),
         )?;
 
-        // Room subscriptions
-        for (room_id, sub) in &body.room_subscriptions {
+        // Compute effective subscription set. MSC4186: subscriptions
+        // are sticky across requests with the same conn_id. Without
+        // a conn_id (snapshot_guard is None), behave per-request.
+        // If a room appears in BOTH unsubscribe_rooms and
+        // room_subscriptions, unsubscribe wins everywhere — both in
+        // the sticky set and in this response.
+        let effective_subs: HashMap<String, StickySubscription> =
+            match snapshot_guard.as_deref_mut() {
+                Some(snap) => {
+                    for (rid, sub) in &body.room_subscriptions {
+                        snap.subscribed_rooms.insert(
+                            rid.clone(),
+                            StickySubscription {
+                                required_state: sub.required_state.clone(),
+                                timeline_limit: sub.timeline_limit.unwrap_or(10) as usize,
+                            },
+                        );
+                    }
+                    for rid in &body.unsubscribe_rooms {
+                        snap.subscribed_rooms.remove(rid);
+                    }
+                    snap.subscribed_rooms.clone()
+                }
+                None => body
+                    .room_subscriptions
+                    .iter()
+                    .filter(|(rid, _)| !body.unsubscribe_rooms.contains(rid))
+                    .map(|(rid, sub)| {
+                        (
+                            rid.clone(),
+                            StickySubscription {
+                                required_state: sub.required_state.clone(),
+                                timeline_limit: sub.timeline_limit.unwrap_or(10) as usize,
+                            },
+                        )
+                    })
+                    .collect(),
+            };
+        drop(snapshot_guard);
+
+        // Emit room data for every effective subscription not
+        // already present via list windows.
+        for (room_id, sub) in &effective_subs {
             if rooms_response.contains_key(room_id) {
                 continue;
             }
@@ -222,17 +472,22 @@ pub async fn sliding_sync(
                     is_encrypted: room_is_encrypted(state, room_nid),
                     room_type: room_create_type(state, room_nid),
                 };
-                let tl = sub.timeline_limit.unwrap_or(10) as usize;
                 let room_data = build_sliding_room(
                     state,
                     &info,
-                    tl,
+                    sub.timeline_limit,
                     &sub.required_state,
                     since,
                     user.user_nid,
                 )?;
                 rooms_response.insert(room_id.clone(), room_data);
             }
+        }
+        // Honour unsubscribe_rooms: drop them from this response
+        // even if they appeared via a list. Spec says the client
+        // doesn't want the data.
+        for rid in &body.unsubscribe_rooms {
+            rooms_response.remove(rid);
         }
 
         Ok((lists_response, rooms_response))
@@ -577,6 +832,7 @@ struct RoomInfo {
     room_type: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_lists(
     state: &AppState,
     lists: &HashMap<String, SyncListConfig>,
@@ -585,16 +841,43 @@ fn build_lists(
     lists_response: &mut Map<String, Value>,
     rooms_response: &mut Map<String, Value>,
     user_nid: u64,
+    snapshot: Option<&mut ConnSnapshot>,
 ) -> Result<(), ApiError> {
+    let mut snapshot_writes: Vec<(String, ListSnapshot)> = Vec::new();
+    // Lists that became multi-range this request — clear their
+    // prior snapshot so the NEXT single-range request emits a
+    // fresh SYNC rather than diffing against state the client no
+    // longer holds.
+    let mut snapshot_clears: Vec<String> = Vec::new();
+    // Clone the prev snapshot data eagerly so we can mutate the
+    // snapshot freely after the loop. The fingerprint + room_ids
+    // are the only fields we read, and they're cheap to clone.
+    let prev_lists: HashMap<String, ListSnapshot> = match snapshot.as_ref() {
+        Some(s) => s
+            .lists
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    ListSnapshot {
+                        room_ids: v.room_ids.clone(),
+                        shape_fingerprint: v.shape_fingerprint,
+                    },
+                )
+            })
+            .collect(),
+        None => HashMap::new(),
+    };
     for (list_name, list_config) in lists {
         let mut sorted: Vec<&RoomInfo> = apply_filters(room_infos, &list_config.filters);
         sort_rooms(&mut sorted, state, user_nid, &list_config.sort);
         let total_count = sorted.len();
 
         // MSC4186 lists support multiple ranges per list (e.g. "show
-        // rows 0-20 AND 100-120"). Collect every range in the request;
-        // emit one SYNC op per range. `range` (singular) is the
-        // legacy single-range field; `ranges` is the plural form.
+        // rows 0-20 AND 100-120"). DELTA ops are only emitted for
+        // the single-range case — multi-range diffing across
+        // discontiguous windows requires per-range snapshots and
+        // isn't worth the complexity for the rare client that asks.
         let ranges: Vec<[u64; 2]> = list_config
             .ranges
             .clone()
@@ -602,16 +885,24 @@ fn build_lists(
             .unwrap_or_else(|| vec![[0, 20]]);
         let timeline_limit = list_config.timeline_limit.unwrap_or(10) as usize;
 
+        let fingerprint = list_shape_fingerprint(list_config);
+        let single_range = ranges.len() == 1;
+
         let mut ops = Vec::new();
+        // Track new room_ids in the (single) range so we can update
+        // the snapshot at the end. For multi-range we still build
+        // ops, but skip snapshot update — next request will be a
+        // fresh SYNC.
+        let mut new_room_ids_for_snapshot: Vec<String> = Vec::new();
         for range in &ranges {
             let start = range[0] as usize;
             let end = (range[1] as usize + 1).min(total_count);
             if start >= total_count {
                 continue;
             }
-            let mut room_ids_in_range = Vec::new();
+            let mut room_ids_in_range: Vec<String> = Vec::new();
             for info in &sorted[start..end] {
-                room_ids_in_range.push(Value::String(info.room_id.clone()));
+                room_ids_in_range.push(info.room_id.clone());
 
                 if !rooms_response.contains_key(&info.room_id) {
                     let room_data = build_sliding_room(
@@ -625,11 +916,42 @@ fn build_lists(
                     rooms_response.insert(info.room_id.clone(), room_data);
                 }
             }
-            ops.push(json!({
-                "op": "SYNC",
-                "range": [start, end.saturating_sub(1)],
-                "room_ids": room_ids_in_range,
-            }));
+
+            // DELTA path: only when single-range and shape matches.
+            let delta_ops = if single_range {
+                prev_lists
+                    .get(list_name)
+                    .filter(|prev| prev.shape_fingerprint == fingerprint)
+                    .map(|prev| compute_list_ops(&prev.room_ids, &room_ids_in_range, start))
+            } else {
+                None
+            };
+            if let Some(d) = delta_ops {
+                ops.extend(d);
+            } else {
+                ops.push(json!({
+                    "op": "SYNC",
+                    "range": [start, end.saturating_sub(1)],
+                    "room_ids": room_ids_in_range
+                        .iter()
+                        .map(|s| Value::String(s.clone()))
+                        .collect::<Vec<_>>(),
+                }));
+            }
+            if single_range {
+                new_room_ids_for_snapshot = room_ids_in_range;
+            }
+        }
+        if single_range {
+            snapshot_writes.push((
+                list_name.clone(),
+                ListSnapshot {
+                    room_ids: new_room_ids_for_snapshot,
+                    shape_fingerprint: fingerprint,
+                },
+            ));
+        } else {
+            snapshot_clears.push(list_name.clone());
         }
 
         lists_response.insert(
@@ -639,6 +961,15 @@ fn build_lists(
                 "ops": ops,
             }),
         );
+    }
+    if let Some(snap) = snapshot {
+        for name in snapshot_clears {
+            snap.lists.remove(&name);
+        }
+        for (name, list_snap) in snapshot_writes {
+            snap.lists.insert(name, list_snap);
+        }
+        snap.last_used = Some(Instant::now());
     }
     Ok(())
 }
@@ -966,4 +1297,210 @@ fn get_room_name(state: &AppState, room_nid: u64) -> Result<Option<String>, ApiE
             .map(|s| s.to_string()));
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(slice: &[&str]) -> Vec<String> {
+        slice.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Replay a sequence of DELETE/INSERT ops on a working list to
+    /// verify the ops actually transform `prev` into `new` — a real
+    /// client would do the same on its side.
+    fn apply_ops(prev: &[String], ops: &[Value]) -> Vec<String> {
+        let mut working = prev.to_vec();
+        for op in ops {
+            let kind = op.get("op").and_then(|v| v.as_str()).unwrap();
+            let index = op.get("index").and_then(|v| v.as_u64()).unwrap() as usize;
+            match kind {
+                "DELETE" => {
+                    working.remove(index);
+                }
+                "INSERT" => {
+                    let rid = op.get("room_id").and_then(|v| v.as_str()).unwrap();
+                    working.insert(index, rid.to_string());
+                }
+                other => panic!("unexpected op {other}"),
+            }
+        }
+        working
+    }
+
+    #[test]
+    fn diff_identical_emits_no_ops() {
+        let a = ids(&["!r1:e", "!r2:e", "!r3:e"]);
+        assert!(compute_list_ops(&a, &a, 0).is_empty());
+    }
+
+    #[test]
+    fn diff_append() {
+        let prev = ids(&["!a", "!b"]);
+        let new = ids(&["!a", "!b", "!c"]);
+        let ops = compute_list_ops(&prev, &new, 0);
+        assert_eq!(apply_ops(&prev, &ops), new);
+        assert_eq!(ops.len(), 1);
+    }
+
+    #[test]
+    fn diff_remove_middle() {
+        let prev = ids(&["!a", "!b", "!c"]);
+        let new = ids(&["!a", "!c"]);
+        let ops = compute_list_ops(&prev, &new, 0);
+        assert_eq!(apply_ops(&prev, &ops), new);
+        assert_eq!(ops.len(), 1);
+    }
+
+    #[test]
+    fn diff_room_jumps_to_top() {
+        // Most common real case: bump_ts moves !c to position 0.
+        let prev = ids(&["!a", "!b", "!c", "!d"]);
+        let new = ids(&["!c", "!a", "!b", "!d"]);
+        let ops = compute_list_ops(&prev, &new, 0);
+        assert_eq!(apply_ops(&prev, &ops), new);
+        // 1 DELETE + 1 INSERT.
+        assert_eq!(ops.len(), 2);
+    }
+
+    #[test]
+    fn diff_full_reverse_is_correct_if_verbose() {
+        let prev = ids(&["!a", "!b", "!c", "!d"]);
+        let new = ids(&["!d", "!c", "!b", "!a"]);
+        let ops = compute_list_ops(&prev, &new, 0);
+        assert_eq!(apply_ops(&prev, &ops), new);
+    }
+
+    #[test]
+    fn diff_honours_range_start_offset() {
+        let prev = ids(&["!a", "!b"]);
+        let new = ids(&["!b", "!a"]);
+        let ops = compute_list_ops(&prev, &new, 50);
+        // Apply against the prev list AT POSITION 50, simulated as a
+        // 50-empty prefix.
+        let mut padded = vec!["pad".to_string(); 50];
+        padded.extend(prev.iter().cloned());
+        let result = apply_ops(&padded, &ops);
+        assert_eq!(&result[50..], new.as_slice());
+    }
+
+    #[test]
+    fn diff_empty_to_full_is_all_inserts() {
+        let prev: Vec<String> = vec![];
+        let new = ids(&["!a", "!b", "!c"]);
+        let ops = compute_list_ops(&prev, &new, 0);
+        assert!(ops.iter().all(|o| o["op"] == "INSERT"));
+        assert_eq!(apply_ops(&prev, &ops), new);
+    }
+
+    #[test]
+    fn diff_full_to_empty_is_all_deletes() {
+        let prev = ids(&["!a", "!b", "!c"]);
+        let new: Vec<String> = vec![];
+        let ops = compute_list_ops(&prev, &new, 0);
+        assert!(ops.iter().all(|o| o["op"] == "DELETE"));
+        assert_eq!(apply_ops(&prev, &ops), new);
+    }
+
+    fn cfg(ranges: Option<Vec<[u64; 2]>>, sort: Vec<String>) -> SyncListConfig {
+        SyncListConfig {
+            ranges,
+            range: None,
+            sort,
+            required_state: Vec::new(),
+            timeline_limit: None,
+            filters: None,
+        }
+    }
+
+    #[test]
+    fn fingerprint_stable_for_same_config() {
+        let a = cfg(Some(vec![[0, 20]]), vec!["by_recency".to_string()]);
+        let b = cfg(Some(vec![[0, 20]]), vec!["by_recency".to_string()]);
+        assert_eq!(list_shape_fingerprint(&a), list_shape_fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_changes_when_range_changes() {
+        let a = cfg(Some(vec![[0, 20]]), vec!["by_recency".to_string()]);
+        let b = cfg(Some(vec![[0, 50]]), vec!["by_recency".to_string()]);
+        assert_ne!(list_shape_fingerprint(&a), list_shape_fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_changes_when_sort_changes() {
+        let a = cfg(Some(vec![[0, 20]]), vec!["by_recency".to_string()]);
+        let b = cfg(Some(vec![[0, 20]]), vec!["by_name".to_string()]);
+        assert_ne!(list_shape_fingerprint(&a), list_shape_fingerprint(&b));
+    }
+
+    #[test]
+    fn cache_returns_same_handle_within_ttl() {
+        let cache = SlidingSyncCache::new();
+        let a = cache.get_or_init(42, "conn-A");
+        // Touch last_used so it's non-stale.
+        a.lock().unwrap().last_used = Some(Instant::now());
+        let b = cache.get_or_init(42, "conn-A");
+        assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn cache_isolates_by_conn_id() {
+        let cache = SlidingSyncCache::new();
+        let a = cache.get_or_init(42, "conn-A");
+        let b = cache.get_or_init(42, "conn-B");
+        assert!(!Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn snapshot_reset_clears_list_and_sub_state() {
+        // Initial-sync request (no pos) with reused conn_id must
+        // wipe prior state so it can't accidentally emit DELTAs
+        // against state the client no longer holds.
+        let cache = SlidingSyncCache::new();
+        let arc = cache.get_or_init(7, "tab-A");
+        {
+            let mut snap = arc.lock().unwrap();
+            snap.lists.insert(
+                "main".to_string(),
+                ListSnapshot {
+                    room_ids: vec!["!a".into(), "!b".into()],
+                    shape_fingerprint: 1,
+                },
+            );
+            snap.subscribed_rooms.insert(
+                "!x".into(),
+                StickySubscription {
+                    required_state: Vec::new(),
+                    timeline_limit: 10,
+                },
+            );
+        }
+        // Simulate the handler's reset path.
+        {
+            let mut snap = arc.lock().unwrap();
+            snap.lists.clear();
+            snap.subscribed_rooms.clear();
+        }
+        let snap = arc.lock().unwrap();
+        assert!(snap.lists.is_empty());
+        assert!(snap.subscribed_rooms.is_empty());
+    }
+
+    #[test]
+    fn cache_concurrent_get_or_init_returns_same_arc() {
+        // Regression: previous version raced — two threads could
+        // create two different Arcs for the same key.
+        let cache = Arc::new(SlidingSyncCache::new());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let c = cache.clone();
+            handles.push(std::thread::spawn(move || c.get_or_init(99, "shared")));
+        }
+        let arcs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for a in &arcs[1..] {
+            assert!(Arc::ptr_eq(&arcs[0], a));
+        }
+    }
 }

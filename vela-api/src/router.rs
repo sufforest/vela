@@ -311,6 +311,12 @@ pub struct AppState {
     /// fully-stated room by pulling /state from one of the servers
     /// the resident named in its send_join response.
     pub partial_state_filler: Arc<crate::federation::partial_state_filler::PartialStateFiller>,
+    /// MSC4186 sliding-sync per-connection snapshot cache.
+    /// `(user_nid, conn_id) -> previous list room_ids`. Lets the
+    /// response emit DELETE/INSERT deltas instead of always re-
+    /// sending the full window with SYNC. Snapshots expire after
+    /// 30 min idle.
+    pub sliding_sync_cache: Arc<crate::sync::sliding_sync::SlidingSyncCache>,
     /// Registered Application Services. Cheaply cloneable; admin
     /// commands, the interest filter, and the masquerading auth
     /// middleware all reach in via this handle.
