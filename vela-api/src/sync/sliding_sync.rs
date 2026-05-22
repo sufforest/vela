@@ -80,34 +80,40 @@ impl SlidingSyncCache {
     /// across the guard.
     pub fn get_or_init(&self, user_nid: u64, conn_id: &str) -> Arc<std::sync::Mutex<ConnSnapshot>> {
         let key = (user_nid, conn_id.to_string());
-        if let Some(existing) = self.inner.get(&key) {
-            let stale = {
-                let mut snap = existing.lock().unwrap();
-                let s = snap
-                    .last_used
-                    .map(|t| t.elapsed() > SNAPSHOT_TTL)
-                    .unwrap_or(false);
-                // Refresh on lookup so an in-flight long-poll
-                // request can't be evicted by a peer arriving 30+
-                // minutes later. The next request still gets the
-                // same Arc.
-                if !s {
-                    snap.last_used = Some(Instant::now());
-                }
-                s
-            };
-            if !stale {
-                return existing.clone();
+        // Atomic get-or-insert via DashMap's entry API. Two threads
+        // racing on the same key both see the same Arc.
+        let arc = self
+            .inner
+            .entry(key.clone())
+            .or_insert_with(|| {
+                Arc::new(std::sync::Mutex::new(ConnSnapshot {
+                    last_used: Some(Instant::now()),
+                    ..Default::default()
+                }))
+            })
+            .clone();
+        // Stale check + refresh. Hold the snapshot's own lock so an
+        // in-flight long-poll keeps refreshing it; only evict if
+        // genuinely past TTL.
+        let stale = {
+            let mut snap = arc.lock().unwrap();
+            let past_ttl = snap
+                .last_used
+                .map(|t| t.elapsed() > SNAPSHOT_TTL)
+                .unwrap_or(false);
+            if !past_ttl {
+                snap.last_used = Some(Instant::now());
             }
-            drop(existing);
-            self.inner.remove(&key);
+            past_ttl
+        };
+        if stale {
+            // Evict only if the map still holds the same Arc — a
+            // concurrent insert could have replaced it.
+            self.inner
+                .remove_if(&key, |_, existing| Arc::ptr_eq(existing, &arc));
+            return self.get_or_init(user_nid, conn_id);
         }
-        let fresh = Arc::new(std::sync::Mutex::new(ConnSnapshot {
-            last_used: Some(Instant::now()),
-            ..Default::default()
-        }));
-        self.inner.insert(key, fresh.clone());
-        fresh
+        arc
     }
 }
 
@@ -388,16 +394,12 @@ pub async fn sliding_sync(
         // Compute effective subscription set. MSC4186: subscriptions
         // are sticky across requests with the same conn_id. Without
         // a conn_id (snapshot_guard is None), behave per-request.
-        // Always honour the in-body unsubscribe_rooms list.
+        // If a room appears in BOTH unsubscribe_rooms and
+        // room_subscriptions, unsubscribe wins everywhere — both in
+        // the sticky set and in this response.
         let effective_subs: HashMap<String, StickySubscription> =
             match snapshot_guard.as_deref_mut() {
                 Some(snap) => {
-                    // Drop unsubscribed first so a single request can
-                    // contain both subscribe(X) and unsubscribe(X) —
-                    // the subscribe wins.
-                    for rid in &body.unsubscribe_rooms {
-                        snap.subscribed_rooms.remove(rid);
-                    }
                     for (rid, sub) in &body.room_subscriptions {
                         snap.subscribed_rooms.insert(
                             rid.clone(),
@@ -406,6 +408,9 @@ pub async fn sliding_sync(
                                 timeline_limit: sub.timeline_limit.unwrap_or(10) as usize,
                             },
                         );
+                    }
+                    for rid in &body.unsubscribe_rooms {
+                        snap.subscribed_rooms.remove(rid);
                     }
                     snap.subscribed_rooms.clone()
                 }
@@ -825,8 +830,28 @@ fn build_lists(
     snapshot: Option<&mut ConnSnapshot>,
 ) -> Result<(), ApiError> {
     let mut snapshot_writes: Vec<(String, ListSnapshot)> = Vec::new();
-    let prev_lists: HashMap<String, &ListSnapshot> = match snapshot.as_ref() {
-        Some(s) => s.lists.iter().map(|(k, v)| (k.clone(), v)).collect(),
+    // Lists that became multi-range this request — clear their
+    // prior snapshot so the NEXT single-range request emits a
+    // fresh SYNC rather than diffing against state the client no
+    // longer holds.
+    let mut snapshot_clears: Vec<String> = Vec::new();
+    // Clone the prev snapshot data eagerly so we can mutate the
+    // snapshot freely after the loop. The fingerprint + room_ids
+    // are the only fields we read, and they're cheap to clone.
+    let prev_lists: HashMap<String, ListSnapshot> = match snapshot.as_ref() {
+        Some(s) => s
+            .lists
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    ListSnapshot {
+                        room_ids: v.room_ids.clone(),
+                        shape_fingerprint: v.shape_fingerprint,
+                    },
+                )
+            })
+            .collect(),
         None => HashMap::new(),
     };
     for (list_name, list_config) in lists {
@@ -911,6 +936,8 @@ fn build_lists(
                     shape_fingerprint: fingerprint,
                 },
             ));
+        } else {
+            snapshot_clears.push(list_name.clone());
         }
 
         lists_response.insert(
@@ -922,6 +949,9 @@ fn build_lists(
         );
     }
     if let Some(snap) = snapshot {
+        for name in snapshot_clears {
+            snap.lists.remove(&name);
+        }
         for (name, list_snap) in snapshot_writes {
             snap.lists.insert(name, list_snap);
         }
@@ -1407,5 +1437,21 @@ mod tests {
         let a = cache.get_or_init(42, "conn-A");
         let b = cache.get_or_init(42, "conn-B");
         assert!(!Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn cache_concurrent_get_or_init_returns_same_arc() {
+        // Regression: previous version raced — two threads could
+        // create two different Arcs for the same key.
+        let cache = Arc::new(SlidingSyncCache::new());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let c = cache.clone();
+            handles.push(std::thread::spawn(move || c.get_or_init(99, "shared")));
+        }
+        let arcs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        for a in &arcs[1..] {
+            assert!(Arc::ptr_eq(&arcs[0], a));
+        }
     }
 }
