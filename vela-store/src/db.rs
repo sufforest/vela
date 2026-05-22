@@ -2863,6 +2863,13 @@ impl Database {
     /// `rel_type_nid`. The stream position of the child is keyed in so the
     /// `/relations` endpoint can iterate most-recent-first via a reverse
     /// prefix scan.
+    ///
+    /// Also maintains:
+    ///   - `relation_counts[(parent, rel_type)]` for O(1) count reads
+    ///   - `thread_index[(room, !latest_sp, root)]` + `thread_root_latest[(room, root)]`
+    ///     when `rel_type` is m.thread (so /threads is an ordered scan)
+    ///   - `thread_participants[(root, sender)]` when `rel_type` is m.thread
+    ///     (so `current_user_participated` is an O(1) point lookup)
     pub fn record_relation(
         &self,
         parent_event_nid: u64,
@@ -2870,6 +2877,10 @@ impl Database {
         child_event_nid: u64,
         rel_type_nid: u64,
         child_type_nid: u64,
+        room_nid: u64,
+        child_sender_nid: u64,
+        is_m_thread: bool,
+        update_thread_recency: bool,
     ) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("event_relations").unwrap();
         let mut value = [0u8; 24];
@@ -2880,7 +2891,221 @@ impl Database {
             &cf,
             keys::encode_u64_pair(parent_event_nid, child_stream_pos),
             value,
-        )
+        )?;
+        self.bump_relation_count(parent_event_nid, rel_type_nid, 1)?;
+        if is_m_thread {
+            // Backfill: skip thread_index update — historical replies
+            // shouldn't masquerade as fresh activity in /threads.
+            // Counts and participants ARE updated since those reflect
+            // set membership, not recency.
+            if update_thread_recency {
+                self.update_thread_index(room_nid, parent_event_nid, child_stream_pos)?;
+            }
+            let pcf = self.db.cf_handle("thread_participants").unwrap();
+            self.db.put_cf(
+                &pcf,
+                keys::encode_u64_pair(parent_event_nid, child_sender_nid),
+                [] as [u8; 0],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// O(1) lookup: has `user_nid` posted any m.thread reply to the
+    /// given thread root? The `thread_participants` CF is
+    /// monotonic — entries are not removed on reply redaction, since
+    /// a redacted reply still counts as participation per spec.
+    pub fn user_participated_in_thread(
+        &self,
+        root_nid: u64,
+        user_nid: u64,
+    ) -> Result<bool, rocksdb::Error> {
+        let cf = self.db.cf_handle("thread_participants").unwrap();
+        Ok(self
+            .db
+            .get_cf(&cf, keys::encode_u64_pair(root_nid, user_nid))?
+            .is_some())
+    }
+
+    /// Increment (`delta > 0`) or decrement (`delta < 0`) the
+    /// (parent, rel_type) counter. Saturates at 0 — a counter that
+    /// would go negative stays at 0 (paranoia against duplicate
+    /// redactions or backfill recording the same event twice).
+    fn bump_relation_count(
+        &self,
+        parent_event_nid: u64,
+        rel_type_nid: u64,
+        delta: i64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("relation_counts").unwrap();
+        let key = keys::encode_u64_pair(parent_event_nid, rel_type_nid);
+        let current = self
+            .db
+            .get_cf(&cf, key)?
+            .map(|b| keys::decode_u64(&b))
+            .unwrap_or(0);
+        let next = if delta >= 0 {
+            current.saturating_add(delta as u64)
+        } else {
+            current.saturating_sub((-delta) as u64)
+        };
+        self.db.put_cf(&cf, key, keys::encode_u64(next))
+    }
+
+    /// O(1) read of the (parent, rel_type) counter. Returns 0 when
+    /// no children have been recorded for this pair.
+    pub fn count_relation_for_type(
+        &self,
+        parent_event_nid: u64,
+        rel_type_nid: u64,
+    ) -> Result<u64, rocksdb::Error> {
+        let cf = self.db.cf_handle("relation_counts").unwrap();
+        let key = keys::encode_u64_pair(parent_event_nid, rel_type_nid);
+        Ok(self
+            .db
+            .get_cf(&cf, key)?
+            .map(|b| keys::decode_u64(&b))
+            .unwrap_or(0))
+    }
+
+    /// Decrement the (parent, rel_type) counter — called when a
+    /// relation event is redacted. The thread_index is left in
+    /// place; it self-corrects on the next thread reply and a
+    /// slightly-stale `latest_event` is bounded in impact.
+    pub fn relation_redacted(
+        &self,
+        parent_event_nid: u64,
+        rel_type_nid: u64,
+    ) -> Result<(), rocksdb::Error> {
+        self.bump_relation_count(parent_event_nid, rel_type_nid, -1)
+    }
+
+    /// Thread index key layout. The middle word is `!latest_sp`
+    /// (`u64::MAX - latest_sp`) so forward iteration walks
+    /// newest-first.
+    fn encode_thread_index_key(room_nid: u64, latest_sp: u64, root_nid: u64) -> [u8; 24] {
+        keys::encode_u64_triple(room_nid, u64::MAX - latest_sp, root_nid)
+    }
+
+    /// Update the thread_index after a new m.thread child lands.
+    /// Deletes the prior (room, !latest_sp, root) key when one
+    /// exists so the index stays a tight set of "latest activity
+    /// per root".
+    fn update_thread_index(
+        &self,
+        room_nid: u64,
+        root_nid: u64,
+        new_latest_sp: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let idx_cf = self.db.cf_handle("thread_index").unwrap();
+        let latest_cf = self.db.cf_handle("thread_root_latest").unwrap();
+        let latest_key = keys::encode_u64_pair(room_nid, root_nid);
+        if let Some(prev_bytes) = self.db.get_cf(&latest_cf, latest_key)? {
+            let prev_sp = keys::decode_u64(&prev_bytes);
+            if prev_sp >= new_latest_sp {
+                // A newer m.thread child already landed (federation
+                // out-of-order delivery, say). Leave the index alone.
+                return Ok(());
+            }
+            self.db.delete_cf(
+                &idx_cf,
+                Self::encode_thread_index_key(room_nid, prev_sp, root_nid),
+            )?;
+        }
+        self.db.put_cf(
+            &idx_cf,
+            Self::encode_thread_index_key(room_nid, new_latest_sp, root_nid),
+            [] as [u8; 0],
+        )?;
+        self.db
+            .put_cf(&latest_cf, latest_key, keys::encode_u64(new_latest_sp))
+    }
+
+    /// Iterate thread roots in `room_nid` ordered by latest m.thread
+    /// activity (newest first). `before_latest_sp` is exclusive on
+    /// the latest_sp axis. Returns `(latest_child_sp, root_event_nid)`
+    /// tuples.
+    pub fn list_thread_roots(
+        &self,
+        room_nid: u64,
+        before_latest_sp: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, u64)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("thread_index").unwrap();
+        let start_key = Self::encode_thread_index_key(room_nid, before_latest_sp, u64::MAX);
+        let iter = self.db.iterator_cf(
+            &cf,
+            IteratorMode::From(&start_key, rocksdb::Direction::Forward),
+        );
+        let prefix = keys::encode_u64(room_nid);
+        let mut out = Vec::new();
+        for item in iter {
+            let (key, _val) = item?;
+            if key.len() < 24 || key[..8] != prefix[..] {
+                break;
+            }
+            // Stored as (room, !latest_sp_desc, root). Decode by
+            // inverting the middle word.
+            let inv_sp = keys::decode_u64(&key[8..16]);
+            let latest_sp = u64::MAX - inv_sp;
+            let root_nid = keys::decode_u64(&key[16..24]);
+            if latest_sp >= before_latest_sp {
+                continue;
+            }
+            out.push((latest_sp, root_nid));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Count children of `parent_event_nid` matching `rel_type_nid`.
+    /// Walks the index without loading values — cheaper than
+    /// `list_relations` for "is the count >0?" / aggregation use.
+    /// Returns `(count, any_user_participated)` where the second
+    /// element is true if any child's sender_nid equals `user_nid`
+    /// (when supplied). Pass `user_nid=None` to skip the check.
+    pub fn count_relations_with_user_check(
+        &self,
+        parent_event_nid: u64,
+        rel_type_nid: u64,
+        user_nid: Option<u64>,
+    ) -> Result<(u64, bool), rocksdb::Error> {
+        let cf = self.db.cf_handle("event_relations").unwrap();
+        let prefix = keys::encode_u64(parent_event_nid);
+        let start_key = keys::encode_u64_pair(parent_event_nid, u64::MAX);
+        let iter = self.db.iterator_cf(
+            &cf,
+            IteratorMode::From(&start_key, rocksdb::Direction::Reverse),
+        );
+        let mut count = 0u64;
+        let mut participated = false;
+        for item in iter {
+            let (key, val) = item?;
+            if key.len() < 16 || key[..8] != prefix[..] {
+                break;
+            }
+            if val.len() < 24 {
+                continue;
+            }
+            let rt = keys::decode_u64(&val[8..16]);
+            if rt != rel_type_nid {
+                continue;
+            }
+            count += 1;
+            if let Some(want) = user_nid
+                && !participated
+            {
+                let child_nid = keys::decode_u64(&val[0..8]);
+                if let Ok(Some((h, _))) = self.get_event(child_nid)
+                    && h.sender_nid == want
+                {
+                    participated = true;
+                }
+            }
+        }
+        Ok((count, participated))
     }
 
     /// Iterate child events of `parent_event_nid`. Returns

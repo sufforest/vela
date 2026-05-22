@@ -765,6 +765,42 @@ fn compute_bundled_relations(
             }
         }
     }
+    // The 1000-row bundle scan can miss thread or replace children
+    // when a popular event has more reactions newer than its thread
+    // replies / edits. Probe each "we only need the latest one"
+    // aggregation explicitly so it still emits. The thread count
+    // is computed unbounded inside `thread_summary` via
+    // count_relations_with_user_check.
+    //
+    // Gate on `entries.len() >= 1000` so events with a small
+    // relation tail don't pay a per-render full-prefix scan to
+    // confirm "no threads / no edits" — if the bundle wasn't
+    // truncated, an empty `threads` / `replaces` is authoritative.
+    let bundle_truncated = entries.len() >= 1000;
+    if bundle_truncated
+        && threads.is_empty()
+        && let Ok(Some(thread_nid)) = state.db.get_nid("m.thread")
+    {
+        let probe = state
+            .db
+            .list_relations(event_nid, Some(thread_nid), None, u64::MAX, true, 1)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        if let Some(&(_, child_nid, rt, ct)) = probe.first() {
+            threads.push((child_nid, rt, ct));
+        }
+    }
+    if bundle_truncated
+        && replaces.is_empty()
+        && let Ok(Some(replace_nid)) = state.db.get_nid("m.replace")
+    {
+        let probe = state
+            .db
+            .list_relations(event_nid, Some(replace_nid), None, u64::MAX, true, 1)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        if let Some(&(_, child_nid, rt, ct)) = probe.first() {
+            replaces.push((child_nid, rt, ct));
+        }
+    }
 
     let mut out = serde_json::Map::new();
     if let Some(agg) = aggregate_annotations(state, &annotations)? {
@@ -905,9 +941,10 @@ fn aggregate_replace(
     Ok(Some(json!({ "event": ev })))
 }
 
-/// Thread aggregation. Same shape as the pre-existing
-/// `compute_thread_aggregation` (kept compatible) but now driven by
-/// the same single relations scan as annotations/replaces.
+/// Thread aggregation. `count` comes from the O(1) `relation_counts`
+/// CF maintained on every record_relation; `current_user_participated`
+/// still needs a per-child sender scan (participants index is a
+/// future optimisation).
 fn thread_summary(
     state: &AppState,
     event_nid: u64,
@@ -918,96 +955,47 @@ fn thread_summary(
     if threads.is_empty() {
         return Ok(None);
     }
-    let count = threads.len() as u64;
     let (latest_nid, _, _) = threads[0];
     let latest = load_client_event(state, latest_nid, room_id)?;
-    let participated = match user_nid {
-        Some(uid) => {
-            let root_sender_is_user = state
-                .db
-                .get_event(event_nid)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-                .map(|(h, _)| h.sender_nid == uid)
-                .unwrap_or(false);
-            root_sender_is_user
-                || threads.iter().any(|(child_nid, _, _)| {
-                    state
-                        .db
-                        .get_event(*child_nid)
-                        .ok()
-                        .flatten()
-                        .map(|(h, _)| h.sender_nid == uid)
-                        .unwrap_or(false)
-                })
-        }
-        None => false,
-    };
-    let mut agg = serde_json::Map::new();
-    if let Some(l) = latest {
-        agg.insert("latest_event".to_string(), l);
-    }
-    agg.insert("count".to_string(), json!(count));
-    if user_nid.is_some() {
-        agg.insert("current_user_participated".to_string(), json!(participated));
-    }
-    Ok(Some(Value::Object(agg)))
-}
-
-/// Build the `m.thread` aggregation object per spec §Threading. Returns
-/// `None` when the event has no thread children (the common case).
-#[allow(dead_code)]
-fn compute_thread_aggregation(
-    state: &AppState,
-    event_nid: u64,
-    room_id: &str,
-    user_nid: Option<u64>,
-) -> Result<Option<Value>, ApiError> {
     let thread_nid = match state
         .db
         .get_nid("m.thread")
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
     {
         Some(n) => n,
-        None => return Ok(None),
+        // Shouldn't happen — we got here because thread children
+        // exist, so the nid must have been minted. Fall back to the
+        // bundled count rather than crashing.
+        None => {
+            return Ok(Some(json!({
+                "count": threads.len() as u64,
+                "latest_event": latest,
+            })));
+        }
     };
-    // Pull a generous window — we only need a count and the latest entry, so
-    // the window can be large enough to make the count meaningful for typical
-    // threads. Heavy threads are paginated separately via /relations.
-    let entries = state
+    let count = state
         .db
-        .list_relations(event_nid, Some(thread_nid), None, u64::MAX, true, 1000)
+        .count_relation_for_type(event_nid, thread_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    if entries.is_empty() {
-        return Ok(None);
-    }
-
-    let count = entries.len() as u64;
-    let (_latest_sp, latest_nid, _, _) = entries[0];
-    let latest = load_client_event(state, latest_nid, room_id)?;
-
     let participated = match user_nid {
         Some(uid) => {
-            // Cheap check: was the root sender uid? If so, true.
             let root_sender_is_user = state
                 .db
                 .get_event(event_nid)
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
                 .map(|(h, _)| h.sender_nid == uid)
                 .unwrap_or(false);
+            // O(1) point lookup against the thread_participants CF —
+            // maintained on every m.thread record_relation. No
+            // prefix scan even for viral threads.
             root_sender_is_user
-                || entries.iter().any(|(_, child_nid, _, _)| {
-                    state
-                        .db
-                        .get_event(*child_nid)
-                        .ok()
-                        .flatten()
-                        .map(|(h, _)| h.sender_nid == uid)
-                        .unwrap_or(false)
-                })
+                || state
+                    .db
+                    .user_participated_in_thread(event_nid, uid)
+                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         }
         None => false,
     };
-
     let mut agg = serde_json::Map::new();
     if let Some(l) = latest {
         agg.insert("latest_event".to_string(), l);

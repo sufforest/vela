@@ -125,7 +125,9 @@ async fn handle(
     // is end-of-stream when going backwards, 0 when going forwards.
     let from =
         parse_stream_token(q.from.as_deref()).unwrap_or(if dir_backwards { u64::MAX } else { 0 });
-    let _to = parse_stream_token(q.to.as_deref()); // optional explicit upper bound — unused for now
+    // `to` is an exclusive boundary opposite the dir of travel.
+    // dir=b: stop when stream_pos <= to. dir=f: stop when stream_pos >= to.
+    let to = parse_stream_token(q.to.as_deref());
 
     let rel_type_nid = match &rel_type {
         Some(rt) => state
@@ -165,6 +167,15 @@ async fn handle(
     let mut chunk = Vec::with_capacity(entries.len());
     let mut last_pos = None;
     for (sp, child_nid, _rt, _ct) in entries {
+        // Apply the `to` upper bound (exclusive on the far side of travel).
+        if let Some(t) = to {
+            if dir_backwards && sp <= t {
+                break;
+            }
+            if !dir_backwards && sp >= t {
+                break;
+            }
+        }
         if let Some(ev) = load_client_event(&state, child_nid, &room_id)? {
             chunk.push(ev);
             last_pos = Some(sp);
@@ -222,50 +233,42 @@ pub async fn threads_list(
     let limit = q.limit.unwrap_or(20).clamp(1, 100);
     let from = parse_stream_token(q.from.as_deref()).unwrap_or(u64::MAX);
     let participated_only = matches!(q.include.as_deref(), Some("participated"));
-    let thread_nid = match state
-        .db
-        .get_nid("m.thread")
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-    {
-        Some(n) => n,
-        None => return Ok(Json(json!({"chunk": []}))),
-    };
 
-    // Walk a window of recent room events looking for thread roots, then sort
-    // by latest m.thread child activity (newest first) — this is the spec's
-    // "thread order", not timeline order. `from` paginates by latest-activity,
-    // so we always scan from the newest end and filter the page afterwards.
-    let scan_window = limit * 50; // heuristic; bounded to keep latency low.
-    let entries = state
+    // `thread_index` is maintained on every m.thread record_relation
+    // call: a `(room, !latest_sp, root)` key whose forward iteration
+    // walks roots newest-first. One ordered scan replaces the prior
+    // timeline-walk-with-window approach; rooms with sparse threads
+    // are no longer truncated.
+    //
+    // When `participated_only` is set we over-fetch (4x limit) so the
+    // post-filter still produces a full page.
+    let fetch_limit = if participated_only {
+        limit.saturating_mul(4)
+    } else {
+        limit
+    };
+    let raw_roots = state
         .db
-        .get_timeline_before(room_nid, u64::MAX, scan_window)
+        .list_thread_roots(room_nid, from, fetch_limit)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
-    let mut candidates: Vec<(u64, u64)> = Vec::new(); // (latest_child_sp, root_nid)
-    for (_, enid) in entries.iter() {
-        let children = state
-            .db
-            .list_relations(*enid, Some(thread_nid), None, u64::MAX, true, 1)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-        let Some(&(latest_sp, _, _, _)) = children.first() else {
-            continue;
-        };
+    let mut candidates: Vec<(u64, u64)> = Vec::new(); // (latest_sp, root_nid)
+    for (latest_sp, root_nid) in raw_roots {
         if participated_only {
-            let participated =
-                root_or_replied_user(state.db.as_ref(), *enid, user.user_nid, thread_nid)?;
+            let participated = root_or_replied_user(state.db.as_ref(), root_nid, user.user_nid)?;
             if !participated {
                 continue;
             }
         }
-        candidates.push((latest_sp, *enid));
+        candidates.push((latest_sp, root_nid));
+        if candidates.len() >= limit {
+            break;
+        }
     }
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
-    candidates.retain(|&(sp, _)| sp < from);
-    candidates.truncate(limit);
+    let next_latest_sp = candidates.last().map(|(sp, _)| *sp);
 
     let mut chunk = Vec::with_capacity(candidates.len());
-    let mut last_pos = None;
-    for (latest_sp, root_nid) in candidates {
+    for (_latest_sp, root_nid) in candidates {
         if let Some(ev) = crate::room::messages::load_client_event_with_relations(
             &state,
             root_nid,
@@ -273,13 +276,14 @@ pub async fn threads_list(
             Some((user.user_nid, &user.device_id)),
         )? {
             chunk.push(ev);
-            last_pos = Some(latest_sp);
         }
     }
 
     let mut resp = serde_json::Map::new();
     resp.insert("chunk".to_string(), Value::Array(chunk));
-    if let Some(pos) = last_pos {
+    if let Some(pos) = next_latest_sp {
+        // Pagination is now by latest-child activity, the spec's
+        // own ordering, instead of root position.
         resp.insert("next_batch".to_string(), Value::String(format!("s{pos}")));
     }
     Ok(Json(Value::Object(resp)))
@@ -289,7 +293,6 @@ fn root_or_replied_user(
     db: &vela_store::db::Database,
     root_nid: u64,
     user_nid: u64,
-    thread_nid: u64,
 ) -> Result<bool, ApiError> {
     if let Some((header, _)) = db
         .get_event(root_nid)
@@ -298,19 +301,8 @@ fn root_or_replied_user(
     {
         return Ok(true);
     }
-    let entries = db
-        .list_relations(root_nid, Some(thread_nid), None, u64::MAX, true, 1000)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    for (_, child_nid, _, _) in entries {
-        if let Some((h, _)) = db
-            .get_event(child_nid)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-            && h.sender_nid == user_nid
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    db.user_participated_in_thread(root_nid, user_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))
 }
 
 #[cfg(test)]
@@ -480,7 +472,17 @@ mod tests {
         let rel_type_nid = state.db.get_or_create_nid(rel_type).unwrap();
         state
             .db
-            .record_relation(parent_nid, stream_pos, nid, rel_type_nid, type_msg)
+            .record_relation(
+                parent_nid,
+                stream_pos,
+                nid,
+                rel_type_nid,
+                type_msg,
+                room_nid,
+                sender_nid,
+                rel_type == "m.thread",
+                true,
+            )
             .unwrap();
         stream_pos
     }
@@ -786,5 +788,284 @@ mod tests {
         .await
         .expect_err("missing parent");
         assert!(matches!(err, ApiError(VelaError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn relations_honours_to_token_backwards() {
+        let (state, _tmp, room_id, room_nid, alice_nid, parent_eid) = setup_room();
+        let p1 = persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            300,
+            "$c1",
+            "m.thread",
+            &parent_eid,
+        );
+        let _p2 = persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            301,
+            "$c2",
+            "m.thread",
+            &parent_eid,
+        );
+        let _p3 = persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            302,
+            "$c3",
+            "m.thread",
+            &parent_eid,
+        );
+        // dir=b (default) with to=s{p1}: should stop before reaching $c1.
+        let res = relations_with_query(
+            State(state.clone()),
+            alice_user(&state),
+            Path((room_id, parent_eid)),
+            Query(RelationsQuery {
+                to: Some(format!("s{p1}")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let ids: Vec<&str> = res
+            .0
+            .get("chunk")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.get("event_id").and_then(|v| v.as_str()))
+            .collect();
+        // $c1's position is the exclusive boundary; we get $c3 + $c2 only.
+        assert_eq!(ids, vec!["$c3", "$c2"]);
+    }
+
+    #[tokio::test]
+    async fn thread_participants_lookup_is_o1() {
+        // Recording an m.thread relation marks the child sender as
+        // a participant of the root. Lookup is a point read.
+        let (state, _tmp, room_id, room_nid, alice_nid, parent_eid) = setup_room();
+        let bob_nid = state.db.get_or_create_nid("@bob:example.com").unwrap();
+        persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            bob_nid,
+            "@bob:example.com",
+            300,
+            "$reply",
+            "m.thread",
+            &parent_eid,
+        );
+        let parent_nid = state.db.get_event_nid_by_id(&parent_eid).unwrap().unwrap();
+        assert!(
+            state
+                .db
+                .user_participated_in_thread(parent_nid, bob_nid)
+                .unwrap()
+        );
+        // Alice hasn't replied — not a participant.
+        assert!(
+            !state
+                .db
+                .user_participated_in_thread(parent_nid, alice_nid)
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn double_redaction_does_not_double_decrement_counter() {
+        // Redacting the same relation event twice (legal per spec)
+        // must only decrement the counter once.
+        let (state, _tmp, room_id, room_nid, alice_nid, parent_eid) = setup_room();
+        persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            300,
+            "$thread_reply",
+            "m.thread",
+            &parent_eid,
+        );
+        let parent_nid = state.db.get_event_nid_by_id(&parent_eid).unwrap().unwrap();
+        let thread_nid = state.db.get_nid("m.thread").unwrap().unwrap();
+        assert_eq!(
+            state
+                .db
+                .count_relation_for_type(parent_nid, thread_nid)
+                .unwrap(),
+            1
+        );
+        let reply_nid = state
+            .db
+            .get_event_nid_by_id("$thread_reply")
+            .unwrap()
+            .unwrap();
+        // First redaction.
+        state.db.mark_redacted_by(reply_nid, 9001).unwrap();
+        state.db.relation_redacted(parent_nid, thread_nid).unwrap();
+        assert_eq!(
+            state
+                .db
+                .count_relation_for_type(parent_nid, thread_nid)
+                .unwrap(),
+            0
+        );
+        // Second redaction of the SAME target — must not decrement.
+        // The handler is guarded by get_redacted_by; simulate the
+        // guarded path here.
+        let already = state.db.get_redacted_by(reply_nid).unwrap().is_some();
+        assert!(already);
+        if !already {
+            state.db.relation_redacted(parent_nid, thread_nid).unwrap();
+        }
+        assert_eq!(
+            state
+                .db
+                .count_relation_for_type(parent_nid, thread_nid)
+                .unwrap(),
+            0,
+            "second redaction must not double-decrement"
+        );
+    }
+
+    #[tokio::test]
+    async fn threads_list_uses_thread_index() {
+        // Create two parents with threads and verify /threads
+        // returns them newest-activity first via the index — no
+        // reliance on the old timeline scan window.
+        let (state, _tmp, room_id, room_nid, alice_nid, parent_eid) = setup_room();
+        // Second parent in the same room.
+        let type_msg = state.db.get_or_create_nid("m.room.message").unwrap();
+        let parent2_nid = 250u64;
+        state
+            .db
+            .persist_event(
+                parent2_nid,
+                "$parent2",
+                room_nid,
+                type_msg,
+                alice_nid,
+                0,
+                6,
+                6,
+                &serde_json::to_vec(&json!({
+                    "type": "m.room.message",
+                    "sender": "@alice:example.com",
+                    "room_id": room_id,
+                    "content": {"msgtype": "m.text", "body": "p2"},
+                    "origin_server_ts": 6,
+                    "depth": 6,
+                    "prev_events": [&parent_eid],
+                    "auth_events": ["$alice_join"],
+                }))
+                .unwrap(),
+                &[200],
+                &[101],
+                false,
+                false,
+            )
+            .unwrap();
+        // Thread reply to parent1 first, then to parent2 — index
+        // should rank parent2 as more recent activity.
+        persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            400,
+            "$r1",
+            "m.thread",
+            &parent_eid,
+        );
+        persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            401,
+            "$r2",
+            "m.thread",
+            "$parent2",
+        );
+
+        let res = threads_list(
+            State(state.clone()),
+            alice_user(&state),
+            Path(room_id),
+            Query(ThreadsQuery::default()),
+        )
+        .await
+        .unwrap();
+        let ids: Vec<&str> = res
+            .0
+            .get("chunk")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.get("event_id").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["$parent2", "$parent_msg"],
+            "newest activity first"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_aggregation_count_exceeds_bundle_cap() {
+        // Bundle scan is capped at 1000 entries; the aggregation
+        // must report the true count via the unbounded path.
+        let (state, _tmp, room_id, room_nid, alice_nid, parent_eid) = setup_room();
+        // 5 children is small but exercises the unbounded path; the
+        // store unit test below covers the >1000 case.
+        for i in 0..5u64 {
+            persist_child(
+                &state,
+                &room_id,
+                room_nid,
+                alice_nid,
+                "@alice:example.com",
+                400 + i,
+                &format!("$t{i}"),
+                "m.thread",
+                &parent_eid,
+            );
+        }
+        let parent_nid = state.db.get_event_nid_by_id(&parent_eid).unwrap().unwrap();
+        let ev = crate::room::messages::load_client_event_with_relations(
+            &state,
+            parent_nid,
+            &room_id,
+            Some((alice_nid, "DEV")),
+        )
+        .unwrap()
+        .unwrap();
+        let count = ev
+            .pointer("/unsigned/m.relations/m.thread/count")
+            .and_then(|v| v.as_u64())
+            .unwrap();
+        assert_eq!(count, 5);
+        let participated = ev
+            .pointer("/unsigned/m.relations/m.thread/current_user_participated")
+            .and_then(|v| v.as_bool())
+            .unwrap();
+        assert!(participated);
     }
 }

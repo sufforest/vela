@@ -57,6 +57,29 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     "event_redactions",
     "user_membership_pos",
     "event_relations",
+    // O(1) count of children per (parent_event_nid, rel_type_nid).
+    // Incremented on every record_relation, decremented when a
+    // relation event is redacted. Reads from the m.thread / m.replace
+    // aggregation path become a single point lookup instead of a
+    // prefix scan.
+    "relation_counts",
+    // Per-room thread roots ordered by latest m.thread activity.
+    // Key: (room_nid_be:8, !latest_child_sp:8, root_event_nid:8).
+    // Lets /threads return the freshest threads via a single
+    // ordered prefix scan instead of walking the room timeline.
+    "thread_index",
+    // Side lookup `(room_nid, root_nid) -> latest_child_sp` so
+    // thread_index inserts can delete the prior key for the same
+    // root before writing the new one. Without this, thread_index
+    // would accumulate stale (latest_sp, root) tuples.
+    "thread_root_latest",
+    // Thread participants set: presence of `(root_nid, user_nid)`
+    // means `user_nid` has at least one m.thread reply to the
+    // root. Lets `current_user_participated` be a single point
+    // lookup instead of a relations-prefix scan. Members are not
+    // removed on reply redaction (a redacted reply still counts
+    // as participation per spec).
+    "thread_participants",
     "user_filters",
     "user_pushers",
     "user_presence",
