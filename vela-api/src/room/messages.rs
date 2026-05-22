@@ -905,9 +905,11 @@ fn aggregate_replace(
     Ok(Some(json!({ "event": ev })))
 }
 
-/// Thread aggregation. Same shape as the pre-existing
-/// `compute_thread_aggregation` (kept compatible) but now driven by
-/// the same single relations scan as annotations/replaces.
+/// Thread aggregation. Count + current_user_participated come from
+/// a full-index scan via `count_relations_with_user_check` — the
+/// bundled relations scan that feeds the other aggregations is
+/// capped at 1000 entries, which would give a wrong count and a
+/// false-negative participated flag for popular threads.
 fn thread_summary(
     state: &AppState,
     event_nid: u64,
@@ -918,96 +920,40 @@ fn thread_summary(
     if threads.is_empty() {
         return Ok(None);
     }
-    let count = threads.len() as u64;
     let (latest_nid, _, _) = threads[0];
     let latest = load_client_event(state, latest_nid, room_id)?;
-    let participated = match user_nid {
-        Some(uid) => {
-            let root_sender_is_user = state
-                .db
-                .get_event(event_nid)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-                .map(|(h, _)| h.sender_nid == uid)
-                .unwrap_or(false);
-            root_sender_is_user
-                || threads.iter().any(|(child_nid, _, _)| {
-                    state
-                        .db
-                        .get_event(*child_nid)
-                        .ok()
-                        .flatten()
-                        .map(|(h, _)| h.sender_nid == uid)
-                        .unwrap_or(false)
-                })
-        }
-        None => false,
-    };
-    let mut agg = serde_json::Map::new();
-    if let Some(l) = latest {
-        agg.insert("latest_event".to_string(), l);
-    }
-    agg.insert("count".to_string(), json!(count));
-    if user_nid.is_some() {
-        agg.insert("current_user_participated".to_string(), json!(participated));
-    }
-    Ok(Some(Value::Object(agg)))
-}
-
-/// Build the `m.thread` aggregation object per spec §Threading. Returns
-/// `None` when the event has no thread children (the common case).
-#[allow(dead_code)]
-fn compute_thread_aggregation(
-    state: &AppState,
-    event_nid: u64,
-    room_id: &str,
-    user_nid: Option<u64>,
-) -> Result<Option<Value>, ApiError> {
     let thread_nid = match state
         .db
         .get_nid("m.thread")
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
     {
         Some(n) => n,
-        None => return Ok(None),
+        // Shouldn't happen — we got here because thread children
+        // exist, so the nid must have been minted. Fall back to the
+        // bounded count rather than crashing.
+        None => {
+            return Ok(Some(json!({
+                "count": threads.len() as u64,
+                "latest_event": latest,
+            })));
+        }
     };
-    // Pull a generous window — we only need a count and the latest entry, so
-    // the window can be large enough to make the count meaningful for typical
-    // threads. Heavy threads are paginated separately via /relations.
-    let entries = state
+    let (count, any_child_is_user) = state
         .db
-        .list_relations(event_nid, Some(thread_nid), None, u64::MAX, true, 1000)
+        .count_relations_with_user_check(event_nid, thread_nid, user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    if entries.is_empty() {
-        return Ok(None);
-    }
-
-    let count = entries.len() as u64;
-    let (_latest_sp, latest_nid, _, _) = entries[0];
-    let latest = load_client_event(state, latest_nid, room_id)?;
-
     let participated = match user_nid {
         Some(uid) => {
-            // Cheap check: was the root sender uid? If so, true.
             let root_sender_is_user = state
                 .db
                 .get_event(event_nid)
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
                 .map(|(h, _)| h.sender_nid == uid)
                 .unwrap_or(false);
-            root_sender_is_user
-                || entries.iter().any(|(_, child_nid, _, _)| {
-                    state
-                        .db
-                        .get_event(*child_nid)
-                        .ok()
-                        .flatten()
-                        .map(|(h, _)| h.sender_nid == uid)
-                        .unwrap_or(false)
-                })
+            root_sender_is_user || any_child_is_user
         }
         None => false,
     };
-
     let mut agg = serde_json::Map::new();
     if let Some(l) = latest {
         agg.insert("latest_event".to_string(), l);

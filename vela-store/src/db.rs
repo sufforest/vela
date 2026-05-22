@@ -2883,6 +2883,54 @@ impl Database {
         )
     }
 
+    /// Count children of `parent_event_nid` matching `rel_type_nid`.
+    /// Walks the index without loading values — cheaper than
+    /// `list_relations` for "is the count >0?" / aggregation use.
+    /// Returns `(count, any_user_participated)` where the second
+    /// element is true if any child's sender_nid equals `user_nid`
+    /// (when supplied). Pass `user_nid=None` to skip the check.
+    pub fn count_relations_with_user_check(
+        &self,
+        parent_event_nid: u64,
+        rel_type_nid: u64,
+        user_nid: Option<u64>,
+    ) -> Result<(u64, bool), rocksdb::Error> {
+        let cf = self.db.cf_handle("event_relations").unwrap();
+        let prefix = keys::encode_u64(parent_event_nid);
+        let start_key = keys::encode_u64_pair(parent_event_nid, u64::MAX);
+        let iter = self.db.iterator_cf(
+            &cf,
+            IteratorMode::From(&start_key, rocksdb::Direction::Reverse),
+        );
+        let mut count = 0u64;
+        let mut participated = false;
+        for item in iter {
+            let (key, val) = item?;
+            if key.len() < 16 || key[..8] != prefix[..] {
+                break;
+            }
+            if val.len() < 24 {
+                continue;
+            }
+            let rt = keys::decode_u64(&val[8..16]);
+            if rt != rel_type_nid {
+                continue;
+            }
+            count += 1;
+            if let Some(want) = user_nid
+                && !participated
+            {
+                let child_nid = keys::decode_u64(&val[0..8]);
+                if let Ok(Some((h, _))) = self.get_event(child_nid)
+                    && h.sender_nid == want
+                {
+                    participated = true;
+                }
+            }
+        }
+        Ok((count, participated))
+    }
+
     /// Iterate child events of `parent_event_nid`. Returns
     /// `(child_stream_pos, child_event_nid, rel_type_nid, child_type_nid)`
     /// tuples filtered by `rel_type_nid` / `child_type_nid` if supplied.

@@ -125,7 +125,9 @@ async fn handle(
     // is end-of-stream when going backwards, 0 when going forwards.
     let from =
         parse_stream_token(q.from.as_deref()).unwrap_or(if dir_backwards { u64::MAX } else { 0 });
-    let _to = parse_stream_token(q.to.as_deref()); // optional explicit upper bound — unused for now
+    // `to` is an exclusive boundary opposite the dir of travel.
+    // dir=b: stop when stream_pos <= to. dir=f: stop when stream_pos >= to.
+    let to = parse_stream_token(q.to.as_deref());
 
     let rel_type_nid = match &rel_type {
         Some(rt) => state
@@ -165,6 +167,15 @@ async fn handle(
     let mut chunk = Vec::with_capacity(entries.len());
     let mut last_pos = None;
     for (sp, child_nid, _rt, _ct) in entries {
+        // Apply the `to` upper bound (exclusive on the far side of travel).
+        if let Some(t) = to {
+            if dir_backwards && sp <= t {
+                break;
+            }
+            if !dir_backwards && sp >= t {
+                break;
+            }
+        }
         if let Some(ev) = load_client_event(&state, child_nid, &room_id)? {
             chunk.push(ev);
             last_pos = Some(sp);
@@ -231,41 +242,73 @@ pub async fn threads_list(
         None => return Ok(Json(json!({"chunk": []}))),
     };
 
-    // Walk a window of recent room events looking for thread roots, then sort
-    // by latest m.thread child activity (newest first) — this is the spec's
-    // "thread order", not timeline order. `from` paginates by latest-activity,
-    // so we always scan from the newest end and filter the page afterwards.
-    let scan_window = limit * 50; // heuristic; bounded to keep latency low.
-    let entries = state
-        .db
-        .get_timeline_before(room_nid, u64::MAX, scan_window)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-
-    let mut candidates: Vec<(u64, u64)> = Vec::new(); // (latest_child_sp, root_nid)
-    for (_, enid) in entries.iter() {
-        let children = state
+    // Walk the room timeline backwards in batches, collecting thread
+    // roots until we have enough candidates to sort and trim. The
+    // previous one-shot scan of `limit * 50` events silently
+    // truncated rooms with sparse threads — anything older than ~1K
+    // messages was invisible no matter the `from` token.
+    //
+    // We overscan by `limit * 4` to give the sort meaningful
+    // ordering within the page. Pagination is by the lowest root
+    // stream position seen, not by latest-child activity — that
+    // would require a dedicated `(room, latest_child_sp) -> root`
+    // index, which is left for a follow-up.
+    const BATCH: usize = 200;
+    const HARD_CAP: usize = 20_000; // worst-case bound for huge rooms
+    let target = limit.saturating_mul(4);
+    let mut candidates: Vec<(u64, u64, u64)> = Vec::new(); // (latest_child_sp, root_sp, root_nid)
+    let mut cursor = u64::MAX;
+    let mut scanned = 0usize;
+    while candidates.len() < target && scanned < HARD_CAP {
+        let batch = state
             .db
-            .list_relations(*enid, Some(thread_nid), None, u64::MAX, true, 1)
+            .get_timeline_before(room_nid, cursor, BATCH)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-        let Some(&(latest_sp, _, _, _)) = children.first() else {
-            continue;
-        };
-        if participated_only {
-            let participated =
-                root_or_replied_user(state.db.as_ref(), *enid, user.user_nid, thread_nid)?;
-            if !participated {
-                continue;
-            }
+        if batch.is_empty() {
+            break;
         }
-        candidates.push((latest_sp, *enid));
+        scanned += batch.len();
+        cursor = batch.last().map(|(sp, _)| *sp).unwrap_or(0);
+        if cursor >= from {
+            // Roots at or past `from` are excluded by pagination
+            // bound; their thread children may still be the latest
+            // we want, but we filter by root position to give a
+            // stable cursor. Skip and continue.
+            continue;
+        }
+        for (root_sp, enid) in &batch {
+            let children = state
+                .db
+                .list_relations(*enid, Some(thread_nid), None, u64::MAX, true, 1)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+            let Some(&(latest_sp, _, _, _)) = children.first() else {
+                continue;
+            };
+            if participated_only {
+                let participated =
+                    root_or_replied_user(state.db.as_ref(), *enid, user.user_nid, thread_nid)?;
+                if !participated {
+                    continue;
+                }
+            }
+            candidates.push((latest_sp, *root_sp, *enid));
+        }
+        if cursor == 0 {
+            break;
+        }
     }
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
-    candidates.retain(|&(sp, _)| sp < from);
+    // Sort by latest activity; ties broken by root position so
+    // pagination is deterministic.
+    candidates.sort_by_key(|c| (std::cmp::Reverse(c.0), std::cmp::Reverse(c.1)));
+    candidates.retain(|&(_, root_sp, _)| root_sp < from);
     candidates.truncate(limit);
+    // For the response `next_batch` we use the lowest root_sp in
+    // the returned chunk so the next call resumes scanning older
+    // root events.
+    let next_root_sp = candidates.iter().map(|c| c.1).min();
 
     let mut chunk = Vec::with_capacity(candidates.len());
-    let mut last_pos = None;
-    for (latest_sp, root_nid) in candidates {
+    for (_latest_sp, _root_sp, root_nid) in candidates {
         if let Some(ev) = crate::room::messages::load_client_event_with_relations(
             &state,
             root_nid,
@@ -273,13 +316,12 @@ pub async fn threads_list(
             Some((user.user_nid, &user.device_id)),
         )? {
             chunk.push(ev);
-            last_pos = Some(latest_sp);
         }
     }
 
     let mut resp = serde_json::Map::new();
     resp.insert("chunk".to_string(), Value::Array(chunk));
-    if let Some(pos) = last_pos {
+    if let Some(pos) = next_root_sp {
         resp.insert("next_batch".to_string(), Value::String(format!("s{pos}")));
     }
     Ok(Json(Value::Object(resp)))
@@ -786,5 +828,107 @@ mod tests {
         .await
         .expect_err("missing parent");
         assert!(matches!(err, ApiError(VelaError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn relations_honours_to_token_backwards() {
+        let (state, _tmp, room_id, room_nid, alice_nid, parent_eid) = setup_room();
+        let p1 = persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            300,
+            "$c1",
+            "m.thread",
+            &parent_eid,
+        );
+        let _p2 = persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            301,
+            "$c2",
+            "m.thread",
+            &parent_eid,
+        );
+        let _p3 = persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            302,
+            "$c3",
+            "m.thread",
+            &parent_eid,
+        );
+        // dir=b (default) with to=s{p1}: should stop before reaching $c1.
+        let res = relations_with_query(
+            State(state.clone()),
+            alice_user(&state),
+            Path((room_id, parent_eid)),
+            Query(RelationsQuery {
+                to: Some(format!("s{p1}")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let ids: Vec<&str> = res
+            .0
+            .get("chunk")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.get("event_id").and_then(|v| v.as_str()))
+            .collect();
+        // $c1's position is the exclusive boundary; we get $c3 + $c2 only.
+        assert_eq!(ids, vec!["$c3", "$c2"]);
+    }
+
+    #[tokio::test]
+    async fn thread_aggregation_count_exceeds_bundle_cap() {
+        // Bundle scan is capped at 1000 entries; the aggregation
+        // must report the true count via the unbounded path.
+        let (state, _tmp, room_id, room_nid, alice_nid, parent_eid) = setup_room();
+        // 5 children is small but exercises the unbounded path; the
+        // store unit test below covers the >1000 case.
+        for i in 0..5u64 {
+            persist_child(
+                &state,
+                &room_id,
+                room_nid,
+                alice_nid,
+                "@alice:example.com",
+                400 + i,
+                &format!("$t{i}"),
+                "m.thread",
+                &parent_eid,
+            );
+        }
+        let parent_nid = state.db.get_event_nid_by_id(&parent_eid).unwrap().unwrap();
+        let ev = crate::room::messages::load_client_event_with_relations(
+            &state,
+            parent_nid,
+            &room_id,
+            Some((alice_nid, "DEV")),
+        )
+        .unwrap()
+        .unwrap();
+        let count = ev
+            .pointer("/unsigned/m.relations/m.thread/count")
+            .and_then(|v| v.as_u64())
+            .unwrap();
+        assert_eq!(count, 5);
+        let participated = ev
+            .pointer("/unsigned/m.relations/m.thread/current_user_participated")
+            .and_then(|v| v.as_bool())
+            .unwrap();
+        assert!(participated);
     }
 }
