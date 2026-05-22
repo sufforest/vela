@@ -1253,13 +1253,20 @@ fn try_apply_redaction_marker(state: &AppState, room_nid: u64, pdu: &Pdu, redact
         return;
     }
 
+    let already_redacted = state
+        .db
+        .get_redacted_by(target_nid)
+        .ok()
+        .flatten()
+        .is_some();
     if let Err(e) = state.db.mark_redacted_by(target_nid, redactor_nid) {
         warn!(target = %target_id, error = %e, "failed to record redaction marker");
     }
-    // Same counter-decrement story as the local redaction path —
-    // keeps the parent's bundled aggregation accurate when a child
-    // relation is redacted by a remote.
-    if let Some(rel) = target_pdu.content.get("m.relates_to")
+    // Decrement the (parent, rel_type) counter only on the FIRST
+    // redaction of this target — same idempotency story as the
+    // local redaction path.
+    if !already_redacted
+        && let Some(rel) = target_pdu.content.get("m.relates_to")
         && let Some(parent_event_id) = rel.get("event_id").and_then(|v| v.as_str())
         && let Some(rel_type) = rel.get("rel_type").and_then(|v| v.as_str())
         && let Ok(Some(parent_nid)) = state.db.get_event_nid_by_id(parent_event_id)

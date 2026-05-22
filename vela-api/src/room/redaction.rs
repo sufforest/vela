@@ -234,14 +234,22 @@ pub async fn redact_event(
     // redaction is still federated to remote servers; they apply
     // their own copy.
     if let Some((target_nid, target_pdu)) = &target {
+        // Check before marking so a second redaction of the same
+        // target doesn't double-decrement the (parent, rel_type)
+        // counter. Spec allows multiple redactions of one event; we
+        // only count the first.
+        let already_redacted = state
+            .db
+            .get_redacted_by(*target_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            .is_some();
         state
             .db
             .mark_redacted_by(*target_nid, event_nid)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-        // If the redacted event was itself a relation, decrement
-        // its (parent, rel_type) counter so the parent's bundled
-        // aggregations stay accurate.
-        decrement_relation_count_if_relation(&state, &target_pdu.content);
+        if !already_redacted {
+            decrement_relation_count_if_relation(&state, &target_pdu.content);
+        }
     }
 
     state.federation_sender.broadcast(room_nid, event_nid);

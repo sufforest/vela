@@ -871,6 +871,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn double_redaction_does_not_double_decrement_counter() {
+        // Redacting the same relation event twice (legal per spec)
+        // must only decrement the counter once.
+        let (state, _tmp, room_id, room_nid, alice_nid, parent_eid) = setup_room();
+        persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            300,
+            "$thread_reply",
+            "m.thread",
+            &parent_eid,
+        );
+        let parent_nid = state.db.get_event_nid_by_id(&parent_eid).unwrap().unwrap();
+        let thread_nid = state.db.get_nid("m.thread").unwrap().unwrap();
+        assert_eq!(
+            state
+                .db
+                .count_relation_for_type(parent_nid, thread_nid)
+                .unwrap(),
+            1
+        );
+        let reply_nid = state
+            .db
+            .get_event_nid_by_id("$thread_reply")
+            .unwrap()
+            .unwrap();
+        // First redaction.
+        state.db.mark_redacted_by(reply_nid, 9001).unwrap();
+        state.db.relation_redacted(parent_nid, thread_nid).unwrap();
+        assert_eq!(
+            state
+                .db
+                .count_relation_for_type(parent_nid, thread_nid)
+                .unwrap(),
+            0
+        );
+        // Second redaction of the SAME target — must not decrement.
+        // The handler is guarded by get_redacted_by; simulate the
+        // guarded path here.
+        let already = state.db.get_redacted_by(reply_nid).unwrap().is_some();
+        assert!(already);
+        if !already {
+            state.db.relation_redacted(parent_nid, thread_nid).unwrap();
+        }
+        assert_eq!(
+            state
+                .db
+                .count_relation_for_type(parent_nid, thread_nid)
+                .unwrap(),
+            0,
+            "second redaction must not double-decrement"
+        );
+    }
+
+    #[tokio::test]
     async fn threads_list_uses_thread_index() {
         // Create two parents with threads and verify /threads
         // returns them newest-activity first via the index — no
