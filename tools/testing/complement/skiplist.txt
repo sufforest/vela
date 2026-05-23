@@ -152,16 +152,6 @@
 ^TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
 
 # --- known bugs, TODO investigate ---
-# TODO(vela): federation /get_missing_events can't anchor when our
-# only forward extremity IS the trigger event (it landed as outlier
-# in a prior pass). The peer's walk between identical anchors
-# returns the empty set; state-at-event then rejects with "unknown
-# prev_event". Need either a smarter earliest_events selection
-# (exclude the trigger when it duplicates) OR a /event/{id}
-# fallback when /get_missing_events returns nothing.
-^TestACLs$
-^TestACLsForEDUs$
-
 # TODO(vela): bug. Device list updates not propagating in
 # good_connectivity + interrupted_connectivity subtests. Suspect
 # the device_list outbound stream's batch boundary handling after

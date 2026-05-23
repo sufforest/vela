@@ -484,6 +484,19 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
                 room_nid,
                 &mut state_at_event,
             );
+            // MSC3706 partial-state safety: if the room is still
+            // filling and state-at-event lacks the sender's
+            // m.room.member, fall back to their auth_events
+            // copy. Spec mandates auth_events contains the
+            // sender's membership for every non-state PDU, so
+            // this is a known-good substitute. No-op when state
+            // already has it.
+            crate::federation::federation_state::ensure_sender_member_in_state(
+                &state.db,
+                &effective_pdu.sender,
+                &effective_pdu.auth_events,
+                &mut state_at_event,
+            );
             let sf = |t: &str, sk: &str| state_at_event.get(&(t.to_string(), sk.to_string()));
             if let Err(AuthError::Rejected(reason)) = check_auth(&effective_pdu, &sf) {
                 let keys: Vec<String> = state_at_event
