@@ -10,7 +10,7 @@ pub mod timestamp;
 pub mod user_directory;
 
 use crate::middleware::json::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use vela_core::error::VelaError;
@@ -352,16 +352,57 @@ fn read_join_rule(state: &AppState, room_nid: u64) -> Result<String, ApiError> {
 
 /// GET /_matrix/client/v3/publicRooms
 ///
+#[derive(Debug, Default, Deserialize)]
+pub struct PublicRoomsQuery {
+    /// Remote homeserver to query instead of our local directory.
+    /// When set, we forward the request via
+    /// `POST /_matrix/federation/v1/publicRooms` and return the
+    /// peer's response. Without it, we serve our own directory.
+    #[serde(default)]
+    pub server: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
 /// Returns rooms visible in the directory. Without a dedicated published
 /// list, we surface joined rooms with `join_rule=public` as a useful
 /// approximation. Callers paginate via `limit` / `since`.
-pub async fn list_public_rooms(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+pub async fn list_public_rooms(
+    State(state): State<AppState>,
+    Query(q): Query<PublicRoomsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if let Some(server) = q.server.as_deref()
+        && server != state.config.server_name
+    {
+        return fetch_remote_public_rooms(&state, server, q.limit, q.since.as_deref(), None).await;
+    }
     let chunk = collect_public_rooms(&state, None)?;
     let total = chunk.len() as u64;
     Ok(Json(json!({
         "chunk": chunk,
         "total_room_count_estimate": total,
     })))
+}
+
+async fn fetch_remote_public_rooms(
+    state: &AppState,
+    server: &str,
+    limit: Option<u64>,
+    since: Option<&str>,
+    search_term: Option<&str>,
+) -> Result<Json<Value>, ApiError> {
+    state
+        .federation_client
+        .fetch_public_rooms(server, limit, since, search_term)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            ApiError(VelaError::Store(format!(
+                "remote publicRooms ({server}) failed: {e}"
+            )))
+        })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -390,14 +431,27 @@ pub struct PublicRoomsBody {
 pub async fn search_public_rooms(
     State(state): State<AppState>,
     _user: AuthenticatedUser,
+    Query(q): Query<PublicRoomsQuery>,
     Json(body): Json<PublicRoomsBody>,
 ) -> Result<Json<Value>, ApiError> {
     let term = body
         .filter
         .as_ref()
-        .and_then(|f| f.generic_search_term.as_deref())
-        .map(|s| s.to_lowercase());
-    let chunk = collect_public_rooms(&state, term.as_deref())?;
+        .and_then(|f| f.generic_search_term.as_deref());
+    if let Some(server) = q.server.as_deref()
+        && server != state.config.server_name
+    {
+        return fetch_remote_public_rooms(
+            &state,
+            server,
+            q.limit.or(body.limit.map(|l| l as u64)),
+            q.since.as_deref().or(body.since.as_deref()),
+            term,
+        )
+        .await;
+    }
+    let lowered = term.map(|s| s.to_lowercase());
+    let chunk = collect_public_rooms(&state, lowered.as_deref())?;
     let total = chunk.len() as u64;
     Ok(Json(json!({
         "chunk": chunk,

@@ -10,6 +10,12 @@ minor versions.
 
 ### Added
 
+- **`?server=` on `/publicRooms`.** GET/POST `/_matrix/client/v3/publicRooms`
+  now accept the `server` query param. When set to a remote homeserver
+  name, vela forwards the request via
+  `POST /_matrix/federation/v1/publicRooms` and returns the peer's
+  response. Clients can browse other homeservers' directories without
+  having to talk to them directly.
 - **Complement in CI.** The Matrix spec-compliance suite now runs on
   every PR via `.github/workflows/complement.yml`. Image build is
   cached through buildkit's GHA backend; the existing

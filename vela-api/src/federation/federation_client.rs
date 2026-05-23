@@ -617,6 +617,42 @@ impl FederationClient {
     /// object (`{origin, origin_server_ts, pdus: [event]}`); we
     /// return just the PDU value, leaving validation / persistence
     /// to the caller via `persist_fetched_event`.
+    /// `POST /_matrix/federation/v1/publicRooms` — fetch a remote
+    /// server's published room directory. Used to back the C2S
+    /// `/publicRooms?server=other.example` query so our local
+    /// clients can browse another homeserver's directory without
+    /// having to talk to it directly. Returns the peer's
+    /// `{chunk, total_room_count_estimate, next_batch?, prev_batch?}`
+    /// shape verbatim.
+    pub async fn fetch_public_rooms(
+        &self,
+        destination: &str,
+        limit: Option<u64>,
+        since: Option<&str>,
+        search_term: Option<&str>,
+    ) -> Result<Value, FederationClientError> {
+        let mut body = serde_json::Map::new();
+        if let Some(l) = limit {
+            body.insert("limit".to_string(), serde_json::json!(l));
+        }
+        if let Some(s) = since {
+            body.insert("since".to_string(), serde_json::json!(s));
+        }
+        if let Some(term) = search_term {
+            body.insert(
+                "filter".to_string(),
+                serde_json::json!({"generic_search_term": term}),
+            );
+        }
+        self.signed_request(
+            reqwest::Method::POST,
+            destination,
+            "/_matrix/federation/v1/publicRooms",
+            Some(Value::Object(body)),
+        )
+        .await
+    }
+
     pub async fn fetch_event_pdu(
         &self,
         destination: &str,
