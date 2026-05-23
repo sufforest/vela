@@ -152,24 +152,13 @@
 ^TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
 
 # --- known bugs, TODO investigate ---
-# TODO(vela): regression introduced by the fetch_missing_events
-# extremity-filter fix (PR #87). The sub-subtest
-# joining_a_remote_manually_upgraded_room_carries_over_existing_push_rules
-# now times out on /sync waiting for the new room's push rule to
-# appear. Likely related to federation-receive sequencing around
-# the manual room upgrade + remote join. Investigate before bumping
-# Complement ref.
-^TestPushRuleRoomUpgrade$
-
-# TODO(vela): federation state-resolution gap. After the extremity-
-# filter fix in fetch_missing_events let us get past the missing-
-# prev_event rejection, the failure moved one layer deeper:
-# state-at-event resolves to a snapshot missing the sender's
-# membership event ("@user-2:hs2 not joined"), even though the
-# sender did join earlier in the test flow. Likely the cached
-# state snapshot at the parent event predates the join, or the
-# join didn't federate to hs3 / was rejected by hs3 silently.
-# Needs trace of compute_state_at_event for these events.
+# TODO(vela): federation /get_missing_events can't anchor when our
+# only forward extremity IS the trigger event (it landed as outlier
+# in a prior pass). The peer's walk between identical anchors
+# returns the empty set; state-at-event then rejects with "unknown
+# prev_event". Need either a smarter earliest_events selection
+# (exclude the trigger when it duplicates) OR a /event/{id}
+# fallback when /get_missing_events returns nothing.
 ^TestACLs$
 ^TestACLsForEDUs$
 
