@@ -88,6 +88,14 @@ impl TypingStream {
         }
         let key = (room_id.to_string(), user_id.to_string());
         for dest in servers {
+            // Skip destinations the room's server_acl denies. Otherwise
+            // a banned peer would still see our local users' typing
+            // indicators via this EDU stream.
+            if crate::federation::server_acl::check_server_acl_db(&self.db, room_nid, &dest)
+                .is_some()
+            {
+                continue;
+            }
             self.buffers
                 .entry(dest)
                 .or_default()

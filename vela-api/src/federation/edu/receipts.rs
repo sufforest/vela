@@ -109,6 +109,14 @@ impl EduStream for ReceiptStream {
             if !servers.iter().any(|s| s == destination) {
                 continue;
             }
+            // server_acl: skip if the destination is denied for this
+            // room. A banned peer should not be able to track our
+            // local users' read positions even via inbound EDU pull.
+            if crate::federation::server_acl::check_server_acl_db(db, room_nid, destination)
+                .is_some()
+            {
+                continue;
+            }
 
             let Some(room_id) = nid_to_string(db, room_nid) else {
                 continue;

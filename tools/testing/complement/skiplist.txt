@@ -170,8 +170,10 @@
 ^TestJumpToDateEndpoint/parallel/federation
 ^TestJumpToDateEndpoint/parallel/from$
 
-# TODO(vela): MSC4306 push rule
-# `.io.element.msc4306.rule.subscribed_thread` not implemented;
-# /pushrules returns 404 for it. Test would pass once we ship the
-# default push rule for subscribed threads.
+# TODO(vela): per-thread unread notification counts. The 404 on
+# `.io.element.msc4306.rule.subscribed_thread` shown in the log is
+# tolerated by the test — the real failure is /sync not returning
+# per-thread `unread_thread_notifications` counts under the MSC3773
+# filter. Requires tracking unread-per-(room, thread) and surfacing
+# it in the room's unread_thread_notifications object.
 ^TestThreadedReceipts$
