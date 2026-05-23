@@ -8,6 +8,14 @@ minor versions.
 
 ## [Unreleased]
 
+### Added
+
+- **Complement in CI.** The Matrix spec-compliance suite now runs on
+  every PR via `.github/workflows/complement.yml`. Image build is
+  cached through buildkit's GHA backend; the existing
+  `tools/testing/complement/{run.sh,skiplist.txt}` runner is reused
+  unmodified so local and CI behaviour stay aligned.
+
 ### Fixed
 
 - **Federated messages didn't trigger push notifications.** The push
