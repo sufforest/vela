@@ -152,10 +152,14 @@
 ^TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
 
 # --- known bugs, TODO investigate ---
-# TODO(vela): bug. /sync of a third homeserver fails to surface a
-# message sent into the room after server_acl is set. May be a
-# federation backfill or ACL+sync interaction. Needs deeper trace.
-^TestACLs$
+# TODO(vela): federation event resolution gap, not an ACL bug.
+# When hs3 has the trigger event as its only forward extremity AND
+# a follow-up PDU references a prev_event we don't have, our
+# /get_missing_events call passes empty earliest_events and the
+# peer returns nothing useful. Need to fall back to /event/{id}
+# direct fetch when /get_missing_events can't anchor. TestACLs
+# itself now passes thanks to the extremity-filter fix; TestACLsForEDUs
+# hits this narrower scenario.
 ^TestACLsForEDUs$
 
 # TODO(vela): bug. Device list updates not propagating in

@@ -1476,8 +1476,18 @@ async fn fetch_missing_events(
     // /sync timeline truncation (typically 20) drops events from before
     // the gap, preserving the spec's "limited batch contains only post-gap
     // events" expectation without an explicit pre/post-gap split.
+    // Exclude `latest_event_id` from `earliest_events`. The peer's
+    // /get_missing_events walks back from `latest_events` until it
+    // hits something in `earliest_events`; if the trigger event we're
+    // trying to fill UP TO is itself in our extremity list (it landed
+    // as an outlier or a prior accept), the search returns the empty
+    // set and the gap never fills.
+    let earliest_filtered: Vec<&String> = earliest_event_ids
+        .iter()
+        .filter(|id| id.as_str() != latest_event_id)
+        .collect();
     let body = serde_json::json!({
-        "earliest_events": earliest_event_ids,
+        "earliest_events": earliest_filtered,
         "latest_events": [latest_event_id],
         "limit": 50,
     });
@@ -1516,7 +1526,7 @@ async fn fetch_missing_events(
         )
         .await
         {
-            debug!(error = %e, "skipping fetched missing event");
+            warn!(error = %e, "skipping fetched missing event");
             continue;
         }
         accepted += 1;
