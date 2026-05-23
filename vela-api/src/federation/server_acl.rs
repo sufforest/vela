@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use crate::middleware::json::Json;
 use crate::router::AppState;
+use vela_store::db::Database;
 
 /// Federation-handler convenience wrapper: 403 with `server_acl:`
 /// reason when the origin is banned, `Ok(())` otherwise.
@@ -50,7 +51,13 @@ pub(crate) fn check_server_acl(
     room_nid: u64,
     sender_domain: &str,
 ) -> Option<String> {
-    let acl = load_room_state_content(state, room_nid, "m.room.server_acl", "")?;
+    check_server_acl_db(&state.db, room_nid, sender_domain)
+}
+
+/// `Database`-only variant for code paths (EDU streams) that don't
+/// carry a full `AppState`. Same semantics as `check_server_acl`.
+pub fn check_server_acl_db(db: &Database, room_nid: u64, sender_domain: &str) -> Option<String> {
+    let acl = load_room_state_content_db(db, room_nid, "m.room.server_acl", "")?;
 
     let allow_ip_literals = acl
         .get("allow_ip_literals")
@@ -83,20 +90,19 @@ pub(crate) fn check_server_acl(
     None
 }
 
-fn load_room_state_content(
-    state: &AppState,
+fn load_room_state_content_db(
+    db: &Database,
     room_nid: u64,
     event_type: &str,
     state_key: &str,
 ) -> Option<Value> {
-    let type_nid = state.db.get_nid(event_type).ok().flatten()?;
-    let sk_nid = state.db.get_nid(state_key).ok().flatten()?;
-    let event_nid = state
-        .db
+    let type_nid = db.get_nid(event_type).ok().flatten()?;
+    let sk_nid = db.get_nid(state_key).ok().flatten()?;
+    let event_nid = db
         .get_state_event_nid(room_nid, type_nid, sk_nid)
         .ok()
         .flatten()?;
-    let (_h, bytes) = state.db.get_event(event_nid).ok().flatten()?;
+    let (_h, bytes) = db.get_event(event_nid).ok().flatten()?;
     let v: Value = serde_json::from_slice(&bytes).ok()?;
     v.get("content").cloned()
 }

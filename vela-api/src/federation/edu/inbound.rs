@@ -358,6 +358,16 @@ async fn handle_receipt(state: &AppState, origin: &str, content: &Value) {
             continue;
         };
 
+        // Per-room m.room.server_acl applies to receipts. A peer
+        // banned from a room must not be able to advance our local
+        // users' read-marker views via a federated receipt.
+        if let Some(reason) =
+            crate::federation::server_acl::check_server_acl(state, room_nid, origin)
+        {
+            debug!(%origin, %room_id, %reason, "dropping m.receipt: server_acl deny");
+            continue;
+        }
+
         for (receipt_type, users_map) in types {
             // Spec carves out `m.read.private` as a per-user-per-server
             // marker that MUST NOT be federated. If we received one,
@@ -545,6 +555,13 @@ async fn handle_typing(state: &AppState, origin: &str, content: &Value) {
     let Ok(Some(room_nid)) = state.db.get_nid(room_id) else {
         return;
     };
+
+    // server_acl gate: a peer banned from the room must not be able
+    // to surface typing indicators on our local /sync.
+    if let Some(reason) = crate::federation::server_acl::check_server_acl(state, room_nid, origin) {
+        debug!(%origin, %room_id, %reason, "dropping m.typing: server_acl deny");
+        return;
+    }
     let user_nid = match state.db.get_or_create_nid(user_id) {
         Ok(n) => n,
         Err(e) => {

@@ -152,9 +152,13 @@
 ^TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
 
 # --- known bugs, TODO investigate ---
-# TODO(vela): bug. /sync of a third homeserver fails to surface a
-# message sent into the room after server_acl is set. May be a
-# federation backfill or ACL+sync interaction. Needs deeper trace.
+# TODO(vela): federation /get_missing_events can't anchor when our
+# only forward extremity IS the trigger event (it landed as outlier
+# in a prior pass). The peer's walk between identical anchors
+# returns the empty set; state-at-event then rejects with "unknown
+# prev_event". Need either a smarter earliest_events selection
+# (exclude the trigger when it duplicates) OR a /event/{id}
+# fallback when /get_missing_events returns nothing.
 ^TestACLs$
 ^TestACLsForEDUs$
 
@@ -170,8 +174,10 @@
 ^TestJumpToDateEndpoint/parallel/federation
 ^TestJumpToDateEndpoint/parallel/from$
 
-# TODO(vela): MSC4306 push rule
-# `.io.element.msc4306.rule.subscribed_thread` not implemented;
-# /pushrules returns 404 for it. Test would pass once we ship the
-# default push rule for subscribed threads.
+# TODO(vela): per-thread unread notification counts. The 404 on
+# `.io.element.msc4306.rule.subscribed_thread` shown in the log is
+# tolerated by the test — the real failure is /sync not returning
+# per-thread `unread_thread_notifications` counts under the MSC3773
+# filter. Requires tracking unread-per-(room, thread) and surfacing
+# it in the room's unread_thread_notifications object.
 ^TestThreadedReceipts$
