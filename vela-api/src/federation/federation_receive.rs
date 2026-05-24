@@ -1796,7 +1796,20 @@ async fn persist_fetched_event_inner(
             "fetched event {} failed check 4: {reason}",
             target_pdu.event_id
         );
-        let _ = state.db.mark_event_rejected(&target_pdu.event_id, &full);
+        // "no m.room.create in state" is a transient local-state hole,
+        // not a real auth violation — it fires when a federation
+        // transaction's auth-chain backfill races our send_join state
+        // persistence on the same room. Marking the event rejected
+        // here turns a temporary gap into a permanent cascade: the
+        // ban PDU that triggered the fetch sees its auth_event on
+        // the rejected list and gets rejected too, even after our
+        // state is fully populated (TestUnbanViaInvite). Defer
+        // rejection for this case so a later retransmission (or a
+        // re-fetch via /event_auth) revalidates against the
+        // populated state.
+        if !reason.contains("no m.room.create in state") {
+            let _ = state.db.mark_event_rejected(&target_pdu.event_id, &full);
+        }
         return Err(full);
     }
 
