@@ -154,10 +154,3 @@
 # --- known bugs, TODO investigate ---
 ^TestJumpToDateEndpoint/parallel/from$
 
-# TODO(vela): per-thread unread notification counts. The 404 on
-# `.io.element.msc4306.rule.subscribed_thread` shown in the log is
-# tolerated by the test — the real failure is /sync not returning
-# per-thread `unread_thread_notifications` counts under the MSC3773
-# filter. Requires tracking unread-per-(room, thread) and surfacing
-# it in the room's unread_thread_notifications object.
-^TestThreadedReceipts$

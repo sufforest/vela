@@ -1194,7 +1194,7 @@ fn recipient_room_displayname(
     {
         return Some(name.to_string());
     }
-    state
+    if let Some(profile_name) = state
         .db
         .get_user(user_nid)
         .ok()
@@ -1204,6 +1204,20 @@ fn recipient_room_displayname(
                 .and_then(|v| v.as_str())
                 .map(String::from)
         })
+        .filter(|s| !s.is_empty())
+    {
+        return Some(profile_name);
+    }
+    // Spec doesn't mandate a default display name, but every server
+    // in the ecosystem (Synapse, Dendrite) treats the localpart as the
+    // de-facto display name when the user hasn't customised. Without
+    // this fallback, `.m.rule.contains_display_name` can never fire
+    // for fresh users — a message body containing `@bob:hs1` would
+    // need a literal "bob" display_name to highlight, which most test
+    // and integration setups never set (TestThreadedReceipts).
+    user_id_str
+        .strip_prefix('@')
+        .and_then(|s| s.split_once(':').map(|(local, _)| local.to_string()))
         .filter(|s| !s.is_empty())
 }
 
