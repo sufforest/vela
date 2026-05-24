@@ -152,12 +152,6 @@
 ^TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
 
 # --- known bugs, TODO investigate ---
-# TODO(vela): bug. Device list updates not propagating in
-# good_connectivity + interrupted_connectivity subtests. Suspect
-# the device_list outbound stream's batch boundary handling after
-# MSC3706 partial-state landed.
-^TestDeviceListsUpdateOverFederation$
-
 # TODO(vela): bug. /timestamp_to_event returns 403 / 404 for
 # federation-imported events. Federation backfill via this
 # endpoint missing entirely or auth-checking too strictly.

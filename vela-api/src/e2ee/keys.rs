@@ -860,39 +860,61 @@ fn federate_device_list_update(
 }
 
 /// Bookkeeping run when a local user joins (or is joined to) a room.
-/// Two effects, both required for `device_lists.changed` to behave
-/// correctly per spec:
+/// Per spec:
 ///
-/// 1. Record `record_device_key_change(joiner)` so all observers — the
-///    joiner's other devices and existing room-mates across all rooms —
-///    see the joiner in their next `/sync` `device_lists.changed`.
-///    Existing room-mates' clients re-`/keys/query` and discover any
-///    new device.
-/// 2. Record `notify_device_key_change(member, [joiner], pos)` for
-///    every other current member of the new room, so the joiner's own
-///    next `/sync` surfaces those members in `device_lists.changed`.
-///    The joiner is a "fresh" observer of those users — their device
-///    state is new information from the joiner's perspective.
+/// - Every other current member of the new room gets the joiner
+///   added to their next /sync `device_lists.changed`.
+/// - The joiner gets every other member added to its own /sync
+///   `device_lists.changed` (now-share-a-room semantics).
+/// - The joiner ALSO gets itself added — Synapse/Conduit do this
+///   so the joiner's other devices see the joiner. But ONLY when
+///   the room had members other than the joiner: a solo-create
+///   has no "share with anyone new" signal, and the spurious
+///   self-entry on every room creation races with later
+///   legitimate self-changes (alice2 logging in) and breaks
+///   `TestDeviceListsUpdateOverFederation/good_connectivity`.
 ///
 /// Federation: the outbound `m.device_list_update` EDUs are emitted
 /// by `federate_device_lists_on_join`; this helper is local-only.
 pub fn record_device_changes_on_join(state: &AppState, user_nid: u64, room_nid: u64) {
-    if let Err(e) = state.db.record_device_key_change(user_nid) {
-        tracing::warn!(error = %e, "record_device_key_change on join failed");
+    let members = state.db.get_room_members(room_nid).unwrap_or_default();
+    let other_members: Vec<u64> = members.iter().copied().filter(|&m| m != user_nid).collect();
+    if other_members.is_empty() {
+        // Solo room create: no shared-room peer, no spurious
+        // self-entry. (Skipping this was the fix for
+        // TestDeviceListsUpdateOverFederation/good_connectivity —
+        // the previous self-entry on every solo create raced with
+        // later legitimate self-changes like alice2 logging in.)
+        crate::router::notify_user(state, user_nid);
+        return;
     }
-    let stream_pos = state.db.next_stream_position().as_u64();
-    if let Ok(members) = state.db.get_room_members(room_nid) {
-        for member_nid in members {
-            if member_nid == user_nid {
-                continue;
-            }
-            if let Err(e) = state
-                .db
-                .notify_device_key_change(member_nid, &[user_nid], stream_pos)
-            {
-                tracing::warn!(error = %e, "notify_device_key_change on join failed");
-            }
+    // Each notify_device_key_change call writes one entry per
+    // observer at the given (observer, pos) key. We need separate
+    // positions per call so writes to the same observer key don't
+    // overwrite each other (joiner is the observer in two of the
+    // three writes below).
+    for &member_nid in &other_members {
+        let pos = state.db.next_stream_position().as_u64();
+        if let Err(e) = state
+            .db
+            .notify_device_key_change(member_nid, &[user_nid], pos)
+        {
+            tracing::warn!(error = %e, "notify_device_key_change on join (member) failed");
         }
+        let pos = state.db.next_stream_position().as_u64();
+        if let Err(e) = state
+            .db
+            .notify_device_key_change(user_nid, &[member_nid], pos)
+        {
+            tracing::warn!(error = %e, "notify_device_key_change on join (joiner-knows-member) failed");
+        }
+    }
+    let pos = state.db.next_stream_position().as_u64();
+    if let Err(e) = state
+        .db
+        .notify_device_key_change(user_nid, &[user_nid], pos)
+    {
+        tracing::warn!(error = %e, "notify_device_key_change on join (self) failed");
     }
     crate::router::notify_user(state, user_nid);
 }

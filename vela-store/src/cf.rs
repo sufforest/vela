@@ -34,6 +34,14 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     "to_device_messages",
     "key_backup",
     "device_key_changes",
+    // Highest m.device_list_update EDU stream_id we've persisted per
+    // (user_nid, device_id). Key: `[user_nid_be:8] | device_id_bytes`.
+    // Value: u64 BE. Used by `handle_device_list_update` to drop
+    // redelivered EDUs (peer restarts and re-sends from an
+    // unadvanced cursor) without creating a fresh
+    // `device_key_changes` entry — which would leak the same change
+    // into a later /sync window for the observer.
+    "device_list_edu_seen",
     "media_metadata",
     "receipts",
     // Generic small-value position tracking. Keys are
