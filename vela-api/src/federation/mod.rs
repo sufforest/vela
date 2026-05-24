@@ -396,10 +396,24 @@ pub async fn receive_transaction(
                 // Persist the rejection so descendant events that
                 // reference this one in `auth_events` can cascade-
                 // reject without needing to re-derive WHY the
-                // ancestor was rejected. Best-effort; a write
-                // failure here just means we lose cascade for this
-                // particular ancestor on this run.
+                // ancestor was rejected.
+                //
+                // EXCEPT for transient state-incompleteness rejections:
+                // a PDU broadcast that races our own outbound-join
+                // bootstrap on the same room gets rejected with
+                // "unknown room" (we haven't created the room nid
+                // yet) or with "no m.room.create in state" (we
+                // haven't promoted state yet). Marking those would
+                // poison any later PDU whose auth chain references
+                // them — even after our state is fully populated and
+                // the re-delivered PDU would otherwise be accepted
+                // (TestUnbanViaInvite: ban PDU cascade-rejected off
+                // alice's own join, which got marked rejected while
+                // her outbound_join was still in flight).
+                let is_transient =
+                    reason == "unknown room" || reason.contains("no m.room.create in state");
                 if !event_id.is_empty()
+                    && !is_transient
                     && let Err(e) = state.db.mark_event_rejected(&event_id, reason)
                 {
                     warn!(%txn_id, %event_id, error = %e, "mark_event_rejected failed");

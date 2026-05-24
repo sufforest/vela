@@ -272,6 +272,24 @@ pub(crate) fn build_sync_response_with_filter(
     let lazy_load = crate::sync::filters::lazy_load_members_enabled(state_filter, timeline_filter)
         && !crate::sync::filters::include_redundant_members(state_filter);
     for &room_nid in joined_room_nids {
+        // The caller passed a snapshot of joined rooms taken at request
+        // start. A long-poll wake on a ban / kick / leave races that
+        // snapshot — the user is no longer joined by the time we build
+        // the response, but the stale snapshot still includes the room
+        // here while `get_user_left_rooms` below also includes it. The
+        // room then shows up in BOTH `rooms.join` and `rooms.leave`
+        // (TestUnbanViaInvite). Re-check current membership and skip
+        // when it isn't still `join`.
+        if state
+            .db
+            .get_membership(room_nid, user.user_nid)
+            .ok()
+            .flatten()
+            != Some(1)
+        {
+            continue;
+        }
+
         let room_id = state
             .db
             .resolve_nid(room_nid)
@@ -1577,17 +1595,28 @@ fn build_leave_sync(
     let mut found_leave = leave_event_nid.is_none();
     let mut more_before_first = false;
     for (pos, enid) in scan.iter().rev() {
+        let is_leave_event = Some(*enid) == leave_event_nid;
         if !found_leave {
-            if Some(*enid) == leave_event_nid {
+            if is_leave_event {
                 found_leave = true;
             } else {
                 continue;
             }
         }
-        if let Some(s) = since
+        // The leave/ban event itself is the membership transition; emit
+        // it regardless of `since`. `set_membership` burns a fresh
+        // stream_pos AFTER persist_event, so the user's membership_pos
+        // (and therefore a /sync `since` derived from
+        // `current_stream_position()`) routinely sits one position
+        // PAST the leave event. Without this carve-out, the leave
+        // event is `pos <= since` and the since-cap below skips it,
+        // leaving `rooms.leave.<room>.timeline` and
+        // `rooms.leave.<room>.state` empty for the very sync that
+        // surfaces the transition (TestUnbanViaInvite).
+        if !is_leave_event
+            && let Some(s) = since
             && *pos <= s
         {
-            // Already on the client; stop here.
             break;
         }
         if timeline_newest_first.len() >= timeline_limit {

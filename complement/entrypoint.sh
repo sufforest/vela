@@ -79,7 +79,18 @@ enabled = false
 # SSRF guard would refuse those — disable it inside the test runner.
 [federation]
 private_ip_block = false
+
+# Complement drops one YAML per test-defined Application Service at
+# this path before starting the container. Loading them at boot is
+# how Synapse/Dendrite pick up the same registrations.
+[appservice]
+registration_dir = "/complement/appservice"
 EOF
+
+# Make sure the dir exists so the loader doesn't warn on a clean
+# blueprint with no AS. Files appear before vela starts in the
+# Complement deployer flow, so the dir is otherwise pre-created.
+mkdir -p /complement/appservice
 
 echo "[vela-complement] starting vela with config $CONF_DIR/vela.toml"
 # Default to debug for vela's own modules; trace specifically for the

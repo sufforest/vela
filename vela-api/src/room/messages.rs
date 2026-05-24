@@ -259,10 +259,16 @@ pub async fn get_messages(
         } else if events.is_empty()
             && let Some(entry_eid) = user_member_event_id(&state, room_nid, user.user_nid)?
         {
-            end_token = format!("e{entry_eid}");
-            if start_token.is_empty() {
-                start_token = end_token.clone();
-            }
+            // Stream-walk found nothing older than the supplied `from`.
+            // This happens on /context-then-/messages right after a
+            // federated join: pre-join history is reachable only via
+            // backfill from the user's own member event (its
+            // prev_events). Walking the DAG inline produces those
+            // events in the same response so callers don't have to
+            // follow an `e{member_event}` cursor through a separate
+            // round-trip. (TestJumpToDateEndpoint federation
+            // paginate-after-timestamp subtests.)
+            return paginate_dag(&state, &room_id_str, room_nid, &entry_eid, limit).await;
         }
     }
 

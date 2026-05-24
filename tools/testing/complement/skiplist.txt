@@ -152,10 +152,6 @@
 ^TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
 
 # --- known bugs, TODO investigate ---
-# TODO(vela): bug. /timestamp_to_event returns 403 / 404 for
-# federation-imported events. Federation backfill via this
-# endpoint missing entirely or auth-checking too strictly.
-^TestJumpToDateEndpoint/parallel/federation
 ^TestJumpToDateEndpoint/parallel/from$
 
 # TODO(vela): per-thread unread notification counts. The 404 on
