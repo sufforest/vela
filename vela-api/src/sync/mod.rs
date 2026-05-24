@@ -869,13 +869,18 @@ fn build_room_sync_for_user(
                 user_ids.push(Value::String(uid));
             }
         }
-        // Even an empty user_ids list is meaningful — it tells clients
-        // "no one is typing right now" after a stop transition, which
-        // is what TestTyping/Typing_can_be_explicitly_stopped checks.
-        ephemeral_events.push(json!({
-            "type": "m.typing",
-            "content": {"user_ids": user_ids}
-        }));
+        // Emit empty user_ids only after an explicit stop transition
+        // (since.is_some()), per TestTyping/Typing_can_be_explicitly_stopped.
+        // On initial sync we'd otherwise inject an empty typing event
+        // into every room — TestACLsForEDUs asserts the ACL'd room has
+        // zero ephemeral events, and the empty snapshot would count.
+        let emit_empty_is_ok = since.is_some();
+        if !user_ids.is_empty() || emit_empty_is_ok {
+            ephemeral_events.push(json!({
+                "type": "m.typing",
+                "content": {"user_ids": user_ids}
+            }));
+        }
     }
 
     // Receipts. MSC4102/TestThreadReceiptsInSyncMSC4102 contract lives

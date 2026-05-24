@@ -69,6 +69,47 @@ pub fn ensure_create_in_state(
     }
 }
 
+/// MSC3706 partial-state safety net. When the room is still
+/// filling and the resolved state-at-event doesn't include the
+/// sender's `m.room.member` (we haven't pulled it from the
+/// resident yet), inject it from the event's `auth_events`. The
+/// spec requires every non-state PDU to list its sender's
+/// membership in `auth_events`, so this is always a known-good
+/// substitute when our local view is genuinely incomplete.
+///
+/// Safe in the non-partial case too: when the state already has
+/// the sender's member entry, this is a no-op. We only fill the
+/// hole; we never overwrite (so a later leave/ban present in
+/// state is respected).
+pub fn ensure_sender_member_in_state(
+    db: &Database,
+    sender: &str,
+    auth_events: &[String],
+    state: &mut HashMap<(String, String), Pdu>,
+) {
+    let key = ("m.room.member".to_string(), sender.to_string());
+    if state.contains_key(&key) {
+        return;
+    }
+    for aid in auth_events {
+        let Some(json) = load_event_json_by_event_id(db, aid) else {
+            continue;
+        };
+        let Some(obj) = json.as_object() else {
+            continue;
+        };
+        let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let sk = obj.get("state_key").and_then(|v| v.as_str()).unwrap_or("");
+        if ty != "m.room.member" || sk != sender {
+            continue;
+        }
+        if let Some(pdu) = Pdu::from_json(aid.clone(), obj) {
+            state.insert(key, pdu);
+            return;
+        }
+    }
+}
+
 /// Load the raw canonical JSON for an event by its event_id string.
 pub fn load_event_json_by_event_id(db: &Database, event_id: &str) -> Option<Value> {
     let nid = db.get_event_nid_by_id(event_id).ok().flatten()?;
