@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use figment::Figment;
 use figment::providers::{Env, Format, Toml};
 use serde::Deserialize;
-use tracing::info;
+use tracing::{info, warn};
 
 use vela_api::federation::federation_client::{FederationClient, RemoteKeyCache};
 use vela_api::federation::federation_resolver::FederationResolver;
@@ -73,6 +73,21 @@ struct Config {
     presence: PresenceSection,
     #[serde(default)]
     push: PushSection,
+    #[serde(default)]
+    appservice: AppServiceSection,
+}
+
+/// `[appservice]` section. File-based application-service preload.
+/// vela's primary AS lifecycle is admin-bot driven (`!as register`),
+/// but Complement (and some operator workflows) drop YAML
+/// registration files at a known path before the server starts.
+/// When `registration_dir` is set, vela scans it for `*.yaml`
+/// at boot and registers each one (duplicates are silently skipped
+/// so re-boots are idempotent).
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+struct AppServiceSection {
+    registration_dir: Option<String>,
 }
 
 /// `[push]` section. Outbound push gateway posture knobs.
@@ -959,6 +974,9 @@ fn main() -> anyhow::Result<()> {
             vela_api::appservice::AsRegistry::open(db.clone())
                 .map_err(|e| anyhow::anyhow!("as registry open: {e}"))?,
         );
+        if let Some(dir) = config.appservice.registration_dir.as_deref() {
+            preload_appservice_dir(dir, &appservice_registry);
+        }
         let appservice_outbox =
             vela_api::appservice::outbox::AsOutbox::new(db.clone(), appservice_registry.clone());
 
@@ -1239,6 +1257,60 @@ fn main() -> anyhow::Result<()> {
         info!("shutdown complete");
         Ok::<(), anyhow::Error>(())
     })
+}
+
+/// Read every `*.yaml` in `dir` and register the parsed AS with the
+/// in-memory registry. Used by the Complement entrypoint (and any
+/// operator workflow that drops registration files at a known path).
+/// Failures per-file are logged and skipped — a malformed file
+/// shouldn't crash the server. Duplicates are silently no-op'd via
+/// the `DuplicateId` error path so reboots are idempotent.
+fn preload_appservice_dir(dir: &str, registry: &vela_api::appservice::AsRegistry) {
+    let path = std::path::Path::new(dir);
+    let entries = match std::fs::read_dir(path) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(%dir, error = %e, "appservice.registration_dir not readable; skipping preload");
+            return;
+        }
+    };
+    let mut loaded = 0usize;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("yaml") {
+            continue;
+        }
+        let yaml = match std::fs::read_to_string(&p) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(file = %p.display(), error = %e, "appservice yaml read failed");
+                continue;
+            }
+        };
+        let parsed = match vela_api::appservice::registration::parse(&yaml) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(file = %p.display(), error = %e, "appservice yaml parse failed");
+                continue;
+            }
+        };
+        let id = parsed.appservice.id.clone();
+        match registry.register(parsed.appservice) {
+            Ok(_) => {
+                info!(file = %p.display(), %id, "appservice preloaded");
+                loaded += 1;
+            }
+            Err(vela_api::appservice::RegistryError::DuplicateId(_)) => {
+                // Already registered (re-boot of a persisted registry).
+                // No-op so the entrypoint can pass the same dir on every
+                // start without operator intervention.
+            }
+            Err(e) => warn!(file = %p.display(), error = %e, "appservice register failed"),
+        }
+    }
+    if loaded > 0 {
+        info!(%dir, count = loaded, "appservice preload complete");
+    }
 }
 
 /// Wait for either SIGINT (Ctrl+C, dev) or SIGTERM (Docker / k8s /
