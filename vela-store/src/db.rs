@@ -172,12 +172,6 @@ pub struct Database {
     /// locally-originated presence change. Same shape and rationale
     /// as `receipts_stream_counter`.
     pub(crate) presence_stream_counter: AtomicU64,
-    /// Monotonic position into `to_device_outbound`, advanced once per
-    /// queued `m.direct_to_device` EDU. Each entry already contains
-    /// the destination, so unlike receipts/presence we don't need a
-    /// per-destination cursor — federation_sender's existing PDU-style
-    /// scan-from-cursor model fits naturally.
-    pub(crate) to_device_outbound_counter: AtomicU64,
 }
 
 impl Database {
@@ -226,7 +220,6 @@ impl Database {
             receipts_stream_counter: AtomicU64::new(1),
             presence_stream_counter: AtomicU64::new(1),
             snapshot_nid_counter: PersistedCounter::ephemeral(1),
-            to_device_outbound_counter: AtomicU64::new(1),
         })
     }
 
@@ -339,7 +332,6 @@ impl Database {
         }
         let receipts_stream_counter = recover_max_receipts_stream(&db).unwrap_or(1);
         let presence_stream_counter = recover_max_presence_stream(&db).unwrap_or(1);
-        let to_device_outbound_counter = recover_max_to_device_outbound(&db).unwrap_or(1);
 
         Ok(Self {
             db,
@@ -349,7 +341,6 @@ impl Database {
             snapshot_nid_counter,
             receipts_stream_counter: AtomicU64::new(receipts_stream_counter),
             presence_stream_counter: AtomicU64::new(presence_stream_counter),
-            to_device_outbound_counter: AtomicU64::new(to_device_outbound_counter),
         })
     }
 
@@ -1195,9 +1186,13 @@ impl Database {
         content_json: &Value,
     ) -> Result<u64, rocksdb::Error> {
         let cf = self.db.cf_handle("to_device_outbound").unwrap();
-        let pos = self
-            .to_device_outbound_counter
-            .fetch_add(1, Ordering::Relaxed);
+        // Use the global monotonic stream position. Both the per-CF
+        // cursor and the entries are positioned in the same sequence,
+        // and across restarts the position never regresses below the
+        // existing cursor (which is what was breaking
+        // `device_list_outbound` after hs2 restart in
+        // TestDeviceListsUpdateOverFederation/stopped_server).
+        let pos = self.next_stream_position().as_u64();
         let key = to_device_outbound_key(destination, pos);
         self.db
             .put_cf(&cf, &key, content_json.to_string().as_bytes())?;
@@ -1341,9 +1336,7 @@ impl Database {
         content_json: &Value,
     ) -> Result<u64, rocksdb::Error> {
         let cf = self.db.cf_handle("device_list_outbound").unwrap();
-        let pos = self
-            .to_device_outbound_counter
-            .fetch_add(1, Ordering::Relaxed);
+        let pos = self.next_stream_position().as_u64();
         let key = to_device_outbound_key(destination, pos);
         self.db
             .put_cf(&cf, &key, content_json.to_string().as_bytes())?;
@@ -1431,9 +1424,7 @@ impl Database {
         content_json: &Value,
     ) -> Result<u64, rocksdb::Error> {
         let cf = self.db.cf_handle("signing_key_update_outbound").unwrap();
-        let pos = self
-            .to_device_outbound_counter
-            .fetch_add(1, Ordering::Relaxed);
+        let pos = self.next_stream_position().as_u64();
         let key = to_device_outbound_key(destination, pos);
         self.db
             .put_cf(&cf, &key, content_json.to_string().as_bytes())?;
@@ -2732,6 +2723,37 @@ impl Database {
             batch.put_cf(&cf, key, val);
         }
         self.db.write(batch)
+    }
+
+    /// Has-this-EDU-already-been-applied check, keyed on the
+    /// `m.device_list_update` (user, device, stream_id) tuple. Returns
+    /// true and updates the high-water mark when the EDU advances the
+    /// stream; returns false (skip) when it's a redelivery of an
+    /// already-applied (or older) stream_id.
+    ///
+    /// The receiver uses this to drop EDUs that hs2 resends after a
+    /// restart with an unadvanced outbound cursor — without it, every
+    /// resend writes a fresh `device_key_changes` entry and the same
+    /// change leaks into a later /sync window for the observer
+    /// (TestDeviceListsUpdateOverFederation/stopped_server).
+    pub fn device_list_edu_advance(
+        &self,
+        user_nid: u64,
+        device_id: &str,
+        stream_id: u64,
+    ) -> Result<bool, rocksdb::Error> {
+        let cf = self.db.cf_handle("device_list_edu_seen").unwrap();
+        let key = keys::encode_u64_bytes(user_nid, device_id.as_bytes());
+        let prev = self
+            .db
+            .get_cf(&cf, &key)?
+            .map(|b| keys::decode_u64(&b))
+            .unwrap_or(0);
+        if stream_id <= prev {
+            return Ok(false);
+        }
+        self.db.put_cf(&cf, &key, keys::encode_u64(stream_id))?;
+        Ok(true)
     }
 
     // --- Room state queries ---
@@ -5721,32 +5743,6 @@ fn recover_max_presence_stream(db: &DB) -> Option<u64> {
     iter.next()
         .and_then(|r| r.ok())
         .map(|(key, _)| keys::decode_u64(&key) + 1)
-}
-
-/// Recover max position from `to_device_outbound`. Keys are
-/// `<destination> 0xff <stream_pos_be>`. Lex-largest *key* is not
-/// the lex-largest *position* — a destination "z" with pos=10 sorts
-/// after "a" with pos=999, so `IteratorMode::End` would return 11
-/// and the next enqueue under "a" would land at pos=11 (already
-/// delivered, sender skips it; new EDU lost). Scan every entry and
-/// take the global max position.
-fn recover_max_to_device_outbound(db: &DB) -> Option<u64> {
-    let cf = db.cf_handle("to_device_outbound")?;
-    let mut max_pos: Option<u64> = None;
-    for entry in db.iterator_cf(&cf, IteratorMode::Start) {
-        let (key, _) = match entry {
-            Ok(kv) => kv,
-            Err(_) => continue,
-        };
-        if key.len() < 8 {
-            continue;
-        }
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&key[key.len() - 8..]);
-        let pos = u64::from_be_bytes(buf);
-        max_pos = Some(max_pos.map_or(pos, |m| m.max(pos)));
-    }
-    max_pos.map(|m| m + 1)
 }
 
 /// Outbox key prefix for one destination. Includes the trailing 0xff

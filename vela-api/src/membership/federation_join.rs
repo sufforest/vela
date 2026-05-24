@@ -729,42 +729,14 @@ pub async fn send_join_v2(
         ));
     }
 
-    // Surface the remote joiner in our local users' next /sync
-    // `device_lists.changed`. The standalone `m.device_list_update`
-    // EDU may follow later; without this bookkeeping our local
-    // users only learn about the new co-resident's keys when they
-    // happen to /keys/query for them. Spec: device-list updates
-    // SHOULD reflect all newly-shared peers immediately on join.
-    if let Ok(remote_user_nid) = state.db.get_or_create_nid(state_key) {
-        let our_server = state.config.server_name.as_str();
-        let stream_pos = state.db.next_stream_position().as_u64();
-        if let Ok(members) = state.db.get_room_members(room_nid) {
-            let mut local_observers: Vec<u64> = Vec::new();
-            for m in members {
-                if m == remote_user_nid {
-                    continue;
-                }
-                if let Ok(Some(uid)) = state.db.resolve_nid(m)
-                    && uid
-                        .split_once(':')
-                        .map(|(_, d)| d == our_server)
-                        .unwrap_or(false)
-                {
-                    local_observers.push(m);
-                }
-            }
-            if !local_observers.is_empty() {
-                let _ = state.db.notify_device_key_change(
-                    remote_user_nid,
-                    &local_observers,
-                    stream_pos,
-                );
-                for &nid in &local_observers {
-                    crate::router::notify_user(&state, nid);
-                }
-            }
-        }
-    }
+    // The remote joiner's `device_lists.changed` notification on our
+    // side is driven by the joiner's home server via the
+    // `m.device_list_update` EDU (handled in
+    // `edu::inbound::handle_device_list_update`, which dedups
+    // redelivered stream_ids). Writing a second entry from this
+    // synchronous path used to leak the same change into a later
+    // /sync window for the observer
+    // (TestDeviceListsUpdateOverFederation/good_connectivity).
 
     // MSC3706 partial-state filter. When the joining server opted in
     // via `?omit_members=true`, drop most m.room.member events from

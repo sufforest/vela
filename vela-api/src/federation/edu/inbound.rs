@@ -72,6 +72,23 @@ async fn handle_device_list_update(state: &AppState, origin: &str, content: &Val
         }
     };
 
+    // Drop redeliveries of an already-applied stream_id. Same EDU
+    // arriving twice (peer restart, retry) writes a fresh
+    // device_key_changes entry at a new stream_pos — which leaks the
+    // change into a later /sync window for the observer. We treat
+    // missing stream_id as 0 so two zero-stream_id EDUs collapse.
+    if let Some(device_id) = obj.get("device_id").and_then(|v| v.as_str()) {
+        let sid = obj.get("stream_id").and_then(|v| v.as_u64()).unwrap_or(0);
+        match state.db.device_list_edu_advance(user_nid, device_id, sid) {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(%user_id, %device_id, stream_id = sid, "dropping redelivered m.device_list_update");
+                return;
+            }
+            Err(e) => warn!(error = %e, "device_list_edu_advance failed; continuing"),
+        }
+    }
+
     // Find local users sharing a room with the changed user. They
     // need to learn that the remote user's device list moved.
     let remote_user_rooms = match state.db.get_user_joined_rooms(user_nid) {
