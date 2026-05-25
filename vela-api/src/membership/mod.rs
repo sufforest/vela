@@ -202,7 +202,8 @@ async fn do_join(
                     &user.user_id,
                     rn,
                 );
-                carry_over_predecessor_push_rules(&state, user.user_nid, rn, room_id.as_str());
+                carry_over_predecessor_push_rules(&state, user.user_nid, rn, room_id.as_str())
+                    .await;
             }
             return Ok(Json(json!({"room_id": room_id.as_str()})));
         }
@@ -261,7 +262,8 @@ async fn do_join(
                 &user.user_id,
                 room_nid,
             );
-            carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str());
+            carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str())
+                .await;
             return Ok(Json(json!({"room_id": room_id.as_str()})));
         }
 
@@ -294,7 +296,7 @@ async fn do_join(
             &user.user_id,
             room_nid,
         );
-        carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str());
+        carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str()).await;
         return Ok(Json(json!({"room_id": room_id.as_str()})));
     }
 
@@ -357,7 +359,7 @@ async fn do_join(
         &user.user_id,
         room_nid,
     );
-    carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str());
+    carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str()).await;
 
     Ok(Json(json!({"room_id": room_id.as_str()})))
 }
@@ -366,7 +368,7 @@ async fn do_join(
 /// clone the joining user's `room` push rule for the predecessor so
 /// the same notify settings apply in the upgraded room. Idempotent,
 /// no-op when the user has no such rule.
-fn carry_over_predecessor_push_rules(
+async fn carry_over_predecessor_push_rules(
     state: &AppState,
     user_nid: u64,
     room_nid: u64,
@@ -388,7 +390,8 @@ fn carry_over_predecessor_push_rules(
         user_nid,
         old_room_id,
         new_room_id,
-    );
+    )
+    .await;
 }
 
 /// Wrap `local_authoriser_for_restricted` with a brief poll-and-retry

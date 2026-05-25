@@ -398,7 +398,9 @@ pub async fn upgrade_room(
         old_room_nid,
         old_room_id.as_str(),
         new_room_id.as_str(),
-    ) {
+    )
+    .await
+    {
         tracing::warn!(error = %e.0, "push rule carry-over after upgrade failed");
     }
 
@@ -407,7 +409,7 @@ pub async fn upgrade_room(
 
 /// For each local member of `old_room_nid`, clone their `global.room`
 /// push rule for `old_room_id` so it also targets `new_room_id`. Idempotent.
-fn carry_over_push_rules(
+async fn carry_over_push_rules(
     state: &AppState,
     old_room_nid: u64,
     old_room_id: &str,
@@ -433,7 +435,7 @@ fn carry_over_push_rules(
         {
             continue;
         }
-        carry_over_push_rules_for_user(state, member_nid, old_room_id, new_room_id)?;
+        carry_over_push_rules_for_user(state, member_nid, old_room_id, new_room_id).await?;
     }
     Ok(())
 }
@@ -441,12 +443,24 @@ fn carry_over_push_rules(
 /// Clone a single user's `global.room` push rule for `old_room_id` so
 /// it also targets `new_room_id`. Idempotent — no-ops when the user
 /// has no rule for old, or already has one for new.
-pub(crate) fn carry_over_push_rules_for_user(
+///
+/// Holds `state.user_locks[user_nid]` across the m.push_rules
+/// read-modify-write so a concurrent PUT/DELETE pushrules (or
+/// another carry_over on the same user from a parallel
+/// federation_join in a different room) can't clobber the new
+/// rule. The lock is the same one `pushrule_user_guard` uses.
+pub(crate) async fn carry_over_push_rules_for_user(
     state: &AppState,
     user_nid: u64,
     old_room_id: &str,
     new_room_id: &str,
 ) -> Result<(), ApiError> {
+    let lock = state
+        .user_locks
+        .entry(user_nid)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _guard = lock.lock_owned().await;
     let Some(mut stored) = state
         .db
         .get_account_data(user_nid, "m.push_rules")

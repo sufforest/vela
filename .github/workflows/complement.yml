@@ -75,8 +75,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: complement-log
-          path: |
-            /tmp/complement-run.log
-            /tmp/complement-retry.log
+          path: /tmp/complement-run.log
           if-no-files-found: ignore
           retention-days: 14
