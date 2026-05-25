@@ -23,6 +23,7 @@ use vela_core::events::pdu::Pdu;
 use vela_core::events::view::EventView;
 use vela_core::federation::keys::{decode_public_key, verify_event_signature};
 use vela_core::identifiers::EventId;
+use vela_core::identifiers::Nid;
 
 use crate::federation::federation_state::{ensure_create_in_state, load_pdu_by_event_id};
 use crate::middleware::federation_auth::{VerifiedBody, XMatrixOrigin};
@@ -222,6 +223,21 @@ pub async fn send_leave_v2(
             "room not known locally",
         )
     })?;
+
+    // Acquire the per-room lock before reading auth state, persisting,
+    // promoting state, and flipping membership. Mirrors process_pdu's
+    // top-of-function lock (PR #92) so a concurrent /send for this
+    // room can't interleave a write between our auth_state read and
+    // our promote_state_event/set_membership writes. Without the
+    // lock, ban events arriving via /send_leave can be promoted just
+    // after a concurrent invite/join for the same user wins state-res,
+    // and the next /sync sees a torn view.
+    let lock = state
+        .room_locks
+        .entry(Nid(room_nid))
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _room_guard = lock.lock().await;
 
     // Verify signature against origin's published keys.
     let keys = state

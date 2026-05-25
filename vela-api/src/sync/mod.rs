@@ -115,7 +115,16 @@ pub async fn sync(
             };
             let tx = notify_tx.clone();
             let handle = tokio::spawn(async move {
-                if rx.recv().await.is_ok() {
+                // Lagged also counts as a wake — the channel buffer
+                // overflowed (64 broadcasts in this room while the
+                // listener was still being scheduled), but the events
+                // ARE in the DB. The main task re-reads on wake, so
+                // letting Lagged signal here is the correct recovery:
+                // turn the lag into a single coalesced wake, drop the
+                // backlog, exit. Only `Closed` (sender dropped) means
+                // no further work for this listener.
+                use tokio::sync::broadcast::error::RecvError;
+                if !matches!(rx.recv().await, Err(RecvError::Closed)) {
                     let _ = tx.send(()).await;
                 }
             });
@@ -135,7 +144,8 @@ pub async fn sync(
         };
         let tx = notify_tx.clone();
         let handle = tokio::spawn(async move {
-            if user_rx.recv().await.is_ok() {
+            use tokio::sync::broadcast::error::RecvError;
+            if !matches!(user_rx.recv().await, Err(RecvError::Closed)) {
                 let _ = tx.send(()).await;
             }
         });
