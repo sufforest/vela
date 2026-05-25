@@ -692,7 +692,8 @@ pub async fn create_room(
             user.user_nid,
             old_room_id,
             room_id.as_str(),
-        );
+        )
+        .await;
     }
 
     // Release the room lock before the remote-invite fan-out below.

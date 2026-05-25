@@ -72,6 +72,7 @@ pub async fn put_pushrule(
     if !valid_kind(&kind) {
         return Err(VelaError::NotFound(format!("unknown rule kind: {kind}")).into());
     }
+    let _guard = pushrule_user_guard(&state, user.user_nid).await;
     let mut global = load_global(&state, user.user_nid)?;
     let arr = global
         .as_object_mut()
@@ -97,12 +98,29 @@ pub async fn delete_pushrule(
     user: AuthenticatedUser,
     Path((kind, rule_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
+    let _guard = pushrule_user_guard(&state, user.user_nid).await;
     let mut global = load_global(&state, user.user_nid)?;
     if let Some(arr) = global.get_mut(&kind).and_then(|v| v.as_array_mut()) {
         arr.retain(|r| r.get("rule_id").and_then(|v| v.as_str()) != Some(rule_id.as_str()));
     }
     save_global(&state, user.user_nid, &global)?;
     Ok(Json(json!({})))
+}
+
+/// Per-user lock around the m.push_rules read-modify-write cycle.
+/// Without this, two concurrent PUT/DELETE pushrules from the same
+/// user race: both load the current m.push_rules blob, both apply
+/// their own rule change to the in-memory copy, and the later save
+/// clobbers the earlier one — silently dropping a rule. Bites
+/// TestPushRuleRoomUpgrade where multiple subtests SetPushRule for
+/// the same bob in parallel.
+async fn pushrule_user_guard(state: &AppState, user_nid: u64) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = state
+        .user_locks
+        .entry(user_nid)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    lock.lock_owned().await
 }
 
 #[derive(Deserialize)]
@@ -117,6 +135,7 @@ pub async fn put_pushrule_enabled(
     Path((kind, rule_id)): Path<(String, String)>,
     Json(body): Json<EnabledBody>,
 ) -> Result<Json<Value>, ApiError> {
+    let _guard = pushrule_user_guard(&state, user.user_nid).await;
     update_rule_field(
         &state,
         user.user_nid,
@@ -155,6 +174,7 @@ pub async fn put_pushrule_actions(
     Path((kind, rule_id)): Path<(String, String)>,
     Json(body): Json<ActionsBody>,
 ) -> Result<Json<Value>, ApiError> {
+    let _guard = pushrule_user_guard(&state, user.user_nid).await;
     update_rule_field(
         &state,
         user.user_nid,

@@ -202,7 +202,8 @@ async fn do_join(
                     &user.user_id,
                     rn,
                 );
-                carry_over_predecessor_push_rules(&state, user.user_nid, rn, room_id.as_str());
+                carry_over_predecessor_push_rules(&state, user.user_nid, rn, room_id.as_str())
+                    .await;
             }
             return Ok(Json(json!({"room_id": room_id.as_str()})));
         }
@@ -233,7 +234,18 @@ async fn do_join(
         // ensures `join_authorised_via_users_server` points at our
         // local user (regression check in
         // TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12).
-        if let Some(authoriser) = local_authoriser_for_restricted(&state, room_nid, &user)? {
+        //
+        // Federation propagation race: if `local_authoriser_for_
+        // restricted` returns None on first try, the room state may
+        // just be stale — the resident server's most recent
+        // m.room.power_levels (the one that promoted our local
+        // member to invite power) might be still in flight. Poll
+        // briefly before falling through to a remote join. Bounded
+        // at ~500 ms total so a genuinely-no-local-authoriser case
+        // doesn't drag the join out.
+        if let Some(authoriser) =
+            local_authoriser_for_restricted_with_wait(&state, room_nid, &user).await?
+        {
             emit_join_event(
                 &state,
                 &user,
@@ -250,7 +262,8 @@ async fn do_join(
                 &user.user_id,
                 room_nid,
             );
-            carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str());
+            carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str())
+                .await;
             return Ok(Json(json!({"room_id": room_id.as_str()})));
         }
 
@@ -283,7 +296,7 @@ async fn do_join(
             &user.user_id,
             room_nid,
         );
-        carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str());
+        carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str()).await;
         return Ok(Json(json!({"room_id": room_id.as_str()})));
     }
 
@@ -346,7 +359,7 @@ async fn do_join(
         &user.user_id,
         room_nid,
     );
-    carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str());
+    carry_over_predecessor_push_rules(&state, user.user_nid, room_nid, room_id.as_str()).await;
 
     Ok(Json(json!({"room_id": room_id.as_str()})))
 }
@@ -355,7 +368,7 @@ async fn do_join(
 /// clone the joining user's `room` push rule for the predecessor so
 /// the same notify settings apply in the upgraded room. Idempotent,
 /// no-op when the user has no such rule.
-fn carry_over_predecessor_push_rules(
+async fn carry_over_predecessor_push_rules(
     state: &AppState,
     user_nid: u64,
     room_nid: u64,
@@ -377,7 +390,34 @@ fn carry_over_predecessor_push_rules(
         user_nid,
         old_room_id,
         new_room_id,
-    );
+    )
+    .await;
+}
+
+/// Wrap `local_authoriser_for_restricted` with a brief poll-and-retry
+/// for the cross-server propagation race: hs2's join handler sees no
+/// local-member-with-invite-power because hs1's m.room.power_levels
+/// update is still in flight on the federation send queue. The first
+/// call is synchronous; if it misses, sleep with exponential backoff
+/// (50ms, 100ms, 200ms — ~350ms total) and re-check, breaking out as
+/// soon as the state catches up. Local lookups are cheap, so the
+/// retry cost is essentially the sleep total when the room
+/// genuinely has no local authoriser.
+async fn local_authoriser_for_restricted_with_wait(
+    state: &AppState,
+    room_nid: u64,
+    user: &AuthenticatedUser,
+) -> Result<Option<String>, ApiError> {
+    if let Some(auth) = local_authoriser_for_restricted(state, room_nid, user)? {
+        return Ok(Some(auth));
+    }
+    for delay_ms in [50u64, 100, 200] {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        if let Some(auth) = local_authoriser_for_restricted(state, room_nid, user)? {
+            return Ok(Some(auth));
+        }
+    }
+    Ok(None)
 }
 
 /// For a non-locally-hosted restricted/knock_restricted room we
