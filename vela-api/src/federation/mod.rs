@@ -318,6 +318,57 @@ fn split_auth_params(s: &str) -> Vec<Option<(String, String)>> {
     results
 }
 
+/// Log and persist the per-PDU outcome from a federation transaction.
+///
+/// Pulled out of the receive_transaction loop so the inline per-room
+/// task can reuse it without duplicating the rejection-bookkeeping.
+/// Called immediately after `process_pdu` so the next event in the
+/// same room sees the rejection via `is_event_rejected`.
+fn record_outcome(
+    state: &AppState,
+    txn_id: &str,
+    event_id: &str,
+    outcome: &crate::federation::federation_receive::PduOutcome,
+) {
+    use crate::federation::federation_receive::PduOutcome;
+    match outcome {
+        PduOutcome::Accepted => {
+            debug!(%txn_id, %event_id, outcome = "accepted", "pdu outcome");
+        }
+        PduOutcome::SoftFailed => {
+            debug!(%txn_id, %event_id, outcome = "soft_failed", "pdu outcome");
+        }
+        PduOutcome::Rejected(reason) => {
+            warn!(%txn_id, %event_id, %reason, "pdu rejected");
+            // Persist the rejection so descendant events that
+            // reference this one in `auth_events` can cascade-
+            // reject without needing to re-derive WHY the
+            // ancestor was rejected.
+            //
+            // EXCEPT for transient state-incompleteness rejections:
+            // a PDU broadcast that races our own outbound-join
+            // bootstrap on the same room gets rejected with
+            // "unknown room" (we haven't created the room nid
+            // yet) or with "no m.room.create in state" (we
+            // haven't promoted state yet). Marking those would
+            // poison any later PDU whose auth chain references
+            // them — even after our state is fully populated and
+            // the re-delivered PDU would otherwise be accepted
+            // (TestUnbanViaInvite: ban PDU cascade-rejected off
+            // alice's own join, which got marked rejected while
+            // her outbound_join was still in flight).
+            let is_transient =
+                reason == "unknown room" || reason.contains("no m.room.create in state");
+            if !event_id.is_empty()
+                && !is_transient
+                && let Err(e) = state.db.mark_event_rejected(event_id, reason)
+            {
+                warn!(%txn_id, %event_id, error = %e, "mark_event_rejected failed");
+            }
+        }
+    }
+}
+
 /// PUT /_matrix/federation/v1/send/{txnId}
 ///
 /// Receives a federation transaction. Runs each PDU through the receive
@@ -378,48 +429,90 @@ pub async fn receive_transaction(
 
     info!(txn_id = %txn_id, pdus = pdus.len(), "processing federation transaction");
 
-    let mut results = serde_json::Map::new();
-    for pdu_json in pdus.iter().take(MAX_PDUS_PER_TRANSACTION) {
-        let (event_id, outcome) = process_pdu(&state, pdu_json).await;
-        // Log at debug for the common (accepted) path; bump to warn
-        // when the PDU was rejected outright so operators see federation
-        // errors without enabling debug logging globally.
-        match &outcome {
-            crate::federation::federation_receive::PduOutcome::Accepted => {
-                debug!(%txn_id, %event_id, outcome = "accepted", "pdu outcome");
-            }
-            crate::federation::federation_receive::PduOutcome::SoftFailed => {
-                debug!(%txn_id, %event_id, outcome = "soft_failed", "pdu outcome");
-            }
-            crate::federation::federation_receive::PduOutcome::Rejected(reason) => {
-                warn!(%txn_id, %event_id, %reason, "pdu rejected");
-                // Persist the rejection so descendant events that
-                // reference this one in `auth_events` can cascade-
-                // reject without needing to re-derive WHY the
-                // ancestor was rejected.
-                //
-                // EXCEPT for transient state-incompleteness rejections:
-                // a PDU broadcast that races our own outbound-join
-                // bootstrap on the same room gets rejected with
-                // "unknown room" (we haven't created the room nid
-                // yet) or with "no m.room.create in state" (we
-                // haven't promoted state yet). Marking those would
-                // poison any later PDU whose auth chain references
-                // them — even after our state is fully populated and
-                // the re-delivered PDU would otherwise be accepted
-                // (TestUnbanViaInvite: ban PDU cascade-rejected off
-                // alice's own join, which got marked rejected while
-                // her outbound_join was still in flight).
-                let is_transient =
-                    reason == "unknown room" || reason.contains("no m.room.create in state");
-                if !event_id.is_empty()
-                    && !is_transient
-                    && let Err(e) = state.db.mark_event_rejected(&event_id, reason)
-                {
-                    warn!(%txn_id, %event_id, error = %e, "mark_event_rejected failed");
-                }
+    // Group PDUs by room_id so independent rooms can be processed in
+    // parallel. Per Matrix federation semantics every PDU's auth checks
+    // and state writes are scoped to its own room — cross-room
+    // dependencies don't exist on the inbound persist path, so room A's
+    // batch never has to wait for room B's auth_chain fetch or DB
+    // writes. Synapse, Dendrite, and Conduwuit all do this: vela was
+    // the only serial-by-room implementation, which made TFRI-shape
+    // transactions (many subtests, mixed rooms per txn) head-of-line-
+    // block under load and tip into the 5s MustSyncUntil deadline. The
+    // per-room lock inside `process_pdu` still serialises writes
+    // within a room, so concurrency is bounded and safe.
+    use std::collections::HashMap;
+    let mut by_room: HashMap<String, Vec<(usize, Value)>> = HashMap::new();
+    for (idx, pdu_json) in pdus.into_iter().take(MAX_PDUS_PER_TRANSACTION).enumerate() {
+        let room_id = pdu_json
+            .get("room_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        by_room.entry(room_id).or_default().push((idx, pdu_json));
+    }
+
+    // Process each room's PDUs serially inside the room (preserves the
+    // sender-asserted topological order Synapse/Dendrite rely on AND
+    // the cascade-rejection contract — a sent_event_N's rejection
+    // must be persisted before the next event in the same room can
+    // observe it via is_event_rejected in its prev_events check),
+    // multiple rooms concurrently across the txn. JoinSet over
+    // tokio::spawn so the tokio runtime can pull tasks across worker
+    // threads — process_pdu mixes HTTP fetches and RocksDB writes, so
+    // the CPU phases benefit from true parallelism (not just I/O
+    // interleaving). Fast path when the txn is single-room: skip the
+    // spawn entirely.
+    //
+    // run_room_serial inlines the rejection bookkeeping that used to
+    // live in the outer loop. Inlining is load-bearing —
+    // TestInboundFederationRejectsEventsWithRejectedAuthEvents drives
+    // a txn where event_N+1 references event_N as a prev_event, and
+    // the state-at-event resolver depends on event_N's rejection
+    // being persisted before event_N+1 runs.
+    let mut indexed_results: Vec<(usize, String, crate::federation::federation_receive::PduOutcome)> =
+        Vec::with_capacity(MAX_PDUS_PER_TRANSACTION);
+    if by_room.len() <= 1 {
+        for (_room_id, pdus_in_room) in by_room {
+            for (idx, pdu) in pdus_in_room {
+                let (event_id, outcome) = process_pdu(&state, &pdu).await;
+                record_outcome(&state, &txn_id, &event_id, &outcome);
+                indexed_results.push((idx, event_id, outcome));
             }
         }
+    } else {
+        let mut set = tokio::task::JoinSet::new();
+        for (_room_id, pdus_in_room) in by_room {
+            let state_clone = state.clone();
+            let txn_id_clone = txn_id.clone();
+            set.spawn(async move {
+                let mut out: Vec<(
+                    usize,
+                    String,
+                    crate::federation::federation_receive::PduOutcome,
+                )> = Vec::with_capacity(pdus_in_room.len());
+                for (idx, pdu) in pdus_in_room {
+                    let (event_id, outcome) = process_pdu(&state_clone, &pdu).await;
+                    record_outcome(&state_clone, &txn_id_clone, &event_id, &outcome);
+                    out.push((idx, event_id, outcome));
+                }
+                out
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(group) => indexed_results.extend(group),
+                Err(e) => warn!(%txn_id, error = %e, "per-room process task panicked"),
+            }
+        }
+    }
+    // Restore the txn's original PDU order in the response so peers
+    // see outcomes in the same sequence they sent — spec doesn't
+    // require this, but it's the principle of least surprise and
+    // avoids a regression for any peer that relies on it.
+    indexed_results.sort_by_key(|(idx, _, _)| *idx);
+
+    let mut results = serde_json::Map::new();
+    for (_idx, event_id, outcome) in indexed_results {
         results.insert(event_id, outcome.to_json());
     }
 
@@ -429,6 +522,11 @@ pub async fn receive_transaction(
     // any particular EDU type). The sending server is `origin.0`,
     // verified by the federation_auth middleware via X-Matrix
     // signature.
+    //
+    // Runs after PDUs so EDUs that reference newly-persisted state
+    // (e.g. a typing EDU for a room the same txn just created via
+    // PDU) see consistent state. Conduwuit + Dendrite use the same
+    // two-phase order.
     if let Some(edus) = body.get("edus").and_then(|p| p.as_array()) {
         for edu in edus {
             dispatch_edu(&state, &origin.0, edu).await;
