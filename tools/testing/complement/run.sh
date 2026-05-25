@@ -6,17 +6,11 @@
 # Defaults assume Complement is checked out at $COMPLEMENT_DIR (or
 # /Users/$USER/code/workspace/references/complement). Override per env.
 #
-# Retry policy: a test that fails on the first pass is re-run in
-# isolation (single test, no `-parallel`). Multi-server federation
-# races still surface at ~1-2% per-test under full parallel load
-# (the per-room lock + pushrule lock + local-authoriser poll fixed
-# the dominant races; the residual is invite-flow propagation
-# timing that local locking can't address). At ~180 tests per run,
-# even 1% per-test rolls a >80% chance of at least one transient
-# red. The isolated rerun almost always passes because the load is
-# lower; a test that fails BOTH the parallel run AND the isolated
-# rerun is reported as a real failure. Set RETRY_FLAKES=0 to
-# disable.
+# Retry policy (opt-in): set RETRY_FLAKES=1 to re-run any top-level
+# failure in isolation. Off by default — the per-room lock, pushrule
+# lock, local-authoriser poll, state-res tiebreak, and invite-rescind
+# fix took multi-server federation races down to zero on local grinds.
+# If CI starts flaking again that's a signal to refactor, not to mask.
 #
 # Usage:
 #   bash tools/testing/complement/run.sh           # full suite, skiplist applied
@@ -31,7 +25,7 @@ TIMEOUT="${TIMEOUT:-30m}"
 LOG="${LOG:-/tmp/complement-run.log}"
 RETRY_LOG="${RETRY_LOG:-/tmp/complement-retry.log}"
 SKIPLIST="${SKIPLIST:-$(dirname "$0")/skiplist.txt}"
-RETRY_FLAKES="${RETRY_FLAKES:-1}"
+RETRY_FLAKES="${RETRY_FLAKES:-0}"
 
 [ -d "$COMPLEMENT_DIR" ] || { echo "complement dir not found at $COMPLEMENT_DIR" >&2; exit 1; }
 [ -f "$SKIPLIST" ] || { echo "skiplist not found at $SKIPLIST" >&2; exit 1; }
