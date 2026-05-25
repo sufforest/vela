@@ -469,8 +469,11 @@ pub async fn receive_transaction(
     // a txn where event_N+1 references event_N as a prev_event, and
     // the state-at-event resolver depends on event_N's rejection
     // being persisted before event_N+1 runs.
-    let mut indexed_results: Vec<(usize, String, crate::federation::federation_receive::PduOutcome)> =
-        Vec::with_capacity(MAX_PDUS_PER_TRANSACTION);
+    let mut indexed_results: Vec<(
+        usize,
+        String,
+        crate::federation::federation_receive::PduOutcome,
+    )> = Vec::with_capacity(MAX_PDUS_PER_TRANSACTION);
     if by_room.len() <= 1 {
         for (_room_id, pdus_in_room) in by_room {
             for (idx, pdu) in pdus_in_room {
