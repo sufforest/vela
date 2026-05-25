@@ -151,6 +151,4 @@
 ^TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
 ^TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
 
-# --- known bugs, TODO investigate ---
-^TestJumpToDateEndpoint/parallel/from$
 

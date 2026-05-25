@@ -176,6 +176,29 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
         }
     };
 
+    // Take the per-room lock NOW (before the auth check), not when we
+    // finally call `persist_received_pdu`. The lock used to be acquired
+    // inside `persist_received_pdu`, leaving the auth-chain fetch +
+    // check-4 + invite-rescind side path running with no exclusion
+    // against a concurrent `outbound_join` bootstrap, `persist_join_
+    // event` send_join handler, or another federation_receive on the
+    // same room. The race produced repeated "fetched event $X failed
+    // check 4: no m.room.create in state" + cascade rejection patterns
+    // that PR #88 and PR #90 patched symptom-by-symptom. Holding the
+    // lock here covers `apply_invite_rescind`, every call into
+    // `fetch_auth_chain` / `persist_fetched_event`, and
+    // `persist_received_pdu` (which no longer takes its own lock). The
+    // lock IS held across HTTP roundtrips of the auth chain fetch —
+    // federation per-room throughput naturally serialises (events
+    // arrive depth-ordered from the sender), so the additional wait
+    // is bounded and predictable.
+    let lock = state
+        .room_locks
+        .entry(Nid(room_nid))
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    let _room_guard = lock.lock().await;
+
     // --- Check 2: signatures ---
     let sender_domain = match pdu.sender_domain() {
         Some(d) => d.to_string(),
@@ -858,6 +881,11 @@ fn load_pdu_by_event_id(state: &AppState, event_id: &str) -> Option<Pdu> {
 
 /// Persist an accepted PDU. Handles events CF write, state updates,
 /// soft-fail marker, and extremity updates (only if NOT soft-failed).
+///
+/// REQUIRES: caller holds `state.room_locks[Nid(room_nid)]`. The
+/// caller in `process_pdu` takes the lock at the top so the auth-
+/// chain fetch + check-4 + persist + side-effects all serialise on
+/// the same lock as `outbound_join`'s state bootstrap.
 async fn persist_received_pdu(
     state: &AppState,
     room_nid: u64,
@@ -865,13 +893,6 @@ async fn persist_received_pdu(
     event_json: &Map<String, Value>,
     soft_failed: bool,
 ) -> Result<(), String> {
-    let lock = state
-        .room_locks
-        .entry(Nid(room_nid))
-        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-        .clone();
-    let _guard = lock.lock().await;
-
     // Resolve type/sender/state_key NIDs.
     let type_nid = state
         .db
