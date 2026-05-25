@@ -1183,10 +1183,33 @@ async fn apply_invite_rescind(
     {
         return PduOutcome::Rejected(format!("promote: {e}"));
     }
-    let new_membership: u8 = if pdu.membership() == Some("ban") {
-        3
-    } else {
-        0
+    // Read membership from CURRENT state, not from the rescind PDU.
+    // promote_state_event applies the state-res tiebreak — if a newer
+    // invite already won (e.g. a parallel invite_v2 promoted the new
+    // invite into current state before this rescind arrived), this
+    // rescind event loses tiebreak and the state pointer stays at the
+    // invite. Forcing membership = leave/ban from the rescind PDU
+    // would clobber user_rooms to leave when state-res says invite.
+    // Bites TestUnbanViaInvite when the unban arrives after the new
+    // invite has already been promoted.
+    let current_member_nid = state
+        .db
+        .get_state_event_nid(room_nid, type_nid, target_nid)
+        .ok()
+        .flatten();
+    let current_membership_str = current_member_nid
+        .and_then(|nid| state.db.get_event(nid).ok().flatten())
+        .and_then(|(_, json)| serde_json::from_slice::<Value>(&json).ok())
+        .as_ref()
+        .and_then(|v| v.pointer("/content/membership"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let new_membership: u8 = match current_membership_str.as_deref() {
+        Some("join") => 1,
+        Some("invite") => 2,
+        Some("ban") => 3,
+        Some("knock") => 4,
+        _ => 0,
     };
     if let Err(e) = state
         .db
