@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -163,6 +164,21 @@ pub struct Database {
     pub(crate) string_nid_counter: PersistedCounter,
     pub(crate) stream_counter: AtomicU64,
     pub(crate) snapshot_nid_counter: PersistedCounter,
+    /// Positions allocated by `next_stream_position` but whose RocksDB
+    /// `WriteBatch` has not yet been confirmed via `mark_stream_applied`.
+    /// `current_stream_position` reports `min(pending) - 1` so /sync's
+    /// `next_batch` never advances past an event that's still in flight
+    /// in another room. Without this gate, a concurrent room's later-
+    /// allocated-but-faster-committed pos would over-advance `next_batch`
+    /// and strand the slower-committing event under the `p > since`
+    /// incremental-sync filter — the TFRI `Non-invitee_user_cannot_rescind`
+    /// race that survived PRs #92/#94/#95.
+    pub(crate) stream_pending: Mutex<BTreeSet<u64>>,
+    /// Largest `pos` such that every position ≤ `pos` has been confirmed
+    /// applied (i.e. its WriteBatch has completed). `current_stream_position`
+    /// reads this directly. Lags the allocation counter under in-flight
+    /// writes; that's the point.
+    pub(crate) stream_applied: AtomicU64,
     /// Monotonic position into `receipts_stream`, advanced once per
     /// locally-originated receipt write. Recovered from the on-disk CF
     /// at open. Independent from `stream_counter` so receipt EDU
@@ -217,6 +233,8 @@ impl Database {
             event_nid_counter: PersistedCounter::ephemeral(1),
             string_nid_counter: PersistedCounter::ephemeral(1),
             stream_counter: AtomicU64::new(1),
+            stream_pending: Mutex::new(BTreeSet::new()),
+            stream_applied: AtomicU64::new(0),
             receipts_stream_counter: AtomicU64::new(1),
             presence_stream_counter: AtomicU64::new(1),
             snapshot_nid_counter: PersistedCounter::ephemeral(1),
@@ -338,6 +356,11 @@ impl Database {
             event_nid_counter,
             string_nid_counter,
             stream_counter: AtomicU64::new(stream_counter),
+            // No in-flight writes after a clean start, so applied == last
+            // allocated position. recover_max_stream returns the next
+            // unused slot, so the largest applied position is one less.
+            stream_pending: Mutex::new(BTreeSet::new()),
+            stream_applied: AtomicU64::new(stream_counter.saturating_sub(1)),
             snapshot_nid_counter,
             receipts_stream_counter: AtomicU64::new(receipts_stream_counter),
             presence_stream_counter: AtomicU64::new(presence_stream_counter),
@@ -357,8 +380,16 @@ impl Database {
     /// is monotonically greater than any previously allocated position
     /// across restarts (durability provided by RocksDB's sequence
     /// number; see `recover_max_stream`).
+    ///
+    /// The allocated position is also recorded in `stream_pending`. The
+    /// caller MUST follow up with `mark_stream_applied(pos)` after their
+    /// RocksDB write either commits or fails — leaving a position in
+    /// pending stalls `current_stream_position` (and thus all /sync
+    /// long-poll progress) forever.
     pub fn next_stream_position(&self) -> StreamPosition {
-        StreamPosition(self.stream_counter.fetch_add(1, Ordering::Relaxed))
+        let pos = self.stream_counter.fetch_add(1, Ordering::Relaxed);
+        self.stream_pending.lock().unwrap().insert(pos);
+        StreamPosition(pos)
     }
 
     pub fn db_ref(&self) -> &DB {
@@ -385,11 +416,49 @@ impl Database {
         self.snapshot_nid_counter.next(&self.db)
     }
 
-    /// Returns the last allocated stream position (the position of the most recent event).
+    /// Returns the largest stream position such that every position ≤ it
+    /// has been fully applied to RocksDB. Used as the `next_batch` upper
+    /// bound for /sync responses: clients then incremental-poll with
+    /// `since = this value`, and the filter `p > since` is gap-safe
+    /// because no allocated-but-unwritten position can be silently
+    /// stepped over.
+    ///
+    /// Lags `stream_counter` under in-flight writes — deliberately. Use
+    /// `next_stream_position` for write allocation; never use this value
+    /// as a write target.
     pub fn current_stream_position(&self) -> u64 {
-        self.stream_counter
-            .load(Ordering::Relaxed)
-            .saturating_sub(1)
+        self.stream_applied.load(Ordering::Relaxed)
+    }
+
+    /// Notify the watermark tracker that the WriteBatch carrying `pos`
+    /// has finished — committed or failed. Removes `pos` from
+    /// `stream_pending` and advances `stream_applied` as far as it can
+    /// without stepping past any still-pending position.
+    ///
+    /// MUST be called for every position returned by
+    /// `next_stream_position`, on both success and failure paths.
+    pub fn mark_stream_applied(&self, pos: u64) {
+        let mut pending = self.stream_pending.lock().unwrap();
+        pending.remove(&pos);
+        // `stream_applied` = (smallest still-pending) - 1, or
+        // `stream_counter - 1` if nothing is in flight. Pick the larger
+        // of the new value and the current one so concurrent commits
+        // can't accidentally rewind the watermark.
+        let new_applied = match pending.iter().next().copied() {
+            Some(min_pending) => min_pending.saturating_sub(1),
+            None => self
+                .stream_counter
+                .load(Ordering::Relaxed)
+                .saturating_sub(1),
+        };
+        // store-max: only advance, never retreat. Concurrent calls into
+        // mark_stream_applied each compute their own `new_applied` from
+        // the post-removal pending state; under the lock this is
+        // monotonic, but the explicit max guard documents the invariant.
+        let current = self.stream_applied.load(Ordering::Relaxed);
+        if new_applied > current {
+            self.stream_applied.store(new_applied, Ordering::Relaxed);
+        }
     }
 
     // --- NID operations ---
@@ -1193,6 +1262,7 @@ impl Database {
         // `device_list_outbound` after hs2 restart in
         // TestDeviceListsUpdateOverFederation/stopped_server).
         let pos = self.next_stream_position().as_u64();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos);
         let key = to_device_outbound_key(destination, pos);
         self.db
             .put_cf(&cf, &key, content_json.to_string().as_bytes())?;
@@ -1337,6 +1407,7 @@ impl Database {
     ) -> Result<u64, rocksdb::Error> {
         let cf = self.db.cf_handle("device_list_outbound").unwrap();
         let pos = self.next_stream_position().as_u64();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos);
         let key = to_device_outbound_key(destination, pos);
         self.db
             .put_cf(&cf, &key, content_json.to_string().as_bytes())?;
@@ -1425,6 +1496,7 @@ impl Database {
     ) -> Result<u64, rocksdb::Error> {
         let cf = self.db.cf_handle("signing_key_update_outbound").unwrap();
         let pos = self.next_stream_position().as_u64();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos);
         let key = to_device_outbound_key(destination, pos);
         self.db
             .put_cf(&cf, &key, content_json.to_string().as_bytes())?;
@@ -2018,6 +2090,10 @@ impl Database {
         } else {
             0
         };
+        // The watermark must advance whether the WriteBatch below
+        // commits or returns Err via `?`. `Option` lets us skip the
+        // mark for the no-position outlier / backfill kinds.
+        let _stream_guard = (stream_pos != 0).then(|| StreamApplyOnDrop::new(self, stream_pos));
 
         // Build binary header + JSON value
         let mut value = Vec::with_capacity(40 + event_json.len());
@@ -2416,6 +2492,7 @@ impl Database {
         // a one-off extra tick per membership change is negligible.
         let cf_pos = self.db.cf_handle("user_membership_pos").unwrap();
         let stream_pos = self.next_stream_position();
+        let _stream_guard = StreamApplyOnDrop::new(self, stream_pos.as_u64());
         batch.put_cf(
             &cf_pos,
             keys::encode_u64_pair(user_nid, room_nid),
@@ -3430,6 +3507,7 @@ impl Database {
         // see their own writes reflected in the next sync hang.
         let cf_pos = self.db.cf_handle("account_data_pos").unwrap();
         let stream_pos = self.next_stream_position();
+        let _stream_guard = StreamApplyOnDrop::new(self, stream_pos.as_u64());
         batch.put_cf(&cf_pos, &key, stream_pos.to_be_bytes());
 
         self.db.write(batch)
@@ -3735,6 +3813,7 @@ impl Database {
         let cf = self.db.cf_handle("thread_subscriptions").unwrap();
         let key = keys::encode_u64_pair_bytes(user_nid, room_nid, thread_root.as_bytes());
         let pos = self.next_stream_position().as_u64();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos);
         let mut value = [0u8; 9];
         value[0] = state;
         value[1..9].copy_from_slice(&pos.to_be_bytes());
@@ -3857,6 +3936,7 @@ impl Database {
         key.extend_from_slice(&keys::encode_u64(room_nid));
         key.extend_from_slice(data_type.as_bytes());
         let pos = self.next_stream_position().as_u64();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos);
         let mut batch = WriteBatch::default();
         batch.put_cf(&cf, &key, value.to_string().as_bytes());
         self.batch_put_stream_pos(
@@ -3924,6 +4004,7 @@ impl Database {
         let key = receipt_key(room_nid, receipt_type, user_nid, thread_id);
         let val = serde_json::json!({"event_id": event_id, "ts": timestamp});
         let pos = self.next_stream_position().as_u64();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos);
         let mut batch = WriteBatch::default();
         batch.put_cf(&cf, &key, val.to_string().as_bytes());
         self.batch_put_stream_pos(&mut batch, &receipts_room_pos_key(room_nid), pos);
@@ -4018,6 +4099,7 @@ impl Database {
         // stream counter (not the federation receipts_stream counter)
         // because `since` cursors are global-stream-pos values.
         let global_pos = self.next_stream_position().as_u64();
+        let _stream_guard = StreamApplyOnDrop::new(self, global_pos);
 
         let mut batch = WriteBatch::default();
         batch.put_cf(&receipts_cf, &receipts_key, receipts_val.as_bytes());
@@ -4359,6 +4441,7 @@ impl Database {
     ) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("to_device_messages").unwrap();
         let msg_id = self.next_stream_position();
+        let _stream_guard = StreamApplyOnDrop::new(self, msg_id.as_u64());
         let key = keys::encode_u64_bytes_bytes(
             target_user_nid,
             target_device_id.as_bytes(),
@@ -4456,6 +4539,7 @@ impl Database {
     pub fn record_device_key_change(&self, changed_user_nid: u64) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("device_key_changes").unwrap();
         let pos = self.next_stream_position();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos.as_u64());
         let val = keys::encode_u64(changed_user_nid);
 
         // Collect observers: always self, plus every joined room-mate.
@@ -4973,6 +5057,7 @@ impl Database {
     ) -> Result<u64, rocksdb::Error> {
         let cf = self.db.cf_handle("federation_outbox").unwrap();
         let pos = self.next_stream_position();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos.as_u64());
         let key = outbox_key(destination, pos.as_u64());
         self.db.put_cf(&cf, &key, keys::encode_u64(event_nid))?;
         Ok(pos.as_u64())
@@ -4994,9 +5079,13 @@ impl Database {
         let cf = self.db.cf_handle("federation_outbox").unwrap();
         let mut batch = WriteBatch::default();
         let mut positions = Vec::with_capacity(destinations.len());
+        // One guard per allocation; they all drop at function exit and
+        // collectively advance the watermark past this batch.
+        let mut _stream_guards: Vec<StreamApplyOnDrop<'_>> = Vec::with_capacity(destinations.len());
         let nid_bytes = keys::encode_u64(event_nid);
         for dest in destinations {
             let pos = self.next_stream_position();
+            _stream_guards.push(StreamApplyOnDrop::new(self, pos.as_u64()));
             let key = outbox_key(dest, pos.as_u64());
             batch.put_cf(&cf, &key, nid_bytes);
             positions.push(pos.as_u64());
@@ -5724,6 +5813,32 @@ impl std::fmt::Display for StreamPosition {
 impl From<StreamPosition> for u64 {
     fn from(p: StreamPosition) -> u64 {
         p.0
+    }
+}
+
+/// RAII guard returned alongside each `next_stream_position` allocation.
+/// On drop — at the end of the persist function, regardless of whether
+/// the RocksDB write succeeded or returned via `?` — calls
+/// `mark_stream_applied(pos)` so the watermark can advance.
+///
+/// Forgetting this guard would stall `current_stream_position` forever
+/// at the smallest still-pending position. Holding it for too long (past
+/// the actual write) just delays the watermark by a few statements,
+/// which is harmless.
+pub struct StreamApplyOnDrop<'a> {
+    db: &'a Database,
+    pos: u64,
+}
+
+impl<'a> StreamApplyOnDrop<'a> {
+    pub fn new(db: &'a Database, pos: u64) -> Self {
+        Self { db, pos }
+    }
+}
+
+impl Drop for StreamApplyOnDrop<'_> {
+    fn drop(&mut self) {
+        self.db.mark_stream_applied(self.pos);
     }
 }
 
