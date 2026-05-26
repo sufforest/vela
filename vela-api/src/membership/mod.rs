@@ -1419,7 +1419,7 @@ pub async fn knock_room(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    state
+    let stream_pos = state
         .db
         .persist_event(
             event_nid,
@@ -1450,6 +1450,15 @@ pub async fn knock_room(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     state.federation_sender.broadcast(room_nid, event_nid);
+
+    // Wake any /sync long-polls listening on this room. Without this
+    // the knock event only surfaces on the next sync poll (initial or
+    // 30s timeout) — peers in the room don't see the knocker until
+    // then. Every other state-persist + broadcast pair in vela does
+    // this; the local knock handler was the holdout.
+    if let Some(sender) = state.room_senders.get(&Nid(room_nid)) {
+        let _ = sender.send(stream_pos);
+    }
 
     Ok(Json(json!({"room_id": room_id.as_str()})))
 }
@@ -1667,7 +1676,7 @@ async fn emit_join_event(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    state
+    let stream_pos = state
         .db
         .persist_event(
             event_nid,
@@ -1698,6 +1707,14 @@ async fn emit_join_event(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     state.federation_sender.broadcast(room_nid, event_nid);
+
+    // Wake /sync long-polls for peers in the room — without this, the
+    // restricted-room join only surfaces on the next sync poll, not
+    // on the long-poll wake. Other emit_* membership paths fire this;
+    // the restricted-join variant was the holdout.
+    if let Some(sender) = state.room_senders.get(&Nid(room_nid)) {
+        let _ = sender.send(stream_pos);
+    }
     Ok(())
 }
 

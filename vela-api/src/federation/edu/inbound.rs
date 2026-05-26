@@ -460,6 +460,18 @@ async fn handle_receipt(state: &AppState, origin: &str, content: &Value) {
                 }
             }
         }
+        // Wake local /sync long-polls so members in this room see the
+        // remote user's read marker move immediately. Without this the
+        // m.receipt EDU is invisible to local clients until the 30s
+        // long-poll fires. Matches the local-receipt wake in
+        // sync/receipts.rs::post_receipt and the inbound-typing wake
+        // above in handle_typing.
+        if let Some(sender) = state
+            .room_senders
+            .get(&vela_core::identifiers::Nid(room_nid))
+        {
+            let _ = sender.send(state.db.current_stream_position());
+        }
     }
 }
 
