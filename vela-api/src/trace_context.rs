@@ -45,7 +45,7 @@ mod imp {
     pub fn set_current_parent_from_headers(headers: &axum::http::HeaderMap) {
         let extractor = HeaderExtractor(headers);
         let parent_cx = global::get_text_map_propagator(|p| p.extract(&extractor));
-        Span::current().set_parent(parent_cx);
+        let _ = Span::current().set_parent(parent_cx);
     }
 
     struct HeaderInjector<'a>(&'a mut HashMap<String, String>);
