@@ -1881,12 +1881,26 @@ async fn persist_fetched_event_inner(
                         // `aev_id` unloadable but recorded as
                         // rejected. Reflect that in our reason
                         // string and propagate.
-                        let reason = if state.db.is_event_rejected(aev_id).unwrap_or(false) {
+                        let is_rejected = state.db.is_event_rejected(aev_id).unwrap_or(false);
+                        let reason = if is_rejected {
                             format!("auth_event {aev_id} is rejected")
                         } else {
                             format!("auth event {aev_id} still missing after recursive fetch")
                         };
-                        let _ = state.db.mark_event_rejected(&target_pdu.event_id, &reason);
+                        // "still missing after recursive fetch" is a
+                        // transient local-state hole — the auth event
+                        // will arrive on a later transaction or a
+                        // backfill, and the next re-send of the
+                        // target event will revalidate cleanly. Same
+                        // shape as the "no m.room.create in state"
+                        // deferral below. Marking rejected here
+                        // permanently strands every downstream event
+                        // that lists target_pdu as auth_event, which
+                        // is the TFRI residual flake on
+                        // Non-invitee_user_cannot_rescind.
+                        if is_rejected {
+                            let _ = state.db.mark_event_rejected(&target_pdu.event_id, &reason);
+                        }
                         return Err(reason);
                     }
                 }
