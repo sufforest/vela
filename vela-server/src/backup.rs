@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::Context;
 use bytes::Bytes;
 use futures::StreamExt;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use tracing::{debug, info, warn};
 
 use vela_store::db::Database;

@@ -282,7 +282,7 @@ const S3_MULTIPART_CHUNK_SIZE: usize = 5 * 1024 * 1024;
 #[async_trait]
 impl MediaStore for S3MediaStore {
     async fn put(&self, media_id: &str, data: &[u8]) -> std::io::Result<()> {
-        use object_store::ObjectStore;
+        use object_store::ObjectStoreExt;
         let body = Bytes::copy_from_slice(data);
         self.client
             .put(&self.path(media_id), body.into())
@@ -296,7 +296,7 @@ impl MediaStore for S3MediaStore {
         media_id: &str,
         mut reader: Pin<Box<dyn AsyncRead + Send + Unpin>>,
     ) -> std::io::Result<u64> {
-        use object_store::ObjectStore;
+        use object_store::ObjectStoreExt;
         let path = self.path(media_id);
         let mut upload = self.client.put_multipart(&path).await.map_err(io_err)?;
 
@@ -348,7 +348,7 @@ impl MediaStore for S3MediaStore {
     }
 
     async fn get(&self, media_id: &str) -> std::io::Result<Option<MediaReader>> {
-        use object_store::{Error as OsErr, ObjectStore};
+        use object_store::{Error as OsErr, ObjectStoreExt};
         match self.client.get(&self.path(media_id)).await {
             Ok(resp) => {
                 let stream = resp.into_stream().map_err(io_err);
@@ -361,16 +361,16 @@ impl MediaStore for S3MediaStore {
     }
 
     async fn size(&self, media_id: &str) -> std::io::Result<Option<u64>> {
-        use object_store::{Error as OsErr, ObjectStore};
+        use object_store::{Error as OsErr, ObjectStoreExt};
         match self.client.head(&self.path(media_id)).await {
-            Ok(meta) => Ok(Some(meta.size as u64)),
+            Ok(meta) => Ok(Some(meta.size)),
             Err(OsErr::NotFound { .. }) => Ok(None),
             Err(e) => Err(io_err(e)),
         }
     }
 
     async fn delete(&self, media_id: &str) -> std::io::Result<()> {
-        use object_store::{Error as OsErr, ObjectStore};
+        use object_store::{Error as OsErr, ObjectStoreExt};
         match self.client.delete(&self.path(media_id)).await {
             Ok(()) => Ok(()),
             Err(OsErr::NotFound { .. }) => Ok(()),
