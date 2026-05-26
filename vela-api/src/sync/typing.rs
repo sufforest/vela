@@ -68,6 +68,9 @@ pub async fn set_typing(
         // EDU. Burning a pos per transition is fine — typing is
         // rare relative to PDUs.
         let pos = state.db.next_stream_position().as_u64();
+        // Typing doesn't persist to RocksDB (in-memory only), but we still
+        // must mark the position applied so safe_stream_position advances.
+        let _stream_guard = vela_store::db::StreamApplyOnDrop::new(&state.db, pos);
         state.typing_change_pos.insert(room_nid, pos);
 
         // Wake local /sync long-polls in the room so the typing EDU

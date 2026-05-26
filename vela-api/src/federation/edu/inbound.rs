@@ -119,6 +119,7 @@ async fn handle_device_list_update(state: &AppState, origin: &str, content: &Val
     }
 
     let stream_pos = state.db.next_stream_position();
+    let _stream_guard = vela_store::db::StreamApplyOnDrop::new(&state.db, stream_pos.as_u64());
     let observer_vec: Vec<u64> = observer_nids.iter().copied().collect();
     if let Err(e) = state
         .db
@@ -214,6 +215,7 @@ async fn handle_signing_key_update(state: &AppState, origin: &str, content: &Val
         return;
     }
     let stream_pos = state.db.next_stream_position();
+    let _stream_guard = vela_store::db::StreamApplyOnDrop::new(&state.db, stream_pos.as_u64());
     let observer_vec: Vec<u64> = observer_nids.iter().copied().collect();
     if let Err(e) = state
         .db
@@ -624,6 +626,7 @@ async fn handle_typing(state: &AppState, origin: &str, content: &Value) {
     // EDU emit gate (since < typing_change_pos) never trips.
     if was_typing != typing {
         let pos = state.db.next_stream_position().as_u64();
+        let _stream_guard = vela_store::db::StreamApplyOnDrop::new(&state.db, pos);
         state.typing_change_pos.insert(room_nid, pos);
         if let Some(sender) = state
             .room_senders

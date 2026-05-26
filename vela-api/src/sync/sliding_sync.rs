@@ -523,7 +523,10 @@ pub async fn sliding_sync(
         extensions.insert(
             "to_device".to_string(),
             json!({
-                "next_batch": state.db.current_stream_position().to_string(),
+                // Use the gap-free committed watermark so the next sliding
+                // sync's `since` can't strand an in-flight pos. See
+                // db::safe_stream_position docs.
+                "next_batch": state.db.safe_stream_position().to_string(),
                 "events": events,
             }),
         );
@@ -753,7 +756,7 @@ pub async fn sliding_sync(
             extensions.insert(
                 "to_device".to_string(),
                 json!({
-                    "next_batch": state.db.current_stream_position().to_string(),
+                    "next_batch": state.db.safe_stream_position().to_string(),
                     "events": events,
                 }),
             );
@@ -796,7 +799,9 @@ pub async fn sliding_sync(
         h.abort();
     }
 
-    let final_pos = state.db.current_stream_position();
+    // Same reason as the to_device next_batch above: this becomes the
+    // client's next `pos`, so it must not advance past in-flight writes.
+    let final_pos = state.db.safe_stream_position();
 
     let mut response = json!({
         "pos": final_pos.to_string(),
