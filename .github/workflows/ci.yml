@@ -47,6 +47,12 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # librocksdb-sys 0.17 (RocksDB 10) drops the bundled bindings and
+      # runs bindgen against the headers at build time, so libclang must
+      # be on the host.
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
@@ -73,6 +79,9 @@ jobs:
       - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@1.88
 
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
@@ -91,6 +100,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -114,6 +126,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -140,6 +155,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -169,6 +187,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -201,6 +222,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
