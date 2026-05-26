@@ -162,6 +162,15 @@ pub struct Database {
     pub(crate) db: DB,
     pub(crate) event_nid_counter: PersistedCounter,
     pub(crate) string_nid_counter: PersistedCounter,
+    /// Serialises allocation of a new NID for a string that has no
+    /// mapping yet. Two concurrent `get_or_create_nid` calls for the
+    /// same fresh string would otherwise both miss the existence check
+    /// and each consume a fresh counter slot — last-write-wins on the
+    /// `nid_map` key leaves one writer's NID with state written under
+    /// it while subsequent lookups resolve to the other NID. Fast path
+    /// (mapping already exists) is lock-free; only the allocate path
+    /// takes the lock, double-checks, then writes.
+    pub(crate) nid_alloc_lock: Mutex<()>,
     pub(crate) stream_counter: AtomicU64,
     /// Positions handed out by `next_stream_position` but whose RocksDB
     /// write hasn't yet been confirmed via `mark_stream_applied`. Used to
@@ -231,6 +240,7 @@ impl Database {
             // anyway (writes refused on the secondary).
             event_nid_counter: PersistedCounter::ephemeral(1),
             string_nid_counter: PersistedCounter::ephemeral(1),
+            nid_alloc_lock: Mutex::new(()),
             stream_counter: AtomicU64::new(1),
             stream_pending: Mutex::new(BTreeSet::new()),
             safe_stream_pos: AtomicU64::new(0),
@@ -354,6 +364,7 @@ impl Database {
             db,
             event_nid_counter,
             string_nid_counter,
+            nid_alloc_lock: Mutex::new(()),
             stream_counter: AtomicU64::new(stream_counter),
             // No in-flight writes immediately after open, so the safe
             // watermark equals the last allocated position. recover_max_stream
@@ -478,6 +489,14 @@ impl Database {
     // --- NID operations ---
 
     pub fn get_or_create_nid(&self, string: &str) -> Result<u64, rocksdb::Error> {
+        // Fast path: existing mapping wins lock-free.
+        if let Some(nid) = nid::get_nid(&self.db, string)? {
+            return Ok(nid);
+        }
+        // Serialise allocation so two writers can't both miss the
+        // existence check and each consume a counter slot — see
+        // `nid_alloc_lock` doc comment.
+        let _guard = self.nid_alloc_lock.lock().expect("nid_alloc_lock poisoned");
         nid::get_or_create_nid(&self.db, &self.string_nid_counter, string)
     }
 
@@ -6991,6 +7010,36 @@ mod stream_recovery_tests {
                 Some(b"legacy-row".to_vec())
             );
         }
+    }
+
+    /// Concurrent `get_or_create_nid` for the same fresh string must
+    /// return the same NID. Regression test for a check-then-write race
+    /// that caused two writers to each allocate a distinct counter
+    /// slot — last-write-wins on `nid_map` then orphaned one writer's
+    /// state under an unreachable NID.
+    #[test]
+    fn get_or_create_nid_is_race_free_for_same_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(Database::open(tmp.path()).unwrap());
+        let s = "@racy-user:example.com";
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let db = db.clone();
+            handles.push(std::thread::spawn(move || db.get_or_create_nid(s).unwrap()));
+        }
+        let nids: std::collections::HashSet<u64> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            nids.len(),
+            1,
+            "concurrent get_or_create_nid allocated multiple NIDs: {nids:?}"
+        );
+        let resolved = db.get_nid(s).unwrap().unwrap();
+        assert_eq!(
+            nids.iter().next().copied(),
+            Some(resolved),
+            "persisted NID disagrees with returned NIDs"
+        );
     }
 }
 

@@ -59,9 +59,18 @@ pub async fn make_leave(
 
     let user_nid = state.db.get_or_create_nid(&user_id).map_err(db_err)?;
     // User must currently be in the room (joined/invited/knocked) to leave it.
-    match state.db.get_membership(room_nid, user_nid).ok().flatten() {
+    let membership = state.db.get_membership(room_nid, user_nid).ok().flatten();
+    match membership {
         Some(1) | Some(2) | Some(4) => {}
         _ => {
+            tracing::warn!(
+                %room_id,
+                %user_id,
+                room_nid,
+                user_nid,
+                ?membership,
+                "make_leave rejected: get_membership returned non-joined/invited/knocked"
+            );
             return Err(err(
                 StatusCode::FORBIDDEN,
                 "M_FORBIDDEN",
