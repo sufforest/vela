@@ -759,7 +759,7 @@ async fn send_tombstone(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    state
+    let stream_pos = state
         .db
         .persist_event(
             event_nid,
@@ -784,6 +784,14 @@ async fn send_tombstone(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     state.federation_sender.broadcast(old_room_nid, event_nid);
+
+    // Wake /sync long-polls on the OLD room so subscribers see the
+    // tombstone immediately — otherwise they keep talking in the
+    // upgraded-away room until their next poll. Mirrors every other
+    // state-persist + broadcast pair in vela.
+    if let Some(sender) = state.room_senders.get(&Nid(old_room_nid)) {
+        let _ = sender.send(stream_pos);
+    }
     Ok(())
 }
 
