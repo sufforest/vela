@@ -56,6 +56,15 @@ pub fn load_state_pdu(
 
 /// Insert `m.room.create` into a state map from persisted state if it's
 /// not already present (v12/MSC4291: create is excluded from auth_events).
+///
+/// Skips synthetic stripped placeholders (`$invite-stripped:…`) — those
+/// come from `invite_room_state` and have a manufactured event_id that
+/// won't match the room_id under the v12 `room_id == create_event_id`
+/// rule. Using them as auth context would cascade-reject every fetched
+/// event for an invited-but-not-yet-joined room until the real create
+/// event arrives via send_join; better to leave the slot empty and let
+/// `check_auth` surface "no m.room.create in state", which the fetched-
+/// event path treats as a transient gap rather than a permanent reject.
 pub fn ensure_create_in_state(
     db: &Database,
     room_nid: u64,
@@ -64,6 +73,7 @@ pub fn ensure_create_in_state(
     let key = ("m.room.create".to_string(), String::new());
     if let std::collections::hash_map::Entry::Vacant(e) = state.entry(key)
         && let Some(create) = load_state_pdu(db, room_nid, "m.room.create", "")
+        && !create.event_id.starts_with("$invite-stripped:")
     {
         e.insert(create);
     }
