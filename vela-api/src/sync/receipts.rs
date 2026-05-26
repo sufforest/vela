@@ -48,6 +48,15 @@ pub async fn post_receipt(
             thread_id,
         )
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    // Wake local /sync long-polls in this room so other members see
+    // the read marker move immediately. Without this the receipt
+    // sits invisible until the 30s long-poll timeout fires.
+    if let Some(sender) = state
+        .room_senders
+        .get(&vela_core::identifiers::Nid(room_nid))
+    {
+        let _ = sender.send(state.db.current_stream_position());
+    }
     // Wake the federation senders for any peers in this room so the
     // m.receipt EDU rides out without waiting for the idle poll.
     state.federation_sender.notify_room(room_nid);
