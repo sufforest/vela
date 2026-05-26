@@ -494,7 +494,8 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
 
     // --- Check 5: state-at-event ---
     // Resolve state from each prev_event's state_snapshot via state_res v2.
-    match compute_state_at_event(state, &effective_pdu, &sender_domain).await {
+    match compute_state_at_event(state, &effective_pdu, &sender_domain, fetch_budget.clone()).await
+    {
         Ok(Some(mut state_at_event)) => {
             // v12 (MSC4291): m.room.create isn't a state event in the
             // post-state snapshot, so it's absent from the resolved
@@ -638,6 +639,7 @@ async fn compute_state_at_event(
     state: &AppState,
     event: &Pdu,
     origin: &str,
+    fetch_budget: FetchBudget,
 ) -> Result<Option<HashMap<(String, String), Pdu>>, String> {
     if event.prev_events.is_empty() {
         return Ok(None);
@@ -660,6 +662,74 @@ async fn compute_state_at_event(
             Some(n) => n,
             None => {
                 if state.db.is_event_rejected(prev_id).unwrap_or(false) {
+                    continue;
+                }
+                // Last-resort fetch: under 3-server topologies the prev_event
+                // can arrive at this server AFTER the event that references
+                // it. /get_missing_events earlier in process_pdu may have
+                // returned empty if the gap walks past the sender's own
+                // earliest-known position. Try /event/{prev_id} directly
+                // against the origin so we can compute state-at-event
+                // instead of rejecting and waiting for re-delivery.
+                // TestACLsForEDUs reproduces this race ~33% under CI load.
+                if let Ok(pdu_value) = state
+                    .federation_client
+                    .fetch_event_pdu(origin, prev_id)
+                    .await
+                    && persist_fetched_event(
+                        state,
+                        &pdu_value,
+                        origin,
+                        fetch_budget.clone(),
+                        FetchKind::MissingTimeline,
+                    )
+                    .await
+                    .is_ok()
+                    && let Some(n) = state
+                        .db
+                        .get_event_nid_by_id(prev_id)
+                        .map_err(|e| format!("db: {e}"))?
+                {
+                    // Fetch succeeded — proceed with this prev_nid.
+                    let nid_after_fetch = n;
+                    let snapshot_nids = state
+                        .db
+                        .get_state_at_event(nid_after_fetch)
+                        .map_err(|e| format!("db: {e}"))?
+                        .unwrap_or_default();
+                    if snapshot_nids.is_empty() {
+                        // No snapshot yet — skip this prev, others may suffice.
+                        continue;
+                    }
+                    let mut sm: StateMap = StateMap::new();
+                    for snid in &snapshot_nids {
+                        let Some(eid) = state
+                            .db
+                            .get_event_id_by_nid(*snid)
+                            .map_err(|e| format!("db: {e}"))?
+                        else {
+                            continue;
+                        };
+                        let Some((header, _)) =
+                            state.db.get_event(*snid).map_err(|e| format!("db: {e}"))?
+                        else {
+                            continue;
+                        };
+                        let Some(et) = state
+                            .db
+                            .resolve_nid(header.type_nid)
+                            .map_err(|e| format!("db: {e}"))?
+                        else {
+                            continue;
+                        };
+                        let sk = state
+                            .db
+                            .resolve_nid(header.state_key_nid)
+                            .map_err(|e| format!("db: {e}"))?
+                            .unwrap_or_default();
+                        sm.insert((et, sk), eid);
+                    }
+                    state_sets.push(sm);
                     continue;
                 }
                 return Err(format!("unknown prev_event {prev_id}"));
