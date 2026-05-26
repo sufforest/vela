@@ -273,6 +273,14 @@ pub(crate) fn build_sync_response_with_filter(
     full_state: bool,
 ) -> Result<Value, ApiError> {
     let current_pos = state.db.current_stream_position();
+    // Safe watermark: largest pos such that EVERY pos ≤ it has committed.
+    // We use this for `next_batch` and the timeline read upper bound so a
+    // later-allocated-but-faster-committed pos in another room can't strand
+    // a slower in-flight pos under the next /sync's `p > since` filter.
+    // current_pos still feeds device_key_changes / account_data_since etc.
+    // where the read upper bound only matters in the "see latest committed"
+    // direction (RocksDB reads never see uncommitted rows).
+    let safe_pos = state.db.safe_stream_position();
     let ignored = load_ignored_users(state, user.user_nid)?;
     let mut join_rooms = serde_json::Map::new();
 
@@ -338,6 +346,7 @@ pub(crate) fn build_sync_response_with_filter(
             Some(&user.device_id),
             timeline_limit,
             unread_thread_notifications,
+            safe_pos,
         )?;
         if !ignored.is_empty() {
             filter_room_timeline_by_ignored(&mut room_data, &ignored);
@@ -523,7 +532,7 @@ pub(crate) fn build_sync_response_with_filter(
 
     state
         .db
-        .set_sync_position(user.user_nid, &user.device_id, current_pos)
+        .set_sync_position(user.user_nid, &user.device_id, safe_pos)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     let presence_events = collect_presence_events(state, user.user_nid, joined_room_nids)?;
@@ -602,7 +611,7 @@ pub(crate) fn build_sync_response_with_filter(
         .collect();
 
     Ok(json!({
-        "next_batch": format!("s{current_pos}"),
+        "next_batch": format!("s{safe_pos}"),
         "rooms": {
             "join": join_rooms,
             "invite": invite_rooms,
@@ -701,6 +710,7 @@ fn build_room_sync_for_user(
     device_id: Option<&str>,
     timeline_limit: usize,
     unread_thread_notifications: bool,
+    safe_pos: u64,
 ) -> Result<Value, ApiError> {
     let (state_events, timeline_events, limited, prev_batch) = match since {
         None => {
@@ -805,10 +815,16 @@ fn build_room_sync_for_user(
                     .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
                 // Drop entries at or before `since_pos`; those are
-                // already on the client.
+                // already on the client. Also cap at `safe_pos`: events
+                // with `p > safe_pos` belong to allocations whose
+                // WriteBatch is still in flight in some other room — if
+                // we deliver them here while next_batch=safe_pos, the
+                // next /sync's `p > since` would re-include them as
+                // duplicates. The capped events come back on the next
+                // iteration after safe_pos advances.
                 let timeline_entries: Vec<(u64, u64)> = timeline_entries
                     .into_iter()
-                    .filter(|(p, _)| *p > since_pos)
+                    .filter(|(p, _)| *p > since_pos && *p <= safe_pos)
                     .collect();
                 // limited covers two cases: batch was truncated by
                 // the filter limit, OR the room had a federation gap

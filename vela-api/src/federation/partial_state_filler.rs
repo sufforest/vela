@@ -361,6 +361,7 @@ fn reconcile_device_lists(
     }
     for &peer_nid in &new_peers {
         let stream_pos = state.db.next_stream_position().as_u64();
+        let _stream_guard = vela_store::db::StreamApplyOnDrop::new(&state.db, stream_pos);
         if let Err(e) = state
             .db
             .notify_device_key_change(peer_nid, &local_observers, stream_pos)

@@ -895,13 +895,16 @@ pub fn record_device_changes_on_join(state: &AppState, user_nid: u64, room_nid: 
     // three writes below).
     for &member_nid in &other_members {
         let pos = state.db.next_stream_position().as_u64();
+        let _g = vela_store::db::StreamApplyOnDrop::new(&state.db, pos);
         if let Err(e) = state
             .db
             .notify_device_key_change(member_nid, &[user_nid], pos)
         {
             tracing::warn!(error = %e, "notify_device_key_change on join (member) failed");
         }
+        drop(_g);
         let pos = state.db.next_stream_position().as_u64();
+        let _g = vela_store::db::StreamApplyOnDrop::new(&state.db, pos);
         if let Err(e) = state
             .db
             .notify_device_key_change(user_nid, &[member_nid], pos)
@@ -910,6 +913,7 @@ pub fn record_device_changes_on_join(state: &AppState, user_nid: u64, room_nid: 
         }
     }
     let pos = state.db.next_stream_position().as_u64();
+    let _g = vela_store::db::StreamApplyOnDrop::new(&state.db, pos);
     if let Err(e) = state
         .db
         .notify_device_key_change(user_nid, &[user_nid], pos)
@@ -942,6 +946,7 @@ pub fn record_device_changes_on_leave(state: &AppState, departing_nid: u64, room
         return;
     }
     let stream_pos = state.db.next_stream_position().as_u64();
+    let _stream_guard = vela_store::db::StreamApplyOnDrop::new(&state.db, stream_pos);
 
     // Direction 1: from each remaining member's perspective, the
     // departing user has left.

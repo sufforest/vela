@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -162,6 +163,20 @@ pub struct Database {
     pub(crate) event_nid_counter: PersistedCounter,
     pub(crate) string_nid_counter: PersistedCounter,
     pub(crate) stream_counter: AtomicU64,
+    /// Positions handed out by `next_stream_position` but whose RocksDB
+    /// write hasn't yet been confirmed via `mark_stream_applied`. Used to
+    /// derive `safe_stream_position` — the gap-free committed watermark
+    /// that /sync's `next_batch` rides on so an out-of-order commit on a
+    /// different room can't strand the slower in-flight write under
+    /// the next /sync's `p > since` filter.
+    pub(crate) stream_pending: Mutex<BTreeSet<u64>>,
+    /// Largest `pos` such that every position ≤ `pos` has been confirmed
+    /// applied. Read by `safe_stream_position` (for /sync next_batch + the
+    /// timeline filter). `current_stream_position` is unchanged and still
+    /// returns `stream_counter - 1` so consumers that want "everything
+    /// committed so far" (device_key_changes, account_data_since) see
+    /// recent writes without lag.
+    pub(crate) safe_stream_pos: AtomicU64,
     pub(crate) snapshot_nid_counter: PersistedCounter,
     /// Monotonic position into `receipts_stream`, advanced once per
     /// locally-originated receipt write. Recovered from the on-disk CF
@@ -217,6 +232,8 @@ impl Database {
             event_nid_counter: PersistedCounter::ephemeral(1),
             string_nid_counter: PersistedCounter::ephemeral(1),
             stream_counter: AtomicU64::new(1),
+            stream_pending: Mutex::new(BTreeSet::new()),
+            safe_stream_pos: AtomicU64::new(0),
             receipts_stream_counter: AtomicU64::new(1),
             presence_stream_counter: AtomicU64::new(1),
             snapshot_nid_counter: PersistedCounter::ephemeral(1),
@@ -338,6 +355,11 @@ impl Database {
             event_nid_counter,
             string_nid_counter,
             stream_counter: AtomicU64::new(stream_counter),
+            // No in-flight writes immediately after open, so the safe
+            // watermark equals the last allocated position. recover_max_stream
+            // returns the next unused slot, so last allocated is counter - 1.
+            stream_pending: Mutex::new(BTreeSet::new()),
+            safe_stream_pos: AtomicU64::new(stream_counter.saturating_sub(1)),
             snapshot_nid_counter,
             receipts_stream_counter: AtomicU64::new(receipts_stream_counter),
             presence_stream_counter: AtomicU64::new(presence_stream_counter),
@@ -357,8 +379,16 @@ impl Database {
     /// is monotonically greater than any previously allocated position
     /// across restarts (durability provided by RocksDB's sequence
     /// number; see `recover_max_stream`).
+    ///
+    /// The allocated position is also recorded in `stream_pending`.
+    /// Callers MUST follow up with `mark_stream_applied(pos)` after their
+    /// RocksDB write either commits or fails — leaving a position in
+    /// pending forever stalls `safe_stream_position` (and thus /sync's
+    /// next_batch progress) at the smallest still-pending value.
     pub fn next_stream_position(&self) -> StreamPosition {
-        StreamPosition(self.stream_counter.fetch_add(1, Ordering::Relaxed))
+        let pos = self.stream_counter.fetch_add(1, Ordering::Relaxed);
+        self.stream_pending.lock().unwrap().insert(pos);
+        StreamPosition(pos)
     }
 
     pub fn db_ref(&self) -> &DB {
@@ -386,10 +416,63 @@ impl Database {
     }
 
     /// Returns the last allocated stream position (the position of the most recent event).
+    ///
+    /// This is the upper bound for "everything that's been allocated", regardless
+    /// of whether its RocksDB write has committed yet. Use it as the read upper
+    /// bound where you want recent committed writes immediately visible —
+    /// `get_device_key_changes`, `get_account_data_since`, etc. RocksDB reads
+    /// only see committed rows, so an over-reported counter never causes a
+    /// false positive; it only ensures no false negative on recent commits.
     pub fn current_stream_position(&self) -> u64 {
         self.stream_counter
             .load(Ordering::Relaxed)
             .saturating_sub(1)
+    }
+
+    /// Returns the largest stream position `N` such that EVERY allocated
+    /// position ≤ `N` has been confirmed via `mark_stream_applied`. Lags
+    /// `current_stream_position` whenever any allocation is still in
+    /// flight — that's the point.
+    ///
+    /// Use this for /sync's `next_batch` and for the upper bound on the
+    /// timeline read filter: it guarantees that a client's next /sync
+    /// using this as `since` can't have an event with `p > since` already
+    /// committed-but-stranded. Other consumers should NOT use this — see
+    /// `current_stream_position` for read upper bounds.
+    pub fn safe_stream_position(&self) -> u64 {
+        self.safe_stream_pos.load(Ordering::Relaxed)
+    }
+
+    /// Confirm that the WriteBatch carrying `pos` has finished — committed
+    /// or failed — and advance `safe_stream_position` as far as the now-
+    /// updated pending set allows.
+    ///
+    /// MUST be called for every position returned by `next_stream_position`,
+    /// on both success and failure paths. The RAII guard
+    /// `StreamApplyOnDrop` (defined further down) makes this safe to wire
+    /// in at each write callsite without rewriting every `?` path.
+    ///
+    /// Idempotent: calling twice on the same `pos` is a no-op the second
+    /// time (the BTreeSet removal is a no-op for already-removed entries).
+    pub fn mark_stream_applied(&self, pos: u64) {
+        let mut pending = self.stream_pending.lock().unwrap();
+        pending.remove(&pos);
+        // The new safe watermark is (smallest still-pending pos) - 1, or
+        // (counter - 1) when nothing is in flight.
+        let new_applied = match pending.iter().next().copied() {
+            Some(min_pending) => min_pending.saturating_sub(1),
+            None => self
+                .stream_counter
+                .load(Ordering::Relaxed)
+                .saturating_sub(1),
+        };
+        // store-max: never retreat. The Mutex serialises the pending edits,
+        // so within this critical section `new_applied` is the correct value;
+        // the max guard documents the monotonicity invariant for readers.
+        let current = self.safe_stream_pos.load(Ordering::Relaxed);
+        if new_applied > current {
+            self.safe_stream_pos.store(new_applied, Ordering::Relaxed);
+        }
     }
 
     // --- NID operations ---
@@ -1193,6 +1276,7 @@ impl Database {
         // `device_list_outbound` after hs2 restart in
         // TestDeviceListsUpdateOverFederation/stopped_server).
         let pos = self.next_stream_position().as_u64();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos);
         let key = to_device_outbound_key(destination, pos);
         self.db
             .put_cf(&cf, &key, content_json.to_string().as_bytes())?;
@@ -1337,6 +1421,7 @@ impl Database {
     ) -> Result<u64, rocksdb::Error> {
         let cf = self.db.cf_handle("device_list_outbound").unwrap();
         let pos = self.next_stream_position().as_u64();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos);
         let key = to_device_outbound_key(destination, pos);
         self.db
             .put_cf(&cf, &key, content_json.to_string().as_bytes())?;
@@ -1425,6 +1510,7 @@ impl Database {
     ) -> Result<u64, rocksdb::Error> {
         let cf = self.db.cf_handle("signing_key_update_outbound").unwrap();
         let pos = self.next_stream_position().as_u64();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos);
         let key = to_device_outbound_key(destination, pos);
         self.db
             .put_cf(&cf, &key, content_json.to_string().as_bytes())?;
@@ -2018,6 +2104,10 @@ impl Database {
         } else {
             0
         };
+        // Only writes_timeline() kinds allocate, so the guard only fires
+        // when there's something to mark applied. Drop order on function
+        // exit covers both the Ok return and any `?`-propagated error.
+        let _stream_guard = (stream_pos != 0).then(|| StreamApplyOnDrop::new(self, stream_pos));
 
         // Build binary header + JSON value
         let mut value = Vec::with_capacity(40 + event_json.len());
@@ -2416,6 +2506,7 @@ impl Database {
         // a one-off extra tick per membership change is negligible.
         let cf_pos = self.db.cf_handle("user_membership_pos").unwrap();
         let stream_pos = self.next_stream_position();
+        let _stream_guard = StreamApplyOnDrop::new(self, stream_pos.as_u64());
         batch.put_cf(
             &cf_pos,
             keys::encode_u64_pair(user_nid, room_nid),
@@ -3430,6 +3521,7 @@ impl Database {
         // see their own writes reflected in the next sync hang.
         let cf_pos = self.db.cf_handle("account_data_pos").unwrap();
         let stream_pos = self.next_stream_position();
+        let _stream_guard = StreamApplyOnDrop::new(self, stream_pos.as_u64());
         batch.put_cf(&cf_pos, &key, stream_pos.to_be_bytes());
 
         self.db.write(batch)
@@ -3735,6 +3827,7 @@ impl Database {
         let cf = self.db.cf_handle("thread_subscriptions").unwrap();
         let key = keys::encode_u64_pair_bytes(user_nid, room_nid, thread_root.as_bytes());
         let pos = self.next_stream_position().as_u64();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos);
         let mut value = [0u8; 9];
         value[0] = state;
         value[1..9].copy_from_slice(&pos.to_be_bytes());
@@ -3857,6 +3950,7 @@ impl Database {
         key.extend_from_slice(&keys::encode_u64(room_nid));
         key.extend_from_slice(data_type.as_bytes());
         let pos = self.next_stream_position().as_u64();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos);
         let mut batch = WriteBatch::default();
         batch.put_cf(&cf, &key, value.to_string().as_bytes());
         self.batch_put_stream_pos(
@@ -3924,6 +4018,7 @@ impl Database {
         let key = receipt_key(room_nid, receipt_type, user_nid, thread_id);
         let val = serde_json::json!({"event_id": event_id, "ts": timestamp});
         let pos = self.next_stream_position().as_u64();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos);
         let mut batch = WriteBatch::default();
         batch.put_cf(&cf, &key, val.to_string().as_bytes());
         self.batch_put_stream_pos(&mut batch, &receipts_room_pos_key(room_nid), pos);
@@ -4018,6 +4113,7 @@ impl Database {
         // stream counter (not the federation receipts_stream counter)
         // because `since` cursors are global-stream-pos values.
         let global_pos = self.next_stream_position().as_u64();
+        let _stream_guard = StreamApplyOnDrop::new(self, global_pos);
 
         let mut batch = WriteBatch::default();
         batch.put_cf(&receipts_cf, &receipts_key, receipts_val.as_bytes());
@@ -4359,6 +4455,7 @@ impl Database {
     ) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("to_device_messages").unwrap();
         let msg_id = self.next_stream_position();
+        let _stream_guard = StreamApplyOnDrop::new(self, msg_id.as_u64());
         let key = keys::encode_u64_bytes_bytes(
             target_user_nid,
             target_device_id.as_bytes(),
@@ -4456,6 +4553,7 @@ impl Database {
     pub fn record_device_key_change(&self, changed_user_nid: u64) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("device_key_changes").unwrap();
         let pos = self.next_stream_position();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos.as_u64());
         let val = keys::encode_u64(changed_user_nid);
 
         // Collect observers: always self, plus every joined room-mate.
@@ -4973,6 +5071,7 @@ impl Database {
     ) -> Result<u64, rocksdb::Error> {
         let cf = self.db.cf_handle("federation_outbox").unwrap();
         let pos = self.next_stream_position();
+        let _stream_guard = StreamApplyOnDrop::new(self, pos.as_u64());
         let key = outbox_key(destination, pos.as_u64());
         self.db.put_cf(&cf, &key, keys::encode_u64(event_nid))?;
         Ok(pos.as_u64())
@@ -4994,9 +5093,13 @@ impl Database {
         let cf = self.db.cf_handle("federation_outbox").unwrap();
         let mut batch = WriteBatch::default();
         let mut positions = Vec::with_capacity(destinations.len());
+        // Hold one guard per allocation; they all drop at function exit
+        // and collectively advance the watermark past this batch.
+        let mut _stream_guards: Vec<StreamApplyOnDrop<'_>> = Vec::with_capacity(destinations.len());
         let nid_bytes = keys::encode_u64(event_nid);
         for dest in destinations {
             let pos = self.next_stream_position();
+            _stream_guards.push(StreamApplyOnDrop::new(self, pos.as_u64()));
             let key = outbox_key(dest, pos.as_u64());
             batch.put_cf(&cf, &key, nid_bytes);
             positions.push(pos.as_u64());
@@ -5727,6 +5830,35 @@ impl From<StreamPosition> for u64 {
     }
 }
 
+/// RAII guard that runs `mark_stream_applied(pos)` on drop. Wire this
+/// into every persist callsite immediately after `next_stream_position`:
+///
+/// ```ignore
+/// let pos = self.next_stream_position().as_u64();
+/// let _stream_guard = StreamApplyOnDrop::new(self, pos);
+/// // ... build batch, call db.write — `?` short-circuit is fine, guard
+/// // still fires from the function frame's drop.
+/// ```
+///
+/// Without the guard, an early-return via `?` would leak the pos into
+/// `stream_pending` forever and stall `safe_stream_position`.
+pub struct StreamApplyOnDrop<'a> {
+    db: &'a Database,
+    pos: u64,
+}
+
+impl<'a> StreamApplyOnDrop<'a> {
+    pub fn new(db: &'a Database, pos: u64) -> Self {
+        Self { db, pos }
+    }
+}
+
+impl Drop for StreamApplyOnDrop<'_> {
+    fn drop(&mut self) {
+        self.db.mark_stream_applied(self.pos);
+    }
+}
+
 /// Recover max position from receipts_stream CF (keys are u64 BE).
 fn recover_max_receipts_stream(db: &DB) -> Option<u64> {
     let cf = db.cf_handle("receipts_stream")?;
@@ -6091,6 +6223,73 @@ mod stream_recovery_tests {
         let p2 = db.next_stream_position().as_u64();
         let p3 = db.next_stream_position().as_u64();
         assert!(p1 < p2 && p2 < p3, "monotonic: {p1} < {p2} < {p3}");
+    }
+
+    /// `safe_stream_position` must lag behind `current_stream_position` while
+    /// any allocated pos is still pending its WriteBatch — that's the whole
+    /// point. /sync's next_batch uses this so an out-of-order commit can't
+    /// strand the slower in-flight write under the next `p > since` filter.
+    /// Documented as the TFRI residual flake fix; previously tried in PR #100
+    /// (reverted because it conflated this with read upper bounds).
+    #[test]
+    fn safe_stream_pos_lags_pending_writes_then_catches_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+
+        // Snapshot the baseline. On a fresh DB current_stream_position == counter - 1
+        // and safe_stream_position == same (nothing pending).
+        let baseline = db.current_stream_position();
+        assert_eq!(db.safe_stream_position(), baseline);
+
+        // Allocate two positions in order. Both go into stream_pending.
+        let p1 = db.next_stream_position().as_u64();
+        let p2 = db.next_stream_position().as_u64();
+        assert!(p1 < p2);
+
+        // Counter has advanced; safe watermark hasn't.
+        assert_eq!(db.current_stream_position(), p2);
+        assert_eq!(db.safe_stream_position(), baseline);
+
+        // Mark the later position applied first (the race scenario). With p1
+        // still pending, safe_stream_position must NOT advance past p1 - 1.
+        db.mark_stream_applied(p2);
+        assert_eq!(
+            db.safe_stream_position(),
+            p1.saturating_sub(1),
+            "watermark must hold below the smallest still-pending pos"
+        );
+
+        // Now apply p1. Pending drains; watermark catches up to counter - 1.
+        db.mark_stream_applied(p1);
+        assert_eq!(db.safe_stream_position(), p2);
+    }
+
+    /// mark_stream_applied is idempotent on already-removed positions and
+    /// never retreats the watermark — concurrent commits race on the lock.
+    #[test]
+    fn safe_stream_pos_never_retreats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+
+        let p1 = db.next_stream_position().as_u64();
+        let p2 = db.next_stream_position().as_u64();
+        let p3 = db.next_stream_position().as_u64();
+
+        db.mark_stream_applied(p1);
+        db.mark_stream_applied(p2);
+        let after_two = db.safe_stream_position();
+        assert!(after_two >= p2);
+
+        // Spurious double-mark (e.g. a guard fires twice during panic unwind).
+        db.mark_stream_applied(p2);
+        assert_eq!(
+            db.safe_stream_position(),
+            after_two,
+            "double-mark must not retreat"
+        );
+
+        db.mark_stream_applied(p3);
+        assert!(db.safe_stream_position() >= p3);
     }
 
     /// Counter recovery for `to_device_outbound` must take the max
