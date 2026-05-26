@@ -1384,11 +1384,13 @@ fn init_tracing(cfg: &TracingSection) -> Option<OtelShutdownGuard> {
         .with_endpoint(endpoint)
         .build()
         .expect("OTLP exporter builds");
-    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-        .with_resource(opentelemetry_sdk::Resource::new(vec![
-            opentelemetry::KeyValue::new("service.name", "vela"),
-        ]))
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name("vela")
+                .build(),
+        )
         .build();
     opentelemetry::global::set_tracer_provider(provider.clone());
     let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "vela");
@@ -1420,7 +1422,7 @@ fn init_tracing(_cfg: &TracingSection) -> Option<OtelGuard> {
 /// collector.
 #[cfg(feature = "otel")]
 struct OtelShutdownGuard {
-    provider: opentelemetry_sdk::trace::TracerProvider,
+    provider: opentelemetry_sdk::trace::SdkTracerProvider,
 }
 
 #[cfg(feature = "otel")]
