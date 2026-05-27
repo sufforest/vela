@@ -272,14 +272,12 @@ pub(crate) fn build_sync_response_with_filter(
     filter: Option<&Value>,
     full_state: bool,
 ) -> Result<Value, ApiError> {
-    let current_pos = state.db.current_stream_position();
     // Safe watermark: largest pos such that EVERY pos ≤ it has committed.
-    // We use this for `next_batch` and the timeline read upper bound so a
-    // later-allocated-but-faster-committed pos in another room can't strand
-    // a slower in-flight pos under the next /sync's `p > since` filter.
-    // current_pos still feeds device_key_changes / account_data_since etc.
-    // where the read upper bound only matters in the "see latest committed"
-    // direction (RocksDB reads never see uncommitted rows).
+    // Used wherever a returned pos becomes a future /sync's `since` —
+    // next_batch, the timeline upper bound, and the device-list upper
+    // bound. If a device_lists.changed entry at pos B > safe_pos slips
+    // in, next_batch=safe_pos lands below B and the next /sync's
+    // `since`-keyed scan re-delivers B as a duplicate change.
     let safe_pos = state.db.safe_stream_position();
     let ignored = load_ignored_users(state, user.user_nid)?;
     let mut join_rooms = serde_json::Map::new();
@@ -550,7 +548,7 @@ pub(crate) fn build_sync_response_with_filter(
     let device_lists_changed: Vec<String> = {
         let nids = state
             .db
-            .get_device_key_changes(user.user_nid, dl_from, current_pos + 1)
+            .get_device_key_changes(user.user_nid, dl_from, safe_pos + 1)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
         let mut out = Vec::new();
         for nid in nids {
@@ -572,7 +570,7 @@ pub(crate) fn build_sync_response_with_filter(
     let device_lists_left: Vec<String> = {
         let raw = state
             .db
-            .get_device_list_left(user.user_nid, dl_from, current_pos + 1)
+            .get_device_list_left(user.user_nid, dl_from, safe_pos + 1)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
         let our_rooms: HashSet<u64> = state
             .db
