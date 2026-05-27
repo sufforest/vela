@@ -946,7 +946,7 @@ async fn do_remote_leave(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    state
+    let stream_pos = state
         .db
         .persist_event(
             event_nid,
@@ -971,6 +971,12 @@ async fn do_remote_leave(
         .set_membership(room_nid, user.user_nid, 0)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     crate::router::notify_user(state, user.user_nid);
+    // Other local members of this remote room need to see the leave
+    // event in their next /sync without waiting for the long-poll
+    // timeout. Same pattern as the local membership emit paths.
+    if let Some(sender_ch) = state.room_senders.get(&Nid(room_nid)) {
+        let _ = sender_ch.send(stream_pos);
+    }
 
     Ok(())
 }
@@ -2065,6 +2071,16 @@ async fn emit_membership_event_for_target(
             .notify_device_key_change(target_user_nid, &current_members, stream_pos);
     }
 
+    // Wake local /sync long-pollers as soon as state is durable. The
+    // federated invite POST below is awaited inline and can hang for
+    // the full federation timeout (~30s) when the remote is slow;
+    // local observers shouldn't sit on the long-poll until that
+    // returns. Mirrors PR #95's hoist of room_senders.send out of the
+    // federation-dependent suffix.
+    if let Some(sender_ch) = state.room_senders.get(&Nid(room_nid)) {
+        let _ = sender_ch.send(stream_pos);
+    }
+
     // Federate to remote servers.
     state.federation_sender.broadcast(room_nid, event_nid);
 
@@ -2112,11 +2128,6 @@ async fn emit_membership_event_for_target(
                 );
             }
         }
-    }
-
-    // Notify sync
-    if let Some(sender_ch) = state.room_senders.get(&Nid(room_nid)) {
-        let _ = sender_ch.send(stream_pos);
     }
 
     Ok(())
