@@ -52,9 +52,6 @@
 
 
 
-
-
-
 # --- Deferred spec bugs ---
 # Listed here only because the fix requires non-trivial new
 # infrastructure. Each one is a real spec gap we should close,
@@ -75,12 +72,6 @@
 ^TestRoomForget/Parallel/Leave_for_forgotten_room_shows_up_in_v2_incremental_/sync$
 
 # --- Optional spec behaviour we choose not to implement ---
-
-# DELETE /directory/room: spec says "Servers MAY choose to update
-# the alt_aliases for the m.room.canonical_alias state event in
-# the room when an alias is removed" (directory.yaml line 169).
-# The MAY makes this optional. Skiplisting until/unless we add
-# it for client UX parity with synapse.
 
 # Complement mock bug on the MSC3916 federation media endpoint:
 # /federation/v1/media/download/{mediaId} doesn't have an `origin`
