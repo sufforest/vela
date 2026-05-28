@@ -81,7 +81,6 @@
 # the room when an alias is removed" (directory.yaml line 169).
 # The MAY makes this optional. Skiplisting until/unless we add
 # it for client UX parity with synapse.
-^TestRoomDeleteAlias/Parallel/Can_delete_canonical_alias$
 
 # Complement mock bug on the MSC3916 federation media endpoint:
 # /federation/v1/media/download/{mediaId} doesn't have an `origin`
