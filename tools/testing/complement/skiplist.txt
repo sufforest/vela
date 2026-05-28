@@ -76,17 +76,6 @@
 # client UI ever shows a regression here.
 ^TestRoomForget/Parallel/Leave_for_forgotten_room_shows_up_in_v2_incremental_/sync$
 
-# --- Feature gaps (stable spec, not yet implemented) ---
-
-# `?at=<sync_token>` on /rooms/{}/members — return state at a
-# stream position. Spec: rooms.yaml line 215 (the `at` query
-# parameter is part of the stable Client-Server API). Real fix
-# needs (a) prev_batch pointing past createRoom state events
-# (vela includes them in timeline), and (b) a state-at-stream-pos
-# index that resolves a sync token to a snapshot. Deferred until
-# we redesign sync's timeline/state split.
-^TestGetRoomMembersAtPoint$
-
 # --- Optional spec behaviour we choose not to implement ---
 
 # DELETE /directory/room: spec says "Servers MAY choose to update

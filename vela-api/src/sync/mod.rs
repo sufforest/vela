@@ -732,17 +732,23 @@ fn build_room_sync_for_user(
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
             let mut timeline_events = Vec::new();
-            let mut first_pos = None;
-            for (pos, enid) in &timeline_entries {
-                if first_pos.is_none() {
-                    first_pos = Some(*pos);
-                }
+            for (_, enid) in &timeline_entries {
                 if let Some(ev) = load_timeline_event(state, *enid, room_id, user_nid, device_id)? {
                     timeline_events.push(ev);
                 }
             }
-
-            let prev_batch = first_pos.map(|p| format!("s{p}"));
+            // prev_batch points at the LATEST event in the batch. /members?at
+            // and other "state at this point" queries expect this token to
+            // represent the state INCLUDING all events delivered in the
+            // batch — the client uses prev_batch as "the position I'm at in
+            // this room right now". (Per-room next_batch isn't a spec
+            // concept; clients re-purpose prev_batch.) /messages?from=
+            // backward will return events with pos < prev_batch, which
+            // overlaps the timeline batch by all-but-one events; clients
+            // dedupe on event_id, so the redundancy is harmless.
+            // TestGetRoomMembersAtPoint locks this semantic in.
+            let last_pos = timeline_entries.last().map(|(p, _)| *p);
+            let prev_batch = last_pos.map(|p| format!("s{p}"));
             (state_events, timeline_events, true, prev_batch)
         }
         Some(since_pos) => {
