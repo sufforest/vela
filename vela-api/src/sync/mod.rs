@@ -476,7 +476,7 @@ pub(crate) fn build_sync_response_with_filter(
             .collect(),
         Some(since_pos) => state
             .db
-            .get_account_data_since(user.user_nid, since_pos)
+            .get_account_data_since(user.user_nid, since_pos, safe_pos + 1)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
             .into_iter()
             .map(|(dtype, content)| json!({"type": dtype, "content": content}))
