@@ -345,12 +345,38 @@ pub async fn sliding_sync(
             };
             let tx = notify_tx.clone();
             let handle = tokio::spawn(async move {
-                if rx.recv().await.is_ok() {
+                // Lagged also counts as a wake — mirrors /sync's
+                // listener (sync/mod.rs:118). Only `Closed` means no
+                // further work.
+                use tokio::sync::broadcast::error::RecvError;
+                if !matches!(rx.recv().await, Err(RecvError::Closed)) {
                     let _ = tx.send(()).await;
                 }
             });
             task_handles.push(handle);
         }
+
+        // Also subscribe to the per-user channel so the long-poll wakes
+        // when the user's room list changes (invite accepted, DM created,
+        // knock, leave, ban). Without this a pending /sliding_sync only
+        // learns about new rooms after its timeout. Mirrors the
+        // user_senders subscribe in sync/mod.rs (also added in #95 for
+        // the v1 /sync path).
+        let mut user_rx = {
+            let sender = state.user_senders.entry(user.user_nid).or_insert_with(|| {
+                let (tx, _) = tokio::sync::broadcast::channel(64);
+                tx
+            });
+            sender.value().subscribe()
+        };
+        let tx = notify_tx.clone();
+        let handle = tokio::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            if !matches!(user_rx.recv().await, Err(RecvError::Closed)) {
+                let _ = tx.send(()).await;
+            }
+        });
+        task_handles.push(handle);
     }
     drop(notify_tx);
 
