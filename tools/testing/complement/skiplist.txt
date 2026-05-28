@@ -107,21 +107,6 @@
 ^TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph$
 ^TestMSC4297StateResolutionV2_1_starts_from_empty_set$
 
-# JumpToDate sub-tests that hinge on the test client's `time.Now()`
-# being strictly greater than the events vela just persisted. With
-# wall-clock ms resolution, fast hardware (Vela on Apple silicon is
-# ≪1ms per createRoom/SendEvent) collapses all events + the captured
-# `time.Now()` into the same ms — so a `dir=f` query at given_ts ==
-# event_ts qualifies all of them and tie-break picks a state event
-# instead of the message the test wants. Synapse passes only because
-# its per-request latency naturally pushes the timestamps apart.
-# Spec-correct on both sides; this isn't a vela bug. Skiplist until
-# we add an artificial wall-clock advance in createRoom or the
-# upstream test stops relying on processing latency.
-^TestJumpToDateEndpoint/parallel/should_find_event_after_given_timestamp$
-^TestJumpToDateEndpoint/parallel/should_find_next_event_topologically_before_given_timestamp_when_all_message_timestamps_are_the_same$
-^TestJumpToDateEndpoint/parallel/should_find_next_event_topologically_after_given_timestamp_when_all_message_timestamps_are_the_same$
-
 # Complement test is incompatible with v12-default servers: it uses
 # `alice.GetDefaultRoomVersion(t)` for the room (we return v12) but
 # signs the "bad" event as RoomVersionV5, and gomatrixserverlib's v5
