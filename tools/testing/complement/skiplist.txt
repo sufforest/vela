@@ -115,14 +115,5 @@
 # default room version is v5 or older. Spec-correct on both sides.
 ^TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6$
 
-# Same v12 vs v10 power_levels.users issue as the skiplisted
-# TestPowerLevels above: these tests assert the creator appears
-# in m.room.power_levels.users with PL > users_default, which is
-# spec-illegal in v12 (MSC4289 requires creators be absent). Vela
-# is v12-only by design.
-^TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12$
-^TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12$
-^TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
-^TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
 
 
