@@ -15,8 +15,6 @@
 # Re-evaluate the list on every Complement upgrade — the upstream test
 # names occasionally rename.
 
-# Application-service bridge endpoints out of scope for now. ~16s.
-^TestJoinFederatedRoomFromApplicationServiceBridgeUser$
 
 # v10/v12 incompatibility: test asserts the room creator appears in
 # m.room.power_levels.users with PL > users_default. v12 (MSC4289)
