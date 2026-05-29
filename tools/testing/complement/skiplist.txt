@@ -15,8 +15,6 @@
 # Re-evaluate the list on every Complement upgrade — the upstream test
 # names occasionally rename.
 
-# Application-service bridge endpoints out of scope for now. ~16s.
-^TestJoinFederatedRoomFromApplicationServiceBridgeUser$
 
 # v10/v12 incompatibility: test asserts the room creator appears in
 # m.room.power_levels.users with PL > users_default. v12 (MSC4289)
@@ -54,9 +52,6 @@
 
 
 
-
-
-
 # --- Deferred spec bugs ---
 # Listed here only because the fix requires non-trivial new
 # infrastructure. Each one is a real spec gap we should close,
@@ -76,25 +71,7 @@
 # client UI ever shows a regression here.
 ^TestRoomForget/Parallel/Leave_for_forgotten_room_shows_up_in_v2_incremental_/sync$
 
-# --- Feature gaps (stable spec, not yet implemented) ---
-
-# `?at=<sync_token>` on /rooms/{}/members — return state at a
-# stream position. Spec: rooms.yaml line 215 (the `at` query
-# parameter is part of the stable Client-Server API). Real fix
-# needs (a) prev_batch pointing past createRoom state events
-# (vela includes them in timeline), and (b) a state-at-stream-pos
-# index that resolves a sync token to a snapshot. Deferred until
-# we redesign sync's timeline/state split.
-^TestGetRoomMembersAtPoint$
-
 # --- Optional spec behaviour we choose not to implement ---
-
-# DELETE /directory/room: spec says "Servers MAY choose to update
-# the alt_aliases for the m.room.canonical_alias state event in
-# the room when an alias is removed" (directory.yaml line 169).
-# The MAY makes this optional. Skiplisting until/unless we add
-# it for client UX parity with synapse.
-^TestRoomDeleteAlias/Parallel/Can_delete_canonical_alias$
 
 # Complement mock bug on the MSC3916 federation media endpoint:
 # /federation/v1/media/download/{mediaId} doesn't have an `origin`
@@ -118,21 +95,6 @@
 ^TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph$
 ^TestMSC4297StateResolutionV2_1_starts_from_empty_set$
 
-# JumpToDate sub-tests that hinge on the test client's `time.Now()`
-# being strictly greater than the events vela just persisted. With
-# wall-clock ms resolution, fast hardware (Vela on Apple silicon is
-# ≪1ms per createRoom/SendEvent) collapses all events + the captured
-# `time.Now()` into the same ms — so a `dir=f` query at given_ts ==
-# event_ts qualifies all of them and tie-break picks a state event
-# instead of the message the test wants. Synapse passes only because
-# its per-request latency naturally pushes the timestamps apart.
-# Spec-correct on both sides; this isn't a vela bug. Skiplist until
-# we add an artificial wall-clock advance in createRoom or the
-# upstream test stops relying on processing latency.
-^TestJumpToDateEndpoint/parallel/should_find_event_after_given_timestamp$
-^TestJumpToDateEndpoint/parallel/should_find_next_event_topologically_before_given_timestamp_when_all_message_timestamps_are_the_same$
-^TestJumpToDateEndpoint/parallel/should_find_next_event_topologically_after_given_timestamp_when_all_message_timestamps_are_the_same$
-
 # Complement test is incompatible with v12-default servers: it uses
 # `alice.GetDefaultRoomVersion(t)` for the room (we return v12) but
 # signs the "bad" event as RoomVersionV5, and gomatrixserverlib's v5
@@ -141,14 +103,5 @@
 # default room version is v5 or older. Spec-correct on both sides.
 ^TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6$
 
-# Same v12 vs v10 power_levels.users issue as the skiplisted
-# TestPowerLevels above: these tests assert the creator appears
-# in m.room.power_levels.users with PL > users_default, which is
-# spec-illegal in v12 (MSC4289 requires creators be absent). Vela
-# is v12-only by design.
-^TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12$
-^TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV12$
-^TestKnockRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
-^TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11$
 
 

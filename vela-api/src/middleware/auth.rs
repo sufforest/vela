@@ -11,7 +11,7 @@ use crate::router::AppState;
 /// ```ignore
 /// async fn handler(user: AuthenticatedUser, ...) { ... }
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AuthenticatedUser {
     pub user_nid: u64,
     pub user_id: String,

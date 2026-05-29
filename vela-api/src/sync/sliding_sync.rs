@@ -1186,11 +1186,16 @@ fn build_sliding_room(
     let room_id = &info.room_id;
     let is_initial = since.is_none();
 
-    // Timeline
+    // Timeline. Cap the scan at safe_stream_position so events at pos
+    // B > safe_pos (an in-flight write in another room) don't get
+    // delivered in this batch while next_batch lands below B — same
+    // shape as the v1 /sync filter (`*p <= safe_pos`) and the
+    // device_lists / account_data caps.
+    let safe_pos = state.db.safe_stream_position();
     let timeline_entries = if let Some(since_pos) = since {
         state
             .db
-            .get_timeline_range(room_nid, since_pos + 1, u64::MAX, timeline_limit)
+            .get_timeline_range(room_nid, since_pos + 1, safe_pos + 1, timeline_limit)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
     } else {
         state

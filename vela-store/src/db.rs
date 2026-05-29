@@ -3857,10 +3857,20 @@ impl Database {
     /// Return `(data_type, value)` for account_data entries whose most
     /// recent update is strictly after `since_pos`. Used by incremental
     /// /sync to stream changes since the client's last token.
+    /// Account-data entries whose stream position falls in `(since_pos,
+    /// upper_bound)`. Upper bound is exclusive and the caller is
+    /// expected to pass the current `safe_stream_position() + 1` so the
+    /// next /sync's `since` (the next_batch returned with this batch)
+    /// covers exactly this range. Without the upper bound, a write at
+    /// pos B with `safe_pos < B <= current_pos` (an in-flight allocation
+    /// in another room) is delivered now AND re-delivered next /sync
+    /// when `since` lands below B — same shape as the device_lists
+    /// watermark fix in PR #105.
     pub fn get_account_data_since(
         &self,
         user_nid: u64,
         since_pos: u64,
+        upper_bound: u64,
     ) -> Result<Vec<(String, Value)>, rocksdb::Error> {
         let cf_pos = self.db.cf_handle("account_data_pos").unwrap();
         let cf_data = self.db.cf_handle("account_data").unwrap();
@@ -3878,7 +3888,7 @@ impl Database {
             let mut buf = [0u8; 8];
             buf.copy_from_slice(&val);
             let pos = u64::from_be_bytes(buf);
-            if pos <= since_pos {
+            if pos <= since_pos || pos >= upper_bound {
                 continue;
             }
             let data_type = String::from_utf8_lossy(&key[8..]).to_string();

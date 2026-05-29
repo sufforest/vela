@@ -786,35 +786,37 @@ pub async fn list_members(
     let member_events: Vec<u64> =
         match (q.at.as_deref().and_then(parse_stream_token), view_at_leave) {
             (Some(at_pos), _) => {
-                // Find the event with the largest stream_pos <= at_pos
-                // in this room and use its post-state snapshot. Falling
-                // back to current state when no such event exists
-                // (callers can pass a pre-room token; returning current
-                // state is at least usable).
-                let mut event_at: Option<u64> = None;
+                // Find the most recent STATE event with pos <= at_pos
+                // and use its post-state snapshot. Only state events
+                // get a recorded snapshot (`promote_state_event` writes
+                // it); timeline messages don't. Naively picking the
+                // last event in `[0, at_pos]` would land on a message
+                // and miss the snapshot, falling back to current state
+                // — that's the bug TestGetRoomMembersAtPoint hits when
+                // bob joins after the at-token is captured. Walk
+                // backwards through the timeline window looking for an
+                // event that has a snapshot recorded.
                 let snapshot_window = state
                     .db
                     .get_timeline_range(room_nid, 0, at_pos.saturating_add(1), 10_000)
                     .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-                if let Some((_, nid)) = snapshot_window.last() {
-                    event_at = Some(*nid);
-                }
-                match event_at {
-                    Some(nid) => state
+                let mut state_snapshot: Option<Vec<u64>> = None;
+                for (_, nid) in snapshot_window.iter().rev() {
+                    if let Some(snap) = state
                         .db
-                        .get_state_at_event(nid)
+                        .get_state_at_event(*nid)
                         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-                        .unwrap_or_else(|| {
-                            state
-                                .db
-                                .get_all_state_event_nids(room_nid)
-                                .unwrap_or_default()
-                        }),
-                    None => state
+                    {
+                        state_snapshot = Some(snap);
+                        break;
+                    }
+                }
+                state_snapshot.unwrap_or_else(|| {
+                    state
                         .db
                         .get_all_state_event_nids(room_nid)
-                        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?,
-                }
+                        .unwrap_or_default()
+                })
             }
             (None, Some(snapshot_owner_event_nid)) => state
                 .db

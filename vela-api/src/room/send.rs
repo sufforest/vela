@@ -316,7 +316,7 @@ pub async fn send_state_event_no_key(
     .await
 }
 
-async fn send_state_inner(
+pub(crate) async fn send_state_inner(
     state: AppState,
     user: AuthenticatedUser,
     room_id_str: String,

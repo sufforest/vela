@@ -188,7 +188,85 @@ pub async fn delete_room_alias(
         .db
         .delete_room_alias(&room_alias)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
+    // Spec: deleting an alias that's currently named in the room's
+    // m.room.canonical_alias (either as `alias` or in `alt_aliases`)
+    // requires emitting a fresh canonical_alias with the dead reference
+    // removed — clients use the resulting timeline event as the signal
+    // that the canonical pointer is stale. Without this, /messages and
+    // /sync continue showing the old canonical_alias pointing at a
+    // now-404 alias.
+    maybe_clear_canonical_alias_on_delete(&state, &user, &room_id, &room_alias).await;
+
     Ok(Json(json!({})))
+}
+
+/// If the room's current `m.room.canonical_alias` names `deleted_alias`
+/// in `alias` or `alt_aliases`, emit a new canonical_alias with the
+/// reference removed. Best-effort — failures only mean the canonical
+/// pointer stays stale; clients still see the underlying alias 404 on
+/// their next /directory/room/{alias} call.
+async fn maybe_clear_canonical_alias_on_delete(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    room_id: &str,
+    deleted_alias: &str,
+) {
+    let Ok(Some(room_nid)) = state.db.get_nid(room_id) else {
+        return;
+    };
+    let Ok(Some(canonical)) =
+        crate::membership::read_state_value_pub(state, room_nid, "m.room.canonical_alias", "")
+    else {
+        return;
+    };
+    let content = canonical.get("content").and_then(|c| c.as_object());
+    let Some(content) = content else { return };
+
+    let current_alias = content.get("alias").and_then(|v| v.as_str());
+    let alt_aliases: Vec<String> = content
+        .get("alt_aliases")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let alias_matched = current_alias == Some(deleted_alias);
+    let new_alt_aliases: Vec<String> = alt_aliases
+        .iter()
+        .filter(|a| a.as_str() != deleted_alias)
+        .cloned()
+        .collect();
+    let alt_changed = new_alt_aliases.len() != alt_aliases.len();
+
+    if !alias_matched && !alt_changed {
+        return;
+    }
+
+    let mut new_content = serde_json::Map::new();
+    if !alias_matched && let Some(a) = current_alias {
+        new_content.insert("alias".to_string(), Value::String(a.to_string()));
+    }
+    if !new_alt_aliases.is_empty() {
+        new_content.insert(
+            "alt_aliases".to_string(),
+            Value::Array(new_alt_aliases.into_iter().map(Value::String).collect()),
+        );
+    }
+
+    let _ = crate::room::send::send_state_inner(
+        state.clone(),
+        user.clone(),
+        room_id.to_string(),
+        "m.room.canonical_alias".to_string(),
+        String::new(),
+        None,
+        Value::Object(new_content),
+    )
+    .await;
 }
 
 /// Power level threshold required to delete or rebind an alias. Reads

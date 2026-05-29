@@ -7,6 +7,7 @@
 //! Invite-only flows are handled via the client `/invite` API; restricted and
 //! knock rooms need `join_authorised_via_users_server` crypto (deferred to 3c).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -700,12 +701,35 @@ pub async fn send_join_v2(
         }
         Err(_) => Vec::new(),
     };
-    // Auth chain for the join event: walk pdu.auth_events transitively via the
-    // DB. We do this BEFORE persist (the join event itself isn't in the DB yet
-    // and shouldn't be in the chain anyway — the chain is the dependencies of
-    // the join event, not the join event itself).
-    let auth_chain_ids =
-        auth_chain_including_seeds(&state.db, &pdu.auth_events).unwrap_or_default();
+    // Auth chain for the response: per spec, this is the transitive
+    // closure of auth_events for EVERY state event being returned,
+    // not just the join event's own auth_events. The join event's
+    // declared auth_events are only the trivial subset (create + PL
+    // + JR + sender's prev member); a room with deep membership
+    // history (TestCorruptedAuthChain pads with 100 leave/join
+    // cycles) has a state-event chain that walks back through every
+    // historical member event. Returning only pdu.auth_events here
+    // gives the joining server a chain too shallow to validate the
+    // returned state.
+    let mut chain_seeds: Vec<String> = Vec::new();
+    let mut seen_seeds: HashSet<String> = HashSet::new();
+    for aev in &pdu.auth_events {
+        if seen_seeds.insert(aev.clone()) {
+            chain_seeds.push(aev.clone());
+        }
+    }
+    for ev in &state_events_before {
+        if let Some(arr) = ev.get("auth_events").and_then(|v| v.as_array()) {
+            for a in arr {
+                if let Some(eid) = a.as_str()
+                    && seen_seeds.insert(eid.to_string())
+                {
+                    chain_seeds.push(eid.to_string());
+                }
+            }
+        }
+    }
+    let auth_chain_ids = auth_chain_including_seeds(&state.db, &chain_seeds).unwrap_or_default();
     let mut auth_chain_pdus: Vec<Value> = Vec::with_capacity(auth_chain_ids.len());
     for id in &auth_chain_ids {
         if let Some(j) = load_event_json_by_event_id(&state.db, id) {
