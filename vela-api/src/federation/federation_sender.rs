@@ -1,19 +1,35 @@
 //! Outbound federation transaction sender.
 //!
-//! One async task per destination. Each task polls a **persistent
-//! outbox** in RocksDB (`federation_outbox` CF), batches up to 50
-//! events into a transaction, signs and sends, then deletes the
-//! drained entries on success. The in-process channel is a wake
-//! signal, not the queue — durability lives entirely in the DB.
+//! One async task per destination, dispatching per-(destination, room)
+//! transactions concurrently. The persistent outbox in RocksDB
+//! (`federation_outbox` CF) is keyed `<dest> 0xff <room_nid:8> <pos:8>`
+//! so each room's pending entries can be drained without scanning the
+//! whole destination, and rooms inside the same destination no longer
+//! block each other on a slow send.
+//!
+//! Per cycle the destination task:
+//!   1. Enumerates rooms with pending entries (`list_outbound_rooms_for_destination`).
+//!   2. Spawns one `send_room_txn` per room, plus one `send_edu_txn`
+//!      for the EDU streams (EDUs aren't room-keyed and share a single
+//!      per-destination channel).
+//!   3. Awaits all spawned sends via `FuturesUnordered`. Any success
+//!      resets backoff; any failure with no success applies it.
+//!   4. Waits for the next wake (`broadcast()` notify, or the idle
+//!      poll tick).
 //!
 //! Per-destination isolation: each destination has its own task and
 //! its own backoff state, so one slow / dead peer does not stall
-//! delivery to anyone else.
+//! delivery to anyone else. Per-room ordering inside a destination is
+//! preserved by the outbox key shape — one room's TXNs are sent in
+//! `(room_nid, pos)` order; nothing serialises against other rooms.
 //!
 //! Restart recovery: on startup `FederationSender::new` enumerates
 //! every destination with at least one pending entry and spawns its
-//! task. No event acknowledged on the inbound side is lost when the
-//! process restarts.
+//! task. `Database::open` runs a one-shot migration that rewrites any
+//! legacy outbox entries (`<dest> 0xff <pos:8>` from before the
+//! per-room refactor) to the new key shape, looking up each event's
+//! room via the room_timeline index. No event acknowledged on the
+//! inbound side is lost when the process restarts.
 //!
 //! Backoff: 2s initial → ×2 → 5min cap. After 24h of continuous
 //! failure the destination is considered dead and its task exits
@@ -177,8 +193,11 @@ impl FederationSender {
         // hot path at one RocksDB write call regardless of how many
         // remotes the room federates to.
         let dest_refs: Vec<&str> = destinations.iter().map(|s| s.as_str()).collect();
-        if let Err(e) = self.db.enqueue_outbound_batch(&dest_refs, event_nid) {
-            warn!(event_nid, error = %e, "outbox batch enqueue failed");
+        if let Err(e) = self
+            .db
+            .enqueue_outbound_batch(&dest_refs, room_nid, event_nid)
+        {
+            warn!(event_nid, room_nid, error = %e, "outbox batch enqueue failed");
             return;
         }
 
@@ -345,22 +364,23 @@ async fn run_destination(
     let mut last_success = Instant::now();
 
     loop {
-        // Read the next PDU batch from the outbox.
-        let batch = match db.peek_outbound(&server_name, MAX_PDUS_PER_TXN) {
-            Ok(b) => b,
+        // Each cycle: send per-room PDU TXNs concurrently (one TXN per
+        // room with pending events) and a single EDU-only TXN. Rooms no
+        // longer block each other inside a destination — a slow room
+        // doesn't stall others, and a destination's PDU throughput
+        // scales with how many rooms have pending entries.
+        let rooms = match db.list_outbound_rooms_for_destination(&server_name) {
+            Ok(r) => r,
             Err(e) => {
-                warn!(%server_name, error = %e, "peek_outbound failed");
+                warn!(%server_name, error = %e, "list_outbound_rooms_for_destination failed");
                 tokio::time::sleep(BACKOFF_INITIAL).await;
                 continue;
             }
         };
 
-        // Drain registered EDU streams for this destination. The cursor
-        // for each stream is advanced only after a successful send.
         let (edus, cursor_advances) = drain_edu_streams(&edu_streams, &server_name, &db);
 
-        if batch.is_empty() && edus.is_empty() {
-            // Nothing pending — wait for a wake or the idle poll.
+        if rooms.is_empty() && edus.is_empty() {
             tokio::select! {
                 _ = notify.notified() => {},
                 _ = tokio::time::sleep(IDLE_POLL) => {},
@@ -368,59 +388,159 @@ async fn run_destination(
             continue;
         }
 
-        let pdus: Vec<Value> = batch
-            .iter()
-            .filter_map(|(_, nid)| load_event_json_for_send(&db, *nid))
-            .collect();
-
-        if pdus.is_empty() && !batch.is_empty() && edus.is_empty() {
-            // Outbox referenced events that no longer exist (rare).
-            // Drop the dangling entries so the queue doesn't spin.
-            let positions: Vec<u64> = batch.iter().map(|(p, _)| *p).collect();
-            let _ = db.delete_outbound(&server_name, &positions);
-            continue;
+        // Per-room PDU TXNs run concurrently. An EDU-only TXN runs
+        // alongside if there are EDUs to send.
+        let mut futures: futures::stream::FuturesUnordered<_> =
+            futures::stream::FuturesUnordered::new();
+        for room_nid in rooms {
+            let server = server_name.clone();
+            let origin = our_server_name.clone();
+            let db = db.clone();
+            let client = client.clone();
+            futures.push(tokio::spawn(async move {
+                send_room_txn(&server, room_nid, &origin, &db, &client).await
+            }));
+        }
+        if !edus.is_empty() {
+            let server = server_name.clone();
+            let origin = our_server_name.clone();
+            let db = db.clone();
+            let client = client.clone();
+            let edus_clone = edus.clone();
+            let advances = cursor_advances.clone();
+            futures.push(tokio::spawn(async move {
+                send_edu_txn(&server, &origin, edus_clone, advances, &db, &client).await
+            }));
         }
 
-        let txn_id = new_txn_id();
-        let body = json!({
-            "origin": our_server_name,
-            "origin_server_ts": now_ms(),
-            "pdus": pdus,
-            "edus": edus,
-        });
+        use futures::StreamExt;
+        let mut any_success = false;
+        let mut any_failure = false;
+        while let Some(joined) = futures.next().await {
+            match joined {
+                Ok(SendOutcome::Success) => any_success = true,
+                Ok(SendOutcome::Empty) => {} // room queue raced empty — neither outcome
+                Ok(SendOutcome::Failure) => any_failure = true,
+                Err(e) => {
+                    warn!(%server_name, error = %e, "spawned send task panicked");
+                    any_failure = true;
+                }
+            }
+        }
 
-        match client.send_transaction(&server_name, &txn_id, body).await {
-            Ok(_) => {
-                debug!(
+        if any_success {
+            backoff = BACKOFF_INITIAL;
+            last_success = Instant::now();
+        }
+        if any_failure && !any_success {
+            if last_success.elapsed() > DEAD_AFTER {
+                warn!(
                     %server_name,
-                    pdus = batch.len(),
-                    edus = edus.len(),
-                    "transaction sent"
+                    "destination dead after 24h of continuous failures; task exiting (outbox preserved on disk for next restart)"
                 );
-                let positions: Vec<u64> = batch.iter().map(|(p, _)| *p).collect();
-                if let Err(e) = db.delete_outbound(&server_name, &positions) {
-                    warn!(%server_name, error = %e, "delete_outbound failed");
-                }
-                for (stream_name, new_cursor) in &cursor_advances {
-                    if let Err(e) = db.set_edu_cursor(&server_name, stream_name, *new_cursor) {
-                        warn!(%server_name, %stream_name, error = %e, "set_edu_cursor failed");
-                    }
-                }
-                backoff = BACKOFF_INITIAL;
-                last_success = Instant::now();
+                return;
             }
-            Err(e) => {
-                warn!(%server_name, error = %e, "transaction send failed");
-                if last_success.elapsed() > DEAD_AFTER {
-                    warn!(
-                        %server_name,
-                        "destination dead after 24h of continuous failures; task exiting (outbox preserved on disk for next restart)"
-                    );
-                    return;
-                }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff.saturating_mul(2)).min(BACKOFF_MAX);
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff.saturating_mul(2)).min(BACKOFF_MAX);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SendOutcome {
+    Success,
+    Empty,
+    Failure,
+}
+
+/// Drain one room's pending entries for `destination` and send them as
+/// a single TXN. Per-room ordering is preserved by the outbox key
+/// shape; concurrent calls for different rooms can run alongside this
+/// one against the same destination.
+async fn send_room_txn(
+    server_name: &str,
+    room_nid: u64,
+    our_server_name: &str,
+    db: &Database,
+    client: &FederationClient,
+) -> SendOutcome {
+    let batch = match db.peek_outbound_for_room(server_name, room_nid, MAX_PDUS_PER_TXN) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(%server_name, room_nid, error = %e, "peek_outbound_for_room failed");
+            return SendOutcome::Failure;
+        }
+    };
+    if batch.is_empty() {
+        return SendOutcome::Empty;
+    }
+    let pdus: Vec<Value> = batch
+        .iter()
+        .filter_map(|(_, nid)| load_event_json_for_send(db, *nid))
+        .collect();
+    if pdus.is_empty() {
+        // Outbox referenced events that no longer exist. Drop the
+        // dangling entries so the queue doesn't spin.
+        let positions: Vec<u64> = batch.iter().map(|(p, _)| *p).collect();
+        let _ = db.delete_outbound_for_room(server_name, room_nid, &positions);
+        return SendOutcome::Empty;
+    }
+    let txn_id = new_txn_id();
+    let body = json!({
+        "origin": our_server_name,
+        "origin_server_ts": now_ms(),
+        "pdus": pdus,
+        "edus": [],
+    });
+    match client.send_transaction(server_name, &txn_id, body).await {
+        Ok(_) => {
+            debug!(%server_name, room_nid, pdus = batch.len(), "room PDU txn sent");
+            let positions: Vec<u64> = batch.iter().map(|(p, _)| *p).collect();
+            if let Err(e) = db.delete_outbound_for_room(server_name, room_nid, &positions) {
+                warn!(%server_name, room_nid, error = %e, "delete_outbound_for_room failed");
             }
+            SendOutcome::Success
+        }
+        Err(e) => {
+            warn!(%server_name, room_nid, error = %e, "room PDU txn send failed");
+            SendOutcome::Failure
+        }
+    }
+}
+
+/// EDU-only TXN. EDUs aren't keyed by room, so they share a single
+/// per-destination stream. On success advance the per-stream cursors.
+async fn send_edu_txn(
+    server_name: &str,
+    our_server_name: &str,
+    edus: Vec<Value>,
+    cursor_advances: Vec<(String, u64)>,
+    db: &Database,
+    client: &FederationClient,
+) -> SendOutcome {
+    if edus.is_empty() {
+        return SendOutcome::Empty;
+    }
+    let txn_id = new_txn_id();
+    let body = json!({
+        "origin": our_server_name,
+        "origin_server_ts": now_ms(),
+        "pdus": [],
+        "edus": edus,
+    });
+    match client.send_transaction(server_name, &txn_id, body).await {
+        Ok(_) => {
+            debug!(%server_name, edus = edus.len(), "EDU-only txn sent");
+            for (stream_name, new_cursor) in &cursor_advances {
+                if let Err(e) = db.set_edu_cursor(server_name, stream_name, *new_cursor) {
+                    warn!(%server_name, %stream_name, error = %e, "set_edu_cursor failed");
+                }
+            }
+            SendOutcome::Success
+        }
+        Err(e) => {
+            warn!(%server_name, error = %e, "EDU-only txn send failed");
+            SendOutcome::Failure
         }
     }
 }
@@ -498,11 +618,14 @@ mod tests {
         let db = Arc::new(Database::open(tmp.path()).unwrap());
 
         // Enqueue directly via the DB API (proxy for what broadcast does).
-        let pos1 = db.enqueue_outbound("peer.example", 1001).unwrap();
-        let pos2 = db.enqueue_outbound("peer.example", 1002).unwrap();
+        let room_nid = 42;
+        let pos1 = db.enqueue_outbound("peer.example", room_nid, 1001).unwrap();
+        let pos2 = db.enqueue_outbound("peer.example", room_nid, 1002).unwrap();
         assert!(pos2 > pos1);
 
-        let pending = db.peek_outbound("peer.example", 10).unwrap();
+        let pending = db
+            .peek_outbound_for_room("peer.example", room_nid, 10)
+            .unwrap();
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].1, 1001);
         assert_eq!(pending[1].1, 1002);
@@ -512,8 +635,11 @@ mod tests {
         assert_eq!(dests, vec!["peer.example"]);
 
         // Delete first, second remains.
-        db.delete_outbound("peer.example", &[pos1]).unwrap();
-        let pending = db.peek_outbound("peer.example", 10).unwrap();
+        db.delete_outbound_for_room("peer.example", room_nid, &[pos1])
+            .unwrap();
+        let pending = db
+            .peek_outbound_for_room("peer.example", room_nid, 10)
+            .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].1, 1002);
     }
@@ -549,12 +675,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open(tmp.path()).unwrap());
 
-        db.enqueue_outbound("a", 1).unwrap();
-        db.enqueue_outbound("ab", 2).unwrap();
-        db.enqueue_outbound("a", 3).unwrap();
+        let room_nid = 7;
+        db.enqueue_outbound("a", room_nid, 1).unwrap();
+        db.enqueue_outbound("ab", room_nid, 2).unwrap();
+        db.enqueue_outbound("a", room_nid, 3).unwrap();
 
-        let a = db.peek_outbound("a", 10).unwrap();
-        let ab = db.peek_outbound("ab", 10).unwrap();
+        let a = db.peek_outbound_for_room("a", room_nid, 10).unwrap();
+        let ab = db.peek_outbound_for_room("ab", room_nid, 10).unwrap();
         let a_nids: Vec<u64> = a.iter().map(|(_, n)| *n).collect();
         let ab_nids: Vec<u64> = ab.iter().map(|(_, n)| *n).collect();
         assert_eq!(a_nids, vec![1, 3], "server 'a' must not see 'ab' entries");
