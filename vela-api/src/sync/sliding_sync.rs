@@ -1268,6 +1268,35 @@ fn build_sliding_room(
         .count_room_members_by_membership(room_nid, 2)
         .unwrap_or(0);
 
+    // Heroes for room-name resolution by the client. Same shape as v3
+    // /sync's `m.heroes` (user_id strings, alphabetic, cap 5,
+    // requesting user excluded), only emitted when `info.name` came
+    // back unset — for named rooms the client picks `name` directly
+    // and doesn't need heroes, so the membership scan is wasted work.
+    const HEROES_CAP: usize = 5;
+    let heroes: Vec<String> = if info.name.is_some() {
+        Vec::new()
+    } else {
+        let mut nids = state
+            .db
+            .get_room_members_by_membership(room_nid, 1)
+            .unwrap_or_default();
+        let invited = state
+            .db
+            .get_room_members_by_membership(room_nid, 2)
+            .unwrap_or_default();
+        nids.extend(invited);
+        let mut user_ids: Vec<String> = nids
+            .into_iter()
+            .filter(|nid| *nid != user_nid)
+            .filter_map(|nid| state.db.resolve_nid(nid).ok().flatten())
+            .collect();
+        user_ids.sort();
+        user_ids.dedup();
+        user_ids.truncate(HEROES_CAP);
+        user_ids
+    };
+
     // Unread counts mirror /sync semantics. Sliding sync clients show
     // the same badge on a room tile as /sync clients do, so they need
     // the same per-batch evaluation against the user's read receipts.
@@ -1283,6 +1312,7 @@ fn build_sliding_room(
         "highlight_count": highlight_count,
         "joined_count": joined_count,
         "invited_count": invited_count,
+        "heroes": heroes,
         "membership": info.membership,
     });
 
