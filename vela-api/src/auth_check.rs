@@ -739,9 +739,18 @@ mod tests {
 
         // Both remote destinations have the event in their outbox; our
         // own server does not get an outbox entry.
-        let outbox_a = state.db.peek_outbound("server-a.example", 10).unwrap();
-        let outbox_b = state.db.peek_outbound("server-b.example", 10).unwrap();
-        let outbox_self = state.db.peek_outbound("example.com", 10).unwrap();
+        let outbox_a = state
+            .db
+            .peek_outbound_for_room("server-a.example", room_nid, 10)
+            .unwrap();
+        let outbox_b = state
+            .db
+            .peek_outbound_for_room("server-b.example", room_nid, 10)
+            .unwrap();
+        let outbox_self = state
+            .db
+            .peek_outbound_for_room("example.com", room_nid, 10)
+            .unwrap();
 
         assert!(
             outbox_a.iter().any(|(_, nid)| *nid == event_nid),

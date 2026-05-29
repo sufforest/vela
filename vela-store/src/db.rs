@@ -360,7 +360,7 @@ impl Database {
         let receipts_stream_counter = recover_max_receipts_stream(&db).unwrap_or(1);
         let presence_stream_counter = recover_max_presence_stream(&db).unwrap_or(1);
 
-        Ok(Self {
+        let this = Self {
             db,
             event_nid_counter,
             string_nid_counter,
@@ -374,7 +374,116 @@ impl Database {
             snapshot_nid_counter,
             receipts_stream_counter: AtomicU64::new(receipts_stream_counter),
             presence_stream_counter: AtomicU64::new(presence_stream_counter),
-        })
+        };
+        // Migrate any pre-per-room outbox entries left over from before
+        // the federation_sender refactor. No-op on fresh DBs.
+        if let Err(e) = this.migrate_federation_outbox_to_per_room() {
+            tracing::warn!(error = %e, "federation outbox migration failed; entries may be stuck");
+        }
+        Ok(this)
+    }
+
+    /// Rewrite legacy federation_outbox entries (keyed
+    /// `<dest> 0xff <pos:8>`) to the per-room format
+    /// (`<dest> 0xff <room_nid:8> <pos:8>`). The room is looked up via
+    /// the event's persisted room_nid. Entries whose event no longer
+    /// exists on disk are dropped — they can't be sent anyway.
+    fn migrate_federation_outbox_to_per_room(&self) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("federation_outbox").unwrap();
+        let mut to_delete: Vec<Vec<u8>> = Vec::new();
+        let mut to_put: Vec<(Vec<u8>, [u8; 8])> = Vec::new();
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+        for item in iter {
+            let (key, val) = item?;
+            // Detect the old format: <dest_bytes> 0xff <pos:8>.
+            // New format is <dest_bytes> 0xff <room_nid:8> <pos:8>.
+            // Find the 0xff separator, then check suffix length.
+            let Some(sep) = key.iter().position(|&b| b == 0xff) else {
+                continue;
+            };
+            let suffix_len = key.len() - sep - 1;
+            if suffix_len != 8 {
+                continue; // already migrated or unrelated
+            }
+            if val.len() != 8 {
+                to_delete.push(key.to_vec());
+                continue;
+            }
+            let event_nid = keys::decode_u64(&val);
+            // Recover the event's room_nid via the event header (room is
+            // encoded as the lookup-target of the per-event index).
+            let room_nid = match self.get_event(event_nid) {
+                Ok(Some((header, _))) => {
+                    // header doesn't carry room_nid; resolve via the
+                    // event's home in room_state isn't viable. Instead,
+                    // the (room, type, state_key) tuple isn't enough
+                    // either. We use the room_timeline scan: every
+                    // event lives at exactly one (room_nid, pos) key.
+                    // Since the cost of migration is paid once at
+                    // startup, walking once is acceptable.
+                    let _ = header;
+                    self.lookup_event_room_nid(event_nid)?
+                }
+                _ => None,
+            };
+            let Some(room_nid) = room_nid else {
+                // Event missing — drop the entry, it's unsendable.
+                to_delete.push(key.to_vec());
+                continue;
+            };
+            // Decode old pos.
+            let pos_bytes = &key[sep + 1..];
+            let mut pos_buf = [0u8; 8];
+            pos_buf.copy_from_slice(pos_bytes);
+            let pos = u64::from_be_bytes(pos_buf);
+            let dest_bytes = &key[..sep];
+            let dest_str = String::from_utf8_lossy(dest_bytes).to_string();
+            let new_key = outbox_key(&dest_str, room_nid, pos);
+            to_delete.push(key.to_vec());
+            to_put.push((new_key, keys::encode_u64(event_nid)));
+        }
+        if to_delete.is_empty() && to_put.is_empty() {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::default();
+        for old in &to_delete {
+            batch.delete_cf(&cf, old);
+        }
+        for (new_key, val) in &to_put {
+            batch.put_cf(&cf, new_key, val);
+        }
+        let migrated = to_put.len();
+        let dropped = to_delete.len() - migrated;
+        self.db.write(batch)?;
+        if migrated > 0 || dropped > 0 {
+            tracing::info!(
+                migrated,
+                dropped,
+                "federation_outbox: rewrote legacy entries to per-room key format"
+            );
+        }
+        Ok(())
+    }
+
+    /// Resolve `event_nid` → `room_nid` by walking the per-room
+    /// timeline index. Only used by one-shot startup migration; the
+    /// hot path uses the room_nid known at enqueue time.
+    fn lookup_event_room_nid(&self, event_nid: u64) -> Result<Option<u64>, rocksdb::Error> {
+        let cf = self.db.cf_handle("room_timeline").unwrap();
+        let target = keys::encode_u64(event_nid);
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+        for item in iter {
+            let (key, val) = item?;
+            if val.as_ref() == target {
+                if key.len() < 16 {
+                    continue;
+                }
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(&key[..8]);
+                return Ok(Some(u64::from_be_bytes(buf)));
+            }
+        }
+        Ok(None)
     }
 
     // --- Counter operations ---
@@ -5096,12 +5205,13 @@ impl Database {
     pub fn enqueue_outbound(
         &self,
         destination: &str,
+        room_nid: u64,
         event_nid: u64,
     ) -> Result<u64, rocksdb::Error> {
         let cf = self.db.cf_handle("federation_outbox").unwrap();
         let pos = self.next_stream_position();
         let _stream_guard = StreamApplyOnDrop::new(self, pos.as_u64());
-        let key = outbox_key(destination, pos.as_u64());
+        let key = outbox_key(destination, room_nid, pos.as_u64());
         self.db.put_cf(&cf, &key, keys::encode_u64(event_nid))?;
         Ok(pos.as_u64())
     }
@@ -5110,10 +5220,12 @@ impl Database {
     /// `WriteBatch`. Shaves N-1 RocksDB write syscalls + WAL appends off
     /// the local-send hot path when broadcasting to many remote peers.
     /// Returns the assigned stream_pos for each destination, in input
-    /// order.
+    /// order. All entries share `room_nid`; this is the broadcast of a
+    /// single event so the room is the same for every destination.
     pub fn enqueue_outbound_batch(
         &self,
         destinations: &[&str],
+        room_nid: u64,
         event_nid: u64,
     ) -> Result<Vec<u64>, rocksdb::Error> {
         if destinations.is_empty() {
@@ -5129,7 +5241,7 @@ impl Database {
         for dest in destinations {
             let pos = self.next_stream_position();
             _stream_guards.push(StreamApplyOnDrop::new(self, pos.as_u64()));
-            let key = outbox_key(dest, pos.as_u64());
+            let key = outbox_key(dest, room_nid, pos.as_u64());
             batch.put_cf(&cf, &key, nid_bytes);
             positions.push(pos.as_u64());
         }
@@ -5137,15 +5249,17 @@ impl Database {
         Ok(positions)
     }
 
-    /// Read up to `limit` pending entries for `destination` in send order.
-    /// Returns `(stream_pos, event_nid)` pairs.
-    pub fn peek_outbound(
+    /// Read up to `limit` pending entries for a specific `(destination,
+    /// room_nid)` pair in send order. Returns `(stream_pos, event_nid)`
+    /// pairs. Used by per-(destination, room) sender workers.
+    pub fn peek_outbound_for_room(
         &self,
         destination: &str,
+        room_nid: u64,
         limit: usize,
     ) -> Result<Vec<(u64, u64)>, rocksdb::Error> {
         let cf = self.db.cf_handle("federation_outbox").unwrap();
-        let prefix = outbox_prefix(destination);
+        let prefix = outbox_room_prefix(destination, room_nid);
         let mut out = Vec::new();
         let iter = self.db.prefix_iterator_cf(&cf, &prefix);
         for item in iter {
@@ -5156,7 +5270,7 @@ impl Database {
             if val.len() != 8 || key.len() < prefix.len() + 8 {
                 continue;
             }
-            // Stream pos is the trailing 8 bytes after the prefix.
+            // Stream pos is the trailing 8 bytes after the (dest, room) prefix.
             let pos_bytes = &key[prefix.len()..prefix.len() + 8];
             let mut buf = [0u8; 8];
             buf.copy_from_slice(pos_bytes);
@@ -5170,10 +5284,44 @@ impl Database {
         Ok(out)
     }
 
-    /// Delete the named outbox entries (after successful send).
-    pub fn delete_outbound(
+    /// Enumerate every room with at least one pending entry for
+    /// `destination`. Used by the destination dispatcher to spawn
+    /// per-(destination, room) workers without scanning each room
+    /// individually.
+    pub fn list_outbound_rooms_for_destination(
         &self,
         destination: &str,
+    ) -> Result<Vec<u64>, rocksdb::Error> {
+        let cf = self.db.cf_handle("federation_outbox").unwrap();
+        let dest_prefix = outbox_prefix(destination);
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let iter = self.db.prefix_iterator_cf(&cf, &dest_prefix);
+        for item in iter {
+            let (key, _val) = item?;
+            if !key.starts_with(&dest_prefix) {
+                break;
+            }
+            // After the destination prefix we expect <room_nid:8><pos:8>.
+            if key.len() != dest_prefix.len() + 16 {
+                continue;
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&key[dest_prefix.len()..dest_prefix.len() + 8]);
+            let room_nid = u64::from_be_bytes(buf);
+            if seen.insert(room_nid) {
+                out.push(room_nid);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete the named outbox entries for a specific `(destination,
+    /// room_nid)` after a successful send.
+    pub fn delete_outbound_for_room(
+        &self,
+        destination: &str,
+        room_nid: u64,
         positions: &[u64],
     ) -> Result<(), rocksdb::Error> {
         if positions.is_empty() {
@@ -5182,7 +5330,7 @@ impl Database {
         let cf = self.db.cf_handle("federation_outbox").unwrap();
         let mut batch = WriteBatch::default();
         for &pos in positions {
-            batch.delete_cf(&cf, outbox_key(destination, pos));
+            batch.delete_cf(&cf, outbox_key(destination, room_nid, pos));
         }
         self.db.write(batch)
     }
@@ -5916,9 +6064,23 @@ fn outbox_prefix(destination: &str) -> Vec<u8> {
     p
 }
 
-/// Full outbox key: `<destination> 0xff <stream_pos_be>`.
-fn outbox_key(destination: &str, stream_pos: u64) -> Vec<u8> {
-    let mut k = outbox_prefix(destination);
+/// Per-(destination, room) prefix used to scan one room's pending
+/// entries when the federation_sender dispatches per-room workers.
+fn outbox_room_prefix(destination: &str, room_nid: u64) -> Vec<u8> {
+    let mut p = Vec::with_capacity(destination.len() + 1 + 8);
+    p.extend_from_slice(destination.as_bytes());
+    p.push(0xff);
+    p.extend_from_slice(&keys::encode_u64(room_nid));
+    p
+}
+
+/// Full outbox key: `<destination> 0xff <room_nid_be> <stream_pos_be>`.
+/// Room is part of the key so workers can drain one room without
+/// scanning the whole destination — per-room ordering falls out of
+/// the natural iterator order and rooms can be sent concurrently to
+/// the same peer.
+fn outbox_key(destination: &str, room_nid: u64, stream_pos: u64) -> Vec<u8> {
+    let mut k = outbox_room_prefix(destination, room_nid);
     k.extend_from_slice(&keys::encode_u64(stream_pos));
     k
 }
@@ -7212,5 +7374,176 @@ mod partial_state_tests {
         db.create_room_meta(nid, "!r:x", "12").unwrap();
         db.clear_partial_state(nid).unwrap();
         db.clear_partial_state(nid).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod outbox_migration_tests {
+    use super::*;
+
+    fn fresh_db() -> (Database, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        (db, tmp)
+    }
+
+    fn legacy_outbox_key(dest: &str, pos: u64) -> Vec<u8> {
+        let mut k = Vec::with_capacity(dest.len() + 1 + 8);
+        k.extend_from_slice(dest.as_bytes());
+        k.push(0xff);
+        k.extend_from_slice(&keys::encode_u64(pos));
+        k
+    }
+
+    /// Plant a minimal events-CF row so `get_event` returns Some, plus
+    /// a room_timeline row so `lookup_event_room_nid` resolves the
+    /// room. Together these are all the migration reads.
+    fn plant_event(db: &Database, event_nid: u64, room_nid: u64, pos: u64) {
+        let events_cf = db.db.cf_handle("events").unwrap();
+        let mut payload = vec![0u8; 48];
+        payload[24..32].copy_from_slice(&keys::encode_u64(1_700_000_000_000));
+        db.db
+            .put_cf(&events_cf, keys::encode_u64(event_nid), &payload)
+            .unwrap();
+        let timeline_cf = db.db.cf_handle("room_timeline").unwrap();
+        let mut tk = Vec::with_capacity(16);
+        tk.extend_from_slice(&keys::encode_u64(room_nid));
+        tk.extend_from_slice(&keys::encode_u64(pos));
+        db.db
+            .put_cf(&timeline_cf, &tk, keys::encode_u64(event_nid))
+            .unwrap();
+    }
+
+    #[test]
+    fn rewrites_legacy_entry_to_per_room_key() {
+        let (db, _tmp) = fresh_db();
+        let dest = "remote.example";
+        let room_nid = 42;
+        let event_nid = 7;
+        let pos = 100;
+
+        plant_event(&db, event_nid, room_nid, pos);
+
+        let outbox_cf = db.db.cf_handle("federation_outbox").unwrap();
+        db.db
+            .put_cf(
+                &outbox_cf,
+                legacy_outbox_key(dest, pos),
+                keys::encode_u64(event_nid),
+            )
+            .unwrap();
+
+        db.migrate_federation_outbox_to_per_room().unwrap();
+
+        // Legacy key is gone.
+        assert!(
+            db.db
+                .get_cf(&outbox_cf, legacy_outbox_key(dest, pos))
+                .unwrap()
+                .is_none()
+        );
+        // New per-room key has the same event_nid.
+        let new_key = outbox_key(dest, room_nid, pos);
+        let got = db.db.get_cf(&outbox_cf, &new_key).unwrap().unwrap();
+        assert_eq!(got, keys::encode_u64(event_nid));
+    }
+
+    #[test]
+    fn drops_legacy_entry_when_event_missing() {
+        let (db, _tmp) = fresh_db();
+        let dest = "remote.example";
+        let outbox_cf = db.db.cf_handle("federation_outbox").unwrap();
+        // event_nid 9999 isn't planted anywhere.
+        db.db
+            .put_cf(
+                &outbox_cf,
+                legacy_outbox_key(dest, 5),
+                keys::encode_u64(9999),
+            )
+            .unwrap();
+
+        db.migrate_federation_outbox_to_per_room().unwrap();
+
+        assert!(
+            db.db
+                .get_cf(&outbox_cf, legacy_outbox_key(dest, 5))
+                .unwrap()
+                .is_none()
+        );
+        // CF is empty.
+        let mut iter = db.db.iterator_cf(&outbox_cf, IteratorMode::Start);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn leaves_already_migrated_entries_alone() {
+        let (db, _tmp) = fresh_db();
+        let dest = "remote.example";
+        let room_nid = 11;
+        let event_nid = 3;
+        let pos = 50;
+
+        plant_event(&db, event_nid, room_nid, pos);
+
+        let outbox_cf = db.db.cf_handle("federation_outbox").unwrap();
+        let new_key = outbox_key(dest, room_nid, pos);
+        db.db
+            .put_cf(&outbox_cf, &new_key, keys::encode_u64(event_nid))
+            .unwrap();
+
+        db.migrate_federation_outbox_to_per_room().unwrap();
+
+        // Same entry still there with same value, untouched.
+        let got = db.db.get_cf(&outbox_cf, &new_key).unwrap().unwrap();
+        assert_eq!(got, keys::encode_u64(event_nid));
+        // No stray entries.
+        let count = db.db.iterator_cf(&outbox_cf, IteratorMode::Start).count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn mixed_legacy_and_new_only_legacy_migrates() {
+        let (db, _tmp) = fresh_db();
+        let dest = "remote.example";
+        let room_nid_a = 100;
+        let room_nid_b = 200;
+
+        plant_event(&db, 1, room_nid_a, 10);
+        plant_event(&db, 2, room_nid_b, 20);
+
+        let outbox_cf = db.db.cf_handle("federation_outbox").unwrap();
+        // Legacy entry for event 1.
+        db.db
+            .put_cf(&outbox_cf, legacy_outbox_key(dest, 10), keys::encode_u64(1))
+            .unwrap();
+        // Already-migrated entry for event 2.
+        db.db
+            .put_cf(
+                &outbox_cf,
+                outbox_key(dest, room_nid_b, 20),
+                keys::encode_u64(2),
+            )
+            .unwrap();
+
+        db.migrate_federation_outbox_to_per_room().unwrap();
+
+        assert!(
+            db.db
+                .get_cf(&outbox_cf, legacy_outbox_key(dest, 10))
+                .unwrap()
+                .is_none()
+        );
+        let migrated = db
+            .db
+            .get_cf(&outbox_cf, outbox_key(dest, room_nid_a, 10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated, keys::encode_u64(1));
+        let untouched = db
+            .db
+            .get_cf(&outbox_cf, outbox_key(dest, room_nid_b, 20))
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched, keys::encode_u64(2));
     }
 }
