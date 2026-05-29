@@ -975,52 +975,42 @@ fn build_room_sync_for_user(
     // need to agree on which prefix shows up.
     const HEROES_CAP: usize = 5;
     let has_room_name_or_alias = {
-        let name_set = crate::membership::read_state_value_pub(
-            state,
-            room_nid,
-            "m.room.name",
-            "",
-        )
-        .ok()
-        .flatten()
-        .and_then(|v| v.get("content").cloned())
-        .and_then(|c| {
-            c.get("name")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
-        let alias_set = crate::membership::read_state_value_pub(
-            state,
-            room_nid,
-            "m.room.canonical_alias",
-            "",
-        )
-        .ok()
-        .flatten()
-        .and_then(|v| v.get("content").cloned())
-        .and_then(|c| {
-            c.get("alias")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        })
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
+        let name_set = crate::membership::read_state_value_pub(state, room_nid, "m.room.name", "")
+            .ok()
+            .flatten()
+            .and_then(|v| v.get("content").cloned())
+            .and_then(|c| c.get("name").and_then(|v| v.as_str()).map(str::to_string))
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let alias_set =
+            crate::membership::read_state_value_pub(state, room_nid, "m.room.canonical_alias", "")
+                .ok()
+                .flatten()
+                .and_then(|v| v.get("content").cloned())
+                .and_then(|c| c.get("alias").and_then(|v| v.as_str()).map(str::to_string))
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
         name_set || alias_set
     };
     let heroes: Vec<String> = if has_room_name_or_alias {
         Vec::new()
     } else {
-        let mut nids = state
-            .db
-            .get_room_members_by_membership(room_nid, 1)
-            .unwrap_or_default();
-        let invited = state
-            .db
-            .get_room_members_by_membership(room_nid, 2)
-            .unwrap_or_default();
-        nids.extend(invited);
+        let pick = |membership: u8| -> Vec<u64> {
+            state
+                .db
+                .get_room_members_by_membership(room_nid, membership)
+                .unwrap_or_default()
+        };
+        let mut nids = pick(1);
+        nids.extend(pick(2));
+        // Per sync.yaml: "When no joined or invited members are
+        // available, this should consist of the banned and left
+        // users." Mostly a degenerate case (e.g. the user is left in
+        // a room that's since emptied) but still spec-required.
+        if nids.iter().all(|&n| Some(n) == user_nid) {
+            nids.extend(pick(0)); // leave
+            nids.extend(pick(3)); // ban
+        }
         let mut user_ids: Vec<String> = nids
             .into_iter()
             .filter(|nid| user_nid != Some(*nid))
