@@ -7376,3 +7376,174 @@ mod partial_state_tests {
         db.clear_partial_state(nid).unwrap();
     }
 }
+
+#[cfg(test)]
+mod outbox_migration_tests {
+    use super::*;
+
+    fn fresh_db() -> (Database, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        (db, tmp)
+    }
+
+    fn legacy_outbox_key(dest: &str, pos: u64) -> Vec<u8> {
+        let mut k = Vec::with_capacity(dest.len() + 1 + 8);
+        k.extend_from_slice(dest.as_bytes());
+        k.push(0xff);
+        k.extend_from_slice(&keys::encode_u64(pos));
+        k
+    }
+
+    /// Plant a minimal events-CF row so `get_event` returns Some, plus
+    /// a room_timeline row so `lookup_event_room_nid` resolves the
+    /// room. Together these are all the migration reads.
+    fn plant_event(db: &Database, event_nid: u64, room_nid: u64, pos: u64) {
+        let events_cf = db.db.cf_handle("events").unwrap();
+        let mut payload = vec![0u8; 48];
+        payload[24..32].copy_from_slice(&keys::encode_u64(1_700_000_000_000));
+        db.db
+            .put_cf(&events_cf, keys::encode_u64(event_nid), &payload)
+            .unwrap();
+        let timeline_cf = db.db.cf_handle("room_timeline").unwrap();
+        let mut tk = Vec::with_capacity(16);
+        tk.extend_from_slice(&keys::encode_u64(room_nid));
+        tk.extend_from_slice(&keys::encode_u64(pos));
+        db.db
+            .put_cf(&timeline_cf, &tk, keys::encode_u64(event_nid))
+            .unwrap();
+    }
+
+    #[test]
+    fn rewrites_legacy_entry_to_per_room_key() {
+        let (db, _tmp) = fresh_db();
+        let dest = "remote.example";
+        let room_nid = 42;
+        let event_nid = 7;
+        let pos = 100;
+
+        plant_event(&db, event_nid, room_nid, pos);
+
+        let outbox_cf = db.db.cf_handle("federation_outbox").unwrap();
+        db.db
+            .put_cf(
+                &outbox_cf,
+                legacy_outbox_key(dest, pos),
+                keys::encode_u64(event_nid),
+            )
+            .unwrap();
+
+        db.migrate_federation_outbox_to_per_room().unwrap();
+
+        // Legacy key is gone.
+        assert!(
+            db.db
+                .get_cf(&outbox_cf, legacy_outbox_key(dest, pos))
+                .unwrap()
+                .is_none()
+        );
+        // New per-room key has the same event_nid.
+        let new_key = outbox_key(dest, room_nid, pos);
+        let got = db.db.get_cf(&outbox_cf, &new_key).unwrap().unwrap();
+        assert_eq!(got, keys::encode_u64(event_nid));
+    }
+
+    #[test]
+    fn drops_legacy_entry_when_event_missing() {
+        let (db, _tmp) = fresh_db();
+        let dest = "remote.example";
+        let outbox_cf = db.db.cf_handle("federation_outbox").unwrap();
+        // event_nid 9999 isn't planted anywhere.
+        db.db
+            .put_cf(
+                &outbox_cf,
+                legacy_outbox_key(dest, 5),
+                keys::encode_u64(9999),
+            )
+            .unwrap();
+
+        db.migrate_federation_outbox_to_per_room().unwrap();
+
+        assert!(
+            db.db
+                .get_cf(&outbox_cf, legacy_outbox_key(dest, 5))
+                .unwrap()
+                .is_none()
+        );
+        // CF is empty.
+        let mut iter = db.db.iterator_cf(&outbox_cf, IteratorMode::Start);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn leaves_already_migrated_entries_alone() {
+        let (db, _tmp) = fresh_db();
+        let dest = "remote.example";
+        let room_nid = 11;
+        let event_nid = 3;
+        let pos = 50;
+
+        plant_event(&db, event_nid, room_nid, pos);
+
+        let outbox_cf = db.db.cf_handle("federation_outbox").unwrap();
+        let new_key = outbox_key(dest, room_nid, pos);
+        db.db
+            .put_cf(&outbox_cf, &new_key, keys::encode_u64(event_nid))
+            .unwrap();
+
+        db.migrate_federation_outbox_to_per_room().unwrap();
+
+        // Same entry still there with same value, untouched.
+        let got = db.db.get_cf(&outbox_cf, &new_key).unwrap().unwrap();
+        assert_eq!(got, keys::encode_u64(event_nid));
+        // No stray entries.
+        let count = db.db.iterator_cf(&outbox_cf, IteratorMode::Start).count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn mixed_legacy_and_new_only_legacy_migrates() {
+        let (db, _tmp) = fresh_db();
+        let dest = "remote.example";
+        let room_nid_a = 100;
+        let room_nid_b = 200;
+
+        plant_event(&db, 1, room_nid_a, 10);
+        plant_event(&db, 2, room_nid_b, 20);
+
+        let outbox_cf = db.db.cf_handle("federation_outbox").unwrap();
+        // Legacy entry for event 1.
+        db.db
+            .put_cf(&outbox_cf, legacy_outbox_key(dest, 10), keys::encode_u64(1))
+            .unwrap();
+        // Already-migrated entry for event 2.
+        db.db
+            .put_cf(
+                &outbox_cf,
+                outbox_key(dest, room_nid_b, 20),
+                keys::encode_u64(2),
+            )
+            .unwrap();
+
+        db.migrate_federation_outbox_to_per_room().unwrap();
+
+        assert!(
+            db.db
+                .get_cf(&outbox_cf, legacy_outbox_key(dest, 10))
+                .unwrap()
+                .is_none()
+        );
+        let migrated = db
+            .db
+            .get_cf(&outbox_cf, outbox_key(dest, room_nid_a, 10))
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated, keys::encode_u64(1));
+        let untouched = db
+            .db
+            .get_cf(&outbox_cf, outbox_key(dest, room_nid_b, 20))
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched, keys::encode_u64(2));
+    }
+}
