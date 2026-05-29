@@ -807,7 +807,22 @@ pub async fn send_join_v2(
     let mut resp = serde_json::Map::new();
     resp.insert("auth_chain".into(), json!(auth_chain_pdus));
     resp.insert("state".into(), json!(response_state));
-    resp.insert("event".into(), Value::Null);
+    // Restricted Rooms only (joins-v2.yaml): "The full event with the
+    // additional signatures of the resident server applied to it."
+    // For restricted joins we signed the make_join template on behalf
+    // of the local authoriser, so the event the joiner sent us already
+    // carries both signatures — echo it back so the joiner can confirm
+    // which exact bytes we persisted. For non-restricted joins the
+    // field stays null (the spec only requires it for restricted).
+    let is_restricted_join = effective_event_obj
+        .get("content")
+        .and_then(|c| c.get("join_authorised_via_users_server"))
+        .is_some();
+    if is_restricted_join {
+        resp.insert("event".into(), Value::Object(effective_event_obj.clone()));
+    } else {
+        resp.insert("event".into(), Value::Null);
+    }
     if partial_state {
         // Spec name since Matrix 1.6 (joins-v2.yaml). The MSC3706-era
         // unstable name was `partial_state`; peers on current spec
