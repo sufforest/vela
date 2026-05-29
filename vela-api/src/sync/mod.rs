@@ -963,6 +963,75 @@ fn build_room_sync_for_user(
         .count_room_members_by_membership(room_nid, 2)
         .unwrap_or(0);
 
+    // "Heroes" — up to HEROES_CAP joined-or-invited members (excluding
+    // the requesting user) clients use to render a room name when
+    // m.room.name and m.room.canonical_alias are both unset. Spec says
+    // "Required if the room's `m.room.name` or `m.room.canonical_alias`
+    // state events are unset or empty" — when either is set the field
+    // is optional, so we skip the membership scan to keep /sync cheap
+    // for named rooms (the common case in normal use). Spec orders by
+    // "stream ordering"; we pick alphabetically on user_id since the
+    // membership index doesn't preserve insertion order and replicas
+    // need to agree on which prefix shows up.
+    const HEROES_CAP: usize = 5;
+    let has_room_name_or_alias = {
+        let name_set = crate::membership::read_state_value_pub(
+            state,
+            room_nid,
+            "m.room.name",
+            "",
+        )
+        .ok()
+        .flatten()
+        .and_then(|v| v.get("content").cloned())
+        .and_then(|c| {
+            c.get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+        let alias_set = crate::membership::read_state_value_pub(
+            state,
+            room_nid,
+            "m.room.canonical_alias",
+            "",
+        )
+        .ok()
+        .flatten()
+        .and_then(|v| v.get("content").cloned())
+        .and_then(|c| {
+            c.get("alias")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+        name_set || alias_set
+    };
+    let heroes: Vec<String> = if has_room_name_or_alias {
+        Vec::new()
+    } else {
+        let mut nids = state
+            .db
+            .get_room_members_by_membership(room_nid, 1)
+            .unwrap_or_default();
+        let invited = state
+            .db
+            .get_room_members_by_membership(room_nid, 2)
+            .unwrap_or_default();
+        nids.extend(invited);
+        let mut user_ids: Vec<String> = nids
+            .into_iter()
+            .filter(|nid| user_nid != Some(*nid))
+            .filter_map(|nid| state.db.resolve_nid(nid).ok().flatten())
+            .collect();
+        user_ids.sort();
+        user_ids.dedup();
+        user_ids.truncate(HEROES_CAP);
+        user_ids
+    };
+
     // Same delta-skip as receipts above: on incremental sync, skip the
     // room_account_data snapshot when nothing has changed in the
     // `(user, room)` slot since the client's `since` cursor.
@@ -1021,6 +1090,7 @@ fn build_room_sync_for_user(
     payload.insert(
         "summary".to_string(),
         json!({
+            "m.heroes": heroes,
             "m.joined_member_count": joined_count,
             "m.invited_member_count": invited_count,
         }),
