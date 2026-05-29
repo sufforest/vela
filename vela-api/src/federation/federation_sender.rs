@@ -687,4 +687,104 @@ mod tests {
         assert_eq!(a_nids, vec![1, 3], "server 'a' must not see 'ab' entries");
         assert_eq!(ab_nids, vec![2]);
     }
+
+    /// Per-room isolation inside the same destination — `peek_outbound_for_room`
+    /// must return only the queried room's PDUs even when many rooms have
+    /// entries interleaved by stream position. This is the invariant that
+    /// makes per-room TXN dispatch correct.
+    #[tokio::test]
+    async fn room_isolation_within_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+
+        // Interleave by stream position across three rooms — entry order
+        // would mix them in a per-destination scan.
+        db.enqueue_outbound("peer.example", 1, 100).unwrap();
+        db.enqueue_outbound("peer.example", 2, 101).unwrap();
+        db.enqueue_outbound("peer.example", 1, 102).unwrap();
+        db.enqueue_outbound("peer.example", 3, 103).unwrap();
+        db.enqueue_outbound("peer.example", 2, 104).unwrap();
+
+        let r1: Vec<u64> = db
+            .peek_outbound_for_room("peer.example", 1, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect();
+        let r2: Vec<u64> = db
+            .peek_outbound_for_room("peer.example", 2, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect();
+        let r3: Vec<u64> = db
+            .peek_outbound_for_room("peer.example", 3, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect();
+
+        assert_eq!(r1, vec![100, 102]);
+        assert_eq!(r2, vec![101, 104]);
+        assert_eq!(r3, vec![103]);
+    }
+
+    /// `list_outbound_rooms_for_destination` returns every room with at
+    /// least one pending entry and nothing more. This is what drives
+    /// per-cycle TXN dispatch — a missing room would silently skip its
+    /// queue forever; a stale entry would spawn a no-op TXN every cycle.
+    #[tokio::test]
+    async fn list_outbound_rooms_reflects_pending_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+
+        // No rooms pending → empty list.
+        assert!(
+            db.list_outbound_rooms_for_destination("peer.example")
+                .unwrap()
+                .is_empty()
+        );
+
+        let pos_a = db.enqueue_outbound("peer.example", 10, 1).unwrap();
+        db.enqueue_outbound("peer.example", 20, 2).unwrap();
+        db.enqueue_outbound("peer.example", 10, 3).unwrap();
+
+        let mut rooms = db
+            .list_outbound_rooms_for_destination("peer.example")
+            .unwrap();
+        rooms.sort();
+        assert_eq!(rooms, vec![10, 20]);
+
+        // Another destination's rooms don't bleed through.
+        db.enqueue_outbound("other.example", 30, 4).unwrap();
+        let rooms = db
+            .list_outbound_rooms_for_destination("peer.example")
+            .unwrap();
+        assert!(!rooms.contains(&30));
+
+        // Draining one room removes it from the list.
+        db.delete_outbound_for_room("peer.example", 10, &[pos_a])
+            .unwrap();
+        let still_has_room_10 = db
+            .peek_outbound_for_room("peer.example", 10, 10)
+            .unwrap()
+            .iter()
+            .any(|(_, n)| *n == 3);
+        assert!(still_has_room_10, "room 10 still has pos 3 pending");
+        let rooms = db
+            .list_outbound_rooms_for_destination("peer.example")
+            .unwrap();
+        assert!(rooms.contains(&10), "room 10 still pending");
+
+        // Drain room 20 fully — it falls off the list.
+        let r20 = db.peek_outbound_for_room("peer.example", 20, 10).unwrap();
+        let positions: Vec<u64> = r20.iter().map(|(p, _)| *p).collect();
+        db.delete_outbound_for_room("peer.example", 20, &positions)
+            .unwrap();
+        let rooms = db
+            .list_outbound_rooms_for_destination("peer.example")
+            .unwrap();
+        assert!(!rooms.contains(&20));
+        assert!(rooms.contains(&10));
+    }
 }
