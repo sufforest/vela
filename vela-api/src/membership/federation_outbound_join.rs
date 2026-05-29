@@ -250,13 +250,14 @@ async fn bootstrap_remote_room(
         .db
         .create_room_meta(room_nid, room_id.as_str(), room_version);
 
-    // MSC3706: when the resident returned partial state, persist the
-    // flag + the server hints. The background filler picks these up
-    // and pulls /state from one of them to finish bootstrapping the
-    // room. A response missing `partial_state` (or with it false) is
-    // a full-state response — no flag set.
+    // Spec field is `members_omitted` (joins-v2.yaml, Matrix 1.6).
+    // Fall back to the legacy `partial_state` for peers that haven't
+    // updated their send_join response to the stable field name yet.
+    // A response missing both (or with both false) is a full-state
+    // response — no flag set.
     let partial_state = send_join_resp
-        .get("partial_state")
+        .get("members_omitted")
+        .or_else(|| send_join_resp.get("partial_state"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if partial_state {
