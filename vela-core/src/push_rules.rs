@@ -169,39 +169,40 @@ fn json_pointer_get(event: &Value, key: &str) -> Option<Value> {
 /// Matrix glob: `*` matches any substring, `?` any single character.
 /// Case-insensitive per spec.
 pub fn glob_match(pattern: &str, input: &str) -> bool {
-    // Convert to a regex under the hood — but keep it simple: split on `*`
-    // and check each chunk appears in order. `?` handled by treating each
-    // non-wildcard char as needing exact match against one input char when
-    // walking the chunk, but we simplify by only handling `*`. Real
-    // Element default rules don't use `?`.
-    let pattern_lc = pattern.to_lowercase();
-    let input_lc = input.to_lowercase();
-    let parts: Vec<&str> = pattern_lc.split('*').collect();
-    if parts.len() == 1 {
-        // No wildcard: exact match.
-        return input_lc == pattern_lc;
+    // Push-rules / MSC4155 glob shape: `*` matches zero or more chars,
+    // `?` matches exactly one. Case-insensitive. Backtracking matcher
+    // — pushrules patterns are short, so the O(p*i) worst case is fine.
+    let pat: Vec<char> = pattern.to_lowercase().chars().collect();
+    let inp: Vec<char> = input.to_lowercase().chars().collect();
+    glob_match_inner(&pat, 0, &inp, 0)
+}
+
+fn glob_match_inner(pat: &[char], pi: usize, inp: &[char], ii: usize) -> bool {
+    if pi == pat.len() {
+        return ii == inp.len();
     }
-    let mut cursor = 0;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
+    match pat[pi] {
+        '*' => {
+            // Collapse runs of `*` so we don't blow up on `**`-style
+            // patterns.
+            let mut next = pi + 1;
+            while next < pat.len() && pat[next] == '*' {
+                next += 1;
+            }
+            // `*` at end matches the rest of the input outright.
+            if next == pat.len() {
+                return true;
+            }
+            for skip in ii..=inp.len() {
+                if glob_match_inner(pat, next, inp, skip) {
+                    return true;
+                }
+            }
+            false
         }
-        if i == 0 && !input_lc[cursor..].starts_with(part) {
-            return false;
-        }
-        match input_lc[cursor..].find(part) {
-            Some(idx) => cursor += idx + part.len(),
-            None => return false,
-        }
+        '?' => ii < inp.len() && glob_match_inner(pat, pi + 1, inp, ii + 1),
+        c => ii < inp.len() && inp[ii] == c && glob_match_inner(pat, pi + 1, inp, ii + 1),
     }
-    // Last part must match end if the pattern doesn't end in `*`.
-    if let Some(last) = parts.last()
-        && !last.is_empty()
-        && !input_lc.ends_with(last)
-    {
-        return false;
-    }
-    true
 }
 
 /// Word-boundary contains check for `contains_display_name`. A display
@@ -603,6 +604,60 @@ mod tests {
         assert!(!glob_match("foo*", "barfoo"));
         assert!(glob_match("exact", "exact"));
         assert!(!glob_match("exact", "inexact"));
+    }
+
+    /// `?` matches exactly one character; `*` matches zero or more.
+    /// Exercises the MSC4155-style globs like `@user-?*`.
+    #[test]
+    fn glob_match_question_mark_single_char() {
+        assert!(glob_match("a?c", "abc"));
+        assert!(glob_match("a?c", "axc"));
+        assert!(!glob_match("a?c", "ac"), "? must consume one char");
+        assert!(!glob_match("a?c", "abbc"), "? consumes exactly one");
+    }
+
+    #[test]
+    fn glob_match_combined_wildcards() {
+        // @user-?* — `@user-` literal, then exactly one char, then
+        // anything. The single-char slot is content-agnostic: `:` is
+        // a valid match for `?` here.
+        assert!(glob_match("@user-?*", "@user-1"));
+        assert!(glob_match("@user-?*", "@user-1:hs2"));
+        assert!(glob_match("@user-?*", "@user-:hs2"));
+        assert!(!glob_match("@user-?*", "@user-"));
+        assert!(!glob_match("@user-?*", "@admin-1"));
+    }
+
+    #[test]
+    fn glob_match_runs_of_stars_collapse() {
+        // `**` shouldn't blow up exponentially or change semantics.
+        assert!(glob_match("a**b", "ab"));
+        assert!(glob_match("a**b", "axxxxxxxxb"));
+        assert!(glob_match("**", ""));
+        assert!(glob_match("**", "anything"));
+    }
+
+    #[test]
+    fn glob_match_case_insensitive() {
+        assert!(glob_match("FOO*", "foobar"));
+        assert!(glob_match("*BAR", "FooBar"));
+        assert!(glob_match("e?act", "EXACT"));
+    }
+
+    #[test]
+    fn glob_match_unicode_input_doesnt_panic() {
+        // Multi-byte chars in the input would break naive byte
+        // indexing; the matcher walks chars so this should match.
+        assert!(glob_match("h*ø*", "høllø"));
+        assert!(glob_match("?", "Ω"));
+        assert!(!glob_match("?", "ΩΩ"));
+    }
+
+    #[test]
+    fn glob_match_empty_pattern_matches_empty_input() {
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "x"));
+        assert!(glob_match("*", ""));
     }
 
     #[test]

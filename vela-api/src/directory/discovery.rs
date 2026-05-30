@@ -84,9 +84,24 @@ pub async fn versions(State(state): State<AppState>) -> Json<Value> {
     // fall through to features they know about instead of bailing.
     let mut unstable = serde_json::Map::from_iter([
         ("org.matrix.simplified_msc3575".to_string(), json!(true)),
-        ("org.matrix.msc3030".to_string(), json!(false)),
+        // MSC3030 stabilised in Matrix 1.6 as `/v1/rooms/{id}/timestamp_to_event`.
+        // Advertise the unstable flag too for clients that don't check
+        // matrix versions — the endpoint is implemented either way.
+        ("org.matrix.msc3030".to_string(), json!(true)),
+        // MSC3391 (account_data deletion endpoints).
+        ("org.matrix.msc3391".to_string(), json!(true)),
+        // MSC3874 (filter /messages by m.relates_to.rel_type).
+        ("org.matrix.msc3874".to_string(), json!(true)),
+        // MSC3890 (purge device-local notification settings on logout).
+        ("org.matrix.msc3890".to_string(), json!(true)),
+        // MSC3930 (default push rules for poll events).
+        ("org.matrix.msc3930".to_string(), json!(true)),
+        // MSC3967 (idempotent cross-signing key upload).
+        ("org.matrix.msc3967".to_string(), json!(true)),
         ("org.matrix.msc4140".to_string(), json!(false)),
         ("org.matrix.msc4143".to_string(), json!(true)),
+        // MSC4155 (server-side invite filtering).
+        ("org.matrix.msc4155".to_string(), json!(true)),
         ("org.matrix.msc4222".to_string(), json!(true)),
         ("io.element.msc4306".to_string(), json!(true)),
         ("io.element.msc4308".to_string(), json!(true)),

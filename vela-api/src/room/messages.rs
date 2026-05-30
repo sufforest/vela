@@ -1577,3 +1577,81 @@ pub(crate) fn membership_at_event(
     }
     Ok(None)
 }
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    /// MSC3874 rel_types filter recognised at both the spec'd nest
+    /// (\`room.timeline\`) and the top level. None on absent.
+    #[test]
+    fn filter_rel_types_under_room_timeline() {
+        let f =
+            r#"{"room":{"timeline":{"org.matrix.msc3874.rel_types":["m.thread","m.reference"]}}}"#;
+        let got = filter_rel_types(Some(f), false).unwrap();
+        assert_eq!(got, vec!["m.thread".to_string(), "m.reference".to_string()]);
+    }
+
+    #[test]
+    fn filter_rel_types_top_level() {
+        let f = r#"{"org.matrix.msc3874.rel_types":["m.annotation"]}"#;
+        let got = filter_rel_types(Some(f), false).unwrap();
+        assert_eq!(got, vec!["m.annotation".to_string()]);
+    }
+
+    #[test]
+    fn filter_rel_types_not_rel_types_separate_field() {
+        let f = r#"{"org.matrix.msc3874.not_rel_types":["m.thread"]}"#;
+        assert!(filter_rel_types(Some(f), false).is_none());
+        let got = filter_rel_types(Some(f), true).unwrap();
+        assert_eq!(got, vec!["m.thread".to_string()]);
+    }
+
+    #[test]
+    fn filter_rel_types_absent_returns_none() {
+        assert!(filter_rel_types(Some(r#"{}"#), false).is_none());
+        assert!(filter_rel_types(Some(r#"{"foo":1}"#), false).is_none());
+        assert!(filter_rel_types(None, false).is_none());
+    }
+
+    #[test]
+    fn filter_rel_types_malformed_json_returns_none() {
+        assert!(filter_rel_types(Some("not json"), false).is_none());
+        assert!(filter_rel_types(Some("[]"), false).is_none());
+    }
+
+    #[test]
+    fn filter_rel_types_non_string_entries_dropped() {
+        let f = r#"{"org.matrix.msc3874.rel_types":["m.thread",42,null,"m.reference"]}"#;
+        let got = filter_rel_types(Some(f), false).unwrap();
+        assert_eq!(got, vec!["m.thread".to_string(), "m.reference".to_string()]);
+    }
+
+    /// Pre-existing \`contains_url\` filter follows the same nest/top
+    /// pattern. Tests pinned here so future filter changes don't
+    /// silently drop coverage.
+    #[test]
+    fn filter_contains_url_recognised_at_both_locations() {
+        let nested = r#"{"room":{"timeline":{"contains_url":true}}}"#;
+        assert_eq!(filter_contains_url(Some(nested)), Some(true));
+        let top = r#"{"contains_url":false}"#;
+        assert_eq!(filter_contains_url(Some(top)), Some(false));
+        let neither = r#"{"foo":"bar"}"#;
+        assert_eq!(filter_contains_url(Some(neither)), None);
+    }
+
+    #[test]
+    fn filter_lazy_load_members_detected_at_either_level() {
+        assert!(filter_lazy_load_members(Some(
+            r#"{"lazy_load_members": true}"#
+        )));
+        assert!(filter_lazy_load_members(Some(
+            r#"{"room":{"timeline":{"lazy_load_members": true}}}"#
+        )));
+        assert!(!filter_lazy_load_members(Some(r#"{}"#)));
+        assert!(!filter_lazy_load_members(None));
+        assert!(!filter_lazy_load_members(Some(
+            r#"{"lazy_load_members": false}"#
+        )));
+    }
+}

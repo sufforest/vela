@@ -8,7 +8,7 @@ pub mod sliding_sync;
 pub mod thread_subscriptions;
 pub mod typing;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::middleware::json::Json;
@@ -645,14 +645,26 @@ pub(crate) fn build_sync_response_inner(
         .filter(|u| !left_set.contains(u.as_str()))
         .collect();
 
+    // Per spec, each rooms.{join,invite,leave,knock} section is
+    // optional. Emit only those that have entries so consumers that
+    // test `JSONKeyMissing` (e.g. MSC4155 invite-filter coverage)
+    // see the section disappear when filtering blocked an invite.
+    let mut rooms = serde_json::Map::new();
+    if !join_rooms.is_empty() {
+        rooms.insert("join".into(), Value::Object(join_rooms));
+    }
+    if !invite_rooms.is_empty() {
+        rooms.insert("invite".into(), Value::Object(invite_rooms));
+    }
+    if !leave_rooms.is_empty() {
+        rooms.insert("leave".into(), Value::Object(leave_rooms));
+    }
+    if !knock_rooms.is_empty() {
+        rooms.insert("knock".into(), Value::Object(knock_rooms));
+    }
     Ok(json!({
         "next_batch": format!("s{safe_pos}"),
-        "rooms": {
-            "join": join_rooms,
-            "invite": invite_rooms,
-            "leave": leave_rooms,
-            "knock": knock_rooms,
-        },
+        "rooms": rooms,
         "presence": {"events": presence_events},
         "account_data": {"events": global_account_data},
         "to_device": {"events": to_device_events},
@@ -734,6 +746,92 @@ fn load_timeline_event(
         _ => None,
     };
     crate::room::messages::load_client_event_with_relations(state, event_nid, room_id, caller)
+}
+
+/// Per spec, `/sync`'s `state` field on incremental sync is the delta
+/// between the client's last sync position and the start of the
+/// returned timeline batch. Vela walks `room_timeline` in
+/// `(since_exclusive, upper_exclusive)` (so the caller passes
+/// `since_pos + 1` and `first_timeline_pos`), keeps only state events,
+/// dedupes on `(type, state_key)` keeping the latest position, and
+/// loads them as client events.
+///
+/// Capped at `DELTA_STATE_SCAN_LIMIT` events scanned to keep wide gap
+/// catch-ups from doing an unbounded walk. Beyond the cap the client
+/// keeps any stale state until they do a full sync — strictly worse
+/// than current behaviour (which always returns empty) but in line
+/// with how Synapse treats deeply-stale clients.
+fn compute_state_delta(
+    state: &AppState,
+    room_nid: u64,
+    room_id: &str,
+    since_exclusive: u64,
+    upper_exclusive: u64,
+    user_nid: Option<u64>,
+    device_id: Option<&str>,
+) -> Result<Vec<Value>, ApiError> {
+    const DELTA_STATE_SCAN_LIMIT: usize = 500;
+    if since_exclusive >= upper_exclusive {
+        return Ok(Vec::new());
+    }
+    let entries = state
+        .db
+        .get_timeline_range(
+            room_nid,
+            since_exclusive,
+            upper_exclusive,
+            DELTA_STATE_SCAN_LIMIT,
+        )
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut latest_by_slot: HashMap<(String, String), (u64, u64)> = HashMap::new();
+    for (pos, nid) in &entries {
+        // The event header has type_nid + state_key_nid as u64; a
+        // state event has a non-zero state_key_nid in the events CF
+        // header. Re-fetch just enough to decide.
+        let (header, _) = match state
+            .db
+            .get_event(*nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        {
+            Some(h) => h,
+            None => continue,
+        };
+        if header.state_key_nid == 0 {
+            continue;
+        }
+        let etype = state
+            .db
+            .resolve_nid(header.type_nid)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let skey = state
+            .db
+            .resolve_nid(header.state_key_nid)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        latest_by_slot
+            .entry((etype, skey))
+            .and_modify(|cur| {
+                if *pos > cur.0 {
+                    *cur = (*pos, *nid);
+                }
+            })
+            .or_insert((*pos, *nid));
+    }
+    let mut out = Vec::with_capacity(latest_by_slot.len());
+    for (_, (_, nid)) in latest_by_slot {
+        if let Some(mut ev) = load_client_event(state, nid, room_id)? {
+            attach_membership_for_user(state, &mut ev, user_nid, nid);
+            attach_txn_id_for_user(state, &mut ev, user_nid, device_id, nid);
+            out.push(ev);
+        }
+    }
+    Ok(out)
 }
 
 fn build_room_sync_for_user(
@@ -918,8 +1016,26 @@ fn build_room_sync_for_user(
                     }
                 }
 
+                // State delta: events with state_key that changed in
+                // the range (since_pos, first_pos). Per spec, /sync's
+                // `state` field is the delta between the client's last
+                // sync and the start of the timeline. Without this,
+                // power-level changes, room name updates, etc. that
+                // happened while the client was offline never reach
+                // the client until they do a full sync.
+                let delta_upper = first_pos.unwrap_or(safe_pos + 1);
+                let state_events = compute_state_delta(
+                    state,
+                    room_nid,
+                    room_id,
+                    since_pos + 1,
+                    delta_upper,
+                    user_nid,
+                    device_id,
+                )?;
+
                 let prev_batch = first_pos.map(|p| format!("s{p}"));
-                (vec![], timeline_events, limited, prev_batch)
+                (state_events, timeline_events, limited, prev_batch)
             }
         }
     };
@@ -1942,13 +2058,16 @@ mod tests {
             .unwrap()
             .expect("invite transition indexed");
 
-        // Incremental sync from the exact pos of the invite: should be excluded.
+        // Incremental sync from the exact pos of the invite: should
+        // be excluded. With the MSC4155-driven sparse rooms emission,
+        // an empty invite slot causes `rooms.invite` to be absent
+        // entirely, which is equally "no stale invite".
         let resp = build_sync_response(&state, &user, &[], Some(pos)).unwrap();
-        let invites = resp.pointer("/rooms/invite").unwrap().as_object().unwrap();
-        assert!(
-            !invites.contains_key("!room:example.com"),
-            "stale invite should not reappear on incremental sync"
-        );
+        let has_stale_invite = resp
+            .pointer("/rooms/invite")
+            .and_then(|v| v.as_object())
+            .is_some_and(|o| o.contains_key("!room:example.com"));
+        assert!(!has_stale_invite, "stale invite should not reappear");
 
         // Incremental sync from before pos: invite reappears.
         let resp = build_sync_response(&state, &user, &[], Some(pos - 1)).unwrap();
@@ -2328,7 +2447,9 @@ mod tests {
         );
 
         // Incremental sync from a token equal to current pos: nothing
-        // happened since, so the room must be omitted.
+        // happened since, so the room must be omitted. Sparse rooms
+        // emission means `rooms.join` itself may be absent — that's
+        // also "room not present".
         let resp = build_sync_response_with_filter(
             &state,
             &alice_user,
@@ -2338,13 +2459,13 @@ mod tests {
             false,
         )
         .unwrap();
-        let join = resp
+        let has_room = resp
             .pointer("/rooms/join")
             .and_then(|v| v.as_object())
-            .unwrap();
+            .is_some_and(|o| o.contains_key(&room_id));
         assert!(
-            !join.contains_key(&room_id),
-            "unchanged room must not appear on incremental sync: {join:?}"
+            !has_room,
+            "unchanged room must not appear on incremental sync"
         );
 
         // full_state=true forces the room to be present even when nothing
@@ -2381,11 +2502,11 @@ mod tests {
             .unwrap()
             .unwrap();
         let resp = build_sync_response(&state, &user, &[], Some(pos)).unwrap();
-        let leaves = resp.pointer("/rooms/leave").unwrap().as_object().unwrap();
-        assert!(
-            !leaves.contains_key("!leftroom:example.com"),
-            "stale leave should not reappear"
-        );
+        let has_stale_leave = resp
+            .pointer("/rooms/leave")
+            .and_then(|v| v.as_object())
+            .is_some_and(|o| o.contains_key("!leftroom:example.com"));
+        assert!(!has_stale_leave, "stale leave should not reappear");
     }
 
     #[test]
@@ -2780,5 +2901,187 @@ mod tests {
         let (_notif, hl, _) =
             compute_unread_counts(&state, room_nid, alice_nid, &[ev], false).unwrap();
         assert_eq!(hl, 1, "profile displayname should still drive highlight");
+    }
+
+    /// `compute_state_delta` returns the most-recent state event for
+    /// each `(type, state_key)` slot that changed between
+    /// `since_exclusive` and `upper_exclusive`. Non-state events in
+    /// the same range are ignored.
+    #[test]
+    fn state_delta_picks_latest_per_slot() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!delta:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        let bob_nid = db.get_or_create_nid("@bob:example.com").unwrap();
+        let _ = (alice_nid, bob_nid);
+
+        // Pos 1: alice writes m.room.name = "v1".
+        let p1 = persist_state(
+            db,
+            1001,
+            "$n1",
+            room_nid,
+            room_id,
+            "m.room.name",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"name": "v1"}),
+            10,
+            1,
+            &[],
+        );
+        // Pos 2: alice writes a regular m.room.message (NOT a state event).
+        let type_msg = db.get_or_create_nid("m.room.message").unwrap();
+        let body = json!({
+            "type": "m.room.message",
+            "sender": "@alice:example.com",
+            "room_id": room_id,
+            "content": {"body": "hi"},
+            "origin_server_ts": 11, "depth": 2,
+            "prev_events": [], "auth_events": [],
+        });
+        let _p2 = db
+            .persist_event(
+                1002,
+                "$m1",
+                room_nid,
+                type_msg,
+                alice_nid,
+                0,
+                11,
+                2,
+                &serde_json::to_vec(&body).unwrap(),
+                &[],
+                &[],
+                false,
+                false,
+            )
+            .unwrap();
+        // Pos 3: alice updates m.room.name = "v2" — supersedes p1.
+        let p3 = persist_state(
+            db,
+            1003,
+            "$n2",
+            room_nid,
+            room_id,
+            "m.room.name",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"name": "v2"}),
+            12,
+            3,
+            &[],
+        );
+        assert!(p3 > p1, "stream pos must advance");
+
+        let out = compute_state_delta(&state, room_nid, room_id, 1, p3 + 1, None, None).unwrap();
+        let by_slot: std::collections::HashMap<String, String> = out
+            .iter()
+            .map(|ev| {
+                let key = format!(
+                    "{}|{}",
+                    ev.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+                    ev.get("state_key").and_then(|v| v.as_str()).unwrap_or("")
+                );
+                let name = ev
+                    .pointer("/content/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                (key, name)
+            })
+            .collect();
+        assert_eq!(by_slot.len(), 1, "one slot, latest only: {by_slot:?}");
+        assert_eq!(by_slot.get("m.room.name|").map(String::as_str), Some("v2"));
+    }
+
+    /// `since_exclusive >= upper_exclusive` means the client is
+    /// up-to-date with everything we'd emit; the delta is empty.
+    #[test]
+    fn state_delta_empty_when_range_inverted_or_collapsed() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_nid = db.get_or_create_nid("!noop:example.com").unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        persist_state(
+            db,
+            2001,
+            "$x",
+            room_nid,
+            "!noop:example.com",
+            "m.room.name",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"name": "x"}),
+            1,
+            1,
+            &[],
+        );
+        assert!(
+            compute_state_delta(&state, room_nid, "!noop:example.com", 10, 10, None, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            compute_state_delta(&state, room_nid, "!noop:example.com", 11, 10, None, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// State events in disjoint slots all come back (one per slot).
+    #[test]
+    fn state_delta_returns_one_event_per_slot() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!multi:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+
+        let p1 = persist_state(
+            db,
+            3001,
+            "$pl",
+            room_nid,
+            room_id,
+            "m.room.power_levels",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"users_default": 0}),
+            1,
+            1,
+            &[],
+        );
+        let p2 = persist_state(
+            db,
+            3002,
+            "$jr",
+            room_nid,
+            room_id,
+            "m.room.join_rules",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"join_rule": "public"}),
+            2,
+            2,
+            &[],
+        );
+        assert!(p2 > p1);
+
+        let out = compute_state_delta(&state, room_nid, room_id, 1, p2 + 1, None, None).unwrap();
+        let types: std::collections::HashSet<String> = out
+            .iter()
+            .filter_map(|ev| ev.get("type").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert!(types.contains("m.room.power_levels"));
+        assert!(types.contains("m.room.join_rules"));
+        assert_eq!(out.len(), 2);
     }
 }

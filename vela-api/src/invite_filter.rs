@@ -57,21 +57,32 @@ pub fn decide(cfg: &Value, sender_user_id: &str) -> InviteAction {
         patterns.iter().any(|p| glob_match(p, target))
     };
 
-    // Explicit allow short-circuits everything else.
-    if matches(&list("allowed_users"), sender_user_id)
-        || matches(&list("allowed_servers"), sender_domain)
-    {
+    // Per MSC4155: user-level rules win over server-level rules so
+    // operators can carve specific exceptions out of an
+    // allowed/blocked server bucket. Within each level, allow >
+    // block > ignore.
+    let allowed_users = list("allowed_users");
+    let blocked_users = list("blocked_users");
+    let ignored_users = list("ignored_users");
+    if matches(&allowed_users, sender_user_id) {
         return InviteAction::Allow;
     }
-    // Block beats ignore.
-    if matches(&list("blocked_users"), sender_user_id)
-        || matches(&list("blocked_servers"), sender_domain)
-    {
+    if matches(&blocked_users, sender_user_id) {
         return InviteAction::Block;
     }
-    if matches(&list("ignored_users"), sender_user_id)
-        || matches(&list("ignored_servers"), sender_domain)
-    {
+    if matches(&ignored_users, sender_user_id) {
+        return InviteAction::Ignore;
+    }
+    let allowed_servers = list("allowed_servers");
+    let blocked_servers = list("blocked_servers");
+    let ignored_servers = list("ignored_servers");
+    if matches(&allowed_servers, sender_domain) {
+        return InviteAction::Allow;
+    }
+    if matches(&blocked_servers, sender_domain) {
+        return InviteAction::Block;
+    }
+    if matches(&ignored_servers, sender_domain) {
         return InviteAction::Ignore;
     }
     InviteAction::Allow
@@ -103,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn allow_overrides_block() {
+    fn user_level_allow_overrides_server_block() {
         let cfg = json!({
             "blocked_servers": ["hs2"],
             "allowed_users": ["@friendly_bob:hs2"],
@@ -113,17 +124,101 @@ mod tests {
     }
 
     #[test]
+    fn user_level_block_overrides_server_allow() {
+        let cfg = json!({
+            "allowed_servers": ["hs2"],
+            "blocked_users": ["@evil_bob:hs2"],
+        });
+        assert_eq!(decide(&cfg, "@evil_bob:hs2"), InviteAction::Block);
+        assert_eq!(decide(&cfg, "@friendly_bob:hs2"), InviteAction::Allow);
+    }
+
+    #[test]
     fn ignored_user_returns_ignore() {
         let cfg = json!({"ignored_users": ["@bob:example.com"]});
         assert_eq!(decide(&cfg, "@bob:example.com"), InviteAction::Ignore);
     }
 
     #[test]
-    fn block_beats_ignore() {
+    fn user_ignore_beats_server_block() {
+        // Per MSC4155 user-level rules dominate server-level — a user
+        // marked Ignore stays Ignore even when their server is on the
+        // block list.
         let cfg = json!({
             "ignored_users": ["@bob:example.com"],
             "blocked_servers": ["example.com"],
         });
+        assert_eq!(decide(&cfg, "@bob:example.com"), InviteAction::Ignore);
+    }
+
+    /// Within a level (user OR server), allow > block > ignore. Both
+    /// listed at the same level → first one wins.
+    #[test]
+    fn allow_at_same_level_overrides_block() {
+        let cfg = json!({
+            "allowed_users": ["@bob:example.com"],
+            "blocked_users": ["@bob:example.com"],
+            "ignored_users": ["@bob:example.com"],
+        });
+        assert_eq!(decide(&cfg, "@bob:example.com"), InviteAction::Allow);
+    }
+
+    #[test]
+    fn block_at_same_level_overrides_ignore() {
+        let cfg = json!({
+            "blocked_users": ["@bob:example.com"],
+            "ignored_users": ["@bob:example.com"],
+        });
         assert_eq!(decide(&cfg, "@bob:example.com"), InviteAction::Block);
+    }
+
+    /// `?` matches exactly one character (push-rules glob, exercised
+    /// by MSC4155 patterns like `@user-?*`).
+    #[test]
+    fn glob_question_mark_matches_one_char() {
+        let cfg = json!({"blocked_users": ["@user-?:example.com"]});
+        assert_eq!(decide(&cfg, "@user-1:example.com"), InviteAction::Block);
+        assert_eq!(decide(&cfg, "@user-12:example.com"), InviteAction::Allow);
+    }
+
+    /// `_servers` list values are interpreted as domain globs without
+    /// any user_id parsing, so `*` alone blocks everyone.
+    #[test]
+    fn star_server_blocks_every_domain() {
+        let cfg = json!({"blocked_servers": ["*"]});
+        assert_eq!(decide(&cfg, "@a:hs1"), InviteAction::Block);
+        assert_eq!(decide(&cfg, "@b:another.example"), InviteAction::Block);
+    }
+
+    /// Configs that put non-string entries in the lists must not
+    /// panic — they're silently skipped.
+    #[test]
+    fn non_string_entries_are_ignored() {
+        let cfg = json!({
+            "blocked_users": [42, true, null, {"x": 1}, "@bob:example.com"],
+        });
+        assert_eq!(decide(&cfg, "@bob:example.com"), InviteAction::Block);
+        assert_eq!(decide(&cfg, "@alice:example.com"), InviteAction::Allow);
+    }
+
+    /// A user_id without a `:` separator (malformed) shouldn't crash
+    /// the domain extraction; it just doesn't match server lists.
+    #[test]
+    fn missing_separator_falls_through_server_rules() {
+        let cfg = json!({"blocked_servers": ["hs1"]});
+        // Domain extraction returns "" — no match.
+        assert_eq!(decide(&cfg, "no-colon-here"), InviteAction::Allow);
+    }
+
+    /// Empty list keys behave the same as missing keys — no false
+    /// match against the empty pattern set.
+    #[test]
+    fn empty_lists_are_inert() {
+        let cfg = json!({
+            "allowed_users": [],
+            "blocked_users": [],
+            "ignored_users": [],
+        });
+        assert_eq!(decide(&cfg, "@bob:example.com"), InviteAction::Allow);
     }
 }
