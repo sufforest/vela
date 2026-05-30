@@ -40,6 +40,13 @@ pub struct SyncQuery {
     /// suppress the implicit "online" mark that polling /sync otherwise
     /// triggers. Omitted → caller goes online.
     pub set_presence: Option<String>,
+    /// MSC4222 (stable in Matrix 1.16). When `true`, the room state in
+    /// the response is emitted under `state_after` instead of `state`,
+    /// reflecting state at the **end** of the timeline rather than at
+    /// the start. Clients without this opt-in keep the legacy `state`
+    /// field shape.
+    #[serde(rename = "use_state_after")]
+    pub use_state_after: Option<bool>,
 }
 
 /// GET /_matrix/client/v3/sync
@@ -155,16 +162,18 @@ pub async fn sync(
 
     let filter = resolve_filter(&state, &user, query.filter.as_deref())?;
     let full_state = query.full_state.unwrap_or(false);
+    let use_state_after = query.use_state_after.unwrap_or(false);
 
     // Now check the DB — any events broadcast after our subscribe() call
     // will be caught by the spawned listener tasks.
-    let response = build_sync_response_with_filter(
+    let response = build_sync_response_inner(
         &state,
         &user,
         &joined_room_nids,
         since,
         filter.as_ref(),
         full_state,
+        use_state_after,
     )?;
 
     // A joined room appears in `rooms.join` only when it has new
@@ -243,13 +252,14 @@ pub async fn sync(
         .get_user_joined_rooms(user.user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
-    let response = build_sync_response_with_filter(
+    let response = build_sync_response_inner(
         &state,
         &user,
         &joined_room_nids,
         since,
         filter.as_ref(),
         full_state,
+        use_state_after,
     )?;
     Ok(Json(response))
 }
@@ -271,6 +281,26 @@ pub(crate) fn build_sync_response_with_filter(
     since: Option<u64>,
     filter: Option<&Value>,
     full_state: bool,
+) -> Result<Value, ApiError> {
+    build_sync_response_inner(
+        state,
+        user,
+        joined_room_nids,
+        since,
+        filter,
+        full_state,
+        false,
+    )
+}
+
+pub(crate) fn build_sync_response_inner(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    joined_room_nids: &[u64],
+    since: Option<u64>,
+    filter: Option<&Value>,
+    full_state: bool,
+    use_state_after: bool,
 ) -> Result<Value, ApiError> {
     // Safe watermark: largest pos such that EVERY pos ≤ it has committed.
     // Used wherever a returned pos becomes a future /sync's `since` —
@@ -345,6 +375,7 @@ pub(crate) fn build_sync_response_with_filter(
             timeline_limit,
             unread_thread_notifications,
             safe_pos,
+            use_state_after,
         )?;
         if !ignored.is_empty() {
             filter_room_timeline_by_ignored(&mut room_data, &ignored);
@@ -353,7 +384,11 @@ pub(crate) fn build_sync_response_with_filter(
             crate::sync::filters::apply_timeline_filter(&mut room_data, tf);
         }
         if lazy_load {
-            crate::sync::filters::apply_lazy_load_state(&mut room_data, &user.user_id);
+            crate::sync::filters::apply_lazy_load_state(
+                &mut room_data,
+                &user.user_id,
+                use_state_after,
+            );
         }
 
         // Spec: on incremental sync, joined rooms that have no new content
@@ -709,6 +744,7 @@ fn build_room_sync_for_user(
     timeline_limit: usize,
     unread_thread_notifications: bool,
     safe_pos: u64,
+    use_state_after: bool,
 ) -> Result<Value, ApiError> {
     let (state_events, timeline_events, limited, prev_batch) = match since {
         None => {
@@ -1068,7 +1104,18 @@ fn build_room_sync_for_user(
     };
 
     let mut payload = serde_json::Map::new();
-    payload.insert("state".to_string(), json!({"events": state_events}));
+    // MSC4222: emit `state_after` (state at end of timeline) when the
+    // client opted in, otherwise the legacy `state` field (state at
+    // start of timeline). For initial sync these collapse to the same
+    // content — current state IS state-at-end. For incremental sync
+    // vela doesn't compute delta state today, so `state_after.events`
+    // is the same empty list as `state.events` would be.
+    let state_field = if use_state_after {
+        "state_after"
+    } else {
+        "state"
+    };
+    payload.insert(state_field.to_string(), json!({"events": state_events}));
     payload.insert(
         "timeline".to_string(),
         json!({
