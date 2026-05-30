@@ -929,4 +929,79 @@ mod tests {
             serde_json::from_str(r#"{"a": 1, "b": -42, "c": 9007199254740991}"#).unwrap();
         assert_eq!(find_invalid_number(&v), None);
     }
+
+    /// `existing_state_event_if_unchanged` must NOT short-circuit when
+    /// a different sender PUTs the same content at the same
+    /// `(type, state_key)`. Otherwise low-power users could "set"
+    /// state events written by the room creator by replaying the
+    /// existing content. MSC3757 TestWithoutOwnedState locks this in.
+    #[test]
+    fn unchanged_short_circuit_requires_sender_match() {
+        use crate::test_helpers::build_test_state;
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+
+        let room_id = "!ss:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_id = "@alice:example.com";
+        let bob_id = "@bob:example.com";
+        let alice_nid = db.get_or_create_nid(alice_id).unwrap();
+        let _bob_nid = db.get_or_create_nid(bob_id).unwrap();
+        let etype = "com.example.test";
+        let skey = "@target:example.com";
+        let type_nid = db.get_or_create_nid(etype).unwrap();
+        let skey_nid = db.get_or_create_nid(skey).unwrap();
+
+        // Alice writes the initial event with `{"v": 1}`.
+        let content = serde_json::json!({"v": 1});
+        let body = serde_json::json!({
+            "type": etype,
+            "sender": alice_id,
+            "state_key": skey,
+            "room_id": room_id,
+            "content": content,
+            "origin_server_ts": 1, "depth": 1,
+            "prev_events": [], "auth_events": [],
+        });
+        db.persist_event(
+            42,
+            "$e1",
+            room_nid,
+            type_nid,
+            alice_nid,
+            skey_nid,
+            1,
+            1,
+            &serde_json::to_vec(&body).unwrap(),
+            &[],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+        db.promote_state_event(room_nid, 42, type_nid, skey_nid)
+            .unwrap();
+
+        // Same sender + same content → short-circuit returns the
+        // existing event_id.
+        let same =
+            existing_state_event_if_unchanged(&state, room_nid, etype, skey, alice_id, &content);
+        assert_eq!(same.as_deref(), Some("$e1"));
+
+        // Different sender + same content → no short-circuit. Caller
+        // must fall through to the auth path.
+        let cross =
+            existing_state_event_if_unchanged(&state, room_nid, etype, skey, bob_id, &content);
+        assert!(
+            cross.is_none(),
+            "cross-sender writes must not short-circuit"
+        );
+
+        // Same sender + different content → no short-circuit (regular
+        // state update).
+        let updated = serde_json::json!({"v": 2});
+        let changed =
+            existing_state_event_if_unchanged(&state, room_nid, etype, skey, alice_id, &updated);
+        assert!(changed.is_none());
+    }
 }
