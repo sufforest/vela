@@ -150,4 +150,75 @@ mod tests {
         });
         assert_eq!(decide(&cfg, "@bob:example.com"), InviteAction::Ignore);
     }
+
+    /// Within a level (user OR server), allow > block > ignore. Both
+    /// listed at the same level → first one wins.
+    #[test]
+    fn allow_at_same_level_overrides_block() {
+        let cfg = json!({
+            "allowed_users": ["@bob:example.com"],
+            "blocked_users": ["@bob:example.com"],
+            "ignored_users": ["@bob:example.com"],
+        });
+        assert_eq!(decide(&cfg, "@bob:example.com"), InviteAction::Allow);
+    }
+
+    #[test]
+    fn block_at_same_level_overrides_ignore() {
+        let cfg = json!({
+            "blocked_users": ["@bob:example.com"],
+            "ignored_users": ["@bob:example.com"],
+        });
+        assert_eq!(decide(&cfg, "@bob:example.com"), InviteAction::Block);
+    }
+
+    /// `?` matches exactly one character (push-rules glob, exercised
+    /// by MSC4155 patterns like `@user-?*`).
+    #[test]
+    fn glob_question_mark_matches_one_char() {
+        let cfg = json!({"blocked_users": ["@user-?:example.com"]});
+        assert_eq!(decide(&cfg, "@user-1:example.com"), InviteAction::Block);
+        assert_eq!(decide(&cfg, "@user-12:example.com"), InviteAction::Allow);
+    }
+
+    /// `_servers` list values are interpreted as domain globs without
+    /// any user_id parsing, so `*` alone blocks everyone.
+    #[test]
+    fn star_server_blocks_every_domain() {
+        let cfg = json!({"blocked_servers": ["*"]});
+        assert_eq!(decide(&cfg, "@a:hs1"), InviteAction::Block);
+        assert_eq!(decide(&cfg, "@b:another.example"), InviteAction::Block);
+    }
+
+    /// Configs that put non-string entries in the lists must not
+    /// panic — they're silently skipped.
+    #[test]
+    fn non_string_entries_are_ignored() {
+        let cfg = json!({
+            "blocked_users": [42, true, null, {"x": 1}, "@bob:example.com"],
+        });
+        assert_eq!(decide(&cfg, "@bob:example.com"), InviteAction::Block);
+        assert_eq!(decide(&cfg, "@alice:example.com"), InviteAction::Allow);
+    }
+
+    /// A user_id without a `:` separator (malformed) shouldn't crash
+    /// the domain extraction; it just doesn't match server lists.
+    #[test]
+    fn missing_separator_falls_through_server_rules() {
+        let cfg = json!({"blocked_servers": ["hs1"]});
+        // Domain extraction returns "" — no match.
+        assert_eq!(decide(&cfg, "no-colon-here"), InviteAction::Allow);
+    }
+
+    /// Empty list keys behave the same as missing keys — no false
+    /// match against the empty pattern set.
+    #[test]
+    fn empty_lists_are_inert() {
+        let cfg = json!({
+            "allowed_users": [],
+            "blocked_users": [],
+            "ignored_users": [],
+        });
+        assert_eq!(decide(&cfg, "@bob:example.com"), InviteAction::Allow);
+    }
 }
