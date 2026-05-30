@@ -40,6 +40,13 @@ pub struct SyncQuery {
     /// suppress the implicit "online" mark that polling /sync otherwise
     /// triggers. Omitted → caller goes online.
     pub set_presence: Option<String>,
+    /// MSC4222 (stable in Matrix 1.16). When `true`, the room state in
+    /// the response is emitted under `state_after` instead of `state`,
+    /// reflecting state at the **end** of the timeline rather than at
+    /// the start. Clients without this opt-in keep the legacy `state`
+    /// field shape.
+    #[serde(rename = "use_state_after")]
+    pub use_state_after: Option<bool>,
 }
 
 /// GET /_matrix/client/v3/sync
@@ -155,16 +162,18 @@ pub async fn sync(
 
     let filter = resolve_filter(&state, &user, query.filter.as_deref())?;
     let full_state = query.full_state.unwrap_or(false);
+    let use_state_after = query.use_state_after.unwrap_or(false);
 
     // Now check the DB — any events broadcast after our subscribe() call
     // will be caught by the spawned listener tasks.
-    let response = build_sync_response_with_filter(
+    let response = build_sync_response_inner(
         &state,
         &user,
         &joined_room_nids,
         since,
         filter.as_ref(),
         full_state,
+        use_state_after,
     )?;
 
     // A joined room appears in `rooms.join` only when it has new
@@ -243,13 +252,14 @@ pub async fn sync(
         .get_user_joined_rooms(user.user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
-    let response = build_sync_response_with_filter(
+    let response = build_sync_response_inner(
         &state,
         &user,
         &joined_room_nids,
         since,
         filter.as_ref(),
         full_state,
+        use_state_after,
     )?;
     Ok(Json(response))
 }
@@ -271,6 +281,26 @@ pub(crate) fn build_sync_response_with_filter(
     since: Option<u64>,
     filter: Option<&Value>,
     full_state: bool,
+) -> Result<Value, ApiError> {
+    build_sync_response_inner(
+        state,
+        user,
+        joined_room_nids,
+        since,
+        filter,
+        full_state,
+        false,
+    )
+}
+
+pub(crate) fn build_sync_response_inner(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    joined_room_nids: &[u64],
+    since: Option<u64>,
+    filter: Option<&Value>,
+    full_state: bool,
+    use_state_after: bool,
 ) -> Result<Value, ApiError> {
     // Safe watermark: largest pos such that EVERY pos ≤ it has committed.
     // Used wherever a returned pos becomes a future /sync's `since` —
@@ -345,6 +375,7 @@ pub(crate) fn build_sync_response_with_filter(
             timeline_limit,
             unread_thread_notifications,
             safe_pos,
+            use_state_after,
         )?;
         if !ignored.is_empty() {
             filter_room_timeline_by_ignored(&mut room_data, &ignored);
@@ -353,7 +384,11 @@ pub(crate) fn build_sync_response_with_filter(
             crate::sync::filters::apply_timeline_filter(&mut room_data, tf);
         }
         if lazy_load {
-            crate::sync::filters::apply_lazy_load_state(&mut room_data, &user.user_id);
+            crate::sync::filters::apply_lazy_load_state(
+                &mut room_data,
+                &user.user_id,
+                use_state_after,
+            );
         }
 
         // Spec: on incremental sync, joined rooms that have no new content
@@ -462,16 +497,18 @@ pub(crate) fn build_sync_response_with_filter(
         knock_rooms.insert(room_id, knock_data);
     }
 
-    // Global account data. On initial sync we return everything; on
-    // incremental sync we stream only entries modified after `since` so
-    // clients (Element's cross-signing setup, push rule edits, etc.) see
-    // their own writes reflected and can tell the write landed.
+    // Global account data. On initial sync we return everything except
+    // MSC3391-tombstoned entries (empty `{}` content represents a
+    // deletion — a fresh device shouldn't see them at all). On
+    // incremental sync we stream every change including the empty-
+    // content event, so other devices catch up on the delete.
     let mut global_account_data: Vec<Value> = match since {
         None => state
             .db
             .get_all_account_data(user.user_nid)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
             .into_iter()
+            .filter(|(_, content)| !content.as_object().is_some_and(|o| o.is_empty()))
             .map(|(dtype, content)| json!({"type": dtype, "content": content}))
             .collect(),
         Some(since_pos) => state
@@ -709,6 +746,7 @@ fn build_room_sync_for_user(
     timeline_limit: usize,
     unread_thread_notifications: bool,
     safe_pos: u64,
+    use_state_after: bool,
 ) -> Result<Value, ApiError> {
     let (state_events, timeline_events, limited, prev_batch) = match since {
         None => {
@@ -963,6 +1001,65 @@ fn build_room_sync_for_user(
         .count_room_members_by_membership(room_nid, 2)
         .unwrap_or(0);
 
+    // "Heroes" — up to HEROES_CAP joined-or-invited members (excluding
+    // the requesting user) clients use to render a room name when
+    // m.room.name and m.room.canonical_alias are both unset. Spec says
+    // "Required if the room's `m.room.name` or `m.room.canonical_alias`
+    // state events are unset or empty" — when either is set the field
+    // is optional, so we skip the membership scan to keep /sync cheap
+    // for named rooms (the common case in normal use). Spec orders by
+    // "stream ordering"; we pick alphabetically on user_id since the
+    // membership index doesn't preserve insertion order and replicas
+    // need to agree on which prefix shows up.
+    const HEROES_CAP: usize = 5;
+    let has_room_name_or_alias = {
+        let name_set = crate::membership::read_state_value_pub(state, room_nid, "m.room.name", "")
+            .ok()
+            .flatten()
+            .and_then(|v| v.get("content").cloned())
+            .and_then(|c| c.get("name").and_then(|v| v.as_str()).map(str::to_string))
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        let alias_set =
+            crate::membership::read_state_value_pub(state, room_nid, "m.room.canonical_alias", "")
+                .ok()
+                .flatten()
+                .and_then(|v| v.get("content").cloned())
+                .and_then(|c| c.get("alias").and_then(|v| v.as_str()).map(str::to_string))
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+        name_set || alias_set
+    };
+    let heroes: Vec<String> = if has_room_name_or_alias {
+        Vec::new()
+    } else {
+        let pick = |membership: u8| -> Vec<u64> {
+            state
+                .db
+                .get_room_members_by_membership(room_nid, membership)
+                .unwrap_or_default()
+        };
+        let mut nids = pick(1);
+        nids.extend(pick(2));
+        // Per sync.yaml: "When no joined or invited members are
+        // available, this should consist of the banned and left
+        // users." Mostly a degenerate case (e.g. the user is left in
+        // a room that's since emptied) but still spec-required.
+        if nids.iter().all(|&n| Some(n) == user_nid) {
+            nids.extend(pick(0)); // leave
+            nids.extend(pick(3)); // ban
+        }
+        let mut user_ids: Vec<String> = nids
+            .into_iter()
+            .filter(|nid| user_nid != Some(*nid))
+            .filter_map(|nid| state.db.resolve_nid(nid).ok().flatten())
+            .collect();
+        user_ids.sort();
+        user_ids.dedup();
+        user_ids.truncate(HEROES_CAP);
+        user_ids
+    };
+
     // Same delta-skip as receipts above: on incremental sync, skip the
     // room_account_data snapshot when nothing has changed in the
     // `(user, room)` slot since the client's `since` cursor.
@@ -975,13 +1072,21 @@ fn build_room_sync_for_user(
         _ => true,
     };
     let room_account_data = match (user_nid, room_account_data_changed) {
-        (Some(uid), true) => state
-            .db
-            .get_all_room_account_data(uid, room_nid)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-            .into_iter()
-            .map(|(dtype, content)| json!({"type": dtype, "content": content}))
-            .collect::<Vec<_>>(),
+        (Some(uid), true) => {
+            let all = state
+                .db
+                .get_all_room_account_data(uid, room_nid)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+            // MSC3391: on initial sync (no `since`) skip tombstoned
+            // entries (empty `{}` content). Incremental sync keeps them
+            // so other devices catch up on the deletion.
+            all.into_iter()
+                .filter(|(_, content)| {
+                    since.is_some() || !content.as_object().is_some_and(|o| o.is_empty())
+                })
+                .map(|(dtype, content)| json!({"type": dtype, "content": content}))
+                .collect::<Vec<_>>()
+        }
         _ => Vec::new(),
     };
 
@@ -1009,7 +1114,18 @@ fn build_room_sync_for_user(
     };
 
     let mut payload = serde_json::Map::new();
-    payload.insert("state".to_string(), json!({"events": state_events}));
+    // MSC4222: emit `state_after` (state at end of timeline) when the
+    // client opted in, otherwise the legacy `state` field (state at
+    // start of timeline). For initial sync these collapse to the same
+    // content — current state IS state-at-end. For incremental sync
+    // vela doesn't compute delta state today, so `state_after.events`
+    // is the same empty list as `state.events` would be.
+    let state_field = if use_state_after {
+        "state_after"
+    } else {
+        "state"
+    };
+    payload.insert(state_field.to_string(), json!({"events": state_events}));
     payload.insert(
         "timeline".to_string(),
         json!({
@@ -1021,6 +1137,7 @@ fn build_room_sync_for_user(
     payload.insert(
         "summary".to_string(),
         json!({
+            "m.heroes": heroes,
             "m.joined_member_count": joined_count,
             "m.invited_member_count": invited_count,
         }),

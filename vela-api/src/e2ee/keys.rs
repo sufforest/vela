@@ -520,13 +520,32 @@ pub async fn upload_signing_keys(
     user: AuthenticatedUser,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    // Decide whether UIA is required based on whether the user already
-    // has ANY cross-signing key stored. Missing = first-time setup.
+    // Decide whether UIA is required. Per MSC3967:
+    //   * No keys on file yet → first-time setup, skip UIA.
+    //   * Existing keys but the new body matches them exactly (no slot
+    //     differs, no new slot introduced) → idempotent re-upload, skip
+    //     UIA.
+    //   * Any slot in the new body that's either changing an existing
+    //     value OR populating a previously-empty slot → require UIA.
+    //     "Adding a self_signing_key when only master_key was on file"
+    //     is itself a key-material change clients must re-authenticate
+    //     to authorise.
     let existing = state
         .db
         .get_cross_signing_keys(user.user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    if !existing.is_empty() {
+    let any_change = ["master_key", "self_signing_key", "user_signing_key"]
+        .iter()
+        .any(|slot| {
+            let new = body.get(*slot).filter(|v| !v.is_null());
+            let old = existing.get(*slot);
+            match (new, old) {
+                (Some(n), Some(o)) => n != o,
+                (Some(_), None) => true,
+                _ => false,
+            }
+        });
+    if !existing.is_empty() && any_change {
         crate::auth::uia::require_password_auth(&state, &body)?;
     }
 

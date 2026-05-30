@@ -374,7 +374,7 @@ pub fn include_redundant_members(state_filter: Option<&Value>) -> bool {
 /// state events are kept unconditionally. This implements the spec's
 /// lazy-load contract: clients render display names + avatars from the
 /// member events, and only those for active senders are needed.
-pub fn apply_lazy_load_state(room: &mut Value, user_id: &str) {
+pub fn apply_lazy_load_state(room: &mut Value, user_id: &str, use_state_after: bool) {
     use std::collections::HashSet;
     let mut keep: HashSet<String> = room
         .pointer("/timeline/events")
@@ -387,10 +387,14 @@ pub fn apply_lazy_load_state(room: &mut Value, user_id: &str) {
         .unwrap_or_default();
     keep.insert(user_id.to_string());
 
-    if let Some(state_events) = room
-        .pointer_mut("/state/events")
-        .and_then(|v| v.as_array_mut())
-    {
+    // MSC4222 puts the state list under `state_after.events` instead of
+    // the legacy `state.events`. Same filtering shape either way.
+    let pointer = if use_state_after {
+        "/state_after/events"
+    } else {
+        "/state/events"
+    };
+    if let Some(state_events) = room.pointer_mut(pointer).and_then(|v| v.as_array_mut()) {
         state_events.retain(|ev| {
             let etype = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
             if etype != "m.room.member" {
@@ -468,7 +472,7 @@ mod tests {
                 {"type": "m.room.message", "sender": "@charlie:s", "content": {}},
             ]},
         });
-        apply_lazy_load_state(&mut room, "@alice:s");
+        apply_lazy_load_state(&mut room, "@alice:s", false);
         let state_events = room["state"]["events"].as_array().unwrap();
         let kinds: Vec<(&str, &str)> = state_events
             .iter()
@@ -548,7 +552,7 @@ mod tests {
             ]},
             "timeline": {"events": []},
         });
-        apply_lazy_load_state(&mut room, "@alice:s");
+        apply_lazy_load_state(&mut room, "@alice:s", false);
         let kinds: Vec<&str> = room["state"]["events"]
             .as_array()
             .unwrap()

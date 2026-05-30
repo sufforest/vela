@@ -132,6 +132,28 @@ pub async fn invite_v2(
         crate::federation::server_acl::deny_if_blocked(&state, room_nid, &origin.0)?;
     }
 
+    // MSC4155 invite filtering: consult the target's
+    // `org.matrix.msc4155.invite_permission_config` account_data and
+    // reject (Block) or silently swallow (Ignore) accordingly.
+    let invitee_nid = state.db.get_or_create_nid(&state_key).map_err(db_err)?;
+    let invite_action = crate::invite_filter::check_invite(&state.db, invitee_nid, &sender);
+    match invite_action {
+        crate::invite_filter::InviteAction::Block => {
+            return Err(err(
+                StatusCode::FORBIDDEN,
+                "M_FORBIDDEN",
+                "invite blocked by recipient",
+            ));
+        }
+        crate::invite_filter::InviteAction::Ignore => {
+            // Pretend to accept (200 OK with the signed event echoed
+            // back as if persisted) but do nothing locally — the
+            // invite never surfaces in /sync for the target.
+            return Ok(Json(json!({"event": event})));
+        }
+        crate::invite_filter::InviteAction::Allow => {}
+    }
+
     // Verify the origin's signature.
     let keys = state
         .remote_keys

@@ -163,5 +163,13 @@ pub async fn delete_device(
         .delete_device_tokens(user.user_nid, &device_id)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     let _ = state.db.delete_device(user.user_nid, &device_id);
+    // MSC3890: device-local notification settings live in account_data
+    // keyed by the device_id and stop being useful once the device is
+    // gone, so tombstone the entry as part of the device deletion.
+    crate::auth::logout::purge_msc3890_local_notification_settings_pub(
+        &state,
+        user.user_nid,
+        &device_id,
+    );
     Ok(Json(json!({})))
 }

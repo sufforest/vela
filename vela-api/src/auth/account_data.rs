@@ -22,8 +22,19 @@ pub async fn get_account_data(
         .get_account_data(user.user_nid, &data_type)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         .ok_or_else(|| ApiError(VelaError::NotFound("account data not found".into())))?;
-
+    // MSC3391: empty content `{}` is functionally a deletion. Surface
+    // it as 404 from the GET endpoint so clients agree the entry is
+    // gone, even though /sync still streams the empty-content event
+    // (lets other devices catch up).
+    if is_empty_object(&value) {
+        return Err(VelaError::NotFound("account data not found".into()).into());
+    }
     Ok(Json(value))
+}
+
+/// True when `v` is a JSON object with no keys (`{}`).
+fn is_empty_object(v: &Value) -> bool {
+    v.as_object().is_some_and(|o| o.is_empty())
 }
 
 /// PUT /_matrix/client/v3/user/{userId}/account_data/{type}
@@ -73,7 +84,9 @@ pub async fn get_room_account_data(
         .get_room_account_data(user.user_nid, room_nid, &data_type)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         .ok_or_else(|| ApiError(VelaError::NotFound("account data not found".into())))?;
-
+    if is_empty_object(&value) {
+        return Err(VelaError::NotFound("account data not found".into()).into());
+    }
     Ok(Json(value))
 }
 
@@ -101,6 +114,35 @@ pub async fn set_room_account_data(
 
     crate::router::notify_user(&state, user.user_nid);
     Ok(Json(json!({})))
+}
+
+/// DELETE /_matrix/client/unstable/org.matrix.msc3391/user/{userId}/account_data/{type}
+///
+/// MSC3391 explicit-deletion endpoint. Semantically equivalent to
+/// `PUT` with an empty `{}` body — the entry stays in the user's
+/// account data with empty content so `/sync` surfaces the change to
+/// other devices.
+pub async fn delete_account_data(
+    state: State<AppState>,
+    user: AuthenticatedUser,
+    Path((user_id, data_type)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    set_account_data(state, user, Path((user_id, data_type)), Json(json!({}))).await
+}
+
+/// DELETE /_matrix/client/unstable/org.matrix.msc3391/user/{userId}/rooms/{roomId}/account_data/{type}
+pub async fn delete_room_account_data(
+    state: State<AppState>,
+    user: AuthenticatedUser,
+    Path((user_id, room_id, data_type)): Path<(String, String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    set_room_account_data(
+        state,
+        user,
+        Path((user_id, room_id, data_type)),
+        Json(json!({})),
+    )
+    .await
 }
 
 // ----- Room tags (m.tag account data) -----

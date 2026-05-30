@@ -356,6 +356,19 @@ pub fn default_global_rules() -> Value {
                     {"set_tweak": "highlight"},
                 ],
             },
+            // MSC3930: poll responses must not generate push notifications
+            // (the user already cast the vote; pushing on it is noise).
+            {
+                "rule_id": ".org.matrix.msc3930.rule.poll_response",
+                "default": true,
+                "enabled": true,
+                "conditions": [{
+                    "kind": "event_match",
+                    "key": "type",
+                    "pattern": "org.matrix.msc3381.poll.response",
+                }],
+                "actions": [],
+            },
         ],
         "content": [],
         "room": [],
@@ -390,6 +403,68 @@ pub fn default_global_rules() -> Value {
                     "notify",
                     {"set_tweak": "sound", "value": "default"},
                 ],
+            },
+            // MSC3930: poll starts in 1:1 rooms get sound. The
+            // room_member_count condition mirrors the .m.rule.room_one_to_one
+            // pattern.
+            {
+                "rule_id": ".org.matrix.msc3930.rule.poll_start_one_to_one",
+                "default": true,
+                "enabled": true,
+                "conditions": [
+                    {"kind": "room_member_count", "is": "2"},
+                    {
+                        "kind": "event_match",
+                        "key": "type",
+                        "pattern": "org.matrix.msc3381.poll.start",
+                    },
+                ],
+                "actions": [
+                    "notify",
+                    {"set_tweak": "sound", "value": "default"},
+                ],
+            },
+            // MSC3930: poll ends in 1:1 rooms get sound.
+            {
+                "rule_id": ".org.matrix.msc3930.rule.poll_end_one_to_one",
+                "default": true,
+                "enabled": true,
+                "conditions": [
+                    {"kind": "room_member_count", "is": "2"},
+                    {
+                        "kind": "event_match",
+                        "key": "type",
+                        "pattern": "org.matrix.msc3381.poll.end",
+                    },
+                ],
+                "actions": [
+                    "notify",
+                    {"set_tweak": "sound", "value": "default"},
+                ],
+            },
+            // MSC3930: poll starts in larger rooms notify quietly.
+            {
+                "rule_id": ".org.matrix.msc3930.rule.poll_start",
+                "default": true,
+                "enabled": true,
+                "conditions": [{
+                    "kind": "event_match",
+                    "key": "type",
+                    "pattern": "org.matrix.msc3381.poll.start",
+                }],
+                "actions": ["notify"],
+            },
+            // MSC3930: poll ends in larger rooms notify quietly.
+            {
+                "rule_id": ".org.matrix.msc3930.rule.poll_end",
+                "default": true,
+                "enabled": true,
+                "conditions": [{
+                    "kind": "event_match",
+                    "key": "type",
+                    "pattern": "org.matrix.msc3381.poll.end",
+                }],
+                "actions": ["notify"],
             },
         ],
     })

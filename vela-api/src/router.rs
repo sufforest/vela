@@ -462,6 +462,17 @@ pub fn build_router(state: AppState) -> Router {
             "/_matrix/client/v3/user/{userId}/rooms/{roomId}/account_data/{type}",
             get(account_data::get_room_account_data).put(account_data::set_room_account_data),
         )
+        // MSC3391: explicit-deletion endpoints for account data. Mounted
+        // under the unstable prefix the MSC defines until the stable
+        // spec lands.
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc3391/user/{userId}/account_data/{type}",
+            axum::routing::delete(account_data::delete_account_data),
+        )
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc3391/user/{userId}/rooms/{roomId}/account_data/{type}",
+            axum::routing::delete(account_data::delete_room_account_data),
+        )
         .route(
             "/_matrix/client/v3/user/{userId}/rooms/{roomId}/tags",
             get(account_data::list_tags),
