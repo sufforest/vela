@@ -3100,4 +3100,172 @@ mod tests {
         assert!(types.contains("m.room.join_rules"));
         assert_eq!(out.len(), 2);
     }
+
+    /// Non-state events (`state_key_nid == 0`) inside the range must
+    /// NOT contribute to the delta. This is the test that catches a
+    /// regression where compute_state_delta treats every event as
+    /// state.
+    #[test]
+    fn state_delta_skips_non_state_events_in_range() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!noisy:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        let type_msg = db.get_or_create_nid("m.room.message").unwrap();
+
+        // Three plain timeline messages.
+        for (nid, eid) in &[(4001u64, "$m1"), (4002, "$m2"), (4003, "$m3")] {
+            let body = json!({
+                "type": "m.room.message",
+                "sender": "@alice:example.com",
+                "room_id": room_id,
+                "content": {"body": "x"},
+                "origin_server_ts": 1, "depth": 1,
+                "prev_events": [], "auth_events": [],
+            });
+            db.persist_event(
+                *nid,
+                eid,
+                room_nid,
+                type_msg,
+                alice_nid,
+                0,
+                1,
+                1,
+                &serde_json::to_vec(&body).unwrap(),
+                &[],
+                &[],
+                false,
+                false,
+            )
+            .unwrap();
+        }
+        let out = compute_state_delta(&state, room_nid, room_id, 1, 99999, None, None).unwrap();
+        assert!(
+            out.is_empty(),
+            "non-state events shouldn't contribute: {out:#?}"
+        );
+    }
+
+    /// A room with no events in the range returns an empty delta.
+    /// Distinct from the "inverted range" test — here the range is
+    /// valid but the room genuinely has nothing in it.
+    #[test]
+    fn state_delta_empty_for_empty_room() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_nid = db.get_or_create_nid("!quiet:example.com").unwrap();
+        let out = compute_state_delta(&state, room_nid, "!quiet:example.com", 1, 99999, None, None)
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// The `(since_exclusive, upper_exclusive)` window translates to
+    /// the timeline scan's `[from, to)` half-open range — `from`
+    /// inclusive, `to` exclusive. Callers in sync pass `since + 1` as
+    /// `since_exclusive` to skip the event the client already has.
+    /// Pin both boundary behaviours so a later signature change can't
+    /// silently flip inclusivity.
+    #[test]
+    fn state_delta_window_is_half_open_lower_inclusive() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!boundary:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+
+        let p = persist_state(
+            db,
+            5001,
+            "$jr",
+            room_nid,
+            room_id,
+            "m.room.join_rules",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"join_rule": "public"}),
+            1,
+            1,
+            &[],
+        );
+        // since_exclusive == p (inclusive lower) → event INCLUDED.
+        let out = compute_state_delta(&state, room_nid, room_id, p, p + 10, None, None).unwrap();
+        assert_eq!(out.len(), 1, "lower bound is inclusive");
+
+        // since_exclusive == p + 1 → event excluded.
+        let out =
+            compute_state_delta(&state, room_nid, room_id, p + 1, p + 10, None, None).unwrap();
+        assert!(out.is_empty(), "events past lower bound are excluded");
+
+        // upper_exclusive == p (exclusive upper) → event excluded.
+        let out = compute_state_delta(&state, room_nid, room_id, 1, p, None, None).unwrap();
+        assert!(out.is_empty(), "upper bound is exclusive");
+    }
+
+    /// State events with the same `(type, state_key)` slot but
+    /// arriving at different positions both contribute initially, but
+    /// only the latest position survives the dedupe.
+    #[test]
+    fn state_delta_latest_wins_when_multiple_writes_same_slot() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!races:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+
+        let _ = persist_state(
+            db,
+            6001,
+            "$pl1",
+            room_nid,
+            room_id,
+            "m.room.power_levels",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"users_default": 0}),
+            1,
+            1,
+            &[],
+        );
+        let _ = persist_state(
+            db,
+            6002,
+            "$pl2",
+            room_nid,
+            room_id,
+            "m.room.power_levels",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"users_default": 5}),
+            2,
+            2,
+            &[],
+        );
+        let p3 = persist_state(
+            db,
+            6003,
+            "$pl3",
+            room_nid,
+            room_id,
+            "m.room.power_levels",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"users_default": 10}),
+            3,
+            3,
+            &[],
+        );
+        let out = compute_state_delta(&state, room_nid, room_id, 1, p3 + 1, None, None).unwrap();
+        assert_eq!(out.len(), 1);
+        let users_default = out[0]
+            .pointer("/content/users_default")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_default();
+        assert_eq!(users_default, 10, "latest write wins: {out:#?}");
+    }
 }
