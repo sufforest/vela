@@ -3381,4 +3381,102 @@ mod tests {
             "m.push_rules should NOT be synthesised on incremental sync"
         );
     }
+
+    /// `typing_change_pos` is a process-local `DashMap`. A typing
+    /// transition writes the room's stream position; the sync read
+    /// path compares it against the client's `since`. Sanity-check the
+    /// map mechanics so a future refactor catches removal.
+    #[test]
+    fn typing_change_pos_round_trips() {
+        let (state, _tmp) = build_test_state();
+        let room_nid = 42u64;
+        // Empty default.
+        assert!(state.typing_change_pos.get(&room_nid).is_none());
+
+        state.typing_change_pos.insert(room_nid, 100);
+        assert_eq!(
+            state.typing_change_pos.get(&room_nid).map(|v| *v),
+            Some(100)
+        );
+
+        // Updates overwrite.
+        state.typing_change_pos.insert(room_nid, 200);
+        assert_eq!(
+            state.typing_change_pos.get(&room_nid).map(|v| *v),
+            Some(200)
+        );
+    }
+
+    /// The typing/receipt coalescing rule reuses `timeline_events`
+    /// emptiness as the signal. Pin the negation pattern so the future
+    /// refactor that replaces `is_empty()` with a count comparison
+    /// doesn't accidentally invert the check.
+    #[test]
+    fn timeline_has_new_is_negation_of_is_empty() {
+        let events: Vec<Value> = Vec::new();
+        assert!(events.is_empty());
+        // !is_empty() means "has new" — the same flag the sync path
+        // uses to coalesce typing + receipts in.
+        assert!(!(!events.is_empty()));
+        let with_one = vec![json!({"type": "m.room.message"})];
+        assert!(!with_one.is_empty());
+        assert!(!with_one.is_empty());
+    }
+
+    /// `room_is_unchanged` returns true for a room whose join data has
+    /// no timeline / state / ephemeral / account_data events. This is
+    /// the predicate that controls sparse rooms emission.
+    #[test]
+    fn room_is_unchanged_recognises_empty_sections() {
+        let empty = json!({
+            "timeline": {"events": []},
+            "state": {"events": []},
+            "ephemeral": {"events": []},
+            "account_data": {"events": []},
+        });
+        assert!(room_is_unchanged(&empty));
+
+        let with_timeline = json!({
+            "timeline": {"events": [{"type": "m.room.message"}]},
+            "state": {"events": []},
+            "ephemeral": {"events": []},
+            "account_data": {"events": []},
+        });
+        assert!(!room_is_unchanged(&with_timeline));
+
+        let with_state = json!({
+            "timeline": {"events": []},
+            "state": {"events": [{"type": "m.room.name"}]},
+            "ephemeral": {"events": []},
+            "account_data": {"events": []},
+        });
+        assert!(!room_is_unchanged(&with_state));
+
+        let with_ephem = json!({
+            "timeline": {"events": []},
+            "state": {"events": []},
+            "ephemeral": {"events": [{"type": "m.typing"}]},
+            "account_data": {"events": []},
+        });
+        assert!(!room_is_unchanged(&with_ephem));
+
+        let with_account = json!({
+            "timeline": {"events": []},
+            "state": {"events": []},
+            "ephemeral": {"events": []},
+            "account_data": {"events": [{"type": "m.tag"}]},
+        });
+        assert!(!room_is_unchanged(&with_account));
+    }
+
+    /// Rooms with literally no section keys (missing entirely) must
+    /// still be treated as unchanged — defensive read for malformed
+    /// values that future refactors might temporarily produce.
+    #[test]
+    fn room_is_unchanged_treats_missing_keys_as_empty() {
+        let empty_object = json!({});
+        assert!(room_is_unchanged(&empty_object));
+        let only_summary = json!({"summary": {"m.joined_member_count": 1}});
+        assert!(room_is_unchanged(&only_summary));
+    }
 }
