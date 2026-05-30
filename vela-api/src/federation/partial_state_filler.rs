@@ -380,3 +380,87 @@ fn reconcile_device_lists(
         "MSC3706 device_list reconciliation fired",
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::build_test_state;
+    use serde_json::json;
+
+    /// `pick_anchor_event_id` returns the first extremity's event_id.
+    /// Errors when the room has no extremities yet — that's the
+    /// pre-bootstrap state we should retry, not crash on.
+    #[test]
+    fn pick_anchor_event_id_errors_when_no_extremities() {
+        let (state, _tmp) = build_test_state();
+        let room_nid = state.db.get_or_create_nid("!noext:example.com").unwrap();
+        let err = pick_anchor_event_id(&state, room_nid).expect_err("no extremity → error");
+        assert!(
+            err.contains("no extremities"),
+            "expected 'no extremities', got: {err}"
+        );
+    }
+
+    /// When the room has an extremity its event_id is returned.
+    /// Verify both the happy path and that picking the FIRST element
+    /// is deterministic for a single-extremity room.
+    #[test]
+    fn pick_anchor_event_id_returns_extremity_event_id() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!anc:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        let type_msg = db.get_or_create_nid("m.room.message").unwrap();
+
+        // Persist a single timeline event so it becomes the only
+        // extremity.
+        let body = json!({
+            "type": "m.room.message",
+            "sender": "@alice:example.com",
+            "room_id": room_id,
+            "content": {"body": "hi"},
+            "origin_server_ts": 1, "depth": 1,
+            "prev_events": [], "auth_events": [],
+        });
+        db.persist_event(
+            7777,
+            "$anchor",
+            room_nid,
+            type_msg,
+            alice_nid,
+            0,
+            1,
+            1,
+            &serde_json::to_vec(&body).unwrap(),
+            &[],
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+
+        let got = pick_anchor_event_id(&state, room_nid).unwrap();
+        assert_eq!(got, "$anchor");
+    }
+
+    /// `_reset_for_test` flips the filler's `running` flag back to
+    /// false so each test starts from a clean state without leaking
+    /// the in-progress marker into the next case.
+    #[test]
+    fn reset_for_test_clears_running_flag() {
+        let (state, _tmp) = build_test_state();
+        // Manually set running so we can observe the reset.
+        state
+            .partial_state_filler
+            .running
+            .store(true, std::sync::atomic::Ordering::Release);
+        _reset_for_test(&state);
+        assert!(
+            !state
+                .partial_state_filler
+                .running
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+}
