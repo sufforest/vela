@@ -3184,4 +3184,124 @@ mod tests {
         let msg = format!("{}", err.0);
         assert!(msg.contains("not found"), "want not-found, got {msg}");
     }
+
+    /// `membership_u8` maps spec strings to the internal byte
+    /// representation. This is the substrate every membership
+    /// transition relies on; a typo here would silently break the
+    /// /sync rooms.* sections.
+    #[test]
+    fn membership_u8_maps_spec_strings() {
+        assert_eq!(membership_u8("join"), 1);
+        assert_eq!(membership_u8("invite"), 2);
+        assert_eq!(membership_u8("ban"), 3);
+        assert_eq!(membership_u8("knock"), 4);
+        assert_eq!(membership_u8("leave"), 0);
+        // Unknown strings fall back to leave.
+        assert_eq!(membership_u8(""), 0);
+        assert_eq!(membership_u8("foo"), 0);
+    }
+
+    /// `is_local_user` parses `@user:server` correctly and is robust
+    /// to malformed user_ids (no `:`, multiple `:`).
+    #[test]
+    fn is_local_user_uses_server_domain() {
+        assert!(is_local_user("@alice:example.com", "example.com"));
+        assert!(!is_local_user("@alice:example.com", "other.example"));
+        // Port-bearing server names are preserved by the rsplit.
+        assert!(is_local_user("@alice:hs1:8448", "hs1:8448"));
+        // No colon → not local to any server.
+        assert!(!is_local_user("malformed", "example.com"));
+    }
+
+    /// `creator_server` returns the domain of the create event's
+    /// sender. Used in the /leave routing decision — null when there's
+    /// no create event yet.
+    #[tokio::test]
+    async fn creator_server_resolves_create_sender_domain() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!cs:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:resident.example").unwrap();
+        let create_type = db.get_or_create_nid("m.room.create").unwrap();
+        let empty_skey = db.get_or_create_nid("").unwrap();
+
+        // No create event yet → None.
+        assert_eq!(creator_server(&state, room_nid).unwrap(), None);
+
+        // Persist a create event sent from resident.example.
+        let body = json!({
+            "type": "m.room.create",
+            "sender": "@alice:resident.example",
+            "state_key": "",
+            "room_id": room_id,
+            "content": {"room_version": "12"},
+            "origin_server_ts": 1, "depth": 1,
+            "prev_events": [], "auth_events": [],
+        });
+        let event_nid = 9001u64;
+        db.persist_event(
+            event_nid,
+            "$c",
+            room_nid,
+            create_type,
+            alice_nid,
+            empty_skey,
+            1,
+            1,
+            &serde_json::to_vec(&body).unwrap(),
+            &[],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+        db.promote_state_event(room_nid, event_nid, create_type, empty_skey)
+            .unwrap();
+
+        let got = creator_server(&state, room_nid).unwrap();
+        assert_eq!(got.as_deref(), Some("resident.example"));
+    }
+
+    /// Sender with empty domain (post-split) doesn't crash
+    /// `creator_server`; it just returns None.
+    #[tokio::test]
+    async fn creator_server_returns_none_for_malformed_sender() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!malf:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let bad_sender_nid = db.get_or_create_nid("nosep").unwrap();
+        let create_type = db.get_or_create_nid("m.room.create").unwrap();
+        let empty_skey = db.get_or_create_nid("").unwrap();
+        let body = json!({
+            "type": "m.room.create",
+            "sender": "nosep",
+            "state_key": "",
+            "room_id": room_id,
+            "content": {"room_version": "12"},
+            "origin_server_ts": 1, "depth": 1,
+            "prev_events": [], "auth_events": [],
+        });
+        let nid = 9100u64;
+        db.persist_event(
+            nid,
+            "$mc",
+            room_nid,
+            create_type,
+            bad_sender_nid,
+            empty_skey,
+            1,
+            1,
+            &serde_json::to_vec(&body).unwrap(),
+            &[],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+        db.promote_state_event(room_nid, nid, create_type, empty_skey)
+            .unwrap();
+        assert_eq!(creator_server(&state, room_nid).unwrap(), None);
+    }
 }
