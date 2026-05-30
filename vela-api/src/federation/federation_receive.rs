@@ -2311,4 +2311,84 @@ mod tests {
         .await;
         assert!(res.is_err(), "expected Err on exhausted budget");
     }
+
+    /// The partial-state branch in Check 5 (state-at-event resolution
+    /// failed) is gated on `get_partial_state_info`. Verify the DB
+    /// helper returns the expected `(partial, servers)` tuple so the
+    /// receive path's gate behaves correctly under various states.
+    #[tokio::test]
+    async fn partial_state_info_gates_check_5_fallback() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_nid = db.get_or_create_nid("!partial:example.com").unwrap();
+
+        // Default: not partial-state.
+        let (partial, servers) = db.get_partial_state_info(room_nid).unwrap();
+        assert!(!partial);
+        assert!(servers.is_empty());
+
+        // Set partial-state with the resident server.
+        db.set_partial_state_join(room_nid, &["resident.example".into()])
+            .unwrap();
+        let (partial, servers) = db.get_partial_state_info(room_nid).unwrap();
+        assert!(partial);
+        assert_eq!(servers, vec!["resident.example".to_string()]);
+
+        // Clear flips back; the Check 5 path would now go through the
+        // strict rejection.
+        db.clear_partial_state(room_nid).unwrap();
+        let (partial, _) = db.get_partial_state_info(room_nid).unwrap();
+        assert!(!partial);
+    }
+
+    /// Membership transitions (`set_membership` byte 0/1/2/3/4) must
+    /// round-trip through `get_membership` for both sync and
+    /// federation/receive to read back the right state — this is the
+    /// substrate the partial-state ban / leave paths rely on.
+    #[tokio::test]
+    async fn membership_byte_round_trip_covers_all_states() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_nid = db.get_or_create_nid("!mb:example.com").unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+
+        // Initial: no record → None.
+        assert_eq!(db.get_membership(room_nid, alice_nid).unwrap(), None);
+
+        for byte in [0u8, 1, 2, 3, 4] {
+            db.set_membership(room_nid, alice_nid, byte).unwrap();
+            assert_eq!(
+                db.get_membership(room_nid, alice_nid).unwrap(),
+                Some(byte),
+                "byte {byte} round-trip"
+            );
+        }
+    }
+
+    /// Banned (3) and left (0) users both appear in
+    /// `get_user_left_rooms` — this is what makes /sync's rooms.leave
+    /// section surface a remote-ban event after the partial-state
+    /// soft-fail relaxation accepts it.
+    #[tokio::test]
+    async fn left_rooms_index_includes_banned_users() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        let room_left = db.get_or_create_nid("!left:example.com").unwrap();
+        let room_banned = db.get_or_create_nid("!banned:example.com").unwrap();
+        let room_joined = db.get_or_create_nid("!joined:example.com").unwrap();
+
+        db.set_membership(room_left, alice_nid, 0).unwrap();
+        db.set_membership(room_banned, alice_nid, 3).unwrap();
+        db.set_membership(room_joined, alice_nid, 1).unwrap();
+
+        let mut left = db.get_user_left_rooms(alice_nid).unwrap();
+        left.sort();
+        let mut expected = vec![room_left, room_banned];
+        expected.sort();
+        assert_eq!(left, expected);
+
+        let joined = db.get_user_joined_rooms(alice_nid).unwrap();
+        assert_eq!(joined, vec![room_joined]);
+    }
 }
