@@ -558,17 +558,35 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
             // /sync timelines without contributing to current state.
         }
         Err(reason) => {
-            // Log the detailed reason (may include internal DB error text or
-            // NID values) operator-side; don't ship it to the federating peer.
-            error!(
-                event_id = %effective_pdu.event_id,
-                error = %reason,
-                "state-at-event resolution failed"
-            );
-            return (
-                effective_pdu.event_id.clone(),
-                PduOutcome::Rejected("state-at-event resolution failed".into()),
-            );
+            // Partial-state rooms hit "unknown prev_event" frequently
+            // while the filler is catching up — those events are
+            // legitimate (the resident vouches via Check 4 against
+            // declared auth_events) and rejecting them on the
+            // resolution-failed path means a mid-resync ban / kick /
+            // join never lands. MSC3902 expects the homeserver to
+            // accept these and resolve once the resync completes.
+            let is_partial_state = state
+                .db
+                .get_partial_state_info(room_nid)
+                .map(|(p, _)| p)
+                .unwrap_or(false);
+            if is_partial_state {
+                debug!(
+                    event_id = %effective_pdu.event_id,
+                    reason = %reason,
+                    "state-at-event resolution failed in partial-state room — accepting via declared auth_events"
+                );
+            } else {
+                error!(
+                    event_id = %effective_pdu.event_id,
+                    error = %reason,
+                    "state-at-event resolution failed"
+                );
+                return (
+                    effective_pdu.event_id.clone(),
+                    PduOutcome::Rejected("state-at-event resolution failed".into()),
+                );
+            }
         }
     }
 
