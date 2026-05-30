@@ -497,16 +497,18 @@ pub(crate) fn build_sync_response_inner(
         knock_rooms.insert(room_id, knock_data);
     }
 
-    // Global account data. On initial sync we return everything; on
-    // incremental sync we stream only entries modified after `since` so
-    // clients (Element's cross-signing setup, push rule edits, etc.) see
-    // their own writes reflected and can tell the write landed.
+    // Global account data. On initial sync we return everything except
+    // MSC3391-tombstoned entries (empty `{}` content represents a
+    // deletion — a fresh device shouldn't see them at all). On
+    // incremental sync we stream every change including the empty-
+    // content event, so other devices catch up on the delete.
     let mut global_account_data: Vec<Value> = match since {
         None => state
             .db
             .get_all_account_data(user.user_nid)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
             .into_iter()
+            .filter(|(_, content)| !content.as_object().is_some_and(|o| o.is_empty()))
             .map(|(dtype, content)| json!({"type": dtype, "content": content}))
             .collect(),
         Some(since_pos) => state
@@ -1070,13 +1072,21 @@ fn build_room_sync_for_user(
         _ => true,
     };
     let room_account_data = match (user_nid, room_account_data_changed) {
-        (Some(uid), true) => state
-            .db
-            .get_all_room_account_data(uid, room_nid)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-            .into_iter()
-            .map(|(dtype, content)| json!({"type": dtype, "content": content}))
-            .collect::<Vec<_>>(),
+        (Some(uid), true) => {
+            let all = state
+                .db
+                .get_all_room_account_data(uid, room_nid)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+            // MSC3391: on initial sync (no `since`) skip tombstoned
+            // entries (empty `{}` content). Incremental sync keeps them
+            // so other devices catch up on the deletion.
+            all.into_iter()
+                .filter(|(_, content)| {
+                    since.is_some() || !content.as_object().is_some_and(|o| o.is_empty())
+                })
+                .map(|(dtype, content)| json!({"type": dtype, "content": content}))
+                .collect::<Vec<_>>()
+        }
         _ => Vec::new(),
     };
 
