@@ -1111,6 +1111,12 @@ fn build_room_sync_for_user(
             .is_some_and(|max| max > since_pos),
         _ => true, // initial sync OR unauthenticated: always emit the snapshot
     };
+    // Same coalescing rule as typing above: if the room is going to
+    // appear in this response because of a fresh timeline event, ride
+    // the current receipt snapshot along so test contracts that wait
+    // for `timeline + ephemeral.m.receipt` in one response succeed
+    // without depending on transition timing.
+    let receipts_changed = receipts_changed || timeline_has_new;
     if receipts_changed
         && let Some(uid) = user_nid
         && let Some(receipts_event) = build_receipts_event(state, room_nid, uid)?
