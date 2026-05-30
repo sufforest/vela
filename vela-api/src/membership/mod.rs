@@ -2012,6 +2012,55 @@ async fn emit_membership_event_for_target(
     // Gate: authorise against current room state before persisting.
     authorise_event(state, room_nid, &event_id, &event, None)?;
 
+    // MSC4155: for federated invites, ask the remote to take the
+    // invite BEFORE we persist locally. If the remote rejects with
+    // any 4xx (e.g. M_FORBIDDEN from the recipient's
+    // invite_permission_config), surface the error to the local
+    // caller. 5xx / network / other errors keep best-effort
+    // semantics — we persist anyway and the remote backfills later.
+    if membership == "invite"
+        && !is_local_user(target_user_id, server_name)
+        && let Some(target_server) = target_user_id.split_once(':').map(|(_, d)| d.to_string())
+    {
+        let invite_room_state = build_invite_stripped_state(state, room_nid, room_id.as_str())?;
+        let body = json!({
+            "event": Value::Object(event.clone()),
+            "room_version": room_version.as_str(),
+            "invite_room_state": invite_room_state,
+        });
+        match state
+            .federation_client
+            .send_invite_v2(&target_server, room_id.as_str(), event_id.as_str(), body)
+            .await
+        {
+            Ok(_) => { /* fall through to persist */ }
+            Err(e) => {
+                let msg = e.to_string();
+                let status = msg
+                    .strip_prefix("http error: status ")
+                    .and_then(|s| s.split_once(' '))
+                    .and_then(|(code, _)| code.trim_end_matches(':').parse::<u16>().ok());
+                if matches!(status, Some(s) if (400..500).contains(&s)) {
+                    tracing::debug!(
+                        target = %target_server,
+                        event = %event_id.as_str(),
+                        error = %e,
+                        "federated invite rejected by remote; surfacing to caller"
+                    );
+                    return Err(ApiError(VelaError::Forbidden(
+                        "remote server refused invite".into(),
+                    )));
+                }
+                tracing::warn!(
+                    target = %target_server,
+                    event = %event_id.as_str(),
+                    error = %e,
+                    "federated invite POST failed; persisting locally for backfill"
+                );
+            }
+        }
+    }
+
     // Persist
     let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&event);
@@ -2104,52 +2153,6 @@ async fn emit_membership_event_for_target(
 
     // Federate to remote servers.
     state.federation_sender.broadcast(room_nid, event_nid);
-
-    // Federated-invite hook: when we invite a user on another server, we also
-    // PUT the signed event to their `/_matrix/federation/v2/invite/{room}/{event}`.
-    // The remote validates and may add their signature.
-    //
-    // Awaited inline (not spawned). Spec / industry behaviour: clients
-    // expect synchronous /invite — both Synapse and Continuwuity block
-    // the C2S response until the remote ACKs. Fire-and-forget races
-    // tests like TestFederationRejectInvite where the invitee's
-    // server gets a /leave call immediately after the C2S /invite
-    // returns 200; if the federation POST hasn't landed, the remote
-    // hasn't created the room/membership and the leave 404s.
-    //
-    // On federation failure we still log and return 200 to the
-    // client: the local invite event is already authorised +
-    // persisted, and the remote can pick it up later via backfill
-    // once they have a member in the room. Keeping the C2S call
-    // succeeding matches synapse's "best-effort" semantics — the
-    // client sees the invite locally even when federation flaps.
-    if membership == "invite" {
-        let server = &state.config.server_name;
-        if !is_local_user(target_user_id, server) {
-            let target_server = match target_user_id.split_once(':') {
-                Some((_, d)) => d.to_string(),
-                None => return Ok(()),
-            };
-            let invite_room_state = build_invite_stripped_state(state, room_nid, room_id.as_str())?;
-            let body = json!({
-                "event": Value::Object(event.clone()),
-                "room_version": room_version.as_str(),
-                "invite_room_state": invite_room_state,
-            });
-            if let Err(e) = state
-                .federation_client
-                .send_invite_v2(&target_server, room_id.as_str(), event_id.as_str(), body)
-                .await
-            {
-                tracing::warn!(
-                    target = %target_server,
-                    event = %event_id.as_str(),
-                    error = %e,
-                    "federated invite POST failed; remote can backfill later"
-                );
-            }
-        }
-    }
 
     Ok(())
 }

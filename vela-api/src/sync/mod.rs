@@ -645,14 +645,26 @@ pub(crate) fn build_sync_response_inner(
         .filter(|u| !left_set.contains(u.as_str()))
         .collect();
 
+    // Per spec, each rooms.{join,invite,leave,knock} section is
+    // optional. Emit only those that have entries so consumers that
+    // test `JSONKeyMissing` (e.g. MSC4155 invite-filter coverage)
+    // see the section disappear when filtering blocked an invite.
+    let mut rooms = serde_json::Map::new();
+    if !join_rooms.is_empty() {
+        rooms.insert("join".into(), Value::Object(join_rooms));
+    }
+    if !invite_rooms.is_empty() {
+        rooms.insert("invite".into(), Value::Object(invite_rooms));
+    }
+    if !leave_rooms.is_empty() {
+        rooms.insert("leave".into(), Value::Object(leave_rooms));
+    }
+    if !knock_rooms.is_empty() {
+        rooms.insert("knock".into(), Value::Object(knock_rooms));
+    }
     Ok(json!({
         "next_batch": format!("s{safe_pos}"),
-        "rooms": {
-            "join": join_rooms,
-            "invite": invite_rooms,
-            "leave": leave_rooms,
-            "knock": knock_rooms,
-        },
+        "rooms": rooms,
         "presence": {"events": presence_events},
         "account_data": {"events": global_account_data},
         "to_device": {"events": to_device_events},

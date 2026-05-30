@@ -169,39 +169,40 @@ fn json_pointer_get(event: &Value, key: &str) -> Option<Value> {
 /// Matrix glob: `*` matches any substring, `?` any single character.
 /// Case-insensitive per spec.
 pub fn glob_match(pattern: &str, input: &str) -> bool {
-    // Convert to a regex under the hood — but keep it simple: split on `*`
-    // and check each chunk appears in order. `?` handled by treating each
-    // non-wildcard char as needing exact match against one input char when
-    // walking the chunk, but we simplify by only handling `*`. Real
-    // Element default rules don't use `?`.
-    let pattern_lc = pattern.to_lowercase();
-    let input_lc = input.to_lowercase();
-    let parts: Vec<&str> = pattern_lc.split('*').collect();
-    if parts.len() == 1 {
-        // No wildcard: exact match.
-        return input_lc == pattern_lc;
+    // Push-rules / MSC4155 glob shape: `*` matches zero or more chars,
+    // `?` matches exactly one. Case-insensitive. Backtracking matcher
+    // — pushrules patterns are short, so the O(p*i) worst case is fine.
+    let pat: Vec<char> = pattern.to_lowercase().chars().collect();
+    let inp: Vec<char> = input.to_lowercase().chars().collect();
+    glob_match_inner(&pat, 0, &inp, 0)
+}
+
+fn glob_match_inner(pat: &[char], pi: usize, inp: &[char], ii: usize) -> bool {
+    if pi == pat.len() {
+        return ii == inp.len();
     }
-    let mut cursor = 0;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
+    match pat[pi] {
+        '*' => {
+            // Collapse runs of `*` so we don't blow up on `**`-style
+            // patterns.
+            let mut next = pi + 1;
+            while next < pat.len() && pat[next] == '*' {
+                next += 1;
+            }
+            // `*` at end matches the rest of the input outright.
+            if next == pat.len() {
+                return true;
+            }
+            for skip in ii..=inp.len() {
+                if glob_match_inner(pat, next, inp, skip) {
+                    return true;
+                }
+            }
+            false
         }
-        if i == 0 && !input_lc[cursor..].starts_with(part) {
-            return false;
-        }
-        match input_lc[cursor..].find(part) {
-            Some(idx) => cursor += idx + part.len(),
-            None => return false,
-        }
+        '?' => ii < inp.len() && glob_match_inner(pat, pi + 1, inp, ii + 1),
+        c => ii < inp.len() && inp[ii] == c && glob_match_inner(pat, pi + 1, inp, ii + 1),
     }
-    // Last part must match end if the pattern doesn't end in `*`.
-    if let Some(last) = parts.last()
-        && !last.is_empty()
-        && !input_lc.ends_with(last)
-    {
-        return false;
-    }
-    true
 }
 
 /// Word-boundary contains check for `contains_display_name`. A display
