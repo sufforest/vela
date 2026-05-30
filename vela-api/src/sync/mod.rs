@@ -2058,13 +2058,16 @@ mod tests {
             .unwrap()
             .expect("invite transition indexed");
 
-        // Incremental sync from the exact pos of the invite: should be excluded.
+        // Incremental sync from the exact pos of the invite: should
+        // be excluded. With the MSC4155-driven sparse rooms emission,
+        // an empty invite slot causes `rooms.invite` to be absent
+        // entirely, which is equally "no stale invite".
         let resp = build_sync_response(&state, &user, &[], Some(pos)).unwrap();
-        let invites = resp.pointer("/rooms/invite").unwrap().as_object().unwrap();
-        assert!(
-            !invites.contains_key("!room:example.com"),
-            "stale invite should not reappear on incremental sync"
-        );
+        let has_stale_invite = resp
+            .pointer("/rooms/invite")
+            .and_then(|v| v.as_object())
+            .is_some_and(|o| o.contains_key("!room:example.com"));
+        assert!(!has_stale_invite, "stale invite should not reappear");
 
         // Incremental sync from before pos: invite reappears.
         let resp = build_sync_response(&state, &user, &[], Some(pos - 1)).unwrap();
@@ -2444,7 +2447,9 @@ mod tests {
         );
 
         // Incremental sync from a token equal to current pos: nothing
-        // happened since, so the room must be omitted.
+        // happened since, so the room must be omitted. Sparse rooms
+        // emission means `rooms.join` itself may be absent — that's
+        // also "room not present".
         let resp = build_sync_response_with_filter(
             &state,
             &alice_user,
@@ -2454,13 +2459,13 @@ mod tests {
             false,
         )
         .unwrap();
-        let join = resp
+        let has_room = resp
             .pointer("/rooms/join")
             .and_then(|v| v.as_object())
-            .unwrap();
+            .is_some_and(|o| o.contains_key(&room_id));
         assert!(
-            !join.contains_key(&room_id),
-            "unchanged room must not appear on incremental sync: {join:?}"
+            !has_room,
+            "unchanged room must not appear on incremental sync"
         );
 
         // full_state=true forces the room to be present even when nothing
@@ -2497,11 +2502,11 @@ mod tests {
             .unwrap()
             .unwrap();
         let resp = build_sync_response(&state, &user, &[], Some(pos)).unwrap();
-        let leaves = resp.pointer("/rooms/leave").unwrap().as_object().unwrap();
-        assert!(
-            !leaves.contains_key("!leftroom:example.com"),
-            "stale leave should not reappear"
-        );
+        let has_stale_leave = resp
+            .pointer("/rooms/leave")
+            .and_then(|v| v.as_object())
+            .is_some_and(|o| o.contains_key("!leftroom:example.com"));
+        assert!(!has_stale_leave, "stale leave should not reappear");
     }
 
     #[test]
