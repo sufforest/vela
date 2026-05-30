@@ -1010,6 +1010,27 @@ pub async fn invite_user(
     // the user; we then re-check existence and proceed.
     maybe_query_as_for_unknown_user(&state, &body.user_id).await;
 
+    // MSC4155: when the invitee is local, honour their
+    // invite_permission_config. Remote invitees get the check on
+    // their own server's inbound /federation/v2/invite handler.
+    if is_local_user(&body.user_id, &state.config.server_name)
+        && let Ok(target_nid) = state.db.get_or_create_nid(&body.user_id)
+    {
+        match crate::invite_filter::check_invite(&state.db, target_nid, &user.user_id) {
+            crate::invite_filter::InviteAction::Block => {
+                return Err(ApiError(VelaError::Forbidden(
+                    "invite blocked by recipient".into(),
+                )));
+            }
+            crate::invite_filter::InviteAction::Ignore => {
+                // Pretend to succeed but don't emit — the recipient
+                // never sees the invite in /sync.
+                return Ok(Json(json!({})));
+            }
+            crate::invite_filter::InviteAction::Allow => {}
+        }
+    }
+
     emit_membership_event_for_target(
         &state,
         &user,

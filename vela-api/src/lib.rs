@@ -12,6 +12,7 @@ pub mod directory;
 pub mod e2ee;
 pub mod federation;
 pub mod health;
+pub mod invite_filter;
 pub mod media;
 pub mod membership;
 pub mod metrics;
