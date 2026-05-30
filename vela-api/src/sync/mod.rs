@@ -3268,4 +3268,117 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(users_default, 10, "latest write wins: {out:#?}");
     }
+
+    /// Spec: `next_batch` MUST be a string token; clients re-feed it
+    /// as `since` and expect strict-monotonic ordering. Pin the
+    /// `s{pos}` token shape so a downstream refactor can't silently
+    /// switch to a different encoding (e.g. opaque base64).
+    #[test]
+    fn next_batch_uses_stream_position_token_shape() {
+        let (state, _tmp) = build_test_state();
+        let user = fake_user(&state, "@alice:example.com");
+        let resp = build_sync_response(&state, &user, &[], None).unwrap();
+        let next_batch = resp
+            .pointer("/next_batch")
+            .and_then(|v| v.as_str())
+            .expect("next_batch present");
+        assert!(
+            next_batch.starts_with('s'),
+            "expected s-prefixed pos token: {next_batch}"
+        );
+        let pos: u64 = next_batch[1..].parse().expect("numeric pos");
+        assert!(pos >= 1, "pos >= 1, got {pos}");
+    }
+
+    /// /sync top-level response keeps the device_lists, account_data,
+    /// presence, to_device, and one-time-keys count sections present
+    /// even on a fresh account with nothing in any of them — clients
+    /// pin on these keys existing for initial render.
+    #[test]
+    fn sync_top_level_sections_always_present() {
+        let (state, _tmp) = build_test_state();
+        let user = fake_user(&state, "@alice:example.com");
+        let resp = build_sync_response(&state, &user, &[], None).unwrap();
+        for key in [
+            "/next_batch",
+            "/account_data/events",
+            "/device_lists/changed",
+            "/device_lists/left",
+            "/device_one_time_keys_count",
+            "/device_unused_fallback_key_types",
+            "/presence/events",
+            "/to_device/events",
+        ] {
+            assert!(
+                resp.pointer(key).is_some(),
+                "expected {key} in /sync response: {resp:#?}"
+            );
+        }
+    }
+
+    /// Sparse-rooms rule: a sync with zero joined / invited / left /
+    /// knocked rooms emits an EMPTY `rooms` object, not one with the
+    /// section keys all populated as empty objects. Without this the
+    /// MSC4155 `JSONKeyMissing` checks regress.
+    #[test]
+    fn sync_rooms_object_is_empty_when_no_rooms() {
+        let (state, _tmp) = build_test_state();
+        let user = fake_user(&state, "@bob:example.com");
+        let resp = build_sync_response(&state, &user, &[], None).unwrap();
+        let rooms = resp.pointer("/rooms").and_then(|v| v.as_object()).unwrap();
+        assert!(
+            rooms.is_empty(),
+            "expected empty rooms object, got {rooms:?}"
+        );
+    }
+
+    /// `m.push_rules` is synthesised on initial sync when the user
+    /// hasn't customised — clients depend on it for default
+    /// notification settings. Verify the shape so a refactor of the
+    /// account_data path doesn't drop it.
+    #[test]
+    fn initial_sync_synthesises_push_rules_account_data() {
+        let (state, _tmp) = build_test_state();
+        let user = fake_user(&state, "@alice:example.com");
+        let resp = build_sync_response(&state, &user, &[], None).unwrap();
+        let events = resp
+            .pointer("/account_data/events")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        let push_rules = events
+            .iter()
+            .find(|e| e.get("type").and_then(|v| v.as_str()) == Some("m.push_rules"))
+            .expect("m.push_rules synthesised on initial sync");
+        let global = push_rules
+            .pointer("/content/global")
+            .expect("content.global present");
+        assert!(
+            global.get("override").is_some(),
+            "global.override missing: {push_rules:#?}"
+        );
+        assert!(global.get("underride").is_some());
+    }
+
+    /// Incremental sync DOESN'T re-synthesise `m.push_rules` — the
+    /// rules don't change unless the user wrote, in which case the
+    /// account_data event already covered it.
+    #[test]
+    fn incremental_sync_skips_push_rules_synthesis() {
+        let (state, _tmp) = build_test_state();
+        let user = fake_user(&state, "@alice:example.com");
+        // Advance the stream so `since = 1` is a valid past position.
+        let _ = state.db.next_stream_position();
+        let resp = build_sync_response(&state, &user, &[], Some(1)).unwrap();
+        let events = resp
+            .pointer("/account_data/events")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        let has_push_rules = events
+            .iter()
+            .any(|e| e.get("type").and_then(|v| v.as_str()) == Some("m.push_rules"));
+        assert!(
+            !has_push_rules,
+            "m.push_rules should NOT be synthesised on incremental sync"
+        );
+    }
 }
