@@ -396,9 +396,14 @@ pub(crate) async fn send_state_inner(
     // Continuwuity follow the optimisation, and the spec
     // `TestInboundCanReturnMissingEvents` "shared" sub-test bakes
     // that behaviour into its expected event count.
-    if let Some(existing_event_id) =
-        existing_state_event_if_unchanged(&state, room_nid, &event_type, &state_key, &content)
-    {
+    if let Some(existing_event_id) = existing_state_event_if_unchanged(
+        &state,
+        room_nid,
+        &event_type,
+        &state_key,
+        &user.user_id,
+        &content,
+    ) {
         return Ok(Json(json!({ "event_id": existing_event_id })));
     }
 
@@ -816,6 +821,7 @@ fn existing_state_event_if_unchanged(
     room_nid: u64,
     event_type: &str,
     state_key: &str,
+    sender: &str,
     new_content: &Value,
 ) -> Option<String> {
     let type_nid = state.db.get_nid(event_type).ok().flatten()?;
@@ -827,6 +833,19 @@ fn existing_state_event_if_unchanged(
         .flatten()?;
     let (_h, bytes) = state.db.get_event(event_nid).ok().flatten()?;
     let existing: Value = serde_json::from_slice(&bytes).ok()?;
+    // Sender match is required: a different user re-PUTting the same
+    // content is a NEW state-event request from them, and the full
+    // auth check (rule 9, power level, etc.) has to decide whether
+    // they're allowed to write at this `(type, state_key)`. Without
+    // this guard a low-power user could "set" a high-power event by
+    // simply replaying the existing content.
+    let existing_sender = existing
+        .get("sender")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if existing_sender != sender {
+        return None;
+    }
     let existing_content = existing.get("content")?;
     if existing_content == new_content {
         state.db.get_event_id_by_nid(event_nid).ok().flatten()

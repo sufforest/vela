@@ -105,3 +105,9 @@
 
 
 
+
+# TestMSC3757OwnedState requires the msc3757 room version
+# (`org.matrix.msc3757.10`). Vela does not yet enumerate that
+# version as supported, so the test fails at create-room.
+# Adopting the version is a separate piece of work.
+^TestMSC3757OwnedState$
