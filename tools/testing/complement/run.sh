@@ -34,7 +34,7 @@ RETRY_FLAKES="${RETRY_FLAKES:-0}"
 # Empty list → don't pass -skip (regex of empty would match everything).
 SKIP_REGEX=$(grep -vE '^\s*(#|$)' "$SKIPLIST" | paste -sd '|' -)
 
-PACKAGES=("./tests/csapi" "./tests" "./tests/msc4306" "./tests/msc4222")
+PACKAGES=("./tests/csapi" "./tests" "./tests/msc4306" "./tests/msc4222" "./tests/msc3967")
 if [ $# -gt 0 ]; then
     PACKAGES=("$@")
 fi
