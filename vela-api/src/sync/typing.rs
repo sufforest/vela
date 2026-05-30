@@ -123,3 +123,79 @@ pub fn get_typing_users(state: &AppState, room_nid: u64) -> Vec<u64> {
     typers.retain(|(_, expires)| *expires > now_ms);
     typers.iter().map(|(uid, _)| *uid).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::build_test_state;
+
+    /// A room with no typing entries returns an empty list — not None
+    /// or panic. This is the no-op fast path /sync hits for every
+    /// quiet room.
+    #[test]
+    fn get_typing_users_returns_empty_when_no_entry() {
+        let (state, _tmp) = build_test_state();
+        let users = get_typing_users(&state, 999);
+        assert!(users.is_empty());
+    }
+
+    /// Active (non-expired) typers come back in arbitrary order.
+    /// Pin the contract that the set is what got inserted, ignoring
+    /// order.
+    #[test]
+    fn get_typing_users_returns_active_typers() {
+        let (state, _tmp) = build_test_state();
+        let room_nid = 1u64;
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000;
+        state
+            .typing_state
+            .insert(room_nid, vec![(10, future), (20, future), (30, future)]);
+        let mut users = get_typing_users(&state, room_nid);
+        users.sort();
+        assert_eq!(users, vec![10, 20, 30]);
+    }
+
+    /// Lazy expiry pruning: typers whose `expires` is in the past
+    /// must be filtered out on the next read. The state DashMap also
+    /// retains the pruned-down entry so subsequent reads are O(active).
+    #[test]
+    fn get_typing_users_prunes_expired_entries() {
+        let (state, _tmp) = build_test_state();
+        let room_nid = 2u64;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        // Two typers: one active, one expired 60s ago.
+        state.typing_state.insert(
+            room_nid,
+            vec![(11, now_ms + 60_000), (22, now_ms.saturating_sub(60_000))],
+        );
+        let users = get_typing_users(&state, room_nid);
+        assert_eq!(users, vec![11]);
+
+        // The in-place prune persists.
+        let entry = state.typing_state.get(&room_nid).unwrap();
+        let stored: Vec<u64> = entry.value().iter().map(|(u, _)| *u).collect();
+        assert_eq!(stored, vec![11]);
+    }
+
+    /// All-expired returns empty AND the room's entry is pruned to an
+    /// empty vec rather than removed entirely. Subsequent inserts
+    /// reuse the slot.
+    #[test]
+    fn get_typing_users_returns_empty_when_all_expired() {
+        let (state, _tmp) = build_test_state();
+        let room_nid = 3u64;
+        let past = 1u64; // long expired
+        state
+            .typing_state
+            .insert(room_nid, vec![(1, past), (2, past)]);
+        let users = get_typing_users(&state, room_nid);
+        assert!(users.is_empty());
+    }
+}
