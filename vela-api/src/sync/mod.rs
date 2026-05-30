@@ -2897,4 +2897,186 @@ mod tests {
             compute_unread_counts(&state, room_nid, alice_nid, &[ev], false).unwrap();
         assert_eq!(hl, 1, "profile displayname should still drive highlight");
     }
+
+    /// `compute_state_delta` returns the most-recent state event for
+    /// each `(type, state_key)` slot that changed between
+    /// `since_exclusive` and `upper_exclusive`. Non-state events in
+    /// the same range are ignored.
+    #[test]
+    fn state_delta_picks_latest_per_slot() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!delta:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        let bob_nid = db.get_or_create_nid("@bob:example.com").unwrap();
+        let _ = (alice_nid, bob_nid);
+
+        // Pos 1: alice writes m.room.name = "v1".
+        let p1 = persist_state(
+            db,
+            1001,
+            "$n1",
+            room_nid,
+            room_id,
+            "m.room.name",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"name": "v1"}),
+            10,
+            1,
+            &[],
+        );
+        // Pos 2: alice writes a regular m.room.message (NOT a state event).
+        let type_msg = db.get_or_create_nid("m.room.message").unwrap();
+        let body = json!({
+            "type": "m.room.message",
+            "sender": "@alice:example.com",
+            "room_id": room_id,
+            "content": {"body": "hi"},
+            "origin_server_ts": 11, "depth": 2,
+            "prev_events": [], "auth_events": [],
+        });
+        let _p2 = db
+            .persist_event(
+                1002,
+                "$m1",
+                room_nid,
+                type_msg,
+                alice_nid,
+                0,
+                11,
+                2,
+                &serde_json::to_vec(&body).unwrap(),
+                &[],
+                &[],
+                false,
+                false,
+            )
+            .unwrap();
+        // Pos 3: alice updates m.room.name = "v2" — supersedes p1.
+        let p3 = persist_state(
+            db,
+            1003,
+            "$n2",
+            room_nid,
+            room_id,
+            "m.room.name",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"name": "v2"}),
+            12,
+            3,
+            &[],
+        );
+        assert!(p3 > p1, "stream pos must advance");
+
+        let out = compute_state_delta(&state, room_nid, room_id, 1, p3 + 1, None, None).unwrap();
+        let by_slot: std::collections::HashMap<String, String> = out
+            .iter()
+            .map(|ev| {
+                let key = format!(
+                    "{}|{}",
+                    ev.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+                    ev.get("state_key").and_then(|v| v.as_str()).unwrap_or("")
+                );
+                let name = ev
+                    .pointer("/content/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                (key, name)
+            })
+            .collect();
+        assert_eq!(by_slot.len(), 1, "one slot, latest only: {by_slot:?}");
+        assert_eq!(by_slot.get("m.room.name|").map(String::as_str), Some("v2"));
+    }
+
+    /// `since_exclusive >= upper_exclusive` means the client is
+    /// up-to-date with everything we'd emit; the delta is empty.
+    #[test]
+    fn state_delta_empty_when_range_inverted_or_collapsed() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_nid = db.get_or_create_nid("!noop:example.com").unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        persist_state(
+            db,
+            2001,
+            "$x",
+            room_nid,
+            "!noop:example.com",
+            "m.room.name",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"name": "x"}),
+            1,
+            1,
+            &[],
+        );
+        assert!(
+            compute_state_delta(&state, room_nid, "!noop:example.com", 10, 10, None, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            compute_state_delta(&state, room_nid, "!noop:example.com", 11, 10, None, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// State events in disjoint slots all come back (one per slot).
+    #[test]
+    fn state_delta_returns_one_event_per_slot() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!multi:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+
+        let p1 = persist_state(
+            db,
+            3001,
+            "$pl",
+            room_nid,
+            room_id,
+            "m.room.power_levels",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"users_default": 0}),
+            1,
+            1,
+            &[],
+        );
+        let p2 = persist_state(
+            db,
+            3002,
+            "$jr",
+            room_nid,
+            room_id,
+            "m.room.join_rules",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"join_rule": "public"}),
+            2,
+            2,
+            &[],
+        );
+        assert!(p2 > p1);
+
+        let out = compute_state_delta(&state, room_nid, room_id, 1, p2 + 1, None, None).unwrap();
+        let types: std::collections::HashSet<String> = out
+            .iter()
+            .filter_map(|ev| ev.get("type").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert!(types.contains("m.room.power_levels"));
+        assert!(types.contains("m.room.join_rules"));
+        assert_eq!(out.len(), 2);
+    }
 }
