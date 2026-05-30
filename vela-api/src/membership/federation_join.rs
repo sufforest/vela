@@ -687,20 +687,23 @@ pub async fn send_join_v2(
 
     // Build the state + auth_chain response BEFORE persisting (so the
     // response reflects pre-join state per spec).
-    let state_events_before = match state.db.get_all_state_event_nids(room_nid) {
-        Ok(nids) => {
-            let mut evs = Vec::with_capacity(nids.len());
-            for nid in nids {
-                if let Ok(Some(eid)) = state.db.get_event_id_by_nid(nid)
-                    && let Some(j) = load_event_json_by_event_id(&state.db, &eid)
-                {
-                    evs.push(j);
+    let (state_events_before, state_event_ids): (Vec<Value>, HashSet<String>) =
+        match state.db.get_all_state_event_nids(room_nid) {
+            Ok(nids) => {
+                let mut evs = Vec::with_capacity(nids.len());
+                let mut ids = HashSet::with_capacity(nids.len());
+                for nid in nids {
+                    if let Ok(Some(eid)) = state.db.get_event_id_by_nid(nid)
+                        && let Some(j) = load_event_json_by_event_id(&state.db, &eid)
+                    {
+                        evs.push(j);
+                        ids.insert(eid);
+                    }
                 }
+                (evs, ids)
             }
-            evs
-        }
-        Err(_) => Vec::new(),
-    };
+            Err(_) => (Vec::new(), HashSet::new()),
+        };
     // Auth chain for the response: per spec, this is the transitive
     // closure of auth_events for EVERY state event being returned,
     // not just the join event's own auth_events. The join event's
@@ -730,8 +733,16 @@ pub async fn send_join_v2(
         }
     }
     let auth_chain_ids = auth_chain_including_seeds(&state.db, &chain_seeds).unwrap_or_default();
+    // State events already returned in `state` MUST NOT be repeated in
+    // `auth_chain` — Complement's test harness treats the returned
+    // state as the union of the two lists, so duplicates show up as
+    // unexpected extras during state checks. Auth chain is the
+    // transitive auth closure *not* present in the state we returned.
     let mut auth_chain_pdus: Vec<Value> = Vec::with_capacity(auth_chain_ids.len());
     for id in &auth_chain_ids {
+        if state_event_ids.contains(id) {
+            continue;
+        }
         if let Some(j) = load_event_json_by_event_id(&state.db, id) {
             auth_chain_pdus.push(j);
         }
@@ -798,7 +809,12 @@ pub async fn send_join_v2(
     resp.insert("state".into(), json!(response_state));
     resp.insert("event".into(), Value::Null);
     if partial_state {
-        resp.insert("partial_state".into(), json!(true));
+        // Spec name since Matrix 1.6 (joins-v2.yaml). The MSC3706-era
+        // unstable name was `partial_state`; peers on current spec
+        // ignore the legacy field and assume full state, defeating the
+        // fast-join optimisation. Emitting the stable name doesn't
+        // confuse legacy peers since they'd already fall back to /state.
+        resp.insert("members_omitted".into(), json!(true));
         resp.insert("servers_in_room".into(), json!([our_server]));
     }
     Ok(Json(Value::Object(resp)))
@@ -852,6 +868,28 @@ fn essential_member_state_keys(
         if let Some(sender) = ev.get("sender").and_then(|v| v.as_str()) {
             keep.insert(sender.to_string());
         }
+    }
+    // "Heroes" — up to HEROES_CAP joined members worth including so the
+    // joining server can render a room name without waiting for the
+    // background /state fill. Spec phrases this as "useful for
+    // generating a name"; we pick alphabetically so the choice is
+    // deterministic across replicas.
+    const HEROES_CAP: usize = 5;
+    let mut joined_state_keys: Vec<&str> = state_events_before
+        .iter()
+        .filter(|ev| {
+            ev.get("type").and_then(|v| v.as_str()) == Some("m.room.member")
+                && ev
+                    .get("content")
+                    .and_then(|c| c.get("membership"))
+                    .and_then(|m| m.as_str())
+                    == Some("join")
+        })
+        .filter_map(|ev| ev.get("state_key").and_then(|v| v.as_str()))
+        .collect();
+    joined_state_keys.sort();
+    for sk in joined_state_keys.into_iter().take(HEROES_CAP) {
+        keep.insert(sk.to_string());
     }
     keep
 }
@@ -1679,5 +1717,124 @@ mod tests {
                 "signature path rejected what should have been accepted: {msg}",
             );
         }
+    }
+
+    /// Synthesise a state-events list with `count` joined members named
+    /// `@u<NN>:example.com` plus a creator. Used by heroes/partial-state
+    /// tests to control what `essential_member_state_keys` sees without
+    /// driving a full send_join.
+    fn make_joined_members(prefix: &str, count: usize) -> Vec<Value> {
+        (0..count)
+            .map(|i| {
+                let user = format!("@{prefix}{i:02}:example.com");
+                json!({
+                    "type": "m.room.member",
+                    "state_key": user,
+                    "sender": user,
+                    "content": {"membership": "join"},
+                })
+            })
+            .collect()
+    }
+
+    /// Heroes — joined members included in a partial-state response so
+    /// the joining server can render a room name without waiting for
+    /// the background filler — are capped at 5 and chosen
+    /// alphabetically so the choice is deterministic across replicas.
+    #[tokio::test]
+    async fn partial_state_heroes_capped_and_alphabetic() {
+        let (state, _tmp, _room_id, _alice) =
+            make_room_with_join_rules("example.com", json!({"join_rule": "public"})).await;
+        // Find the room_nid that the fixture created.
+        let room_nid = state.db.get_nid("!room:example.com").unwrap().unwrap();
+
+        // 8 joined members, alphabetically deterministic. Heroes should
+        // pick the first 5.
+        let state_events = make_joined_members("u", 8);
+        let join_event = serde_json::Map::from_iter([
+            ("type".to_string(), json!("m.room.member")),
+            ("state_key".to_string(), json!("@charlie:remote.example")),
+            ("sender".to_string(), json!("@charlie:remote.example")),
+            ("content".to_string(), json!({"membership": "join"})),
+        ]);
+
+        let keep = essential_member_state_keys(&state, room_nid, &join_event, &state_events);
+
+        // First 5 of u00..u07 must be included; later ones must not.
+        for i in 0..5 {
+            let u = format!("@u{i:02}:example.com");
+            assert!(keep.contains(&u), "expected hero {u} in keep set");
+        }
+        for i in 5..8 {
+            let u = format!("@u{i:02}:example.com");
+            assert!(!keep.contains(&u), "{u} should have been dropped past cap");
+        }
+        // Plus the joiner himself.
+        assert!(keep.contains("@charlie:remote.example"));
+    }
+
+    /// Members in non-join states (leave / ban / invite / knock) MUST
+    /// NOT count as heroes — partial-state responses are about who's
+    /// "in the room" right now.
+    #[tokio::test]
+    async fn partial_state_heroes_skip_non_joined_members() {
+        let (state, _tmp, _room_id, _alice) =
+            make_room_with_join_rules("example.com", json!({"join_rule": "public"})).await;
+        let room_nid = state.db.get_nid("!room:example.com").unwrap().unwrap();
+
+        let mut state_events: Vec<Value> = vec![
+            json!({
+                "type": "m.room.member",
+                "state_key": "@joined:example.com",
+                "sender": "@joined:example.com",
+                "content": {"membership": "join"},
+            }),
+            json!({
+                "type": "m.room.member",
+                "state_key": "@left:example.com",
+                "sender": "@left:example.com",
+                "content": {"membership": "leave"},
+            }),
+            json!({
+                "type": "m.room.member",
+                "state_key": "@banned:example.com",
+                "sender": "@admin:example.com",
+                "content": {"membership": "ban"},
+            }),
+            json!({
+                "type": "m.room.member",
+                "state_key": "@invited:example.com",
+                "sender": "@inviter:example.com",
+                "content": {"membership": "invite"},
+            }),
+            json!({
+                "type": "m.room.member",
+                "state_key": "@knocked:example.com",
+                "sender": "@knocked:example.com",
+                "content": {"membership": "knock"},
+            }),
+        ];
+        // Add a non-member state event to ensure type filtering also
+        // works — random m.room.topic should not be treated as a hero.
+        state_events.push(json!({
+            "type": "m.room.topic",
+            "state_key": "",
+            "sender": "@joined:example.com",
+            "content": {"topic": "hi"},
+        }));
+
+        let join_event = serde_json::Map::from_iter([
+            ("state_key".to_string(), json!("@charlie:remote.example")),
+            ("sender".to_string(), json!("@charlie:remote.example")),
+            ("content".to_string(), json!({"membership": "join"})),
+        ]);
+
+        let keep = essential_member_state_keys(&state, room_nid, &join_event, &state_events);
+
+        assert!(keep.contains("@joined:example.com"));
+        assert!(!keep.contains("@left:example.com"));
+        assert!(!keep.contains("@banned:example.com"));
+        assert!(!keep.contains("@invited:example.com"));
+        assert!(!keep.contains("@knocked:example.com"));
     }
 }
