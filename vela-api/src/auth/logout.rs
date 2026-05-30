@@ -196,4 +196,91 @@ mod tests {
             .collect();
         assert_eq!(bob_devices, vec!["BOB_DEV".to_string()]);
     }
+
+    /// MSC3890: after logout the user's
+    /// `org.matrix.msc3890.local_notification_settings.{device_id}`
+    /// account_data entry must be tombstoned (empty content).
+    #[tokio::test]
+    async fn logout_tombstones_msc3890_notification_settings_for_device() {
+        let (state, _tmp) = build_test_state();
+        let (alice_nid, dev1, _tok) = register(&state, "@alice:example.com");
+        let dtype = format!("org.matrix.msc3890.local_notification_settings.{dev1}");
+
+        // Pre-seed a non-empty setting for the device.
+        state
+            .db
+            .set_account_data(alice_nid, &dtype, &serde_json::json!({"is_silenced": true}))
+            .unwrap();
+        let pre = state.db.get_account_data(alice_nid, &dtype).unwrap();
+        assert_eq!(
+            pre.as_ref()
+                .and_then(|v| v.pointer("/is_silenced"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "pre-condition: entry exists with content"
+        );
+
+        let _ = logout(
+            State(state.clone()),
+            AuthenticatedUser {
+                user_nid: alice_nid,
+                user_id: "@alice:example.com".into(),
+                device_id: dev1.clone(),
+                appservice_nid: None,
+            },
+        )
+        .await
+        .expect("logout succeeds");
+
+        let post = state.db.get_account_data(alice_nid, &dtype).unwrap();
+        assert_eq!(
+            post.as_ref()
+                .and_then(|v| v.as_object())
+                .map(|o| o.is_empty()),
+            Some(true),
+            "logout must tombstone the per-device notification settings: {post:?}"
+        );
+    }
+
+    /// `logout/all` tombstones the per-device entry for EVERY device,
+    /// not just the caller's. Otherwise other devices' clients would
+    /// still see their settings on the next /sync.
+    #[tokio::test]
+    async fn logout_all_tombstones_msc3890_for_every_device() {
+        let (state, _tmp) = build_test_state();
+        let (alice_nid, dev1, _tok1) = register(&state, "@alice:example.com");
+        let dev2 = "DEV2";
+        state.db.create_device(alice_nid, dev2).unwrap();
+        let _tok2 = state.db.create_token(alice_nid, dev2).unwrap();
+
+        for d in [&dev1, &dev2.to_string()] {
+            let dtype = format!("org.matrix.msc3890.local_notification_settings.{d}");
+            state
+                .db
+                .set_account_data(alice_nid, &dtype, &serde_json::json!({"v": 1}))
+                .unwrap();
+        }
+
+        let _ = logout_all(
+            State(state.clone()),
+            AuthenticatedUser {
+                user_nid: alice_nid,
+                user_id: "@alice:example.com".into(),
+                device_id: dev1.clone(),
+                appservice_nid: None,
+            },
+        )
+        .await
+        .expect("logout_all succeeds");
+
+        for d in [&dev1, &dev2.to_string()] {
+            let dtype = format!("org.matrix.msc3890.local_notification_settings.{d}");
+            let v = state.db.get_account_data(alice_nid, &dtype).unwrap();
+            assert_eq!(
+                v.as_ref().and_then(|v| v.as_object()).map(|o| o.is_empty()),
+                Some(true),
+                "device {d} should be tombstoned: {v:?}"
+            );
+        }
+    }
 }
