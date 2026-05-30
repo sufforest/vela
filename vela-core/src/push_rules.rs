@@ -606,6 +606,60 @@ mod tests {
         assert!(!glob_match("exact", "inexact"));
     }
 
+    /// `?` matches exactly one character; `*` matches zero or more.
+    /// Exercises the MSC4155-style globs like `@user-?*`.
+    #[test]
+    fn glob_match_question_mark_single_char() {
+        assert!(glob_match("a?c", "abc"));
+        assert!(glob_match("a?c", "axc"));
+        assert!(!glob_match("a?c", "ac"), "? must consume one char");
+        assert!(!glob_match("a?c", "abbc"), "? consumes exactly one");
+    }
+
+    #[test]
+    fn glob_match_combined_wildcards() {
+        // @user-?* — `@user-` literal, then exactly one char, then
+        // anything. The single-char slot is content-agnostic: `:` is
+        // a valid match for `?` here.
+        assert!(glob_match("@user-?*", "@user-1"));
+        assert!(glob_match("@user-?*", "@user-1:hs2"));
+        assert!(glob_match("@user-?*", "@user-:hs2"));
+        assert!(!glob_match("@user-?*", "@user-"));
+        assert!(!glob_match("@user-?*", "@admin-1"));
+    }
+
+    #[test]
+    fn glob_match_runs_of_stars_collapse() {
+        // `**` shouldn't blow up exponentially or change semantics.
+        assert!(glob_match("a**b", "ab"));
+        assert!(glob_match("a**b", "axxxxxxxxb"));
+        assert!(glob_match("**", ""));
+        assert!(glob_match("**", "anything"));
+    }
+
+    #[test]
+    fn glob_match_case_insensitive() {
+        assert!(glob_match("FOO*", "foobar"));
+        assert!(glob_match("*BAR", "FooBar"));
+        assert!(glob_match("e?act", "EXACT"));
+    }
+
+    #[test]
+    fn glob_match_unicode_input_doesnt_panic() {
+        // Multi-byte chars in the input would break naive byte
+        // indexing; the matcher walks chars so this should match.
+        assert!(glob_match("h*ø*", "høllø"));
+        assert!(glob_match("?", "Ω"));
+        assert!(!glob_match("?", "ΩΩ"));
+    }
+
+    #[test]
+    fn glob_match_empty_pattern_matches_empty_input() {
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "x"));
+        assert!(glob_match("*", ""));
+    }
+
     #[test]
     fn member_count_comparisons() {
         assert!(member_count_matches(2, "2"));
