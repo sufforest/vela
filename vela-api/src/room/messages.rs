@@ -289,6 +289,32 @@ pub async fn get_messages(
         });
     }
 
+    // MSC3874: filter /messages by `m.relates_to.rel_type`. The unstable
+    // names `org.matrix.msc3874.rel_types` / `not_rel_types` show up
+    // under `room.timeline` in the RoomEventFilter shape. `rel_types`
+    // keeps only events whose relation matches one of the listed types
+    // (events with no `m.relates_to` drop out); `not_rel_types`
+    // excludes matches and keeps everything else, including unrelated
+    // events.
+    if let Some(rel_types) = filter_rel_types(query.filter.as_deref(), false) {
+        chunk.retain(|ev| {
+            let rel_type = ev
+                .pointer("/content/m.relates_to/rel_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            rel_types.iter().any(|t| t == rel_type)
+        });
+    }
+    if let Some(rel_types) = filter_rel_types(query.filter.as_deref(), true) {
+        chunk.retain(|ev| {
+            let rel_type = ev
+                .pointer("/content/m.relates_to/rel_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            !rel_types.iter().any(|t| t == rel_type)
+        });
+    }
+
     // Spec: omit `end` when there are no further events. Returning
     // an empty string leaves Matrix clients pin-polling forever.
     let mut response = serde_json::Map::new();
@@ -330,6 +356,29 @@ fn filter_contains_url(filter_str: Option<&str>) -> Option<bool> {
         .and_then(|x| x.as_bool());
     let top = v.get("contains_url").and_then(|x| x.as_bool());
     nested.or(top)
+}
+
+/// MSC3874: pull `org.matrix.msc3874.rel_types` or
+/// `org.matrix.msc3874.not_rel_types` out of the inline RoomEventFilter
+/// (under `room.timeline` or top-level). `exclude=false` returns the
+/// inclusion list; `exclude=true` returns the exclusion list. Returning
+/// `None` means the field isn't present.
+fn filter_rel_types(filter_str: Option<&str>, exclude: bool) -> Option<Vec<String>> {
+    let s = filter_str?;
+    let v: Value = serde_json::from_str(s).ok()?;
+    let field = if exclude {
+        "org.matrix.msc3874.not_rel_types"
+    } else {
+        "org.matrix.msc3874.rel_types"
+    };
+    let nested_path = format!("/room/timeline/{field}");
+    let raw = v.pointer(&nested_path).or_else(|| v.get(field));
+    let arr = raw?.as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect(),
+    )
 }
 
 /// Returns true if the inline JSON filter requests lazy loading of
