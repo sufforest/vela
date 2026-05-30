@@ -37,7 +37,29 @@ pub async fn logout(
         .db
         .delete_device(user.user_nid, &user.device_id)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    purge_msc3890_local_notification_settings(&state, user.user_nid, &user.device_id);
     Ok(Json(json!({})))
+}
+
+/// MSC3890: when a device goes away the associated
+/// `org.matrix.msc3890.local_notification_settings.{device_id}` global
+/// account_data entry is no longer meaningful, so we tombstone it
+/// (empty content) so other devices learn the device is gone. Best-
+/// effort — logout still succeeds if the account_data write fails.
+fn purge_msc3890_local_notification_settings(state: &AppState, user_nid: u64, device_id: &str) {
+    let dtype = format!("org.matrix.msc3890.local_notification_settings.{device_id}");
+    let _ = state.db.set_account_data(user_nid, &dtype, &json!({}));
+    crate::router::notify_user(state, user_nid);
+}
+
+/// Public wrapper so `auth::devices::delete_device` can share the same
+/// logic without exposing the helper to the whole crate.
+pub fn purge_msc3890_local_notification_settings_pub(
+    state: &AppState,
+    user_nid: u64,
+    device_id: &str,
+) {
+    purge_msc3890_local_notification_settings(state, user_nid, device_id);
 }
 
 /// `POST /_matrix/client/v3/logout/all`
@@ -63,6 +85,7 @@ pub async fn logout_all(
                 .db
                 .delete_device(user.user_nid, device_id)
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+            purge_msc3890_local_notification_settings(&state, user.user_nid, device_id);
         }
     }
     Ok(Json(json!({})))
