@@ -1059,7 +1059,14 @@ fn build_room_sync_for_user(
         (Some(_), None) => false,    // never transitioned in this process
         (Some(s), Some(p)) => p > s, // a transition happened since the last sync
     };
-    if typing_changed_since {
+    // Also (re-)emit the typing snapshot when the room has new timeline
+    // events to deliver: clients running tests like TestACLsForEDUs
+    // expect a typing event to coexist with the message that woke the
+    // sync. Without this, the typing transition fires once on Response
+    // #1, the message arrives in Response #N, and no single response
+    // ever carries both.
+    let timeline_has_new = !timeline_events.is_empty();
+    if typing_changed_since || timeline_has_new {
         let typing_user_nids = get_typing_users(state, room_nid);
         let mut user_ids = Vec::new();
         for nid in &typing_user_nids {
@@ -1071,12 +1078,15 @@ fn build_room_sync_for_user(
                 user_ids.push(Value::String(uid));
             }
         }
-        // Emit empty user_ids only after an explicit stop transition
-        // (since.is_some()), per TestTyping/Typing_can_be_explicitly_stopped.
-        // On initial sync we'd otherwise inject an empty typing event
-        // into every room — TestACLsForEDUs asserts the ACL'd room has
-        // zero ephemeral events, and the empty snapshot would count.
-        let emit_empty_is_ok = since.is_some();
+        // Emit empty user_ids only when this is incremental sync AND a
+        // typing transition fired (typically an explicit stop), per
+        // TestTyping/Typing_can_be_explicitly_stopped. On initial sync
+        // we'd otherwise inject an empty typing event into every room —
+        // TestACLsForEDUs asserts the ACL'd room has zero ephemeral
+        // events, and the empty snapshot would count. Re-emitting solely
+        // because timeline has new events doesn't need an empty snapshot
+        // — just skip when nobody's typing.
+        let emit_empty_is_ok = since.is_some() && typing_changed_since;
         if !user_ids.is_empty() || emit_empty_is_ok {
             ephemeral_events.push(json!({
                 "type": "m.typing",
