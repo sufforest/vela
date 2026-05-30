@@ -8,7 +8,7 @@ pub mod sliding_sync;
 pub mod thread_subscriptions;
 pub mod typing;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::middleware::json::Json;
@@ -748,6 +748,92 @@ fn load_timeline_event(
     crate::room::messages::load_client_event_with_relations(state, event_nid, room_id, caller)
 }
 
+/// Per spec, `/sync`'s `state` field on incremental sync is the delta
+/// between the client's last sync position and the start of the
+/// returned timeline batch. Vela walks `room_timeline` in
+/// `(since_exclusive, upper_exclusive)` (so the caller passes
+/// `since_pos + 1` and `first_timeline_pos`), keeps only state events,
+/// dedupes on `(type, state_key)` keeping the latest position, and
+/// loads them as client events.
+///
+/// Capped at `DELTA_STATE_SCAN_LIMIT` events scanned to keep wide gap
+/// catch-ups from doing an unbounded walk. Beyond the cap the client
+/// keeps any stale state until they do a full sync — strictly worse
+/// than current behaviour (which always returns empty) but in line
+/// with how Synapse treats deeply-stale clients.
+fn compute_state_delta(
+    state: &AppState,
+    room_nid: u64,
+    room_id: &str,
+    since_exclusive: u64,
+    upper_exclusive: u64,
+    user_nid: Option<u64>,
+    device_id: Option<&str>,
+) -> Result<Vec<Value>, ApiError> {
+    const DELTA_STATE_SCAN_LIMIT: usize = 500;
+    if since_exclusive >= upper_exclusive {
+        return Ok(Vec::new());
+    }
+    let entries = state
+        .db
+        .get_timeline_range(
+            room_nid,
+            since_exclusive,
+            upper_exclusive,
+            DELTA_STATE_SCAN_LIMIT,
+        )
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut latest_by_slot: HashMap<(String, String), (u64, u64)> = HashMap::new();
+    for (pos, nid) in &entries {
+        // The event header has type_nid + state_key_nid as u64; a
+        // state event has a non-zero state_key_nid in the events CF
+        // header. Re-fetch just enough to decide.
+        let (header, _) = match state
+            .db
+            .get_event(*nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        {
+            Some(h) => h,
+            None => continue,
+        };
+        if header.state_key_nid == 0 {
+            continue;
+        }
+        let etype = state
+            .db
+            .resolve_nid(header.type_nid)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let skey = state
+            .db
+            .resolve_nid(header.state_key_nid)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        latest_by_slot
+            .entry((etype, skey))
+            .and_modify(|cur| {
+                if *pos > cur.0 {
+                    *cur = (*pos, *nid);
+                }
+            })
+            .or_insert((*pos, *nid));
+    }
+    let mut out = Vec::with_capacity(latest_by_slot.len());
+    for (_, (_, nid)) in latest_by_slot {
+        if let Some(mut ev) = load_client_event(state, nid, room_id)? {
+            attach_membership_for_user(state, &mut ev, user_nid, nid);
+            attach_txn_id_for_user(state, &mut ev, user_nid, device_id, nid);
+            out.push(ev);
+        }
+    }
+    Ok(out)
+}
+
 fn build_room_sync_for_user(
     state: &AppState,
     room_nid: u64,
@@ -930,8 +1016,26 @@ fn build_room_sync_for_user(
                     }
                 }
 
+                // State delta: events with state_key that changed in
+                // the range (since_pos, first_pos). Per spec, /sync's
+                // `state` field is the delta between the client's last
+                // sync and the start of the timeline. Without this,
+                // power-level changes, room name updates, etc. that
+                // happened while the client was offline never reach
+                // the client until they do a full sync.
+                let delta_upper = first_pos.unwrap_or(safe_pos + 1);
+                let state_events = compute_state_delta(
+                    state,
+                    room_nid,
+                    room_id,
+                    since_pos + 1,
+                    delta_upper,
+                    user_nid,
+                    device_id,
+                )?;
+
                 let prev_batch = first_pos.map(|p| format!("s{p}"));
-                (vec![], timeline_events, limited, prev_batch)
+                (state_events, timeline_events, limited, prev_batch)
             }
         }
     };
