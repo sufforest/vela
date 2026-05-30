@@ -178,6 +178,19 @@ impl FederationSender {
             destinations.push(extra);
         }
 
+        // MSC3902 partial-state rooms: the local membership index
+        // doesn't yet list everyone the resident server told us is in
+        // the room. Union in `servers_in_room` from
+        // `set_partial_state_join` so leaves / messages / EDUs reach
+        // the resident (and other peers) before the filler catches up.
+        if let Ok((true, servers)) = self.db.get_partial_state_info(room_nid) {
+            for s in servers {
+                if s != self.our_server_name && !destinations.iter().any(|d| d == &s) {
+                    destinations.push(s);
+                }
+            }
+        }
+
         if destinations.is_empty() {
             return;
         }

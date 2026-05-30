@@ -795,19 +795,37 @@ pub async fn leave_room(
         .get_membership(room_nid, user.user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
+    // /leave is idempotent — a client re-issuing /leave on a room
+    // they've already left (or were banned from) gets 200 OK per the
+    // c2s spec. Only the "never been here" states (None / not a
+    // member) get rejection. Without this the partial-state Complement
+    // Destroy hook 403s when it tries to leave a room the test body
+    // already left.
+    if matches!(current, Some(0) | Some(3)) {
+        return Ok(Json(json!({})));
+    }
     if !matches!(current, Some(1) | Some(2) | Some(4)) {
-        // must be join, invite, or knock to leave
         return Err(VelaError::Forbidden("not in this room".into()).into());
     }
 
-    // If the room was created on a different server, the leave needs to go
-    // through the federation `make_leave`/`send_leave` flow so the resident
-    // server adds it to the authoritative DAG. We then persist the
-    // returned-signed event locally. Otherwise (we're the resident, or it's
-    // a fully-local room) emit + broadcast as before.
+    // If the room was created on a different server, the leave
+    // normally goes through the federation `make_leave`/`send_leave`
+    // flow so the resident server adds it to the authoritative DAG.
+    // One exception: partial-state joins (MSC3902). We already hold
+    // the user's own membership + the auth state locally, so we can
+    // build and sign the leave directly and federate it through the
+    // normal /send broadcast. Calling make_leave during the filler's
+    // catch-up would race against the resync and the resident often
+    // responds with garbage. Test:
+    // `TestPartialStateJoin/Leave_during_resync/does_not_wait_for_resync`.
     let resident_server = creator_server(&state, room_nid)?;
+    let (is_partial_state, _servers) = state
+        .db
+        .get_partial_state_info(room_nid)
+        .unwrap_or((false, Vec::new()));
     if let Some(rs) = resident_server
         && rs != state.config.server_name
+        && !is_partial_state
     {
         do_remote_leave(&state, &user, room_nid, &room_id, &rs).await?;
         return Ok(Json(json!({})));
