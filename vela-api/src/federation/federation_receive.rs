@@ -607,7 +607,19 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
     };
     let cs_fn = |t: &str, sk: &str| current_state.get(&(t.to_string(), sk.to_string()));
     let cs_outcome = check_auth(&effective_pdu, &cs_fn);
-    let soft_failed = cs_outcome.is_err();
+    // Partial-state rooms hold an incomplete `current_state` while the
+    // filler is catching up — the resident has a power_levels event or
+    // member event our local map doesn't yet have. Soft-failing on that
+    // basis blocks legitimate state changes (a remote ban during resync
+    // never reaches /sync). Treat partial-state Check 6 failures as
+    // accepts; full state reconciliation happens at filler completion.
+    let cs_failed = cs_outcome.is_err();
+    let is_partial_state = state
+        .db
+        .get_partial_state_info(room_nid)
+        .map(|(p, _)| p)
+        .unwrap_or(false);
+    let soft_failed = cs_failed && !is_partial_state;
     if soft_failed {
         let reason = match &cs_outcome {
             Err(AuthError::Rejected(r)) => r.clone(),
