@@ -3086,4 +3086,102 @@ mod tests {
             None
         );
     }
+
+    /// /leave on a room the caller is already left from returns 200 OK.
+    /// The c2s spec mandates the idempotency, and Complement's
+    /// partial-state Destroy hook depends on it.
+    #[tokio::test]
+    async fn leave_room_is_idempotent_for_already_left_user() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!already_left:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let user_id = "@alice:example.com";
+        let user_nid = db.get_or_create_nid(user_id).unwrap();
+        db.set_membership(room_nid, user_nid, 0).unwrap(); // leave
+        let user = AuthenticatedUser {
+            user_nid,
+            user_id: user_id.into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        };
+        let res = leave_room(State(state.clone()), user, Path(room_id.to_string()))
+            .await
+            .expect("idempotent leave returns 200");
+        assert_eq!(res.0, json!({}));
+    }
+
+    /// /leave on a room where the caller was banned (membership=3)
+    /// must also short-circuit to 200 — same spec contract.
+    #[tokio::test]
+    async fn leave_room_is_idempotent_for_banned_user() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!banned:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let user_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        db.set_membership(room_nid, user_nid, 3).unwrap(); // ban
+        let user = AuthenticatedUser {
+            user_nid,
+            user_id: "@alice:example.com".into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        };
+        let res = leave_room(State(state.clone()), user, Path(room_id.to_string()))
+            .await
+            .expect("idempotent leave on banned user");
+        assert_eq!(res.0, json!({}));
+    }
+
+    /// /leave on a room the user has never been a member of returns
+    /// 403 M_FORBIDDEN, distinct from the idempotent already-left
+    /// path. This pins the negative case so a future refactor doesn't
+    /// accidentally allow strangers to "leave" arbitrary rooms.
+    #[tokio::test]
+    async fn leave_room_rejects_non_member() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!notme:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let user_nid = db.get_or_create_nid("@stranger:example.com").unwrap();
+        // No set_membership call — user has never been here.
+        let _ = room_nid;
+        let user = AuthenticatedUser {
+            user_nid,
+            user_id: "@stranger:example.com".into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        };
+        let err = leave_room(State(state.clone()), user, Path(room_id.to_string()))
+            .await
+            .expect_err("stranger can't leave");
+        let msg = format!("{}", err.0);
+        assert!(
+            msg.contains("not in this room"),
+            "want forbidden, got {msg}"
+        );
+    }
+
+    /// Unknown room_id still surfaces as 404 (and NOT as the idempotent
+    /// 200 path), so probing for room existence remains a not-found.
+    #[tokio::test]
+    async fn leave_room_returns_404_for_unknown_room() {
+        let (state, _tmp) = build_test_state();
+        let user_nid = state.db.get_or_create_nid("@alice:example.com").unwrap();
+        let user = AuthenticatedUser {
+            user_nid,
+            user_id: "@alice:example.com".into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        };
+        let err = leave_room(
+            State(state.clone()),
+            user,
+            Path("!never-existed:example.com".to_string()),
+        )
+        .await
+        .expect_err("unknown room is 404");
+        let msg = format!("{}", err.0);
+        assert!(msg.contains("not found"), "want not-found, got {msg}");
+    }
 }
