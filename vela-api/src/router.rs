@@ -124,6 +124,14 @@ pub struct ServerConfig {
     pub presence: PresenceConfig,
     /// Outbound push gateway posture. See `PushConfig`.
     pub push: PushConfig,
+    /// MSC4140 max delay (ms) accepted on `?org.matrix.msc4140.delay=`.
+    /// Caps how far into the future a client can schedule an event.
+    /// Default: 7 days. Setting `0` disables the feature — every
+    /// delayed-send PUT fails 400. Operators wanting a tighter
+    /// window (e.g. a low-volume deployment that doesn't want
+    /// pending events outliving a typical maintenance cycle) shrink
+    /// this to suit.
+    pub max_delay_ms: u64,
 }
 
 /// Presence auto-decay configuration.

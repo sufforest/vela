@@ -44,19 +44,29 @@
 # from a v2 creation, which is server-specific.
 ^TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version$
 
-# `TestCorruptedAuthChain` exercises a specific resolution path the
-# mock server registers handlers for: a single `/state_ids` call at
-# the boundary event (the prev_event vela can't fetch via
-# `/get_missing_events`), followed by `/event` lookups for each id
-# in `auth_chain_ids`. Vela now has the `/state_ids` + `/event`
-# fallback (used when `/event_auth` returns nothing usable), but
-# our BFS for finding the boundary doesn't always land on the
-# exact event the mock expects — it can walk past once an
-# intermediate prev got persisted as an outlier. Real synapse
-# peers serve `/state_ids` for any event_id we ask about, so the
-# interop value is present even though this specific Complement
-# assertion still mismatches. Re-evaluate when we tighten the
-# boundary picker.
+# `TestCorruptedAuthChain` asserts a synapse-specific resolution
+# strategy on the receive path, not vela's BFS quality.
+#
+# The mock server registers handlers for /get_missing_events,
+# /state_ids, and /event. Synapse's check 5 (state-at-event) always
+# pulls state from the peer when local prev snapshots are empty,
+# which is what the test waits for. Vela's check 5 falls through to
+# auth_events-derived state when prev snapshots are empty (see
+# `compute_state_at_event` in `federation_receive.rs` — it returns
+# `Ok(None)` and `process_pdu` then validates against the trigger's
+# own declared `auth_events`, which are already on disk via
+# send_join). That path is spec-compliant and more efficient: vela
+# accepts the trigger without making the /state_ids call the test
+# is waiting for. Synapse, dendrite (skipped upstream), and any
+# other implementation that takes the lighter path lose the test
+# for the same reason.
+#
+# The /state_ids + /event fallback vela ships (PR #118) handles the
+# case where Check 4 (auth_events) itself needs the peer's auth
+# chain — that's the path real peers exercise. The Complement test
+# isn't structured to exercise it; closing this test would require
+# changing vela's check 5 fall-through to always demand peer state
+# even when a lighter path suffices.
 ^TestCorruptedAuthChain$
 
 # --- Deferred spec bugs ---

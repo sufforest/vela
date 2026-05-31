@@ -35,9 +35,11 @@ pub const DELAY_QUERY_PARAM: &str = "org.matrix.msc4140.delay";
 /// and fire.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Maximum allowable delay (ms). Bound it so a malicious / buggy
-/// client can't pin events for years and exhaust the queue.
-const MAX_DELAY_MS: u64 = 7 * 24 * 60 * 60 * 1000; // 7 days
+/// Default for `ServerConfig::max_delay_ms` when the operator
+/// hasn't overridden it. Bounds how far into the future a client
+/// can schedule an event — without a cap a buggy or hostile client
+/// could pin events for years.
+pub const DEFAULT_MAX_DELAY_MS: u64 = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelayedEventRecord {
@@ -359,29 +361,18 @@ pub fn schedule_state(
     Ok(id)
 }
 
-/// Parse the `org.matrix.msc4140.delay` query param. Returns
-/// `Ok(None)` when not present, `Ok(Some(ms))` when valid, `Err`
-/// when the value is malformed or exceeds `MAX_DELAY_MS`.
-pub fn parse_delay(raw: &str) -> Result<Option<u64>, ApiError> {
-    for pair in raw.split('&') {
-        let mut iter = pair.splitn(2, '=');
-        let key = iter.next().unwrap_or("");
-        let val = iter.next().unwrap_or("");
-        if key != DELAY_QUERY_PARAM {
-            continue;
-        }
-        let ms: u64 = val
-            .parse()
-            .map_err(|_| ApiError(VelaError::InvalidParam(format!("delay: {val}"))))?;
-        if ms == 0 || ms > MAX_DELAY_MS {
-            return Err(VelaError::InvalidParam(format!(
-                "delay {ms}ms out of range [1, {MAX_DELAY_MS}]"
-            ))
-            .into());
-        }
-        return Ok(Some(ms));
+/// Validate the `?org.matrix.msc4140.delay=` value against the
+/// operator-configured maximum. Send handlers call this before
+/// scheduling so a 400 surfaces at the API boundary rather than at
+/// fire time.
+pub fn validate_delay_ms(delay_ms: u64, max_delay_ms: u64) -> Result<(), ApiError> {
+    if delay_ms == 0 || delay_ms > max_delay_ms {
+        return Err(VelaError::InvalidParam(format!(
+            "delay {delay_ms}ms out of range [1, {max_delay_ms}]"
+        ))
+        .into());
     }
-    Ok(None)
+    Ok(())
 }
 
 // ============================================================
@@ -612,30 +603,35 @@ pub fn new_store() -> Arc<DelayedEventStore> {
 mod tests {
     use super::*;
 
+    /// Range bound: any value in `[1, max]` accepted; `0` and
+    /// `max+1` rejected.
     #[test]
-    fn parse_delay_accepts_valid_values() {
-        assert_eq!(
-            parse_delay("org.matrix.msc4140.delay=1500").unwrap(),
-            Some(1500)
-        );
-        assert_eq!(parse_delay("foo=bar").unwrap(), None);
-        assert_eq!(parse_delay("").unwrap(), None);
+    fn validate_delay_ms_enforces_inclusive_range() {
+        let max = 10_000;
+        assert!(validate_delay_ms(1, max).is_ok());
+        assert!(validate_delay_ms(5_000, max).is_ok());
+        assert!(validate_delay_ms(max, max).is_ok());
+        assert!(validate_delay_ms(0, max).is_err());
+        assert!(validate_delay_ms(max + 1, max).is_err());
     }
 
+    /// Operators can tighten the cap. A delay accepted under the
+    /// default would be rejected under a shorter operator cap.
     #[test]
-    fn parse_delay_rejects_zero() {
-        assert!(parse_delay("org.matrix.msc4140.delay=0").is_err());
+    fn validate_delay_ms_honours_lower_operator_cap() {
+        let strict = 1_000;
+        assert!(validate_delay_ms(500, strict).is_ok());
+        assert!(validate_delay_ms(1_500, strict).is_err());
     }
 
+    /// Bound-fire: at exactly `DEFAULT_MAX_DELAY_MS` the validator
+    /// accepts; one millisecond over and it errors. Pins the
+    /// inclusive boundary so a future tweak that turns it
+    /// half-open is caught.
     #[test]
-    fn parse_delay_rejects_overflow() {
-        let v = MAX_DELAY_MS + 1;
-        assert!(parse_delay(&format!("org.matrix.msc4140.delay={v}")).is_err());
-    }
-
-    #[test]
-    fn parse_delay_rejects_non_numeric() {
-        assert!(parse_delay("org.matrix.msc4140.delay=abc").is_err());
+    fn validate_delay_ms_default_cap_boundary() {
+        assert!(validate_delay_ms(DEFAULT_MAX_DELAY_MS, DEFAULT_MAX_DELAY_MS).is_ok());
+        assert!(validate_delay_ms(DEFAULT_MAX_DELAY_MS + 1, DEFAULT_MAX_DELAY_MS).is_err());
     }
 
     #[test]
