@@ -222,10 +222,22 @@ fn check_create(event: &Pdu) -> AuthResult {
 }
 
 fn is_recognised_room_version(v: &str) -> bool {
-    // We support only v12 for now, but accept the published stable versions per spec.
+    // Accept the published stable versions (per spec, even ones we don't
+    // create rooms in) plus the unstable versions we explicitly support.
     matches!(
         v,
-        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "10" | "11" | "12"
+        "1" | "2"
+            | "3"
+            | "4"
+            | "5"
+            | "6"
+            | "7"
+            | "8"
+            | "9"
+            | "10"
+            | "11"
+            | "12"
+            | "org.matrix.msc3757.10"
     )
 }
 
