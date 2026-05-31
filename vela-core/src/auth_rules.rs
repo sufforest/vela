@@ -106,13 +106,38 @@ pub fn check_auth(event: &Pdu, state: StateFn<'_>) -> AuthResult {
     }
 
     // --- Rule 9: state_key starting with "@" must match sender ---
+    //
+    // MSC3757 (org.matrix.msc3757.10) widens this: a state_key of
+    // shape `@<localpart>:<server>[_<suffix>]` is authorised by the
+    // embedded `<mxid>` rather than by exact equality with sender,
+    // and room creators may write any owned-state state_key on
+    // behalf of anyone. The malformed-mxid and bad-suffix shapes are
+    // caught at the CS-API layer with 400 M_BAD_JSON before they
+    // ever reach auth — here we just enforce the "right user" check.
     if let Some(sk) = &event.state_key
         && sk.starts_with('@')
-        && sk != &event.sender
     {
-        return Err(AuthError::reject(
-            "state_key starting with @ must match sender",
-        ));
+        let room_version_str = create
+            .content
+            .get("room_version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if room_version_str == "org.matrix.msc3757.10" {
+            let owner = owned_state_key_owner(sk);
+            let sender_is_creator = room_creators(create).contains(&event.sender);
+            match owner {
+                Some(o) if o == event.sender || sender_is_creator => {}
+                _ => {
+                    return Err(AuthError::reject(
+                        "owned state_key sender is neither owner nor room creator",
+                    ));
+                }
+            }
+        } else if sk != &event.sender {
+            return Err(AuthError::reject(
+                "state_key starting with @ must match sender",
+            ));
+        }
     }
 
     // --- Rule 10: m.room.power_levels ---
@@ -197,10 +222,22 @@ fn check_create(event: &Pdu) -> AuthResult {
 }
 
 fn is_recognised_room_version(v: &str) -> bool {
-    // We support only v12 for now, but accept the published stable versions per spec.
+    // Accept the published stable versions (per spec, even ones we don't
+    // create rooms in) plus the unstable versions we explicitly support.
     matches!(
         v,
-        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "10" | "11" | "12"
+        "1" | "2"
+            | "3"
+            | "4"
+            | "5"
+            | "6"
+            | "7"
+            | "8"
+            | "9"
+            | "10"
+            | "11"
+            | "12"
+            | "org.matrix.msc3757.10"
     )
 }
 
@@ -955,6 +992,41 @@ fn get_join_rule<'a>(state: StateFn<'a>) -> &'a str {
     state("m.room.join_rules", "")
         .and_then(|ev| ev.join_rule())
         .unwrap_or("invite")
+}
+
+/// MSC3757 state_key parser. Returns the owner mxid (`@<localpart>:<server>`)
+/// when the state_key matches `@<localpart>:<server>[_<suffix>]`; returns
+/// `None` for malformed forms (no `:`, empty localpart/server, or non-host
+/// characters between `:<server>` and the suffix delimiter).
+///
+/// Notes on the grammar:
+/// - localpart may itself contain `_`, so we cannot split on the FIRST `_`
+///   in the whole state_key. We split at the first `:`, then look for `_`
+///   only in the server-portion.
+/// - server hostnames + optional ports use alphanumerics, `.`, `-`, `:`,
+///   and `[` `]` (IPv6). Anything else after `:<server>` that isn't the
+///   `_<suffix>` delimiter signals a malformed key — callers translate
+///   this to `400 M_BAD_JSON`.
+pub fn owned_state_key_owner(state_key: &str) -> Option<String> {
+    let rest = state_key.strip_prefix('@')?;
+    let (localpart, server_portion) = rest.split_once(':')?;
+    if localpart.is_empty() {
+        return None;
+    }
+    let server_name = match server_portion.find('_') {
+        Some(idx) => &server_portion[..idx],
+        None => server_portion,
+    };
+    if server_name.is_empty() {
+        return None;
+    }
+    if !server_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+    {
+        return None;
+    }
+    Some(format!("@{localpart}:{server_name}"))
 }
 
 /// Returns the set of user IDs who are creators of the room (v12).
@@ -1831,6 +1903,213 @@ mod tests {
         );
         let result = check_auth(&member, &sf);
         assert!(matches!(result, Err(AuthError::Rejected(_))));
+    }
+
+    // ====================================================================
+    // MSC3757 owned-state state_key parser + rule 9 integration
+    // ====================================================================
+
+    /// Well-formed owner state_keys round-trip to the embedded mxid,
+    /// whether or not a suffix is present. Server `:port` and IPv6
+    /// `[::1]` survive — we only split on the `_` delimiter.
+    #[test]
+    fn owned_state_key_parses_well_formed() {
+        assert_eq!(
+            owned_state_key_owner("@alice:example.com"),
+            Some("@alice:example.com".to_string())
+        );
+        assert_eq!(
+            owned_state_key_owner("@alice:example.com_suffix"),
+            Some("@alice:example.com".to_string())
+        );
+        // Localpart contains `_` — must NOT be confused with suffix delimiter.
+        assert_eq!(
+            owned_state_key_owner("@my_user:example.com"),
+            Some("@my_user:example.com".to_string())
+        );
+        // Port survives.
+        assert_eq!(
+            owned_state_key_owner("@alice:example.com:8080_thing"),
+            Some("@alice:example.com:8080".to_string())
+        );
+    }
+
+    /// Malformed shapes return `None` so the CS-API layer can map
+    /// them to `400 M_BAD_JSON`. The spec test `TestMSC3757OwnedState`
+    /// pins these exactly.
+    #[test]
+    fn owned_state_key_rejects_malformed() {
+        // No `:` at all (`@oops` from the spec test).
+        assert_eq!(owned_state_key_owner("@oops"), None);
+        // Doesn't start with `@`.
+        assert_eq!(owned_state_key_owner("alice:example.com"), None);
+        // Empty localpart.
+        assert_eq!(owned_state_key_owner("@:example.com"), None);
+        // Empty server.
+        assert_eq!(owned_state_key_owner("@alice:"), None);
+        // Garbage chars (`!#$`) in the server portion before any `_`.
+        assert_eq!(owned_state_key_owner("@alice:example.com!@#$thing"), None);
+    }
+
+    fn create_pdu(room_version: &str, room_id: &str, creator: &str) -> Pdu {
+        pdu(
+            "$create",
+            "m.room.create",
+            Some(""),
+            creator,
+            json!({"room_version": room_version}),
+            room_id,
+        )
+    }
+
+    /// Rule 9 under MSC3757: the user named in the state_key may write,
+    /// AND the room creator may write on anyone's behalf.
+    #[test]
+    fn rule9_msc3757_owner_and_creator_can_write_owned_state() {
+        let room_id = "!r:example.com";
+        let creator = "@creator:example.com";
+        let user = "@alice:example.com";
+        let create = create_pdu("org.matrix.msc3757.10", room_id, creator);
+        // Use sender-power=100 power_levels so the rule-8 check passes.
+        let pl = pdu(
+            "$pl",
+            "m.room.power_levels",
+            Some(""),
+            creator,
+            json!({"events": {"com.example.test": 0}, "users": {creator: 100}}),
+            room_id,
+        );
+        let join_creator = pdu(
+            "$j_creator",
+            "m.room.member",
+            Some(creator),
+            creator,
+            json!({"membership": "join"}),
+            room_id,
+        );
+        let join_user = pdu(
+            "$j_user",
+            "m.room.member",
+            Some(user),
+            user,
+            json!({"membership": "join"}),
+            room_id,
+        );
+        let state = make_state(vec![
+            (("m.room.create", ""), create),
+            (("m.room.power_levels", ""), pl),
+            (("m.room.member", creator), join_creator),
+            (("m.room.member", user), join_user),
+        ]);
+        let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+
+        // Owner writing their own key with a suffix → allowed.
+        let owned = pdu(
+            "$e1",
+            "com.example.test",
+            Some(&format!("{user}_my_suffix")),
+            user,
+            json!({}),
+            room_id,
+        );
+        assert!(check_auth(&owned, &sf).is_ok());
+
+        // Creator writing on the user's behalf → allowed.
+        let by_creator = pdu(
+            "$e2",
+            "com.example.test",
+            Some(user),
+            creator,
+            json!({}),
+            room_id,
+        );
+        assert!(check_auth(&by_creator, &sf).is_ok());
+    }
+
+    /// A user writing another user's owned state_key (and not the
+    /// creator) → 403.
+    #[test]
+    fn rule9_msc3757_non_owner_non_creator_rejected() {
+        let room_id = "!r:example.com";
+        let creator = "@creator:example.com";
+        let user1 = "@alice:example.com";
+        let user2 = "@bob:example.com";
+        let create = create_pdu("org.matrix.msc3757.10", room_id, creator);
+        let pl = pdu(
+            "$pl",
+            "m.room.power_levels",
+            Some(""),
+            creator,
+            json!({"events": {"com.example.test": 0}}),
+            room_id,
+        );
+        let j1 = pdu(
+            "$j1",
+            "m.room.member",
+            Some(user1),
+            user1,
+            json!({"membership": "join"}),
+            room_id,
+        );
+        let state = make_state(vec![
+            (("m.room.create", ""), create),
+            (("m.room.power_levels", ""), pl),
+            (("m.room.member", user1), j1),
+        ]);
+        let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+
+        // alice tries to write bob's key — neither owner nor creator.
+        let bad = pdu(
+            "$e3",
+            "com.example.test",
+            Some(user2),
+            user1,
+            json!({}),
+            room_id,
+        );
+        assert!(matches!(check_auth(&bad, &sf), Err(AuthError::Rejected(_))));
+    }
+
+    /// Non-MSC3757 (plain v10) keeps strict-equality rule 9: a
+    /// suffix on the state_key fails because state_key != sender.
+    #[test]
+    fn rule9_v10_keeps_strict_equality() {
+        let room_id = "!r:example.com";
+        let user = "@alice:example.com";
+        let create = create_pdu("10", room_id, user);
+        let pl = pdu(
+            "$pl",
+            "m.room.power_levels",
+            Some(""),
+            user,
+            json!({"events": {"com.example.test": 0}}),
+            room_id,
+        );
+        let j = pdu(
+            "$j",
+            "m.room.member",
+            Some(user),
+            user,
+            json!({"membership": "join"}),
+            room_id,
+        );
+        let state = make_state(vec![
+            (("m.room.create", ""), create),
+            (("m.room.power_levels", ""), pl),
+            (("m.room.member", user), j),
+        ]);
+        let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+
+        // Owner WITH suffix: in v10 this fails (state_key != sender).
+        let ev = pdu(
+            "$e4",
+            "com.example.test",
+            Some(&format!("{user}_suffix")),
+            user,
+            json!({}),
+            room_id,
+        );
+        assert!(matches!(check_auth(&ev, &sf), Err(AuthError::Rejected(_))));
     }
 
     #[test]

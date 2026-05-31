@@ -388,6 +388,19 @@ pub(crate) async fn send_state_inner(
     if event_type == "m.room.canonical_alias" {
         validate_canonical_alias(&state, &room_id_str, &content)?;
     }
+    // MSC3757 owned-state state_key validation. For rooms on the
+    // unstable `org.matrix.msc3757.10` version, a state_key beginning
+    // with `@` must parse as `@<localpart>:<server>[_<suffix>]`. Any
+    // other shape (no `:`, garbage after `:<server>` that isn't the
+    // `_` suffix, etc.) is `400 M_BAD_JSON`. The rule-9 owner-check
+    // happens later in auth and returns 403 — that's the right
+    // distinction the Complement test gates on.
+    if room_version.supports_owned_state_events()
+        && state_key.starts_with('@')
+        && vela_core::auth_rules::owned_state_key_owner(&state_key).is_none()
+    {
+        return Err(VelaError::BadJson(format!("malformed owned state_key: {state_key}")).into());
+    }
 
     // No-op short-circuit: when a client sends a state event with
     // content identical to the current state, return the existing
