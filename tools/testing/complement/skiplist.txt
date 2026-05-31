@@ -45,9 +45,14 @@
 ^TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version$
 
 # `TestCorruptedAuthChain` is marked SkipIf(Dendrite) upstream —
-# synapse-specific bugfix coverage that exercises a redaction
-# corner case. Vela's redactor doesn't reproduce the synapse bug,
-# so the test either passes trivially or fails on unrelated grounds.
+# synapse-specific federation-receive coverage. The Complement mock
+# server registers handlers for /state_ids and /get_missing_events
+# but NOT /event_auth. Vela's federation-receive path resolves
+# missing auth_events via /event_auth (which 404s against the mock),
+# whereas synapse uses /get_missing_events for the same purpose.
+# Switching strategies is a deep federation-receive change, not a
+# spec gap — vela's path is spec-compliant. Re-evaluate only if
+# multi-server Complement starts depending on this code path.
 ^TestCorruptedAuthChain$
 
 
