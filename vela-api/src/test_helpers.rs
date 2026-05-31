@@ -105,6 +105,7 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
         partial_state_filler: Arc::new(
             crate::federation::partial_state_filler::PartialStateFiller::new(),
         ),
+        event_relationships_unsigned_cache: Arc::new(DashMap::new()),
         sliding_sync_cache: Arc::new(crate::sync::sliding_sync::SlidingSyncCache::new()),
         appservice_registry,
         appservice_outbox,
