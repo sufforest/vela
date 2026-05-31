@@ -560,8 +560,14 @@ pub fn ensure_running(state: &AppState) {
 }
 
 async fn run_scheduler(state: AppState) {
+    // Tick-then-sleep (not sleep-then-tick): on cold boot we want
+    // any events that aged-past-deadline while the process was down
+    // (the "kept on server restart" subtest schedules a 900ms event
+    // and bounces the server) to fire as soon as we can, not after
+    // the first 100ms slice. The test's CI failure was the cold-
+    // boot first-tick latency racing the test's 5s MustSyncUntil
+    // poll window.
     loop {
-        tokio::time::sleep(TICK_INTERVAL).await;
         let now = now_ms();
         // First pass: collect candidate ids. Second pass: try to
         // atomically claim each via `take_if_due` and fire only on
@@ -585,6 +591,7 @@ async fn run_scheduler(state: AppState) {
                 tracing::debug!(error = ?e, "delayed event fire failed");
             }
         }
+        tokio::time::sleep(TICK_INTERVAL).await;
     }
 }
 
