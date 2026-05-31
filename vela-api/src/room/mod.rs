@@ -2,6 +2,7 @@
 //! state CRUD, send / redact / relations, and the messages/context
 //! read paths.
 
+pub mod event_relationships;
 pub mod messages;
 pub mod redaction;
 pub mod relations;

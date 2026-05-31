@@ -597,6 +597,12 @@ pub fn build_router(state: AppState) -> Router {
             "/_matrix/client/v1/rooms/{room_id}/relations/{event_id}/{rel_type}/{event_type}",
             get(relations::relations_with_rel_and_event_type),
         )
+        // MSC2836 event_relationships (still unstable upstream; no
+        // /v1/ path until the proposal merges to spec).
+        .route(
+            "/_matrix/client/unstable/event_relationships",
+            post(crate::room::event_relationships::event_relationships_cs),
+        )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/read_markers",
             post(receipts::post_read_markers),
@@ -1081,6 +1087,11 @@ fn federation_authed_routes(state: AppState) -> Router<AppState> {
         .route(
             "/_matrix/federation/v1/timestamp_to_event/{room_id}",
             get(crate::directory::timestamp::federation_timestamp_to_event),
+        )
+        // MSC2836 federation companion to the CS-API event_relationships.
+        .route(
+            "/_matrix/federation/v1/event_relationships",
+            post(crate::room::event_relationships::event_relationships_fed),
         )
         .route(
             "/_matrix/federation/v1/user/devices/{user_id}",
