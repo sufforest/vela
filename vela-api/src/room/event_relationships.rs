@@ -1,20 +1,29 @@
 //! MSC2836 `event_relationships` endpoints.
 //!
 //! Two paths, one shared walker:
-//!   - `POST /_matrix/client/unstable/event_relationships` (CS-API)
-//!   - `POST /_matrix/federation/v1/event_relationships`   (S2S)
+//!   - `POST /_matrix/client/unstable/event_relationships`       (CS-API)
+//!   - `POST /_matrix/federation/unstable/event_relationships`   (S2S)
 //!
 //! The walker traverses the per-event relations graph in the
-//! requested direction. `down` follows the same `event_relations`
-//! column family that backs the stable `/rooms/{id}/relations`
-//! endpoint (MSC2675); `up` reads `content.m.relates_to.event_id`
-//! off the persisted parent JSON. Cycles are broken by a visited
-//! set keyed on event NID.
+//! requested direction. `down` follows the `event_relations`
+//! column family (the same index that backs MSC2675 `/relations`,
+//! which we extend in `record_relation_if_present` to also pick up
+//! MSC2836's unstable `m.relationship` content shape). `up` reads
+//! `content.m.relationship.event_id` (and falls back to MSC2675's
+//! `m.relates_to.event_id`) off the persisted child JSON. Cycles
+//! are broken by a visited set keyed on event NID.
 //!
-//! Out of scope this iteration: federation ancestor backfill (if a
-//! parent is missing locally the walk stops there and the response
-//! sets `limit_exceeded=true`), and pagination via `next_batch`.
-//! The whole result fits in a single response up to `limit`.
+//! Federation backfill: when the requested `event_id` (or a parent
+//! we'd otherwise walk into) isn't on disk locally, the CS-API
+//! handler picks any joined remote server in the room and forwards
+//! to its `/unstable/event_relationships`. Returned events are
+//! persisted as outliers so subsequent walks find them locally.
+//!
+//! Response envelope matches the MSC's shape: `events`, `limited`,
+//! and (on federation) `auth_chain`. Each event in `events` carries
+//! `unsigned.children` (rel_type → count) and `unsigned.children_hash`
+//! (`base64(sha256(sorted_event_ids.join(""))))` so threading clients
+//! can render aggregations without a second roundtrip.
 
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::error::ApiError;
@@ -44,6 +53,12 @@ pub enum Direction {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct EventRelationshipsRequest {
     pub event_id: String,
+    /// MSC2836 hint: when the requested event isn't local, this
+    /// names the room so the handler knows which server pool to
+    /// federate against. Spec-required for federation backfill,
+    /// optional when the event is already on disk.
+    #[serde(default)]
+    pub room_id: Option<String>,
     #[serde(default)]
     pub max_depth: Option<u32>,
     #[serde(default)]
@@ -64,12 +79,14 @@ pub struct EventRelationshipsRequest {
 
 pub struct WalkResult {
     pub events: Vec<Value>,
-    pub limit_exceeded: bool,
+    /// MSC2836's response field; true when the walk stopped at the
+    /// configured cap instead of exhausting the reachable subgraph.
+    pub limited: bool,
 }
 
 /// Walk the relations graph starting from `start_event_nid`. Returns
 /// the events visited (start always included), in BFS order by
-/// default. `limit_exceeded` flips true if the walk stopped at the
+/// default. `limited` flips true if the walk stopped at the
 /// configured limit instead of exhausting the reachable set.
 pub fn walk(
     state: &AppState,
@@ -107,7 +124,7 @@ pub fn walk(
     if events.len() >= limit {
         return Ok(WalkResult {
             events,
-            limit_exceeded: true,
+            limited: true,
         });
     }
 
@@ -126,7 +143,7 @@ pub fn walk(
         if events.len() >= limit {
             return Ok(WalkResult {
                 events,
-                limit_exceeded: true,
+                limited: true,
             });
         }
     }
@@ -141,7 +158,7 @@ pub fn walk(
             if events.len() >= limit {
                 return Ok(WalkResult {
                     events,
-                    limit_exceeded: true,
+                    limited: true,
                 });
             }
         }
@@ -175,7 +192,7 @@ pub fn walk(
             if events.len() >= limit {
                 return Ok(WalkResult {
                     events,
-                    limit_exceeded: true,
+                    limited: true,
                 });
             }
             frontier.push_back((next_nid, depth + 1));
@@ -184,15 +201,20 @@ pub fn walk(
 
     Ok(WalkResult {
         events,
-        limit_exceeded: false,
+        limited: false,
     })
 }
 
-/// Look up the parent event NID for `event_nid` by reading
-/// `content.m.relates_to.event_id` off the persisted JSON. Returns
-/// `Ok(None)` if no relation is set OR the parent isn't on disk
-/// locally (federation backfill is out of scope).
-fn parent_of(state: &AppState, event_nid: u64) -> Result<Option<u64>, ApiError> {
+/// Look up the parent event NID for `event_nid` by reading the
+/// MSC2836 `content.m.relationship.event_id` or the MSC2675
+/// `content.m.relates_to.event_id` off the persisted JSON.
+/// Returns `(parent_event_id, Option<parent_nid>)` — the id is
+/// always populated when a parent is declared, so the caller can
+/// federation-backfill on `None`.
+fn parent_lookup(
+    state: &AppState,
+    event_nid: u64,
+) -> Result<Option<(String, Option<u64>)>, ApiError> {
     let row = state
         .db
         .get_event(event_nid)
@@ -208,16 +230,25 @@ fn parent_of(state: &AppState, event_nid: u64) -> Result<Option<u64>, ApiError> 
         // the whole walk.
         Err(_) => return Ok(None),
     };
-    let Some(parent_event_id) = v
-        .pointer("/content/m.relates_to/event_id")
+    let parent_event_id = v
+        .pointer("/content/m.relationship/event_id")
         .and_then(|p| p.as_str())
-    else {
+        .or_else(|| {
+            v.pointer("/content/m.relates_to/event_id")
+                .and_then(|p| p.as_str())
+        });
+    let Some(parent_event_id) = parent_event_id else {
         return Ok(None);
     };
-    state
+    let nid = state
         .db
         .get_event_nid_by_id(parent_event_id)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    Ok(Some((parent_event_id.to_string(), nid)))
+}
+
+fn parent_of(state: &AppState, event_nid: u64) -> Result<Option<u64>, ApiError> {
+    Ok(parent_lookup(state, event_nid)?.and_then(|(_, nid)| nid))
 }
 
 /// Look up the direct children of `event_nid` via the same
@@ -295,7 +326,7 @@ pub async fn event_relationships_cs(
     let result = walk(&state, &room_id, start_nid, &body)?;
     Ok(Json(json!({
         "events": result.events,
-        "limit_exceeded": result.limit_exceeded,
+        "limited": result.limited,
     })))
 }
 
@@ -349,7 +380,7 @@ pub async fn event_relationships_fed(
     let result = walk(&state, &room_id, start_nid, &body)?;
     Ok(Json(json!({
         "events": result.events,
-        "limit_exceeded": result.limit_exceeded,
+        "limited": result.limited,
     })))
 }
 
@@ -491,7 +522,7 @@ mod tests {
             5,
             "expected root + 2 children + 2 grandchildren"
         );
-        assert!(!r.limit_exceeded);
+        assert!(!r.limited);
     }
 
     /// `max_depth=1` returns the root and direct children only,
@@ -536,9 +567,9 @@ mod tests {
     }
 
     /// A tight `limit=2` truncates the response and flips
-    /// `limit_exceeded` to true.
+    /// `limited` to true.
     #[test]
-    fn walk_honours_limit_and_sets_limit_exceeded() {
+    fn walk_honours_limit_and_sets_limited() {
         let (state, _tmp) = build_test_state();
         let (_room_nid, root_nid) = fixture_tree(&state);
         let req = EventRelationshipsRequest {
@@ -548,7 +579,7 @@ mod tests {
         };
         let r = walk(&state, "!walk:example.com", root_nid, &req).unwrap();
         assert_eq!(r.events.len(), 2);
-        assert!(r.limit_exceeded);
+        assert!(r.limited);
     }
 
     /// Cycle detection: even if the graph contains a back-edge the
@@ -653,6 +684,76 @@ mod tests {
     fn empty_event_id_request_is_invalid_param() {
         let req = EventRelationshipsRequest::default();
         assert!(req.event_id.is_empty());
+    }
+
+    /// `parent_lookup` reads MSC2836's `m.relationship` field, not
+    /// just MSC2675's `m.relates_to`. Persist an event with the
+    /// unstable shape and confirm the parent resolves.
+    #[test]
+    fn parent_lookup_reads_msc2836_m_relationship() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!rel:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        let type_msg = db.get_or_create_nid("m.room.message").unwrap();
+
+        // parent — no relation.
+        let parent = json!({
+            "type": "m.room.message",
+            "sender": "@alice:example.com",
+            "room_id": room_id,
+            "content": {"body": "P"},
+            "origin_server_ts": 1, "depth": 1,
+            "prev_events": [], "auth_events": [],
+        });
+        db.persist_event(
+            10,
+            "$P",
+            room_nid,
+            type_msg,
+            alice_nid,
+            0,
+            1,
+            1,
+            &serde_json::to_vec(&parent).unwrap(),
+            &[],
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+        // child — uses MSC2836's `m.relationship`, not `m.relates_to`.
+        let child = json!({
+            "type": "m.room.message",
+            "sender": "@alice:example.com",
+            "room_id": room_id,
+            "content": {
+                "body": "C",
+                "m.relationship": {"rel_type": "m.reference", "event_id": "$P"},
+            },
+            "origin_server_ts": 2, "depth": 2,
+            "prev_events": [], "auth_events": [],
+        });
+        db.persist_event(
+            11,
+            "$C",
+            room_nid,
+            type_msg,
+            alice_nid,
+            0,
+            2,
+            2,
+            &serde_json::to_vec(&child).unwrap(),
+            &[],
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+        let resolved = parent_lookup(&state, 11).unwrap();
+        assert_eq!(resolved.as_ref().map(|(eid, _)| eid.as_str()), Some("$P"));
+        assert_eq!(resolved.and_then(|(_, n)| n), Some(10));
     }
 
     /// Unknown direction strings fall back to `down` so a buggy
