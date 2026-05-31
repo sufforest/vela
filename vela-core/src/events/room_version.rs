@@ -6,6 +6,11 @@
 //! soft-deprecated by the spec with no production rooms left in the
 //! federation that use them. v12 is what we emit by default for
 //! `/createRoom` when the client doesn't ask otherwise.
+//!
+//! `Msc3757V10` is a v10-derived unstable version (`org.matrix.msc3757.10`)
+//! that adds "owned state events": state_keys of the form
+//! `@<mxid>[<_suffix>]` where the user portion authorises the write.
+//! Behaviour-equivalent to v10 except for one auth-rule change (rule 9).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomVersion {
@@ -16,6 +21,8 @@ pub enum RoomVersion {
     V10,
     V11,
     V12,
+    /// MSC3757 owned state events, v10-based.
+    Msc3757V10,
 }
 
 impl RoomVersion {
@@ -28,6 +35,7 @@ impl RoomVersion {
             Self::V10 => "10",
             Self::V11 => "11",
             Self::V12 => "12",
+            Self::Msc3757V10 => "org.matrix.msc3757.10",
         }
     }
 
@@ -43,6 +51,7 @@ impl RoomVersion {
             "10" => Some(Self::V10),
             "11" => Some(Self::V11),
             "12" => Some(Self::V12),
+            "org.matrix.msc3757.10" => Some(Self::Msc3757V10),
             _ => None,
         }
     }
@@ -58,11 +67,14 @@ impl RoomVersion {
             Self::V10,
             Self::V11,
             Self::V12,
+            Self::Msc3757V10,
         ]
     }
 
     /// Returns true if this version is at or above `min`. Used to
-    /// implement `[server] minimum_room_version`.
+    /// implement `[server] minimum_room_version`. MSC3757V10 reports
+    /// 10 — the base version's auth rules apply except where overridden
+    /// by `supports_owned_state_events`.
     pub fn at_least(&self, min: RoomVersion) -> bool {
         self.numeric() >= min.numeric()
     }
@@ -73,7 +85,7 @@ impl RoomVersion {
             Self::V7 => 7,
             Self::V8 => 8,
             Self::V9 => 9,
-            Self::V10 => 10,
+            Self::V10 | Self::Msc3757V10 => 10,
             Self::V11 => 11,
             Self::V12 => 12,
         }
@@ -144,6 +156,14 @@ impl RoomVersion {
     pub fn supports_additional_creators(&self) -> bool {
         self.at_least(Self::V12)
     }
+
+    /// MSC3757: state events whose `state_key` matches
+    /// `@<mxid>[<_suffix>]` are authorised by the embedded `<mxid>`
+    /// (or the room creator), not by exact equality with `sender`.
+    /// Only `Msc3757V10` enables this; v10 keeps strict-equality.
+    pub fn supports_owned_state_events(&self) -> bool {
+        matches!(self, Self::Msc3757V10)
+    }
 }
 
 #[cfg(test)]
@@ -203,8 +223,24 @@ mod tests {
     #[test]
     fn all_supported_is_in_order() {
         let all = RoomVersion::all_supported();
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
         assert_eq!(all[0], RoomVersion::V6);
         assert_eq!(all[6], RoomVersion::V12);
+        assert_eq!(all[7], RoomVersion::Msc3757V10);
+    }
+
+    /// MSC3757 unstable version parses from its `org.matrix.msc3757.10`
+    /// string and reports v10's numeric for the inheritance-style
+    /// `at_least` checks — the new behaviour rides on the boolean
+    /// `supports_owned_state_events` knob, not on numeric ordering.
+    #[test]
+    fn msc3757_v10_parses_and_orders_as_v10() {
+        let v = RoomVersion::parse("org.matrix.msc3757.10").unwrap();
+        assert_eq!(v, RoomVersion::Msc3757V10);
+        assert_eq!(v.as_str(), "org.matrix.msc3757.10");
+        assert!(v.at_least(RoomVersion::V10));
+        assert!(!v.at_least(RoomVersion::V11));
+        assert!(v.supports_owned_state_events());
+        assert!(!RoomVersion::V10.supports_owned_state_events());
     }
 }

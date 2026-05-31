@@ -16,7 +16,8 @@ pub async fn get_capabilities(_user: AuthenticatedUser) -> Json<Value> {
             "m.room_versions": {
                 "default": "12",
                 "available": {
-                    "12": "stable"
+                    "12": "stable",
+                    "org.matrix.msc3757.10": "unstable",
                 }
             },
             "m.set_displayname": {"enabled": true},
