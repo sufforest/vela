@@ -205,4 +205,10 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // `"oauth-delegated"`. A future SAML/LDAP/whatever flow would use
     // its own provider string without touching this schema.
     "external_ids",
+    // MSC4140 delayed events. Key: 16-byte UUID (`delay_id`). Value:
+    // JSON record of the pending event (user_nid, room_id, event_type,
+    // state_key, content, scheduled_at_ms, delay_ms, txn_scope, txn_id).
+    // In-memory DashMap on AppState mirrors this CF for fast scheduler
+    // scans; the CF is the source of truth across restarts.
+    "delayed_events",
 ];

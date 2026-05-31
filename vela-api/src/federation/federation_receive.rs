@@ -1669,16 +1669,27 @@ fn find_state_ids_boundary(state: &AppState, start: &Pdu) -> String {
     }
     visited.insert(start.event_id.clone());
 
+    // `last_known` tracks the deepest event_id we've successfully
+    // loaded. If we hit the hop cap without finding a genuinely
+    // missing event, falling back to `start.event_id` would call
+    // `/state_ids` on the trigger — which the peer may not be
+    // willing to serve (synapse's mock in TestCorruptedAuthChain
+    // only registers a handler at the specific boundary event).
+    // Using the deepest known event instead at least points at
+    // somewhere along the actual prev chain.
+    let mut last_known = start.event_id.clone();
+
     for _ in 0..32 {
         let current = match frontier.pop_front() {
             Some(c) => c,
-            None => return start.event_id.clone(),
+            None => return last_known,
         };
         if !visited.insert(current.clone()) {
             continue;
         }
         match load_pdu_by_event_id(state, &current) {
             Some(p) => {
+                last_known = current;
                 for pid in &p.prev_events {
                     if !visited.contains(pid) {
                         frontier.push_back(pid.clone());
@@ -1688,7 +1699,16 @@ fn find_state_ids_boundary(state: &AppState, start: &Pdu) -> String {
             None => return current,
         }
     }
-    start.event_id.clone()
+    // Hop cap exhausted without finding an unknown event. Return the
+    // first unvisited frontier entry — it's deeper than `start` and
+    // more likely to be a meaningful boundary than the trigger
+    // itself.
+    while let Some(c) = frontier.pop_front() {
+        if !visited.contains(&c) {
+            return c;
+        }
+    }
+    last_known
 }
 
 /// Fallback to `/state_ids` + per-event `/event` when `/event_auth`
@@ -1706,9 +1726,16 @@ async fn fetch_auth_via_state_ids(
     target_event_id: &str,
     budget: FetchBudget,
 ) -> Result<(), String> {
-    if budget_exhausted(&budget) {
-        return Err("fetch budget exhausted".into());
-    }
+    // Deliberately NO entry-time `budget_exhausted` guard. The
+    // budget is shared with the earlier `/event_auth` attempt; by
+    // the time we get here it may already be drained. The
+    // `consume_budget` call inside the loop is the real gate — at
+    // worst the loop short-circuits on the first iteration, which
+    // is identical to the previous "return early" behaviour but
+    // preserves the `/state_ids` request itself so the peer can
+    // still serve auth events that happen to already be on disk
+    // (the loop's `get_event_nid_by_id` short-circuit costs zero
+    // budget).
     let resp = state
         .federation_client
         .state_ids(origin, room_id, target_event_id)

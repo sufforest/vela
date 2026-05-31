@@ -98,7 +98,8 @@ pub async fn versions(State(state): State<AppState>) -> Json<Value> {
         ("org.matrix.msc3930".to_string(), json!(true)),
         // MSC3967 (idempotent cross-signing key upload).
         ("org.matrix.msc3967".to_string(), json!(true)),
-        ("org.matrix.msc4140".to_string(), json!(false)),
+        // MSC4140 delayed events.
+        ("org.matrix.msc4140".to_string(), json!(true)),
         ("org.matrix.msc4143".to_string(), json!(true)),
         // MSC4155 (server-side invite filtering).
         ("org.matrix.msc4155".to_string(), json!(true)),

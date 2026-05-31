@@ -182,6 +182,8 @@ impl Harness {
                 vela_api::federation::partial_state_filler::PartialStateFiller::new(),
             ),
             event_relationships_unsigned_cache: Arc::new(DashMap::new()),
+            delayed_events: vela_api::delayed_events::new_store(),
+            delayed_events_scheduler_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sliding_sync_cache: Arc::new(vela_api::sync::sliding_sync::SlidingSyncCache::new()),
             appservice_registry,
             appservice_outbox,

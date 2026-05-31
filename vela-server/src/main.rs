@@ -1099,6 +1099,8 @@ fn main() -> anyhow::Result<()> {
                 vela_api::federation::partial_state_filler::PartialStateFiller::new(),
             ),
             event_relationships_unsigned_cache: Arc::new(DashMap::new()),
+            delayed_events: vela_api::delayed_events::new_store(),
+            delayed_events_scheduler_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sliding_sync_cache: Arc::new(vela_api::sync::sliding_sync::SlidingSyncCache::new()),
             appservice_registry,
             appservice_outbox,
@@ -1150,6 +1152,10 @@ fn main() -> anyhow::Result<()> {
         // MSC3706 partial-state filler. Cheap no-op if no rooms are
         // flagged partial.
         vela_api::federation::partial_state_filler::ensure_running(&state);
+
+        // MSC4140 delayed events scheduler. Rehydrates the in-memory
+        // queue from the `delayed_events` CF and ticks every 100ms.
+        vela_api::delayed_events::boot(&state);
 
         let app = vela_api::router::build_router(state);
 

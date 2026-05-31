@@ -318,6 +318,15 @@ pub struct AppState {
     /// path and therefore aren't indexed locally. In-memory only —
     /// rebuilds from federation on restart.
     pub event_relationships_unsigned_cache: Arc<DashMap<u64, serde_json::Value>>,
+    /// MSC4140 delayed events store. In-memory mirror of the
+    /// `delayed_events` CF; the scheduler ticks every 100ms and
+    /// fires due events through the normal send pipeline. Loaded
+    /// from disk at boot so pending events survive restarts.
+    pub delayed_events: Arc<crate::delayed_events::DelayedEventStore>,
+    /// Singleton flag so `delayed_events::ensure_running` doesn't
+    /// spawn two schedulers when called twice (boot path + test
+    /// helpers, etc.).
+    pub delayed_events_scheduler_running: Arc<std::sync::atomic::AtomicBool>,
     /// MSC4186 sliding-sync per-connection snapshot cache.
     /// `(user_nid, conn_id) -> previous list room_ids`. Lets the
     /// response emit DELETE/INSERT deltas instead of always re-
@@ -621,6 +630,24 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/_matrix/client/v1/rooms/{room_id}/threads",
             get(relations::threads_list),
+        )
+        // MSC4140 delayed events. Path lives under
+        // `/_matrix/client/unstable/org.matrix.msc4140/`; the MSC
+        // hasn't stabilised and the upstream Complement tests use
+        // the unstable prefix. The action sits in the URL position
+        // (`cancel | restart | send`); the no-action shape is
+        // registered as METHOD_NOT_ALLOWED.
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events",
+            get(crate::delayed_events::list_delayed_events_handler),
+        )
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}",
+            post(crate::delayed_events::update_delayed_event_handler),
+        )
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}",
+            post(crate::delayed_events::update_delayed_event_no_action_handler),
         )
         .route(
             "/_matrix/client/v3/rooms/{room_id}/joined_members",

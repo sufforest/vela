@@ -49,6 +49,11 @@ const MAX_BACKFILL_ROUNDS: usize = 3;
 /// scenarios resolve in 1–2 events; the cap is a defence against a
 /// peer that returns a deep tree as missing.
 const BACKFILL_PER_ROUND: usize = 8;
+/// Cap on children enumerated when computing a local
+/// `unsigned.children_hash`. Past this the hash field is omitted
+/// (see `bundle_unsigned`) — a partial-set hash would mismatch
+/// every other peer's recompute.
+const LOCAL_CHILDREN_CAP: usize = 1024;
 
 const DEFAULT_MAX_DEPTH: u32 = 3;
 const HARD_MAX_DEPTH: u32 = 10;
@@ -407,9 +412,10 @@ fn bundle_unsigned(
         let mut child_eids: Vec<String> = Vec::new();
         let entries = state
             .db
-            .list_relations(nid, None, None, u64::MAX, true, 1024)
+            .list_relations(nid, None, None, u64::MAX, true, LOCAL_CHILDREN_CAP + 1)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-        for (_sp, child_nid, rt_nid, _ct) in entries {
+        let truncated = entries.len() > LOCAL_CHILDREN_CAP;
+        for (_sp, child_nid, rt_nid, _ct) in entries.into_iter().take(LOCAL_CHILDREN_CAP) {
             if let Ok(Some(rt)) = state.db.resolve_nid(rt_nid) {
                 *rel_counts.entry(rt).or_default() += 1;
             }
@@ -428,7 +434,14 @@ fn bundle_unsigned(
         });
         if let Some(u) = unsigned {
             u.insert("children".into(), json!(rel_counts));
-            u.insert("children_hash".into(), json!(hash_b64));
+            // Skip `children_hash` when we couldn't enumerate every
+            // child — a partial-set hash would mismatch every other
+            // server's recompute and clients comparing hashes to
+            // detect "I have a stale aggregate" would always think
+            // they're stale. Better no hash than a wrong one.
+            if !truncated {
+                u.insert("children_hash".into(), json!(hash_b64));
+            }
         }
     }
     Ok(())
@@ -559,6 +572,16 @@ async fn backfill_via_federation(
     // our walk path. Key on the nid we already resolved during persist
     // — the PDU envelope deliberately drops `event_id` (it'd break
     // content_hash verification), so we can't look it up here.
+    //
+    // Trust model: the cached values come from a federation peer and
+    // are NOT verified locally (we can't recompute the hash without
+    // knowing the actual child event_ids). A hostile peer can poison
+    // the cache for any event we ask about. Mitigation: bound the
+    // cache size so a peer can't drive us to OOM, and accept that
+    // counts on backfilled events are advisory rather than
+    // authoritative. The hash field is reused verbatim from the
+    // peer's response so client-side equality comparisons still work
+    // against same-peer data.
     for (nid, ev) in &persisted_pairs {
         let Some(unsigned) = ev.get("unsigned") else {
             continue;
@@ -575,11 +598,37 @@ async fn backfill_via_federation(
         if let Some(h) = children_hash {
             cache_entry.insert("children_hash".into(), h);
         }
+        // Trim the cache opportunistically once it crosses the cap.
+        // DashMap's iteration order is unspecified, so this evicts a
+        // somewhat-random batch — fine for an advisory cache.
+        if state.event_relationships_unsigned_cache.len() >= UNSIGNED_CACHE_MAX {
+            evict_unsigned_cache_batch(&state.event_relationships_unsigned_cache);
+        }
         state
             .event_relationships_unsigned_cache
             .insert(*nid, Value::Object(cache_entry));
     }
     Ok(persisted)
+}
+
+/// Soft cap on the unsigned cache. Past this, every insert triggers a
+/// batch eviction of `UNSIGNED_CACHE_EVICT_BATCH` arbitrary entries.
+/// `10_000` is plenty for a busy server (every thread/thread reply
+/// cycle adds at most one row per backfill); the bound's job is to
+/// stop an adversarial peer pumping new event_nids from blowing the
+/// heap.
+const UNSIGNED_CACHE_MAX: usize = 10_000;
+const UNSIGNED_CACHE_EVICT_BATCH: usize = 1_000;
+
+fn evict_unsigned_cache_batch(cache: &dashmap::DashMap<u64, Value>) {
+    let to_drop: Vec<u64> = cache
+        .iter()
+        .take(UNSIGNED_CACHE_EVICT_BATCH)
+        .map(|e| *e.key())
+        .collect();
+    for k in to_drop {
+        cache.remove(&k);
+    }
 }
 
 /// Return `true` if the parent→child relation is already recorded
@@ -837,13 +886,28 @@ fn promote_to_pdu_events(state: &AppState, events: &mut Vec<Value>, event_ids: &
         let eid = match event_ids.get(i) {
             Some(s) if !s.is_empty() => s.as_str(),
             _ => {
+                tracing::warn!(
+                    "event_relationships federation response: dropping client-shaped \
+                     event into PDU envelope without lookup (no event_id available)"
+                );
                 promoted.push(ev.clone());
                 continue;
             }
         };
         match crate::federation::federation_state::load_event_json_by_event_id(&state.db, eid) {
             Some(pdu) => promoted.push(pdu),
-            None => promoted.push(ev.clone()),
+            None => {
+                // Falling back to the client shape here ships a PDU
+                // the peer can't signature-verify. Log loudly — this
+                // is either a DB issue or a stale `event_ids` list,
+                // both of which would silently corrupt the peer's
+                // auth-chain construction.
+                tracing::warn!(
+                    event_id = %eid,
+                    "event_relationships federation response: PDU load failed, sending client shape"
+                );
+                promoted.push(ev.clone());
+            }
         }
     }
     *events = promoted;
@@ -859,8 +923,13 @@ fn compute_auth_chain_pdus(state: &AppState, event_ids: &[String]) -> Vec<Value>
         .filter(|s| !s.is_empty())
         .map(|s| s.as_str())
         .collect();
-    crate::federation::federation_state::auth_chain_union_pdu_json(&state.db, &roots)
-        .unwrap_or_default()
+    match crate::federation::federation_state::auth_chain_union_pdu_json(&state.db, &roots) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = ?e, "auth_chain computation failed; returning empty");
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]
