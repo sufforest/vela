@@ -1089,8 +1089,10 @@ fn federation_authed_routes(state: AppState) -> Router<AppState> {
             get(crate::directory::timestamp::federation_timestamp_to_event),
         )
         // MSC2836 federation companion to the CS-API event_relationships.
+        // Path is `/unstable/` (not `/v1/`) — the MSC hasn't stabilised
+        // and Complement still hits the unstable path.
         .route(
-            "/_matrix/federation/v1/event_relationships",
+            "/_matrix/federation/unstable/event_relationships",
             post(crate::room::event_relationships::event_relationships_fed),
         )
         .route(

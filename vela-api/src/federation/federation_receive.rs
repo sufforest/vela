@@ -1348,8 +1348,10 @@ async fn apply_invite_rescind(
     PduOutcome::Accepted
 }
 
-/// Record an `m.relates_to` index entry for an inbound event, mirroring
-/// the local-send path. Skips silently if the parent isn't on disk yet —
+/// Record a relations index entry for an inbound event, mirroring the
+/// local-send path. Accepts both `content.m.relates_to` (MSC2675) and
+/// `content.m.relationship` (MSC2836) — Complement's MSC2836 tests use
+/// the unstable shape. Skips silently if the parent isn't on disk yet —
 /// the relation will be missing until back-fill brings it in.
 fn try_record_relation(
     state: &AppState,
@@ -1360,7 +1362,11 @@ fn try_record_relation(
     room_nid: u64,
     sender_nid: u64,
 ) {
-    let Some(rel) = pdu.content.get("m.relates_to") else {
+    let rel_opt = pdu
+        .content
+        .get("m.relates_to")
+        .or_else(|| pdu.content.get("m.relationship"));
+    let Some(rel) = rel_opt else {
         return;
     };
     let Some(parent_event_id) = rel.get("event_id").and_then(|v| v.as_str()) else {

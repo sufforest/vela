@@ -670,6 +670,24 @@ impl FederationClient {
             .ok_or_else(|| FederationClientError::BadJson("response missing pdus[0]".into()))
     }
 
+    /// MSC2836 `POST /_matrix/federation/unstable/event_relationships`.
+    /// Walks the resident server's relations graph from `body.event_id`
+    /// and returns `{events, limited, auth_chain}`. Callers persist the
+    /// returned events as outliers before re-running their local walk.
+    pub async fn event_relationships(
+        &self,
+        destination: &str,
+        body: Value,
+    ) -> Result<Value, FederationClientError> {
+        self.signed_request(
+            reqwest::Method::POST,
+            destination,
+            "/_matrix/federation/unstable/event_relationships",
+            Some(body),
+        )
+        .await
+    }
+
     /// `GET /_matrix/federation/v1/state/{roomId}?event_id=…`
     ///
     /// Fetch the room's full state at the given event as PDU arrays —

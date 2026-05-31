@@ -627,9 +627,12 @@ fn resolve_event_ids_to_nids(state: &AppState, ids: &[EventId]) -> Result<Vec<u6
     Ok(nids)
 }
 
-/// Persist the relation index entry when the event carries `m.relates_to`.
-/// Walks the `content.m.relates_to` blob; skips silently if either the
-/// referenced parent isn't on disk or the rel_type/event_id are absent.
+/// Persist the relation index entry when the event carries a parent
+/// pointer. Reads `content.m.relates_to` (MSC2675 — the stable shape
+/// for replies/threads) OR `content.m.relationship` (MSC2836 — the
+/// unstable shape the upstream Complement tests still use). Both
+/// carry `{rel_type, event_id}`; skips silently if the referenced
+/// parent isn't on disk or either field is missing.
 fn record_relation_if_present(
     state: &AppState,
     event: &serde_json::Map<String, Value>,
@@ -639,7 +642,10 @@ fn record_relation_if_present(
     room_nid: u64,
     child_sender_nid: u64,
 ) -> Result<(), ApiError> {
-    let relates_to = event.get("content").and_then(|c| c.get("m.relates_to"));
+    let content = event.get("content");
+    let relates_to = content
+        .and_then(|c| c.get("m.relates_to"))
+        .or_else(|| content.and_then(|c| c.get("m.relationship")));
     let Some(rel) = relates_to else {
         return Ok(());
     };
