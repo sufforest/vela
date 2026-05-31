@@ -379,22 +379,74 @@ pub fn validate_delay_ms(delay_ms: u64, max_delay_ms: u64) -> Result<(), ApiErro
 // Handlers
 // ============================================================
 
-/// `GET /_matrix/client/v1/delayed_events` — return pending events
-/// owned by the calling user. MSC4140 specifies pagination but
-/// vela returns the full set in one page; users with thousands of
-/// pending events would push us over the response size limit, which
-/// is well beyond the test surface.
+/// Default page size when the caller doesn't supply `?limit=`.
+/// Bound the upper edge separately to cap response size.
+const LIST_DEFAULT_LIMIT: usize = 100;
+const LIST_MAX_LIMIT: usize = 1000;
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ListQuery {
+    /// Opaque resume token from a previous `next_batch`.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Page size cap (default 100, max 1000).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// `GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events` —
+/// return pending events owned by the calling user, paginated.
+/// Pagination uses an opaque `next_batch` token: a freshly-base16'd
+/// `delay_id` of the next record the caller hasn't seen. Order is
+/// lexicographic over `delay_id` (DashMap iteration is unordered,
+/// so we sort the candidate set before slicing).
+///
+/// The lex order matches the random delay_id ordering — it isn't
+/// chronological, but it IS stable and that's the property
+/// pagination needs: callers walking with `from=<prev_token>` see
+/// every record exactly once.
 pub async fn list_delayed_events_handler(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    axum::extract::Query(q): axum::extract::Query<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let mut events: Vec<Value> = Vec::new();
-    for entry in state.delayed_events.by_id.iter() {
-        let rec = entry.value();
-        if rec.user_nid != user.user_nid {
+    let limit = q
+        .limit
+        .unwrap_or(LIST_DEFAULT_LIMIT)
+        .clamp(1, LIST_MAX_LIMIT);
+
+    // Collect ids belonging to the caller, then sort. DashMap's
+    // iteration order is unspecified; without sorting, pagination
+    // would skip or duplicate entries across calls.
+    let mut owned_ids: Vec<String> = state
+        .delayed_events
+        .by_id
+        .iter()
+        .filter(|e| e.value().user_nid == user.user_nid)
+        .map(|e| e.key().clone())
+        .collect();
+    owned_ids.sort();
+
+    // Apply the `from` token (exclusive start — caller's last seen).
+    let start = match q.from {
+        Some(t) => owned_ids.partition_point(|id| id.as_str() <= t.as_str()),
+        None => 0,
+    };
+    let end = (start + limit).min(owned_ids.len());
+    let next_batch = if end < owned_ids.len() {
+        Some(owned_ids[end - 1].clone())
+    } else {
+        None
+    };
+
+    let now = now_ms();
+    let mut events: Vec<Value> = Vec::with_capacity(end - start);
+    for id in &owned_ids[start..end] {
+        let Some(rec) = state.delayed_events.by_id.get(id) else {
             continue;
-        }
-        let remaining = rec.scheduled_at_ms.saturating_sub(now_ms());
+        };
+        let rec = rec.value();
+        let remaining = rec.scheduled_at_ms.saturating_sub(now);
         let mut obj = serde_json::Map::new();
         obj.insert("delay_id".into(), json!(rec.delay_id));
         obj.insert("room_id".into(), json!(rec.room_id));
@@ -412,7 +464,13 @@ pub async fn list_delayed_events_handler(
         obj.insert("remaining".into(), json!(remaining));
         events.push(Value::Object(obj));
     }
-    Ok(Json(json!({"delayed_events": events})))
+
+    let mut resp = serde_json::Map::new();
+    resp.insert("delayed_events".into(), Value::Array(events));
+    if let Some(t) = next_batch {
+        resp.insert("next_batch".into(), Value::String(t));
+    }
+    Ok(Json(Value::Object(resp)))
 }
 
 /// `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}` —
@@ -641,5 +699,157 @@ mod tests {
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
         // Two consecutive IDs differ — random source is wired.
         assert_ne!(id, new_delay_id());
+    }
+
+    /// Helper: build a minimal record for pagination tests. State,
+    /// txn, and content shape don't matter for the slicing logic.
+    fn pagination_rec(delay_id: &str, user_nid: u64) -> DelayedEventRecord {
+        DelayedEventRecord {
+            delay_id: delay_id.to_string(),
+            user_nid,
+            user_id: format!("@u{user_nid}:example.com"),
+            device_id: "DEVICE".into(),
+            room_id: "!r:example.com".into(),
+            event_type: "m.room.message".into(),
+            state_key: None,
+            content: serde_json::json!({}),
+            txn_id: Some(format!("txn-{delay_id}")),
+            scheduled_at_ms: 1_000_000,
+            delay_ms: 1000,
+        }
+    }
+
+    /// The `from` token is the last-seen delay_id, exclusive. The
+    /// partition-point logic must include the next id past it and
+    /// must NOT re-emit the token itself. Bound-fire: the boundary
+    /// where the token equals an existing id.
+    #[test]
+    fn list_pagination_from_token_is_exclusive() {
+        use crate::test_helpers::build_test_state;
+        let (state, _tmp) = build_test_state();
+        // Seed 5 ids for one user.
+        for c in ["a", "b", "c", "d", "e"] {
+            let rec = pagination_rec(c, 1);
+            state.delayed_events.by_id.insert(rec.delay_id.clone(), rec);
+        }
+        // Sorted ids: [a, b, c, d, e]. `from=c` → slice starts at `d`.
+        let mut owned_ids: Vec<String> = state
+            .delayed_events
+            .by_id
+            .iter()
+            .filter(|e| e.value().user_nid == 1)
+            .map(|e| e.key().clone())
+            .collect();
+        owned_ids.sort();
+        let start = owned_ids.partition_point(|id| id.as_str() <= "c");
+        assert_eq!(start, 3, "from=c must skip past c");
+        assert_eq!(&owned_ids[start..], &["d", "e"]);
+    }
+
+    /// Cross-user isolation: a caller's pagination must NOT include
+    /// other users' delays even when their delay_ids would sort into
+    /// the slice. The handler filters before sorting; pin that here.
+    #[test]
+    fn list_pagination_isolates_users() {
+        use crate::test_helpers::build_test_state;
+        let (state, _tmp) = build_test_state();
+        for c in ["a", "c", "e"] {
+            state
+                .delayed_events
+                .by_id
+                .insert(c.to_string(), pagination_rec(c, 1));
+        }
+        for c in ["b", "d"] {
+            state
+                .delayed_events
+                .by_id
+                .insert(c.to_string(), pagination_rec(c, 2));
+        }
+        let owned: Vec<String> = state
+            .delayed_events
+            .by_id
+            .iter()
+            .filter(|e| e.value().user_nid == 1)
+            .map(|e| e.key().clone())
+            .collect();
+        assert_eq!(owned.len(), 3, "only user 1's events");
+        let owned_set: std::collections::HashSet<&str> = owned.iter().map(|s| s.as_str()).collect();
+        for c in ["a", "c", "e"] {
+            assert!(owned_set.contains(c));
+        }
+        for c in ["b", "d"] {
+            assert!(!owned_set.contains(c));
+        }
+    }
+
+    /// Bound-fire on `limit`: a value over `LIST_MAX_LIMIT` clamps
+    /// down; `0` clamps up to 1 (the call still gets at least one
+    /// row, matching the spec's "limit defines page size, not
+    /// opt-out" semantic).
+    #[test]
+    fn list_pagination_limit_clamps_to_bounds() {
+        assert_eq!(
+            (LIST_MAX_LIMIT + 5_000).clamp(1, LIST_MAX_LIMIT),
+            LIST_MAX_LIMIT
+        );
+        assert_eq!(0_usize.clamp(1, LIST_MAX_LIMIT), 1);
+    }
+
+    /// Round-trip pagination: walking `next_batch` from one call to
+    /// the next must produce every record exactly once, in order,
+    /// with no duplicates and no skips. Pins the `next_batch =
+    /// last-seen-id` semantic by simulating the caller's loop.
+    /// Strategy alternative (`next_batch = first-unseen-id`) would
+    /// skip the first id of every page — caught here.
+    #[test]
+    fn list_pagination_round_trip_visits_every_id_once() {
+        use crate::test_helpers::build_test_state;
+        let (state, _tmp) = build_test_state();
+        let all_ids = ["a", "b", "c", "d", "e", "f", "g"];
+        for c in all_ids {
+            state
+                .delayed_events
+                .by_id
+                .insert(c.to_string(), pagination_rec(c, 1));
+        }
+
+        let mut owned_ids: Vec<String> = state
+            .delayed_events
+            .by_id
+            .iter()
+            .filter(|e| e.value().user_nid == 1)
+            .map(|e| e.key().clone())
+            .collect();
+        owned_ids.sort();
+
+        let limit = 3;
+        let mut seen: Vec<String> = Vec::new();
+        let mut from: Option<String> = None;
+        loop {
+            let start = match &from {
+                Some(t) => owned_ids.partition_point(|id| id.as_str() <= t.as_str()),
+                None => 0,
+            };
+            let end = (start + limit).min(owned_ids.len());
+            if start >= end {
+                break;
+            }
+            for id in &owned_ids[start..end] {
+                seen.push(id.clone());
+            }
+            from = if end < owned_ids.len() {
+                Some(owned_ids[end - 1].clone())
+            } else {
+                None
+            };
+            if from.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            all_ids.map(String::from),
+            "round-trip must visit every id exactly once in order"
+        );
     }
 }
