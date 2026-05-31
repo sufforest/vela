@@ -108,6 +108,8 @@ fn new_delay_id() -> String {
 
 /// Insert a record into both DashMap mirror and the persistent CF.
 pub fn store(state: &AppState, rec: DelayedEventRecord) -> Result<(), ApiError> {
+    metrics::counter!("vela_delayed_events_scheduled_total").increment(1);
+    metrics::gauge!("vela_delayed_events_pending").increment(1.0);
     let bytes = serde_json::to_vec(&rec).map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     state
         .db
@@ -173,6 +175,7 @@ pub fn remove(state: &AppState, delay_id: &str) -> Result<Option<DelayedEventRec
     let rec = state.delayed_events.by_id.remove(delay_id).map(|(_, r)| r);
     if let Some(r) = &rec {
         drop_indexes(state, r);
+        metrics::gauge!("vela_delayed_events_pending").decrement(1.0);
     }
     state
         .db
@@ -194,6 +197,9 @@ fn take_if_due(state: &AppState, delay_id: &str, deadline_ms: u64) -> Option<Del
         .by_id
         .remove_if(delay_id, |_, r| r.scheduled_at_ms <= deadline_ms)
         .map(|(_, r)| r);
+    if removed.is_some() {
+        metrics::gauge!("vela_delayed_events_pending").decrement(1.0);
+    }
     if let Some(r) = &removed {
         drop_indexes(state, r);
         let _ = state.db.delete_delayed_event(delay_id);
@@ -250,6 +256,10 @@ pub fn load_from_disk(state: &AppState) -> Result<usize, ApiError> {
             count += 1;
         }
     }
+    // Sync the pending gauge to the loaded record count so the
+    // metric reflects post-boot reality, not just deltas observed
+    // by the scheduler/handlers since process start.
+    metrics::gauge!("vela_delayed_events_pending").set(count as f64);
     Ok(count)
 }
 
@@ -503,7 +513,10 @@ pub async fn update_delayed_event_handler(
             // remove returns None and there's nothing left to do
             // — the user's intent (no further fire) is already
             // achieved by virtue of having already fired once.
-            let _ = remove(&state, &delay_id)?;
+            let removed = remove(&state, &delay_id)?;
+            if removed.is_some() {
+                metrics::counter!("vela_delayed_events_cancelled_total").increment(1);
+            }
             Ok(Json(json!({})))
         }
         "send" => {
@@ -512,10 +525,11 @@ pub async fn update_delayed_event_handler(
             // the event first, we silently skip firing again —
             // double-firing the same event would violate the MSC's
             // "the delayed event is sent at most once" contract.
-            if let Some(rec) = take_if_due(&state, &delay_id, u64::MAX)
-                && let Err(e) = fire_event(&state, rec).await
-            {
-                tracing::debug!(error = ?e, "delayed event manual fire failed");
+            if let Some(rec) = take_if_due(&state, &delay_id, u64::MAX) {
+                metrics::counter!("vela_delayed_events_manual_send_total").increment(1);
+                if let Err(e) = fire_event(&state, rec).await {
+                    tracing::debug!(error = ?e, "delayed event manual fire failed");
+                }
             }
             Ok(Json(json!({})))
         }
@@ -543,6 +557,7 @@ pub async fn update_delayed_event_handler(
                     .db
                     .save_delayed_event(&rec.delay_id, &bytes)
                     .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+                metrics::counter!("vela_delayed_events_restarted_total").increment(1);
             }
             Ok(Json(json!({})))
         }
@@ -636,7 +651,9 @@ async fn run_scheduler(state: AppState) {
             let Some(rec) = take_if_due(&state, &id, now) else {
                 continue;
             };
+            metrics::counter!("vela_delayed_events_fired_total").increment(1);
             if let Err(e) = fire_event(&state, rec).await {
+                metrics::counter!("vela_delayed_events_fire_errors_total").increment(1);
                 tracing::debug!(error = ?e, "delayed event fire failed");
             }
         }
