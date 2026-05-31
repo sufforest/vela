@@ -311,6 +311,13 @@ pub struct AppState {
     /// fully-stated room by pulling /state from one of the servers
     /// the resident named in its send_join response.
     pub partial_state_filler: Arc<crate::federation::partial_state_filler::PartialStateFiller>,
+    /// MSC2836 peer-supplied `unsigned.children` cache, keyed by
+    /// event_nid. Federation backfill populates this from the
+    /// peer's response so `bundle_unsigned` can return authoritative
+    /// counts/hashes for events whose siblings aren't on our walk
+    /// path and therefore aren't indexed locally. In-memory only —
+    /// rebuilds from federation on restart.
+    pub event_relationships_unsigned_cache: Arc<DashMap<u64, serde_json::Value>>,
     /// MSC4186 sliding-sync per-connection snapshot cache.
     /// `(user_nid, conn_id) -> previous list room_ids`. Lets the
     /// response emit DELETE/INSERT deltas instead of always re-

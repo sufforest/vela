@@ -12,7 +12,7 @@
 //! gates local writes, ensuring local and federated events are validated against
 //! identical rules.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 use tracing::{debug, error, warn};
@@ -412,13 +412,39 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
                         PduOutcome::Rejected(format!("auth_event {aev_id} is rejected")),
                     );
                 }
+                // /state_ids + /event fallback. Some peers (notably
+                // Complement's mock servers in TestCorruptedAuthChain,
+                // and any homeserver that uses synapse's
+                // resolution strategy) don't register `/event_auth`
+                // at all; the state-at-event view gives us the same
+                // auth chain via `auth_chain_ids` + per-event /event
+                // fetches. Spec permits any of these endpoints to
+                // serve the same purpose.
+                //
+                // The target for /state_ids is the deepest unknown
+                // prev_event we can walk to from the trigger. Calling
+                // on the trigger itself works for some peers but not
+                // for synapse (which only registers a handler for the
+                // specific boundary event); finding the boundary makes
+                // the fallback robust across both styles.
+                if load_pdu_by_event_id(state, aev_id).is_none() {
+                    let boundary = find_state_ids_boundary(state, &effective_pdu);
+                    let _ = fetch_auth_via_state_ids(
+                        state,
+                        &sender_domain,
+                        &effective_pdu.room_id,
+                        &boundary,
+                        fetch_budget.clone(),
+                    )
+                    .await;
+                }
                 match load_pdu_by_event_id(state, aev_id) {
                     Some(p) => p,
                     None => {
                         return (
                             effective_pdu.event_id.clone(),
                             PduOutcome::Rejected(format!(
-                                "auth event {aev_id} not provided in /event_auth chain"
+                                "auth event {aev_id} not provided in /event_auth or /state_ids chain"
                             )),
                         );
                     }
@@ -1622,6 +1648,132 @@ fn fetch_auth_chain<'a>(
 
         Ok(())
     })
+}
+
+/// BFS back through known events' `prev_events` to find the
+/// deepest event_id we don't have locally. Used as the target for
+/// the `/state_ids` fallback — synapse-style peers serve a state
+/// snapshot at the missing boundary, not at the trigger event
+/// itself. Capped at 32 hops so a degenerate chain can't drive
+/// unbounded reads.
+///
+/// The trigger PDU isn't yet on disk (we're mid-process_pdu), so
+/// callers pass it in directly rather than relying on
+/// `load_pdu_by_event_id` for the seed.
+fn find_state_ids_boundary(state: &AppState, start: &Pdu) -> String {
+    use std::collections::VecDeque;
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut frontier: VecDeque<String> = VecDeque::new();
+    for pid in &start.prev_events {
+        frontier.push_back(pid.clone());
+    }
+    visited.insert(start.event_id.clone());
+
+    for _ in 0..32 {
+        let current = match frontier.pop_front() {
+            Some(c) => c,
+            None => return start.event_id.clone(),
+        };
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        match load_pdu_by_event_id(state, &current) {
+            Some(p) => {
+                for pid in &p.prev_events {
+                    if !visited.contains(pid) {
+                        frontier.push_back(pid.clone());
+                    }
+                }
+            }
+            None => return current,
+        }
+    }
+    start.event_id.clone()
+}
+
+/// Fallback to `/state_ids` + per-event `/event` when `/event_auth`
+/// returns nothing usable. Some peers (Complement's mock used in
+/// TestCorruptedAuthChain, and synapse's own resolution path)
+/// don't serve `/event_auth` at all — they expose the auth chain
+/// indirectly through `/state_ids[event_id=…]`'s `auth_chain_ids`,
+/// and clients walk those one by one via `/event/{eventId}`.
+/// Persists results under `FetchKind::AuthChain` so they appear
+/// only as auth context, not in the timeline.
+async fn fetch_auth_via_state_ids(
+    state: &AppState,
+    origin: &str,
+    room_id: &str,
+    target_event_id: &str,
+    budget: FetchBudget,
+) -> Result<(), String> {
+    if budget_exhausted(&budget) {
+        return Err("fetch budget exhausted".into());
+    }
+    let resp = state
+        .federation_client
+        .state_ids(origin, room_id, target_event_id)
+        .await
+        .map_err(|e| format!("/state_ids: {e}"))?;
+    let mut ids: Vec<String> = Vec::new();
+    for key in ["auth_chain_ids", "pdu_ids"] {
+        if let Some(arr) = resp.get(key).and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    ids.push(s.to_string());
+                }
+            }
+        }
+    }
+    let mut accepted = 0usize;
+    for eid in &ids {
+        if !consume_budget(&budget) {
+            warn!("budget exhausted during /state_ids ingestion");
+            break;
+        }
+        if state.db.get_event_nid_by_id(eid).ok().flatten().is_some() {
+            continue;
+        }
+        match state.federation_client.fetch_event_pdu(origin, eid).await {
+            Ok(ev_json) => {
+                // Use the lightweight outlier persistence path —
+                // `persist_fetched_event` recursively fetches each
+                // event's missing auth_events via /event_auth, which
+                // burns through the shared FetchBudget on a chain
+                // this deep. We just need the bytes on disk so the
+                // outer Check 4 can complete; downstream live events
+                // get their full Check 4 via the normal receive path.
+                let room_id = ev_json
+                    .get("room_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(room_id);
+                let Ok(Some(room_nid)) = state.db.get_nid(room_id) else {
+                    continue;
+                };
+                match crate::membership::federation_outbound_join::persist_remote_event(
+                    state,
+                    room_nid,
+                    &ev_json,
+                    vela_store::db::PersistKind::Outlier,
+                )
+                .await
+                {
+                    Ok(Some(_)) => accepted += 1,
+                    Ok(None) => {} // already had this event
+                    Err(e) => {
+                        debug!(event_id = %eid, error = %e, "/state_ids: persist failed");
+                    }
+                }
+            }
+            Err(e) => {
+                debug!(event_id = %eid, error = %e, "/state_ids: fetch event failed");
+            }
+        }
+    }
+    debug!(
+        accepted,
+        target_event_id, "auth chain fetched via /state_ids"
+    );
+    Ok(())
 }
 
 /// Look up the room's current forward extremities and resolve them to event

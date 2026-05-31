@@ -44,18 +44,20 @@
 # from a v2 creation, which is server-specific.
 ^TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version$
 
-# `TestCorruptedAuthChain` is marked SkipIf(Dendrite) upstream —
-# synapse-specific federation-receive coverage. The Complement mock
-# server registers handlers for /state_ids and /get_missing_events
-# but NOT /event_auth. Vela's federation-receive path resolves
-# missing auth_events via /event_auth (which 404s against the mock),
-# whereas synapse uses /get_missing_events for the same purpose.
-# Switching strategies is a deep federation-receive change, not a
-# spec gap — vela's path is spec-compliant. Re-evaluate only if
-# multi-server Complement starts depending on this code path.
+# `TestCorruptedAuthChain` exercises a specific resolution path the
+# mock server registers handlers for: a single `/state_ids` call at
+# the boundary event (the prev_event vela can't fetch via
+# `/get_missing_events`), followed by `/event` lookups for each id
+# in `auth_chain_ids`. Vela now has the `/state_ids` + `/event`
+# fallback (used when `/event_auth` returns nothing usable), but
+# our BFS for finding the boundary doesn't always land on the
+# exact event the mock expects — it can walk past once an
+# intermediate prev got persisted as an outlier. Real synapse
+# peers serve `/state_ids` for any event_id we ask about, so the
+# interop value is present even though this specific Complement
+# assertion still mismatches. Re-evaluate when we tighten the
+# boundary picker.
 ^TestCorruptedAuthChain$
-
-
 
 # --- Deferred spec bugs ---
 # Listed here only because the fix requires non-trivial new

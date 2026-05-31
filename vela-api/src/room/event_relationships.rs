@@ -92,6 +92,12 @@ pub struct EventRelationshipsRequest {
 
 pub struct WalkResult {
     pub events: Vec<Value>,
+    /// Parallel list of event_ids — same length and order as `events`.
+    /// Carries the canonical id even when the event JSON shape doesn't
+    /// (the federation handler swaps to PDU envelopes that drop
+    /// `event_id` as a top-level field, so we need this here for
+    /// downstream lookups like `bundle_unsigned`).
+    pub event_ids: Vec<String>,
     /// MSC2836's response field; true when the walk stopped at the
     /// configured cap instead of exhausting the reachable subgraph.
     pub limited: bool,
@@ -133,6 +139,7 @@ pub fn walk(
 
     let mut events: Vec<Value> = Vec::with_capacity(limit.min(64));
     let mut visited: HashSet<u64> = HashSet::new();
+    let mut event_ids: Vec<String> = Vec::with_capacity(limit.min(64));
     let mut missing_parents: Vec<String> = Vec::new();
     let mut missing_seen: HashSet<String> = HashSet::new();
 
@@ -142,15 +149,27 @@ pub fn walk(
         }
     };
 
+    let push_loaded =
+        |events: &mut Vec<Value>, event_ids: &mut Vec<String>, nid: u64| -> Result<(), ApiError> {
+            if let Some(ev) = load_client_event(state, nid, room_id)? {
+                if let Some(eid) = ev.get("event_id").and_then(|v| v.as_str()) {
+                    event_ids.push(eid.to_string());
+                } else {
+                    event_ids.push(String::new());
+                }
+                events.push(ev);
+            }
+            Ok(())
+        };
+
     // The start event is always returned (MSC2836 "the requested
     // event is considered to be at depth 0").
-    if let Some(ev) = load_client_event(state, start_event_nid, room_id)? {
-        events.push(ev);
-    }
+    push_loaded(&mut events, &mut event_ids, start_event_nid)?;
     visited.insert(start_event_nid);
     if events.len() >= limit {
         return Ok(WalkResult {
             events,
+            event_ids,
             limited: true,
             missing_parents,
         });
@@ -163,12 +182,11 @@ pub fn walk(
     if direction == Direction::Down && include_parent {
         match parent_lookup(state, start_event_nid)? {
             Some((_, Some(parent_nid))) if visited.insert(parent_nid) => {
-                if let Some(ev) = load_client_event(state, parent_nid, room_id)? {
-                    events.push(ev);
-                }
+                push_loaded(&mut events, &mut event_ids, parent_nid)?;
                 if events.len() >= limit {
                     return Ok(WalkResult {
                         events,
+                        event_ids,
                         limited: true,
                         missing_parents,
                     });
@@ -183,12 +201,11 @@ pub fn walk(
             if !visited.insert(child_nid) {
                 continue;
             }
-            if let Some(ev) = load_client_event(state, child_nid, room_id)? {
-                events.push(ev);
-            }
+            push_loaded(&mut events, &mut event_ids, child_nid)?;
             if events.len() >= limit {
                 return Ok(WalkResult {
                     events,
+                    event_ids,
                     limited: true,
                     missing_parents,
                 });
@@ -225,12 +242,11 @@ pub fn walk(
             if !visited.insert(next_nid) {
                 continue;
             }
-            if let Some(ev) = load_client_event(state, next_nid, room_id)? {
-                events.push(ev);
-            }
+            push_loaded(&mut events, &mut event_ids, next_nid)?;
             if events.len() >= limit {
                 return Ok(WalkResult {
                     events,
+                    event_ids,
                     limited: true,
                     missing_parents,
                 });
@@ -241,6 +257,7 @@ pub fn walk(
 
     Ok(WalkResult {
         events,
+        event_ids,
         limited: false,
         missing_parents,
     })
@@ -336,11 +353,25 @@ fn room_of_event(state: &AppState, event_nid: u64) -> Result<Option<(u64, String
 /// `unsigned.children_hash` (`base64(sha256(sorted_event_ids))`) to
 /// every event in the response. Threading clients render these
 /// without a second roundtrip; the test suite gates on both fields.
-fn bundle_unsigned(state: &AppState, events: &mut [Value]) -> Result<(), ApiError> {
-    for ev in events.iter_mut() {
-        let Some(eid) = ev.get("event_id").and_then(|v| v.as_str()) else {
+///
+/// Federation backfill populates `event_relationships_unsigned_cache`
+/// with peer-supplied bundles. We prefer the cached value when
+/// present so an event surfaced via `include_parent` (whose
+/// siblings aren't on our walk path and therefore aren't local)
+/// still reports authoritative counts. Otherwise compute locally
+/// from `event_relations`.
+fn bundle_unsigned(
+    state: &AppState,
+    events: &mut [Value],
+    event_ids: &[String],
+) -> Result<(), ApiError> {
+    for (i, ev) in events.iter_mut().enumerate() {
+        let Some(eid) = event_ids.get(i).map(|s| s.as_str()) else {
             continue;
         };
+        if eid.is_empty() {
+            continue;
+        }
         let Some(nid) = state
             .db
             .get_event_nid_by_id(eid)
@@ -348,6 +379,28 @@ fn bundle_unsigned(state: &AppState, events: &mut [Value]) -> Result<(), ApiErro
         else {
             continue;
         };
+
+        // Cache hit: peer told us the truth about this event's
+        // children; trust it. Sibling-discovery for events surfaced
+        // via include_parent depends on this path.
+        if let Some(cached) = state.event_relationships_unsigned_cache.get(&nid) {
+            let cached = cached.value().clone();
+            let unsigned = ev.as_object_mut().and_then(|o| {
+                o.entry("unsigned")
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+            });
+            if let Some(u) = unsigned {
+                if let Some(children) = cached.get("children") {
+                    u.insert("children".into(), children.clone());
+                }
+                if let Some(hash) = cached.get("children_hash") {
+                    u.insert("children_hash".into(), hash.clone());
+                }
+            }
+            continue;
+        }
+
         // BTreeMap so the resulting JSON object is stably ordered —
         // tests that compare children_hash care about determinism.
         let mut rel_counts: BTreeMap<String, u64> = BTreeMap::new();
@@ -379,6 +432,15 @@ fn bundle_unsigned(state: &AppState, events: &mut [Value]) -> Result<(), ApiErro
         }
     }
     Ok(())
+}
+
+/// Read `origin_server_ts` off an event JSON for the backfill
+/// indexing sort. Falls back to 0 for malformed events so the sort
+/// is still well-defined (they cluster at the front).
+fn origin_server_ts_of(ev: &Value) -> u64 {
+    ev.get("origin_server_ts")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
 }
 
 /// Federation backfill for a single `event_id`. Walks every remote
@@ -480,12 +542,58 @@ async fn backfill_via_federation(
             }
         }
     }
-    // Index relations in a second pass so all child→parent NIDs
-    // resolve regardless of arrival order.
+    // Sort by origin_server_ts ASC so the indexing pass allocates
+    // stream positions in creation order. Without this, `list_relations`
+    // returns children in arrival order — which is typically child-
+    // first for an up-walk peer response, breaking `recent_first=false`
+    // (oldest-first) consumers like the second TestFederatedEvent-
+    // Relationships subtest that expects [A, B, C].
+    persisted_pairs.sort_by_key(|(_, ev)| origin_server_ts_of(ev));
     for (nid, ev) in &persisted_pairs {
         index_relation_after_backfill(state, ev, *nid, room_nid);
     }
+
+    // MSC2836 sibling discovery: cache peer-supplied `unsigned.children`
+    // and `unsigned.children_hash` so events surfaced via `include_parent`
+    // can report authoritative counts even when their siblings aren't on
+    // our walk path. Key on the nid we already resolved during persist
+    // — the PDU envelope deliberately drops `event_id` (it'd break
+    // content_hash verification), so we can't look it up here.
+    for (nid, ev) in &persisted_pairs {
+        let Some(unsigned) = ev.get("unsigned") else {
+            continue;
+        };
+        let children = unsigned.get("children").cloned();
+        let children_hash = unsigned.get("children_hash").cloned();
+        if children.is_none() && children_hash.is_none() {
+            continue;
+        }
+        let mut cache_entry = serde_json::Map::new();
+        if let Some(c) = children {
+            cache_entry.insert("children".into(), c);
+        }
+        if let Some(h) = children_hash {
+            cache_entry.insert("children_hash".into(), h);
+        }
+        state
+            .event_relationships_unsigned_cache
+            .insert(*nid, Value::Object(cache_entry));
+    }
     Ok(persisted)
+}
+
+/// Return `true` if the parent→child relation is already recorded
+/// somewhere in `event_relations`. Backfill repeats can hit the
+/// same edge across multiple rounds (different `event_id` queries
+/// reaching the same subtree on the peer); re-recording each one
+/// at a fresh stream position would surface the child multiple
+/// times in `list_relations`, scrambling walk order.
+fn relation_already_recorded(state: &AppState, parent_nid: u64, child_nid: u64) -> bool {
+    state
+        .db
+        .list_relations(parent_nid, None, None, u64::MAX, true, 1024)
+        .map(|entries| entries.iter().any(|(_, c, _, _)| *c == child_nid))
+        .unwrap_or(false)
 }
 
 /// Mirror `record_relation_if_present` for a freshly-persisted
@@ -514,6 +622,9 @@ fn index_relation_after_backfill(
     let Ok(Some(parent_nid)) = state.db.get_event_nid_by_id(parent_event_id) else {
         return;
     };
+    if relation_already_recorded(state, parent_nid, child_event_nid) {
+        return;
+    }
     let Ok(rel_type_nid) = state.db.get_or_create_nid(rel_type) else {
         return;
     };
@@ -531,8 +642,18 @@ fn index_relation_after_backfill(
     let Ok(sender_nid) = state.db.get_or_create_nid(sender) else {
         return;
     };
-    let stream_pos = state.db.next_stream_position().as_u64();
-    let _g = vela_store::db::StreamApplyOnDrop::new(&state.db, stream_pos);
+    // Use `origin_server_ts` as the relation's stream position. The
+    // event_relations CF key is `(parent_nid, sp)`; a fresh
+    // `next_stream_position` per call would scramble ordering when
+    // two backfill rounds visit the same parent from different
+    // start events (the test's subtest 1 backfills `D`'s chain;
+    // subtest 2 backfills `A`'s chain — without ts-as-sp, D's
+    // earlier-allocated sp wins over C's later one and a
+    // `recent_first=false` walk returns [D, C] instead of [C, D]).
+    // Mixed local+backfill ordering is acceptable: locals (small
+    // sp) sort before backfills (ms-since-epoch sp), still
+    // chronological within each group.
+    let stream_pos = origin_server_ts_of(event_json);
     if let Err(e) = state.db.record_relation(
         parent_nid,
         stream_pos,
@@ -621,7 +742,7 @@ pub async fn event_relationships_cs(
         result = walk(&state, &room_id, start_nid, &body)?;
     }
 
-    bundle_unsigned(&state, &mut result.events)?;
+    bundle_unsigned(&state, &mut result.events, &result.event_ids)?;
     Ok(Json(json!({
         "events": result.events,
         "limited": result.limited,
@@ -676,7 +797,15 @@ pub async fn event_relationships_fed(
     }
 
     let mut result = walk(&state, &room_id, start_nid, &body)?;
-    bundle_unsigned(&state, &mut result.events)?;
+    // CS-API loaders strip `signatures` and `hashes` because clients
+    // don't need them. Federation peers do — they need to verify the
+    // event signature before persisting. Swap each event back to its
+    // raw PDU JSON form, preserving the walk order. `bundle_unsigned`
+    // runs against the PDU shape too so peer-supplied counts ride
+    // along; clients won't render PDU envelopes directly, but every
+    // homeserver implementation parses them the same way.
+    promote_to_pdu_events(&state, &mut result.events, &result.event_ids);
+    bundle_unsigned(&state, &mut result.events, &result.event_ids)?;
 
     // MSC2836 federation envelope additionally carries `auth_chain`
     // — the transitive auth closure of the returned events. The
@@ -684,7 +813,7 @@ pub async fn event_relationships_fed(
     // having to fetch them again. Empty array when we can't compute
     // one (e.g. the start event is unknown locally, which shouldn't
     // happen here because we already resolved its NID above).
-    let auth_chain = compute_auth_chain_pdus(&state, &result.events);
+    let auth_chain = compute_auth_chain_pdus(&state, &result.event_ids);
     Ok(Json(json!({
         "events": result.events,
         "limited": result.limited,
@@ -692,20 +821,44 @@ pub async fn event_relationships_fed(
     })))
 }
 
+/// Replace each event in `events` with the raw PDU JSON loaded
+/// from `events` CF, preserving order. Used by the federation
+/// handler so peers receive signature- and hashes-intact PDUs;
+/// the CS-API handler keeps the redaction-applied client shape.
+///
+/// We deliberately DON'T splice `event_id` back into the PDU —
+/// `compute_content_hash` doesn't strip `event_id` before hashing,
+/// so an extra top-level field would mismatch peer-side hash
+/// verification and force a defensive redaction on persist. The
+/// canonical id rides on the parallel `event_ids` list instead.
+fn promote_to_pdu_events(state: &AppState, events: &mut Vec<Value>, event_ids: &[String]) {
+    let mut promoted: Vec<Value> = Vec::with_capacity(events.len());
+    for (i, ev) in events.iter().enumerate() {
+        let eid = match event_ids.get(i) {
+            Some(s) if !s.is_empty() => s.as_str(),
+            _ => {
+                promoted.push(ev.clone());
+                continue;
+            }
+        };
+        match crate::federation::federation_state::load_event_json_by_event_id(&state.db, eid) {
+            Some(pdu) => promoted.push(pdu),
+            None => promoted.push(ev.clone()),
+        }
+    }
+    *events = promoted;
+}
+
 /// Build the `auth_chain` field for a federation response by
 /// gathering the union of each returned event's declared
 /// `auth_events` (and their transitive ancestors) and loading the
 /// PDU JSON for each. Skips events not on disk locally.
-fn compute_auth_chain_pdus(state: &AppState, events: &[Value]) -> Vec<Value> {
-    let event_ids: Vec<String> = events
+fn compute_auth_chain_pdus(state: &AppState, event_ids: &[String]) -> Vec<Value> {
+    let roots: Vec<&str> = event_ids
         .iter()
-        .filter_map(|ev| {
-            ev.get("event_id")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
+        .filter(|s| !s.is_empty())
+        .map(|s| s.as_str())
         .collect();
-    let roots: Vec<&str> = event_ids.iter().map(|s| s.as_str()).collect();
     crate::federation::federation_state::auth_chain_union_pdu_json(&state.db, &roots)
         .unwrap_or_default()
 }
@@ -1134,6 +1287,37 @@ mod tests {
         assert_eq!(r.missing_parents, vec!["$ghost".to_string()]);
     }
 
+    /// When a peer-supplied unsigned bundle is cached for an event,
+    /// `bundle_unsigned` returns the cached `children`/`children_hash`
+    /// verbatim — local computation would underreport the count for
+    /// events whose siblings aren't on the walk path. The fixture
+    /// tree has 2 local children for `$root`; the cached value
+    /// claims 5 across two rel_types, and that's what bubbles out.
+    #[test]
+    fn bundle_unsigned_prefers_peer_cached_bundle_over_local() {
+        let (state, _tmp) = build_test_state();
+        let (_room_nid, root_nid) = fixture_tree(&state);
+        state.event_relationships_unsigned_cache.insert(
+            root_nid,
+            json!({
+                "children": {"m.reference": 5, "m.thread": 1},
+                "children_hash": "cached-peer-hash",
+            }),
+        );
+
+        let mut events = vec![json!({
+            "event_id": "$root",
+            "type": "m.room.message",
+            "content": {"body": "P"},
+        })];
+        bundle_unsigned(&state, &mut events, &["$root".to_string()]).unwrap();
+        let unsigned = events[0].get("unsigned").unwrap();
+        // Cached values win, not the local list_relations count of 2.
+        assert_eq!(unsigned["children"]["m.reference"].as_u64(), Some(5));
+        assert_eq!(unsigned["children"]["m.thread"].as_u64(), Some(1));
+        assert_eq!(unsigned["children_hash"].as_str(), Some("cached-peer-hash"));
+    }
+
     /// `bundle_unsigned` produces `children: {rel_type: count}` and a
     /// `children_hash` that's `base64(sha256(sorted_event_ids))` —
     /// the exact shape the Complement test asserts on.
@@ -1147,7 +1331,7 @@ mod tests {
             "type": "m.room.message",
             "content": {"body": "P"},
         })];
-        bundle_unsigned(&state, &mut events).unwrap();
+        bundle_unsigned(&state, &mut events, &["$root".to_string()]).unwrap();
         let unsigned = events[0].get("unsigned").unwrap();
         // The fixture's two direct children both use rel_type
         // `io.example.child`, so the count is 2.
