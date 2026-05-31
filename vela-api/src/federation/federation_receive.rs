@@ -1113,12 +1113,12 @@ async fn persist_received_pdu(
             // the new "no longer shared" relationship. Run BEFORE the
             // membership update so `get_room_members` still includes
             // the observer set.
-            let was_joined = state
+            let prior_membership = state
                 .db
                 .get_membership(room_nid, state_key_nid)
                 .ok()
-                .flatten()
-                == Some(1);
+                .flatten();
+            let was_joined = prior_membership == Some(1);
             if was_joined && (membership_byte == 0 || membership_byte == 3) {
                 crate::e2ee::keys::record_device_changes_on_leave(state, state_key_nid, room_nid);
             }
@@ -1127,6 +1127,30 @@ async fn persist_received_pdu(
                 .set_membership(room_nid, state_key_nid, membership_byte)
             {
                 tracing::warn!(error = %e, "set_membership (federated member event) failed");
+            }
+            // MSC3902 partial-state: when a federated peer joins a
+            // room we're still resyncing, fire device_list_changed
+            // for local observers immediately. The filler's
+            // reconcile_device_lists pass runs only at completion;
+            // without this hook, /sync.device_lists.changed misses
+            // the new peer until the resync ends (sometimes minutes
+            // later). Outside partial-state the joining server's
+            // own m.device_list_update EDU covers this signal, so
+            // we don't fire here to avoid double-counting.
+            let became_joined = !was_joined && membership_byte == 1;
+            if became_joined {
+                let room_is_partial = state
+                    .db
+                    .get_partial_state_info(room_nid)
+                    .map(|(p, _)| p)
+                    .unwrap_or(false);
+                if room_is_partial {
+                    crate::e2ee::keys::record_device_changes_on_join(
+                        state,
+                        state_key_nid,
+                        room_nid,
+                    );
+                }
             }
             // Wake the affected user so their /sync sees the move.
             crate::router::notify_user(state, state_key_nid);

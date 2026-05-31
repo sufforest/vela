@@ -214,6 +214,7 @@ async fn try_fill_one(
                             .clear_partial_state(room_nid)
                             .map_err(|e| format!("clear flag: {e}"))?;
                         reconcile_device_lists(state, room_nid, &members_before);
+                        wake_sync_on_clear(state, room_nid);
                         return Ok(true);
                     }
                     Err(e) => {
@@ -300,6 +301,23 @@ async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> 
         ));
     }
     Ok(())
+}
+
+/// Wake any /sync long-polls blocked on this room. Filler completion
+/// is a state transition observable through /sync (members_omitted
+/// flips false, `rooms.join.<id>.state` now contains the full member
+/// set). Without this wake a client mid-long-poll sees the change
+/// only on its next scheduled refresh.
+fn wake_sync_on_clear(state: &AppState, room_nid: u64) {
+    let pos = state.db.next_stream_position().as_u64();
+    // Filler completion doesn't persist anything new — the state
+    // events were already merged before clear_partial_state. We still
+    // burn a stream position so the wake carries a value > any
+    // previously-returned `next_batch`.
+    let _stream_guard = vela_store::db::StreamApplyOnDrop::new(&state.db, pos);
+    if let Some(sender) = state.room_senders.get(&Nid(room_nid)) {
+        let _ = sender.send(pos);
+    }
 }
 
 /// Reset the `running` flag — exposed for tests so they can re-spawn
@@ -442,6 +460,31 @@ mod tests {
 
         let got = pick_anchor_event_id(&state, room_nid).unwrap();
         assert_eq!(got, "$anchor");
+    }
+
+    /// `wake_sync_on_clear` allocates a fresh stream position and
+    /// broadcasts it on the room's `room_senders` channel. A /sync
+    /// long-poll subscribed before clear must observe the new pos
+    /// — without it, members_omitted=false is delivered only when
+    /// some other event in the room eventually wakes the poll.
+    #[test]
+    fn wake_sync_on_clear_broadcasts_fresh_pos() {
+        let (state, _tmp) = build_test_state();
+        let room_nid = state.db.get_or_create_nid("!wake:example.com").unwrap();
+        // Install a broadcast channel for the room, simulating an
+        // active /sync subscription. The cap matches what the
+        // AppState boot path installs (the value isn't tested).
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<u64>(16);
+        state.room_senders.insert(Nid(room_nid), tx);
+
+        let before = state.db.current_stream_position();
+        wake_sync_on_clear(&state, room_nid);
+        let pos = rx.try_recv().expect("expected a wake on room_senders");
+        // The wake carries a stream pos strictly greater than the
+        // last-applied value at the moment of the wake. Comparing
+        // against `before` keeps the assertion stable under whatever
+        // background events the test harness may have allocated.
+        assert!(pos > before, "wake pos {pos} should exceed {before}");
     }
 
     /// `_reset_for_test` flips the filler's `running` flag back to
