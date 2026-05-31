@@ -3407,22 +3407,6 @@ mod tests {
         );
     }
 
-    /// The typing/receipt coalescing rule reuses `timeline_events`
-    /// emptiness as the signal. Pin the negation pattern so the future
-    /// refactor that replaces `is_empty()` with a count comparison
-    /// doesn't accidentally invert the check.
-    #[test]
-    fn timeline_has_new_is_negation_of_is_empty() {
-        let events: Vec<Value> = Vec::new();
-        assert!(events.is_empty());
-        // !is_empty() means "has new" — the same flag the sync path
-        // uses to coalesce typing + receipts in.
-        assert!(!(!events.is_empty()));
-        let with_one = vec![json!({"type": "m.room.message"})];
-        assert!(!with_one.is_empty());
-        assert!(!with_one.is_empty());
-    }
-
     /// `room_is_unchanged` returns true for a room whose join data has
     /// no timeline / state / ephemeral / account_data events. This is
     /// the predicate that controls sparse rooms emission.
