@@ -558,17 +558,35 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
             // /sync timelines without contributing to current state.
         }
         Err(reason) => {
-            // Log the detailed reason (may include internal DB error text or
-            // NID values) operator-side; don't ship it to the federating peer.
-            error!(
-                event_id = %effective_pdu.event_id,
-                error = %reason,
-                "state-at-event resolution failed"
-            );
-            return (
-                effective_pdu.event_id.clone(),
-                PduOutcome::Rejected("state-at-event resolution failed".into()),
-            );
+            // Partial-state rooms hit "unknown prev_event" frequently
+            // while the filler is catching up — those events are
+            // legitimate (the resident vouches via Check 4 against
+            // declared auth_events) and rejecting them on the
+            // resolution-failed path means a mid-resync ban / kick /
+            // join never lands. MSC3902 expects the homeserver to
+            // accept these and resolve once the resync completes.
+            let is_partial_state = state
+                .db
+                .get_partial_state_info(room_nid)
+                .map(|(p, _)| p)
+                .unwrap_or(false);
+            if is_partial_state {
+                debug!(
+                    event_id = %effective_pdu.event_id,
+                    reason = %reason,
+                    "state-at-event resolution failed in partial-state room — accepting via declared auth_events"
+                );
+            } else {
+                error!(
+                    event_id = %effective_pdu.event_id,
+                    error = %reason,
+                    "state-at-event resolution failed"
+                );
+                return (
+                    effective_pdu.event_id.clone(),
+                    PduOutcome::Rejected("state-at-event resolution failed".into()),
+                );
+            }
         }
     }
 
@@ -589,7 +607,19 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
     };
     let cs_fn = |t: &str, sk: &str| current_state.get(&(t.to_string(), sk.to_string()));
     let cs_outcome = check_auth(&effective_pdu, &cs_fn);
-    let soft_failed = cs_outcome.is_err();
+    // Partial-state rooms hold an incomplete `current_state` while the
+    // filler is catching up — the resident has a power_levels event or
+    // member event our local map doesn't yet have. Soft-failing on that
+    // basis blocks legitimate state changes (a remote ban during resync
+    // never reaches /sync). Treat partial-state Check 6 failures as
+    // accepts; full state reconciliation happens at filler completion.
+    let cs_failed = cs_outcome.is_err();
+    let is_partial_state = state
+        .db
+        .get_partial_state_info(room_nid)
+        .map(|(p, _)| p)
+        .unwrap_or(false);
+    let soft_failed = cs_failed && !is_partial_state;
     if soft_failed {
         let reason = match &cs_outcome {
             Err(AuthError::Rejected(r)) => r.clone(),
@@ -2280,5 +2310,85 @@ mod tests {
         )
         .await;
         assert!(res.is_err(), "expected Err on exhausted budget");
+    }
+
+    /// The partial-state branch in Check 5 (state-at-event resolution
+    /// failed) is gated on `get_partial_state_info`. Verify the DB
+    /// helper returns the expected `(partial, servers)` tuple so the
+    /// receive path's gate behaves correctly under various states.
+    #[tokio::test]
+    async fn partial_state_info_gates_check_5_fallback() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_nid = db.get_or_create_nid("!partial:example.com").unwrap();
+
+        // Default: not partial-state.
+        let (partial, servers) = db.get_partial_state_info(room_nid).unwrap();
+        assert!(!partial);
+        assert!(servers.is_empty());
+
+        // Set partial-state with the resident server.
+        db.set_partial_state_join(room_nid, &["resident.example".into()])
+            .unwrap();
+        let (partial, servers) = db.get_partial_state_info(room_nid).unwrap();
+        assert!(partial);
+        assert_eq!(servers, vec!["resident.example".to_string()]);
+
+        // Clear flips back; the Check 5 path would now go through the
+        // strict rejection.
+        db.clear_partial_state(room_nid).unwrap();
+        let (partial, _) = db.get_partial_state_info(room_nid).unwrap();
+        assert!(!partial);
+    }
+
+    /// Membership transitions (`set_membership` byte 0/1/2/3/4) must
+    /// round-trip through `get_membership` for both sync and
+    /// federation/receive to read back the right state — this is the
+    /// substrate the partial-state ban / leave paths rely on.
+    #[tokio::test]
+    async fn membership_byte_round_trip_covers_all_states() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_nid = db.get_or_create_nid("!mb:example.com").unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+
+        // Initial: no record → None.
+        assert_eq!(db.get_membership(room_nid, alice_nid).unwrap(), None);
+
+        for byte in [0u8, 1, 2, 3, 4] {
+            db.set_membership(room_nid, alice_nid, byte).unwrap();
+            assert_eq!(
+                db.get_membership(room_nid, alice_nid).unwrap(),
+                Some(byte),
+                "byte {byte} round-trip"
+            );
+        }
+    }
+
+    /// Banned (3) and left (0) users both appear in
+    /// `get_user_left_rooms` — this is what makes /sync's rooms.leave
+    /// section surface a remote-ban event after the partial-state
+    /// soft-fail relaxation accepts it.
+    #[tokio::test]
+    async fn left_rooms_index_includes_banned_users() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        let room_left = db.get_or_create_nid("!left:example.com").unwrap();
+        let room_banned = db.get_or_create_nid("!banned:example.com").unwrap();
+        let room_joined = db.get_or_create_nid("!joined:example.com").unwrap();
+
+        db.set_membership(room_left, alice_nid, 0).unwrap();
+        db.set_membership(room_banned, alice_nid, 3).unwrap();
+        db.set_membership(room_joined, alice_nid, 1).unwrap();
+
+        let mut left = db.get_user_left_rooms(alice_nid).unwrap();
+        left.sort();
+        let mut expected = vec![room_left, room_banned];
+        expected.sort();
+        assert_eq!(left, expected);
+
+        let joined = db.get_user_joined_rooms(alice_nid).unwrap();
+        assert_eq!(joined, vec![room_joined]);
     }
 }

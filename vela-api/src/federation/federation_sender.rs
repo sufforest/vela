@@ -178,6 +178,19 @@ impl FederationSender {
             destinations.push(extra);
         }
 
+        // MSC3902 partial-state rooms: the local membership index
+        // doesn't yet list everyone the resident server told us is in
+        // the room. Union in `servers_in_room` from
+        // `set_partial_state_join` so leaves / messages / EDUs reach
+        // the resident (and other peers) before the filler catches up.
+        if let Ok((true, servers)) = self.db.get_partial_state_info(room_nid) {
+            for s in servers {
+                if s != self.our_server_name && !destinations.iter().any(|d| d == &s) {
+                    destinations.push(s);
+                }
+            }
+        }
+
         if destinations.is_empty() {
             return;
         }
@@ -786,5 +799,56 @@ mod tests {
             .unwrap();
         assert!(!rooms.contains(&20));
         assert!(rooms.contains(&10));
+    }
+
+    /// Partial-state rooms: the local memberships index doesn't yet
+    /// list every server the resident told us about. Verify the DB
+    /// has `set_partial_state_join` and `get_partial_state_info`
+    /// round-trip so the broadcast path can union the hint in.
+    #[tokio::test]
+    async fn partial_state_servers_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+        let room_nid = 7;
+        // Empty by default.
+        let (partial, servers) = db.get_partial_state_info(room_nid).unwrap();
+        assert!(!partial);
+        assert!(servers.is_empty());
+
+        db.set_partial_state_join(
+            room_nid,
+            &["resident.example".into(), "peer.example".into()],
+        )
+        .unwrap();
+        let (partial, servers) = db.get_partial_state_info(room_nid).unwrap();
+        assert!(partial);
+        let mut sorted = servers.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec!["peer.example".to_string(), "resident.example".to_string()]
+        );
+
+        // clear_partial_state flips the flag back and drops the hints.
+        db.clear_partial_state(room_nid).unwrap();
+        let (partial, servers) = db.get_partial_state_info(room_nid).unwrap();
+        assert!(!partial);
+        assert!(servers.is_empty());
+    }
+
+    /// Even with the flag set, `set_partial_state_join` with an empty
+    /// list shouldn't be relied on for the federation broadcast —
+    /// `target_server_for_member_event` and the member-event union
+    /// keep working. This test is a smoke check that the helper
+    /// doesn't panic on an empty list.
+    #[tokio::test]
+    async fn partial_state_empty_servers_is_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+        let room_nid = 9;
+        db.set_partial_state_join(room_nid, &[]).unwrap();
+        let (partial, servers) = db.get_partial_state_info(room_nid).unwrap();
+        assert!(partial);
+        assert!(servers.is_empty());
     }
 }

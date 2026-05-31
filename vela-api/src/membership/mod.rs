@@ -795,19 +795,37 @@ pub async fn leave_room(
         .get_membership(room_nid, user.user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
+    // /leave is idempotent — a client re-issuing /leave on a room
+    // they've already left (or were banned from) gets 200 OK per the
+    // c2s spec. Only the "never been here" states (None / not a
+    // member) get rejection. Without this the partial-state Complement
+    // Destroy hook 403s when it tries to leave a room the test body
+    // already left.
+    if matches!(current, Some(0) | Some(3)) {
+        return Ok(Json(json!({})));
+    }
     if !matches!(current, Some(1) | Some(2) | Some(4)) {
-        // must be join, invite, or knock to leave
         return Err(VelaError::Forbidden("not in this room".into()).into());
     }
 
-    // If the room was created on a different server, the leave needs to go
-    // through the federation `make_leave`/`send_leave` flow so the resident
-    // server adds it to the authoritative DAG. We then persist the
-    // returned-signed event locally. Otherwise (we're the resident, or it's
-    // a fully-local room) emit + broadcast as before.
+    // If the room was created on a different server, the leave
+    // normally goes through the federation `make_leave`/`send_leave`
+    // flow so the resident server adds it to the authoritative DAG.
+    // One exception: partial-state joins (MSC3902). We already hold
+    // the user's own membership + the auth state locally, so we can
+    // build and sign the leave directly and federate it through the
+    // normal /send broadcast. Calling make_leave during the filler's
+    // catch-up would race against the resync and the resident often
+    // responds with garbage. Test:
+    // `TestPartialStateJoin/Leave_during_resync/does_not_wait_for_resync`.
     let resident_server = creator_server(&state, room_nid)?;
+    let (is_partial_state, _servers) = state
+        .db
+        .get_partial_state_info(room_nid)
+        .unwrap_or((false, Vec::new()));
     if let Some(rs) = resident_server
         && rs != state.config.server_name
+        && !is_partial_state
     {
         do_remote_leave(&state, &user, room_nid, &room_id, &rs).await?;
         return Ok(Json(json!({})));
@@ -3067,5 +3085,223 @@ mod tests {
             state.db.get_membership(room_nid, charlie_nid).unwrap(),
             None
         );
+    }
+
+    /// /leave on a room the caller is already left from returns 200 OK.
+    /// The c2s spec mandates the idempotency, and Complement's
+    /// partial-state Destroy hook depends on it.
+    #[tokio::test]
+    async fn leave_room_is_idempotent_for_already_left_user() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!already_left:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let user_id = "@alice:example.com";
+        let user_nid = db.get_or_create_nid(user_id).unwrap();
+        db.set_membership(room_nid, user_nid, 0).unwrap(); // leave
+        let user = AuthenticatedUser {
+            user_nid,
+            user_id: user_id.into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        };
+        let res = leave_room(State(state.clone()), user, Path(room_id.to_string()))
+            .await
+            .expect("idempotent leave returns 200");
+        assert_eq!(res.0, json!({}));
+    }
+
+    /// /leave on a room where the caller was banned (membership=3)
+    /// must also short-circuit to 200 — same spec contract.
+    #[tokio::test]
+    async fn leave_room_is_idempotent_for_banned_user() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!banned:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let user_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        db.set_membership(room_nid, user_nid, 3).unwrap(); // ban
+        let user = AuthenticatedUser {
+            user_nid,
+            user_id: "@alice:example.com".into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        };
+        let res = leave_room(State(state.clone()), user, Path(room_id.to_string()))
+            .await
+            .expect("idempotent leave on banned user");
+        assert_eq!(res.0, json!({}));
+    }
+
+    /// /leave on a room the user has never been a member of returns
+    /// 403 M_FORBIDDEN, distinct from the idempotent already-left
+    /// path. This pins the negative case so a future refactor doesn't
+    /// accidentally allow strangers to "leave" arbitrary rooms.
+    #[tokio::test]
+    async fn leave_room_rejects_non_member() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!notme:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let user_nid = db.get_or_create_nid("@stranger:example.com").unwrap();
+        // No set_membership call — user has never been here.
+        let _ = room_nid;
+        let user = AuthenticatedUser {
+            user_nid,
+            user_id: "@stranger:example.com".into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        };
+        let err = leave_room(State(state.clone()), user, Path(room_id.to_string()))
+            .await
+            .expect_err("stranger can't leave");
+        let msg = format!("{}", err.0);
+        assert!(
+            msg.contains("not in this room"),
+            "want forbidden, got {msg}"
+        );
+    }
+
+    /// Unknown room_id still surfaces as 404 (and NOT as the idempotent
+    /// 200 path), so probing for room existence remains a not-found.
+    #[tokio::test]
+    async fn leave_room_returns_404_for_unknown_room() {
+        let (state, _tmp) = build_test_state();
+        let user_nid = state.db.get_or_create_nid("@alice:example.com").unwrap();
+        let user = AuthenticatedUser {
+            user_nid,
+            user_id: "@alice:example.com".into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        };
+        let err = leave_room(
+            State(state.clone()),
+            user,
+            Path("!never-existed:example.com".to_string()),
+        )
+        .await
+        .expect_err("unknown room is 404");
+        let msg = format!("{}", err.0);
+        assert!(msg.contains("not found"), "want not-found, got {msg}");
+    }
+
+    /// `membership_u8` maps spec strings to the internal byte
+    /// representation. This is the substrate every membership
+    /// transition relies on; a typo here would silently break the
+    /// /sync rooms.* sections.
+    #[test]
+    fn membership_u8_maps_spec_strings() {
+        assert_eq!(membership_u8("join"), 1);
+        assert_eq!(membership_u8("invite"), 2);
+        assert_eq!(membership_u8("ban"), 3);
+        assert_eq!(membership_u8("knock"), 4);
+        assert_eq!(membership_u8("leave"), 0);
+        // Unknown strings fall back to leave.
+        assert_eq!(membership_u8(""), 0);
+        assert_eq!(membership_u8("foo"), 0);
+    }
+
+    /// `is_local_user` parses `@user:server` correctly and is robust
+    /// to malformed user_ids (no `:`, multiple `:`).
+    #[test]
+    fn is_local_user_uses_server_domain() {
+        assert!(is_local_user("@alice:example.com", "example.com"));
+        assert!(!is_local_user("@alice:example.com", "other.example"));
+        // Port-bearing server names are preserved by the rsplit.
+        assert!(is_local_user("@alice:hs1:8448", "hs1:8448"));
+        // No colon → not local to any server.
+        assert!(!is_local_user("malformed", "example.com"));
+    }
+
+    /// `creator_server` returns the domain of the create event's
+    /// sender. Used in the /leave routing decision — null when there's
+    /// no create event yet.
+    #[tokio::test]
+    async fn creator_server_resolves_create_sender_domain() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!cs:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:resident.example").unwrap();
+        let create_type = db.get_or_create_nid("m.room.create").unwrap();
+        let empty_skey = db.get_or_create_nid("").unwrap();
+
+        // No create event yet → None.
+        assert_eq!(creator_server(&state, room_nid).unwrap(), None);
+
+        // Persist a create event sent from resident.example.
+        let body = json!({
+            "type": "m.room.create",
+            "sender": "@alice:resident.example",
+            "state_key": "",
+            "room_id": room_id,
+            "content": {"room_version": "12"},
+            "origin_server_ts": 1, "depth": 1,
+            "prev_events": [], "auth_events": [],
+        });
+        let event_nid = 9001u64;
+        db.persist_event(
+            event_nid,
+            "$c",
+            room_nid,
+            create_type,
+            alice_nid,
+            empty_skey,
+            1,
+            1,
+            &serde_json::to_vec(&body).unwrap(),
+            &[],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+        db.promote_state_event(room_nid, event_nid, create_type, empty_skey)
+            .unwrap();
+
+        let got = creator_server(&state, room_nid).unwrap();
+        assert_eq!(got.as_deref(), Some("resident.example"));
+    }
+
+    /// Sender with empty domain (post-split) doesn't crash
+    /// `creator_server`; it just returns None.
+    #[tokio::test]
+    async fn creator_server_returns_none_for_malformed_sender() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!malf:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let bad_sender_nid = db.get_or_create_nid("nosep").unwrap();
+        let create_type = db.get_or_create_nid("m.room.create").unwrap();
+        let empty_skey = db.get_or_create_nid("").unwrap();
+        let body = json!({
+            "type": "m.room.create",
+            "sender": "nosep",
+            "state_key": "",
+            "room_id": room_id,
+            "content": {"room_version": "12"},
+            "origin_server_ts": 1, "depth": 1,
+            "prev_events": [], "auth_events": [],
+        });
+        let nid = 9100u64;
+        db.persist_event(
+            nid,
+            "$mc",
+            room_nid,
+            create_type,
+            bad_sender_nid,
+            empty_skey,
+            1,
+            1,
+            &serde_json::to_vec(&body).unwrap(),
+            &[],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+        db.promote_state_event(room_nid, nid, create_type, empty_skey)
+            .unwrap();
+        assert_eq!(creator_server(&state, room_nid).unwrap(), None);
     }
 }

@@ -1059,7 +1059,14 @@ fn build_room_sync_for_user(
         (Some(_), None) => false,    // never transitioned in this process
         (Some(s), Some(p)) => p > s, // a transition happened since the last sync
     };
-    if typing_changed_since {
+    // Also (re-)emit the typing snapshot when the room has new timeline
+    // events to deliver: clients running tests like TestACLsForEDUs
+    // expect a typing event to coexist with the message that woke the
+    // sync. Without this, the typing transition fires once on Response
+    // #1, the message arrives in Response #N, and no single response
+    // ever carries both.
+    let timeline_has_new = !timeline_events.is_empty();
+    if typing_changed_since || timeline_has_new {
         let typing_user_nids = get_typing_users(state, room_nid);
         let mut user_ids = Vec::new();
         for nid in &typing_user_nids {
@@ -1071,12 +1078,15 @@ fn build_room_sync_for_user(
                 user_ids.push(Value::String(uid));
             }
         }
-        // Emit empty user_ids only after an explicit stop transition
-        // (since.is_some()), per TestTyping/Typing_can_be_explicitly_stopped.
-        // On initial sync we'd otherwise inject an empty typing event
-        // into every room — TestACLsForEDUs asserts the ACL'd room has
-        // zero ephemeral events, and the empty snapshot would count.
-        let emit_empty_is_ok = since.is_some();
+        // Emit empty user_ids only when this is incremental sync AND a
+        // typing transition fired (typically an explicit stop), per
+        // TestTyping/Typing_can_be_explicitly_stopped. On initial sync
+        // we'd otherwise inject an empty typing event into every room —
+        // TestACLsForEDUs asserts the ACL'd room has zero ephemeral
+        // events, and the empty snapshot would count. Re-emitting solely
+        // because timeline has new events doesn't need an empty snapshot
+        // — just skip when nobody's typing.
+        let emit_empty_is_ok = since.is_some() && typing_changed_since;
         if !user_ids.is_empty() || emit_empty_is_ok {
             ephemeral_events.push(json!({
                 "type": "m.typing",
@@ -1101,6 +1111,12 @@ fn build_room_sync_for_user(
             .is_some_and(|max| max > since_pos),
         _ => true, // initial sync OR unauthenticated: always emit the snapshot
     };
+    // Same coalescing rule as typing above: if the room is going to
+    // appear in this response because of a fresh timeline event, ride
+    // the current receipt snapshot along so test contracts that wait
+    // for `timeline + ephemeral.m.receipt` in one response succeed
+    // without depending on transition timing.
+    let receipts_changed = receipts_changed || timeline_has_new;
     if receipts_changed
         && let Some(uid) = user_nid
         && let Some(receipts_event) = build_receipts_event(state, room_nid, uid)?
@@ -3083,5 +3099,368 @@ mod tests {
         assert!(types.contains("m.room.power_levels"));
         assert!(types.contains("m.room.join_rules"));
         assert_eq!(out.len(), 2);
+    }
+
+    /// Non-state events (`state_key_nid == 0`) inside the range must
+    /// NOT contribute to the delta. This is the test that catches a
+    /// regression where compute_state_delta treats every event as
+    /// state.
+    #[test]
+    fn state_delta_skips_non_state_events_in_range() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!noisy:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        let type_msg = db.get_or_create_nid("m.room.message").unwrap();
+
+        // Three plain timeline messages.
+        for (nid, eid) in &[(4001u64, "$m1"), (4002, "$m2"), (4003, "$m3")] {
+            let body = json!({
+                "type": "m.room.message",
+                "sender": "@alice:example.com",
+                "room_id": room_id,
+                "content": {"body": "x"},
+                "origin_server_ts": 1, "depth": 1,
+                "prev_events": [], "auth_events": [],
+            });
+            db.persist_event(
+                *nid,
+                eid,
+                room_nid,
+                type_msg,
+                alice_nid,
+                0,
+                1,
+                1,
+                &serde_json::to_vec(&body).unwrap(),
+                &[],
+                &[],
+                false,
+                false,
+            )
+            .unwrap();
+        }
+        let out = compute_state_delta(&state, room_nid, room_id, 1, 99999, None, None).unwrap();
+        assert!(
+            out.is_empty(),
+            "non-state events shouldn't contribute: {out:#?}"
+        );
+    }
+
+    /// A room with no events in the range returns an empty delta.
+    /// Distinct from the "inverted range" test — here the range is
+    /// valid but the room genuinely has nothing in it.
+    #[test]
+    fn state_delta_empty_for_empty_room() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_nid = db.get_or_create_nid("!quiet:example.com").unwrap();
+        let out = compute_state_delta(&state, room_nid, "!quiet:example.com", 1, 99999, None, None)
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// The `(since_exclusive, upper_exclusive)` window translates to
+    /// the timeline scan's `[from, to)` half-open range — `from`
+    /// inclusive, `to` exclusive. Callers in sync pass `since + 1` as
+    /// `since_exclusive` to skip the event the client already has.
+    /// Pin both boundary behaviours so a later signature change can't
+    /// silently flip inclusivity.
+    #[test]
+    fn state_delta_window_is_half_open_lower_inclusive() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!boundary:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+
+        let p = persist_state(
+            db,
+            5001,
+            "$jr",
+            room_nid,
+            room_id,
+            "m.room.join_rules",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"join_rule": "public"}),
+            1,
+            1,
+            &[],
+        );
+        // since_exclusive == p (inclusive lower) → event INCLUDED.
+        let out = compute_state_delta(&state, room_nid, room_id, p, p + 10, None, None).unwrap();
+        assert_eq!(out.len(), 1, "lower bound is inclusive");
+
+        // since_exclusive == p + 1 → event excluded.
+        let out =
+            compute_state_delta(&state, room_nid, room_id, p + 1, p + 10, None, None).unwrap();
+        assert!(out.is_empty(), "events past lower bound are excluded");
+
+        // upper_exclusive == p (exclusive upper) → event excluded.
+        let out = compute_state_delta(&state, room_nid, room_id, 1, p, None, None).unwrap();
+        assert!(out.is_empty(), "upper bound is exclusive");
+    }
+
+    /// State events with the same `(type, state_key)` slot but
+    /// arriving at different positions both contribute initially, but
+    /// only the latest position survives the dedupe.
+    #[test]
+    fn state_delta_latest_wins_when_multiple_writes_same_slot() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!races:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+
+        let _ = persist_state(
+            db,
+            6001,
+            "$pl1",
+            room_nid,
+            room_id,
+            "m.room.power_levels",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"users_default": 0}),
+            1,
+            1,
+            &[],
+        );
+        let _ = persist_state(
+            db,
+            6002,
+            "$pl2",
+            room_nid,
+            room_id,
+            "m.room.power_levels",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"users_default": 5}),
+            2,
+            2,
+            &[],
+        );
+        let p3 = persist_state(
+            db,
+            6003,
+            "$pl3",
+            room_nid,
+            room_id,
+            "m.room.power_levels",
+            alice_nid,
+            "@alice:example.com",
+            "",
+            json!({"users_default": 10}),
+            3,
+            3,
+            &[],
+        );
+        let out = compute_state_delta(&state, room_nid, room_id, 1, p3 + 1, None, None).unwrap();
+        assert_eq!(out.len(), 1);
+        let users_default = out[0]
+            .pointer("/content/users_default")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_default();
+        assert_eq!(users_default, 10, "latest write wins: {out:#?}");
+    }
+
+    /// Spec: `next_batch` MUST be a string token; clients re-feed it
+    /// as `since` and expect strict-monotonic ordering. Pin the
+    /// `s{pos}` token shape so a downstream refactor can't silently
+    /// switch to a different encoding (e.g. opaque base64).
+    #[test]
+    fn next_batch_uses_stream_position_token_shape() {
+        let (state, _tmp) = build_test_state();
+        let user = fake_user(&state, "@alice:example.com");
+        let resp = build_sync_response(&state, &user, &[], None).unwrap();
+        let next_batch = resp
+            .pointer("/next_batch")
+            .and_then(|v| v.as_str())
+            .expect("next_batch present");
+        assert!(
+            next_batch.starts_with('s'),
+            "expected s-prefixed pos token: {next_batch}"
+        );
+        let pos: u64 = next_batch[1..].parse().expect("numeric pos");
+        assert!(pos >= 1, "pos >= 1, got {pos}");
+    }
+
+    /// /sync top-level response keeps the device_lists, account_data,
+    /// presence, to_device, and one-time-keys count sections present
+    /// even on a fresh account with nothing in any of them — clients
+    /// pin on these keys existing for initial render.
+    #[test]
+    fn sync_top_level_sections_always_present() {
+        let (state, _tmp) = build_test_state();
+        let user = fake_user(&state, "@alice:example.com");
+        let resp = build_sync_response(&state, &user, &[], None).unwrap();
+        for key in [
+            "/next_batch",
+            "/account_data/events",
+            "/device_lists/changed",
+            "/device_lists/left",
+            "/device_one_time_keys_count",
+            "/device_unused_fallback_key_types",
+            "/presence/events",
+            "/to_device/events",
+        ] {
+            assert!(
+                resp.pointer(key).is_some(),
+                "expected {key} in /sync response: {resp:#?}"
+            );
+        }
+    }
+
+    /// Sparse-rooms rule: a sync with zero joined / invited / left /
+    /// knocked rooms emits an EMPTY `rooms` object, not one with the
+    /// section keys all populated as empty objects. Without this the
+    /// MSC4155 `JSONKeyMissing` checks regress.
+    #[test]
+    fn sync_rooms_object_is_empty_when_no_rooms() {
+        let (state, _tmp) = build_test_state();
+        let user = fake_user(&state, "@bob:example.com");
+        let resp = build_sync_response(&state, &user, &[], None).unwrap();
+        let rooms = resp.pointer("/rooms").and_then(|v| v.as_object()).unwrap();
+        assert!(
+            rooms.is_empty(),
+            "expected empty rooms object, got {rooms:?}"
+        );
+    }
+
+    /// `m.push_rules` is synthesised on initial sync when the user
+    /// hasn't customised — clients depend on it for default
+    /// notification settings. Verify the shape so a refactor of the
+    /// account_data path doesn't drop it.
+    #[test]
+    fn initial_sync_synthesises_push_rules_account_data() {
+        let (state, _tmp) = build_test_state();
+        let user = fake_user(&state, "@alice:example.com");
+        let resp = build_sync_response(&state, &user, &[], None).unwrap();
+        let events = resp
+            .pointer("/account_data/events")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        let push_rules = events
+            .iter()
+            .find(|e| e.get("type").and_then(|v| v.as_str()) == Some("m.push_rules"))
+            .expect("m.push_rules synthesised on initial sync");
+        let global = push_rules
+            .pointer("/content/global")
+            .expect("content.global present");
+        assert!(
+            global.get("override").is_some(),
+            "global.override missing: {push_rules:#?}"
+        );
+        assert!(global.get("underride").is_some());
+    }
+
+    /// Incremental sync DOESN'T re-synthesise `m.push_rules` — the
+    /// rules don't change unless the user wrote, in which case the
+    /// account_data event already covered it.
+    #[test]
+    fn incremental_sync_skips_push_rules_synthesis() {
+        let (state, _tmp) = build_test_state();
+        let user = fake_user(&state, "@alice:example.com");
+        // Advance the stream so `since = 1` is a valid past position.
+        let _ = state.db.next_stream_position();
+        let resp = build_sync_response(&state, &user, &[], Some(1)).unwrap();
+        let events = resp
+            .pointer("/account_data/events")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        let has_push_rules = events
+            .iter()
+            .any(|e| e.get("type").and_then(|v| v.as_str()) == Some("m.push_rules"));
+        assert!(
+            !has_push_rules,
+            "m.push_rules should NOT be synthesised on incremental sync"
+        );
+    }
+
+    /// `typing_change_pos` is a process-local `DashMap`. A typing
+    /// transition writes the room's stream position; the sync read
+    /// path compares it against the client's `since`. Sanity-check the
+    /// map mechanics so a future refactor catches removal.
+    #[test]
+    fn typing_change_pos_round_trips() {
+        let (state, _tmp) = build_test_state();
+        let room_nid = 42u64;
+        // Empty default.
+        assert!(state.typing_change_pos.get(&room_nid).is_none());
+
+        state.typing_change_pos.insert(room_nid, 100);
+        assert_eq!(
+            state.typing_change_pos.get(&room_nid).map(|v| *v),
+            Some(100)
+        );
+
+        // Updates overwrite.
+        state.typing_change_pos.insert(room_nid, 200);
+        assert_eq!(
+            state.typing_change_pos.get(&room_nid).map(|v| *v),
+            Some(200)
+        );
+    }
+
+    /// `room_is_unchanged` returns true for a room whose join data has
+    /// no timeline / state / ephemeral / account_data events. This is
+    /// the predicate that controls sparse rooms emission.
+    #[test]
+    fn room_is_unchanged_recognises_empty_sections() {
+        let empty = json!({
+            "timeline": {"events": []},
+            "state": {"events": []},
+            "ephemeral": {"events": []},
+            "account_data": {"events": []},
+        });
+        assert!(room_is_unchanged(&empty));
+
+        let with_timeline = json!({
+            "timeline": {"events": [{"type": "m.room.message"}]},
+            "state": {"events": []},
+            "ephemeral": {"events": []},
+            "account_data": {"events": []},
+        });
+        assert!(!room_is_unchanged(&with_timeline));
+
+        let with_state = json!({
+            "timeline": {"events": []},
+            "state": {"events": [{"type": "m.room.name"}]},
+            "ephemeral": {"events": []},
+            "account_data": {"events": []},
+        });
+        assert!(!room_is_unchanged(&with_state));
+
+        let with_ephem = json!({
+            "timeline": {"events": []},
+            "state": {"events": []},
+            "ephemeral": {"events": [{"type": "m.typing"}]},
+            "account_data": {"events": []},
+        });
+        assert!(!room_is_unchanged(&with_ephem));
+
+        let with_account = json!({
+            "timeline": {"events": []},
+            "state": {"events": []},
+            "ephemeral": {"events": []},
+            "account_data": {"events": [{"type": "m.tag"}]},
+        });
+        assert!(!room_is_unchanged(&with_account));
+    }
+
+    /// Rooms with literally no section keys (missing entirely) must
+    /// still be treated as unchanged — defensive read for malformed
+    /// values that future refactors might temporarily produce.
+    #[test]
+    fn room_is_unchanged_treats_missing_keys_as_empty() {
+        let empty_object = json!({});
+        assert!(room_is_unchanged(&empty_object));
+        let only_summary = json!({"summary": {"m.joined_member_count": 1}});
+        assert!(room_is_unchanged(&only_summary));
     }
 }
