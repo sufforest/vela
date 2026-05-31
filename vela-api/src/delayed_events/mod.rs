@@ -20,7 +20,7 @@ use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::error::ApiError;
 use crate::middleware::json::Json;
 use crate::router::AppState;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -60,12 +60,14 @@ pub struct DelayedEventRecord {
 pub struct DelayedEventStore {
     /// `delay_id` → record. DashMap for concurrent read/write.
     pub by_id: DashMap<String, DelayedEventRecord>,
-    /// Cache of `(user_nid, room_id, event_type, state_key)` →
-    /// `delay_id` for state events. Lets a fresh state-event PUT for
-    /// an existing (type, state_key) cancel its previous pending
-    /// delay — per MSC4140 "Avoid clashing state keys as that would
-    /// cancel previous delayed events on the same key" (test L474).
-    pub state_key_index: DashMap<(u64, String, String, String), String>,
+    /// Cache of `(room_id, event_type, state_key)` → `delay_id` for
+    /// state events. Lets a fresh state-event PUT for an existing
+    /// (type, state_key) cancel its previous pending delay — and
+    /// the key is room-scoped (not user-scoped) because state
+    /// itself is room-scoped: two pending delays from different
+    /// users at the same (room, type, state_key) would both fire,
+    /// and the order would determine the final state.
+    pub state_key_index: DashMap<(String, String, String), String>,
     /// Cache of `(user_nid, device_id, room_id, event_type, txn_id)` →
     /// `delay_id` for message events so a re-PUT of the same txn_id
     /// returns the original `delay_id` instead of minting a new one.
@@ -86,17 +88,20 @@ fn now_ms() -> u64 {
 }
 
 fn new_delay_id() -> String {
-    // Hex-encoded 16-byte UUID. Random enough that collisions across
-    // billions are infeasible; printable so we can dump it into JSON
-    // and URLs without encoding gymnastics.
+    // Hex-encoded 16 bytes from the OS CSPRNG. The action endpoint
+    // treats `delay_id` as a capability token (no auth check beyond
+    // string equality), so the source MUST be cryptographically
+    // secure — `rand::rng()` is ChaCha12 today but a future rand
+    // bump could silently weaken to a non-CS source. `OsRng` is the
+    // OS's CSPRNG (`/dev/urandom` on Unix, `BCryptGenRandom` on
+    // Windows) and that contract is part of the rand-core trait.
+    use rand::TryRngCore;
+    use rand::rngs::OsRng;
     let mut bytes = [0u8; 16];
-    use rand::Rng;
-    rand::rng().fill(&mut bytes);
-    bytes
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join("")
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS CSPRNG must not fail");
+    bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
 }
 
 /// Insert a record into both DashMap mirror and the persistent CF.
@@ -108,12 +113,7 @@ pub fn store(state: &AppState, rec: DelayedEventRecord) -> Result<(), ApiError> 
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     if let Some(sk) = &rec.state_key {
-        let key = (
-            rec.user_nid,
-            rec.room_id.clone(),
-            rec.event_type.clone(),
-            sk.clone(),
-        );
+        let key = state_index_key(&rec.room_id, &rec.event_type, sk);
         state
             .delayed_events
             .state_key_index
@@ -136,35 +136,82 @@ pub fn store(state: &AppState, rec: DelayedEventRecord) -> Result<(), ApiError> 
     Ok(())
 }
 
-/// Remove a record from both stores.
+/// Drop the auxiliary index entries (state_key_index, txn_index)
+/// that point at `rec`. Shared between every removal path so the
+/// CF and the mirrors stay consistent.
+fn drop_indexes(state: &AppState, rec: &DelayedEventRecord) {
+    if let Some(sk) = &rec.state_key {
+        let key = state_index_key(&rec.room_id, &rec.event_type, sk);
+        // Only drop the index entry if it still points at this
+        // delay_id — a concurrent re-schedule may have overwritten
+        // it with a fresh id, and we mustn't clobber the new one.
+        let _ = state
+            .delayed_events
+            .state_key_index
+            .remove_if(&key, |_, v| v == &rec.delay_id);
+    }
+    if let Some(tid) = &rec.txn_id {
+        let key = (
+            rec.user_nid,
+            rec.device_id.clone(),
+            rec.room_id.clone(),
+            rec.event_type.clone(),
+            tid.clone(),
+        );
+        let _ = state
+            .delayed_events
+            .txn_index
+            .remove_if(&key, |_, v| v == &rec.delay_id);
+    }
+}
+
+/// Remove a record from both stores. Idempotent — returns `None`
+/// when the id is unknown.
 pub fn remove(state: &AppState, delay_id: &str) -> Result<Option<DelayedEventRecord>, ApiError> {
     let rec = state.delayed_events.by_id.remove(delay_id).map(|(_, r)| r);
     if let Some(r) = &rec {
-        if let Some(sk) = &r.state_key {
-            let key = (
-                r.user_nid,
-                r.room_id.clone(),
-                r.event_type.clone(),
-                sk.clone(),
-            );
-            state.delayed_events.state_key_index.remove(&key);
-        }
-        if let Some(tid) = &r.txn_id {
-            let key = (
-                r.user_nid,
-                r.device_id.clone(),
-                r.room_id.clone(),
-                r.event_type.clone(),
-                tid.clone(),
-            );
-            state.delayed_events.txn_index.remove(&key);
-        }
+        drop_indexes(state, r);
     }
     state
         .db
         .delete_delayed_event(delay_id)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     Ok(rec)
+}
+
+/// Atomic "take this record if it's still scheduled to fire by
+/// `deadline_ms`" — the scheduler's primitive. Closes the
+/// fire-vs-cancel and fire-vs-restart races: a cancel between the
+/// scheduler's filter pass and its fire pass changes the by_id
+/// map state, and `remove_if` re-checks under the DashMap shard
+/// lock, so the scheduler only fires events that are still both
+/// present AND due.
+fn take_if_due(state: &AppState, delay_id: &str, deadline_ms: u64) -> Option<DelayedEventRecord> {
+    let removed = state
+        .delayed_events
+        .by_id
+        .remove_if(delay_id, |_, r| r.scheduled_at_ms <= deadline_ms)
+        .map(|(_, r)| r);
+    if let Some(r) = &removed {
+        drop_indexes(state, r);
+        let _ = state.db.delete_delayed_event(delay_id);
+    }
+    removed
+}
+
+/// State index key. Cross-user: two users delaying the same
+/// (room, type, state_key) cancel each other, since state is
+/// room-scoped (last-writer-wins). The MSC's "avoid clashing
+/// state keys" guidance is room-scoped, not per-user — making
+/// this per-user would let user A's pending delay sit alongside
+/// user B's, and the order they fire would determine the final
+/// state nondeterministically.
+fn state_index_key(room_id: &str, event_type: &str, state_key: &str) -> (String, String, String) {
+    (
+        room_id.to_string(),
+        event_type.to_string(),
+        state_key.to_string(),
+    )
 }
 
 /// Populate the in-memory store from the persistent CF. Called once
@@ -178,12 +225,7 @@ pub fn load_from_disk(state: &AppState) -> Result<usize, ApiError> {
     for (_, bytes) in rows {
         if let Ok(rec) = serde_json::from_slice::<DelayedEventRecord>(&bytes) {
             if let Some(sk) = &rec.state_key {
-                let key = (
-                    rec.user_nid,
-                    rec.room_id.clone(),
-                    rec.event_type.clone(),
-                    sk.clone(),
-                );
+                let key = state_index_key(&rec.room_id, &rec.event_type, sk);
                 state
                     .delayed_events
                     .state_key_index
@@ -289,12 +331,7 @@ pub fn schedule_state(
     content: Value,
     delay_ms: u64,
 ) -> Result<String, ApiError> {
-    let key = (
-        user.user_nid,
-        room_id.to_string(),
-        event_type.to_string(),
-        state_key.to_string(),
-    );
+    let key = state_index_key(room_id, event_type, state_key);
     if let Some(prior_id) = state
         .delayed_events
         .state_key_index
@@ -387,13 +424,6 @@ pub async fn list_delayed_events_handler(
     Ok(Json(json!({"delayed_events": events})))
 }
 
-#[derive(Deserialize)]
-pub struct ActionParams {
-    /// `cancel` | `restart` | `send`. Per the MSC, the action is in
-    /// the URL path; missing or unrecognised values surface as 404.
-    pub action: String,
-}
-
 /// `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}` —
 /// MSC4140's three-verb management endpoint. The path-positional
 /// `action` is one of `cancel | restart | send`; anything else
@@ -410,31 +440,61 @@ pub async fn update_delayed_event_handler(
     State(state): State<AppState>,
     Path((delay_id, action)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let rec = state
-        .delayed_events
-        .by_id
-        .get(&delay_id)
-        .map(|e| e.value().clone());
-    let rec = match rec {
-        Some(r) => r,
-        None => return Err(VelaError::NotFound("delay_id".into()).into()),
-    };
+    // Early existence check is purely for the 404 path. The
+    // mutating branches re-validate atomically below so a
+    // scheduler tick between the existence check and the mutation
+    // can't double-fire (cancel) or double-fire-and-overwrite
+    // (send/restart).
+    if !state.delayed_events.by_id.contains_key(&delay_id) {
+        return Err(VelaError::NotFound("delay_id".into()).into());
+    }
     match action.as_str() {
         "cancel" => {
-            remove(&state, &delay_id)?;
+            // Atomic remove. If the scheduler already fired it, our
+            // remove returns None and there's nothing left to do
+            // — the user's intent (no further fire) is already
+            // achieved by virtue of having already fired once.
+            let _ = remove(&state, &delay_id)?;
             Ok(Json(json!({})))
         }
         "send" => {
-            // Fire immediately. Remove BEFORE firing so a concurrent
-            // scheduler tick doesn't fire it a second time.
-            let _ = remove(&state, &delay_id)?;
-            fire_event(&state, rec).await?;
+            // `take_if_due` with deadline=MAX gives us an
+            // unconditional atomic remove. If the scheduler claims
+            // the event first, we silently skip firing again —
+            // double-firing the same event would violate the MSC's
+            // "the delayed event is sent at most once" contract.
+            if let Some(rec) = take_if_due(&state, &delay_id, u64::MAX)
+                && let Err(e) = fire_event(&state, rec).await
+            {
+                tracing::debug!(error = ?e, "delayed event manual fire failed");
+            }
             Ok(Json(json!({})))
         }
         "restart" => {
-            let mut updated = rec;
-            updated.scheduled_at_ms = now_ms() + updated.delay_ms;
-            store(&state, updated)?;
+            // Atomic in-place update of `scheduled_at_ms`. Avoids
+            // the remove+store window in which the entry is
+            // momentarily absent (a list call would miss it). The
+            // CF gets re-written outside the lock; if the entry
+            // vanished between our entry-modify and the persist,
+            // the persist is a harmless no-op (next list_from_disk
+            // would just reload the deleted state).
+            let mut now_rec: Option<DelayedEventRecord> = None;
+            state
+                .delayed_events
+                .by_id
+                .entry(delay_id.clone())
+                .and_modify(|r| {
+                    r.scheduled_at_ms = now_ms() + r.delay_ms;
+                    now_rec = Some(r.clone());
+                });
+            if let Some(rec) = now_rec {
+                let bytes = serde_json::to_vec(&rec)
+                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+                state
+                    .db
+                    .save_delayed_event(&rec.delay_id, &bytes)
+                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+            }
             Ok(Json(json!({})))
         }
         _ => Err(VelaError::NotFound(format!("action: {action}")).into()),
@@ -503,41 +563,29 @@ async fn run_scheduler(state: AppState) {
     loop {
         tokio::time::sleep(TICK_INTERVAL).await;
         let now = now_ms();
-        // Collect due events first, then fire outside the iteration
-        // so we don't hold DashMap shards across an await.
-        let due: Vec<DelayedEventRecord> = state
+        // First pass: collect candidate ids. Second pass: try to
+        // atomically claim each via `take_if_due` and fire only on
+        // success. The `take_if_due` re-checks the deadline under
+        // the DashMap shard lock, so a `restart` that pushed the
+        // deadline out OR a `cancel` that removed the entry both
+        // win the race cleanly — the scheduler skips and the next
+        // tick re-evaluates.
+        let candidate_ids: Vec<String> = state
             .delayed_events
             .by_id
             .iter()
             .filter(|e| e.value().scheduled_at_ms <= now)
-            .map(|e| e.value().clone())
+            .map(|e| e.key().clone())
             .collect();
-        for rec in due {
-            let _ = remove(&state, &rec.delay_id);
+        for id in candidate_ids {
+            let Some(rec) = take_if_due(&state, &id, now) else {
+                continue;
+            };
             if let Err(e) = fire_event(&state, rec).await {
                 tracing::debug!(error = ?e, "delayed event fire failed");
             }
         }
     }
-}
-
-#[derive(Deserialize, Debug, Default)]
-pub struct ListQuery {
-    #[serde(default)]
-    pub from: Option<String>,
-    #[serde(default)]
-    pub to: Option<String>,
-}
-
-/// `GET /_matrix/client/v1/delayed_events` with optional pagination
-/// params (currently ignored — see handler doc).
-#[allow(dead_code)]
-pub async fn list_with_query_handler(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Query(_q): Query<ListQuery>,
-) -> Result<Json<Value>, ApiError> {
-    list_delayed_events_handler(State(state), user).await
 }
 
 pub fn boot(state: &AppState) {
