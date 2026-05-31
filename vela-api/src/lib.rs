@@ -8,6 +8,7 @@ pub mod admin;
 pub mod appservice;
 pub mod auth;
 pub mod auth_check;
+pub mod delayed_events;
 pub mod directory;
 pub mod e2ee;
 pub mod federation;

@@ -5015,6 +5015,35 @@ impl Database {
         self.db.put_cf(&cf, key.as_bytes(), value)
     }
 
+    // --- MSC4140 delayed events ---
+
+    /// Persist a delayed event record by `delay_id`.
+    pub fn save_delayed_event(&self, delay_id: &str, value: &[u8]) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("delayed_events").unwrap();
+        self.db.put_cf(&cf, delay_id.as_bytes(), value)
+    }
+
+    /// Remove a delayed event record. Idempotent — a missing key is a
+    /// no-op.
+    pub fn delete_delayed_event(&self, delay_id: &str) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("delayed_events").unwrap();
+        self.db.delete_cf(&cf, delay_id.as_bytes())
+    }
+
+    /// Read all delayed event records as `(delay_id, value_bytes)`
+    /// pairs. Called once on startup to repopulate the in-memory
+    /// scheduler.
+    pub fn list_delayed_events(&self) -> Result<Vec<(String, Vec<u8>)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("delayed_events").unwrap();
+        let mut out = Vec::new();
+        for entry in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (k, v) = entry?;
+            let key = String::from_utf8_lossy(&k).into_owned();
+            out.push((key, v.to_vec()));
+        }
+        Ok(out)
+    }
+
     // --- Admin bot / admin room (vela-specific) ---
 
     /// Persist the user_nid of the server-internal admin bot user.

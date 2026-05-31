@@ -16,13 +16,17 @@ use crate::middleware::error::ApiError;
 use crate::room::rooms::get_or_create_signing_key;
 use crate::router::AppState;
 
-/// AS-spec `?ts=` masquerade. Only honoured when the request is
-/// authenticated as an appservice; ignored otherwise (matches
-/// Synapse, and prevents a regular client from backdating its own
-/// events).
+/// AS-spec `?ts=` masquerade plus MSC4140's `?org.matrix.msc4140.delay=<ms>`.
+/// `ts` only honoured when the request is authenticated as an
+/// appservice; ignored otherwise (matches Synapse, and prevents a
+/// regular client from backdating its own events). `delay` (when
+/// set) shunts the request into the delayed_events queue instead
+/// of sending immediately.
 #[derive(Deserialize)]
 pub struct TsOverride {
     pub ts: Option<u64>,
+    #[serde(rename = "org.matrix.msc4140.delay", default)]
+    pub delay: Option<u64>,
 }
 
 /// PUT /_matrix/client/v3/rooms/{roomId}/send/{eventType}/{txnId}
@@ -31,9 +35,79 @@ pub async fn send_message(
     user: AuthenticatedUser,
     Path((room_id_str, event_type, txn_id)): Path<(String, String, String)>,
     Query(ts_query): Query<TsOverride>,
-    Json(content): Json<Value>,
+    body: Option<Json<Value>>,
 ) -> Result<Json<Value>, ApiError> {
     let ts_override = ts_query.ts.filter(|_| user.appservice_nid.is_some());
+    // MSC4140 idempotency replays use the same path with no body —
+    // accept absence here, but for any non-delay path the body
+    // remains required (see the empty-body M_NOT_JSON guard inside
+    // `send_message_inner`).
+    let content = body.map(|Json(v)| v).unwrap_or(Value::Null);
+    if let Some(delay_ms) = ts_query.delay {
+        if !(1..=7 * 24 * 60 * 60 * 1000).contains(&delay_ms) {
+            return Err(VelaError::InvalidParam(format!("delay {delay_ms} out of range")).into());
+        }
+        // MSC4140 idempotency: a re-PUT with the same
+        // `(user, device, room, event_type, txn_id)` returns the
+        // existing `delay_id` — even when the body is absent (the
+        // upstream test exercises this without a JSON body).
+        if let Some(existing) = crate::delayed_events::existing_delay_id_for_txn(
+            &state,
+            user.user_nid,
+            &user.device_id,
+            &room_id_str,
+            &event_type,
+            &txn_id,
+        ) {
+            return Ok(Json(json!({"delay_id": existing})));
+        }
+        if !content.is_object() {
+            return Err(VelaError::BadJson("event content must be a JSON object".into()).into());
+        }
+        let room_nid = state
+            .db
+            .get_nid(&room_id_str)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            .ok_or_else(|| ApiError(VelaError::NotFound("room not found".into())))?;
+        let membership = state
+            .db
+            .get_membership(room_nid, user.user_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        if membership != Some(1) {
+            return Err(VelaError::Forbidden("not a member of this room".into()).into());
+        }
+        let id = crate::delayed_events::schedule_message(
+            &state,
+            &user,
+            &room_id_str,
+            &event_type,
+            &txn_id,
+            content,
+            delay_ms,
+        )?;
+        return Ok(Json(json!({"delay_id": id})));
+    }
+    send_message_inner(
+        state,
+        user,
+        room_id_str,
+        event_type,
+        txn_id,
+        ts_override,
+        content,
+    )
+    .await
+}
+
+pub(crate) async fn send_message_inner(
+    state: AppState,
+    user: AuthenticatedUser,
+    room_id_str: String,
+    event_type: String,
+    txn_id: String,
+    ts_override: Option<u64>,
+    content: Value,
+) -> Result<Json<Value>, ApiError> {
     // Spec: event content MUST be a JSON object. Reject any other
     // shape (string, number, array, null, bool) with M_BAD_JSON
     // before doing any room/membership/idempotency work.
@@ -283,6 +357,17 @@ pub async fn send_state_event(
     Json(content): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     let ts_override = ts_query.ts.filter(|_| user.appservice_nid.is_some());
+    if let Some(delay_ms) = ts_query.delay {
+        return delayed_state_response(
+            &state,
+            &user,
+            &room_id_str,
+            &event_type,
+            &state_key,
+            content,
+            delay_ms,
+        );
+    }
     send_state_inner(
         state,
         user,
@@ -304,6 +389,17 @@ pub async fn send_state_event_no_key(
     Json(content): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     let ts_override = ts_query.ts.filter(|_| user.appservice_nid.is_some());
+    if let Some(delay_ms) = ts_query.delay {
+        return delayed_state_response(
+            &state,
+            &user,
+            &room_id_str,
+            &event_type,
+            "",
+            content,
+            delay_ms,
+        );
+    }
     send_state_inner(
         state,
         user,
@@ -314,6 +410,45 @@ pub async fn send_state_event_no_key(
         content,
     )
     .await
+}
+
+fn delayed_state_response(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    room_id_str: &str,
+    event_type: &str,
+    state_key: &str,
+    content: Value,
+    delay_ms: u64,
+) -> Result<Json<Value>, ApiError> {
+    if !(1..=7 * 24 * 60 * 60 * 1000).contains(&delay_ms) {
+        return Err(VelaError::InvalidParam(format!("delay {delay_ms} out of range")).into());
+    }
+    // Membership check up front. The fire-time send_state_inner
+    // re-checks, but if the caller isn't currently a member we
+    // surface that immediately rather than queuing a doomed event.
+    let room_nid = state
+        .db
+        .get_nid(room_id_str)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        .ok_or_else(|| ApiError(VelaError::NotFound("room not found".into())))?;
+    let membership = state
+        .db
+        .get_membership(room_nid, user.user_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if membership != Some(1) {
+        return Err(VelaError::Forbidden("not a member of this room".into()).into());
+    }
+    let id = crate::delayed_events::schedule_state(
+        state,
+        user,
+        room_id_str,
+        event_type,
+        state_key,
+        content,
+        delay_ms,
+    )?;
+    Ok(Json(json!({"delay_id": id})))
 }
 
 pub(crate) async fn send_state_inner(
