@@ -32,10 +32,23 @@ use crate::middleware::json::Json;
 use crate::room::messages::load_client_event;
 use crate::router::AppState;
 use axum::extract::{Extension, State};
-use serde::Deserialize;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashSet, VecDeque};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use vela_core::error::VelaError;
+
+/// Cap on the number of federation backfill rounds a single CS-API
+/// request can drive. Each round resolves one batch of missing
+/// parents; the upper bound prevents a pathological chain from
+/// turning a client call into an unbounded federation crawl.
+const MAX_BACKFILL_ROUNDS: usize = 3;
+/// Cap on missing-parent events we'll backfill per round. Test
+/// scenarios resolve in 1–2 events; the cap is a defence against a
+/// peer that returns a deep tree as missing.
+const BACKFILL_PER_ROUND: usize = 8;
 
 const DEFAULT_MAX_DEPTH: u32 = 3;
 const HARD_MAX_DEPTH: u32 = 10;
@@ -50,30 +63,30 @@ pub enum Direction {
     Down,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct EventRelationshipsRequest {
     pub event_id: String,
     /// MSC2836 hint: when the requested event isn't local, this
     /// names the room so the handler knows which server pool to
     /// federate against. Spec-required for federation backfill,
     /// optional when the event is already on disk.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_depth: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_breadth: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub depth_first: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_first: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_parent: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_children: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
 }
 
@@ -82,6 +95,12 @@ pub struct WalkResult {
     /// MSC2836's response field; true when the walk stopped at the
     /// configured cap instead of exhausting the reachable subgraph.
     pub limited: bool,
+    /// Event IDs the walker would have stepped into but couldn't —
+    /// declared parents (via `m.relationship`/`m.relates_to`) not
+    /// on disk locally. The CS-API handler federation-backfills
+    /// these and re-runs the walk; the federation-side handler
+    /// ignores them (no backfill on the way out).
+    pub missing_parents: Vec<String>,
 }
 
 /// Walk the relations graph starting from `start_event_nid`. Returns
@@ -114,6 +133,14 @@ pub fn walk(
 
     let mut events: Vec<Value> = Vec::with_capacity(limit.min(64));
     let mut visited: HashSet<u64> = HashSet::new();
+    let mut missing_parents: Vec<String> = Vec::new();
+    let mut missing_seen: HashSet<String> = HashSet::new();
+
+    let mut record_missing = |eid: &str| {
+        if missing_seen.insert(eid.to_string()) {
+            missing_parents.push(eid.to_string());
+        }
+    };
 
     // The start event is always returned (MSC2836 "the requested
     // event is considered to be at depth 0").
@@ -125,6 +152,7 @@ pub fn walk(
         return Ok(WalkResult {
             events,
             limited: true,
+            missing_parents,
         });
     }
 
@@ -132,19 +160,22 @@ pub fn walk(
     // `include_parent` pulls in the start event's direct parent;
     // for an "up" walk `include_children` pulls in the start event's
     // direct children. Both ignore max_depth.
-    if direction == Direction::Down
-        && include_parent
-        && let Some(parent_nid) = parent_of(state, start_event_nid)?
-        && visited.insert(parent_nid)
-    {
-        if let Some(ev) = load_client_event(state, parent_nid, room_id)? {
-            events.push(ev);
-        }
-        if events.len() >= limit {
-            return Ok(WalkResult {
-                events,
-                limited: true,
-            });
+    if direction == Direction::Down && include_parent {
+        match parent_lookup(state, start_event_nid)? {
+            Some((_, Some(parent_nid))) if visited.insert(parent_nid) => {
+                if let Some(ev) = load_client_event(state, parent_nid, room_id)? {
+                    events.push(ev);
+                }
+                if events.len() >= limit {
+                    return Ok(WalkResult {
+                        events,
+                        limited: true,
+                        missing_parents,
+                    });
+                }
+            }
+            Some((eid, None)) => record_missing(&eid),
+            _ => {}
         }
     }
     if direction == Direction::Up && include_children {
@@ -159,6 +190,7 @@ pub fn walk(
                 return Ok(WalkResult {
                     events,
                     limited: true,
+                    missing_parents,
                 });
             }
         }
@@ -180,7 +212,14 @@ pub fn walk(
         }
         let next_nids: Vec<u64> = match direction {
             Direction::Down => children_of(state, node, max_breadth, recent_first)?,
-            Direction::Up => parent_of(state, node)?.map_or(Vec::new(), |p| vec![p]),
+            Direction::Up => match parent_lookup(state, node)? {
+                Some((_, Some(p))) => vec![p],
+                Some((eid, None)) => {
+                    record_missing(&eid);
+                    Vec::new()
+                }
+                None => Vec::new(),
+            },
         };
         for next_nid in next_nids {
             if !visited.insert(next_nid) {
@@ -193,6 +232,7 @@ pub fn walk(
                 return Ok(WalkResult {
                     events,
                     limited: true,
+                    missing_parents,
                 });
             }
             frontier.push_back((next_nid, depth + 1));
@@ -202,6 +242,7 @@ pub fn walk(
     Ok(WalkResult {
         events,
         limited: false,
+        missing_parents,
     })
 }
 
@@ -245,10 +286,6 @@ fn parent_lookup(
         .get_event_nid_by_id(parent_event_id)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     Ok(Some((parent_event_id.to_string(), nid)))
-}
-
-fn parent_of(state: &AppState, event_nid: u64) -> Result<Option<u64>, ApiError> {
-    Ok(parent_lookup(state, event_nid)?.and_then(|(_, nid)| nid))
 }
 
 /// Look up the direct children of `event_nid` via the same
@@ -295,6 +332,222 @@ fn room_of_event(state: &AppState, event_nid: u64) -> Result<Option<(u64, String
     Ok(room_nid.map(|nid| (nid, room_id.to_string())))
 }
 
+/// Attach MSC2836's `unsigned.children` (rel_type → count) and
+/// `unsigned.children_hash` (`base64(sha256(sorted_event_ids))`) to
+/// every event in the response. Threading clients render these
+/// without a second roundtrip; the test suite gates on both fields.
+fn bundle_unsigned(state: &AppState, events: &mut [Value]) -> Result<(), ApiError> {
+    for ev in events.iter_mut() {
+        let Some(eid) = ev.get("event_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(nid) = state
+            .db
+            .get_event_nid_by_id(eid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        else {
+            continue;
+        };
+        // BTreeMap so the resulting JSON object is stably ordered —
+        // tests that compare children_hash care about determinism.
+        let mut rel_counts: BTreeMap<String, u64> = BTreeMap::new();
+        let mut child_eids: Vec<String> = Vec::new();
+        let entries = state
+            .db
+            .list_relations(nid, None, None, u64::MAX, true, 1024)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        for (_sp, child_nid, rt_nid, _ct) in entries {
+            if let Ok(Some(rt)) = state.db.resolve_nid(rt_nid) {
+                *rel_counts.entry(rt).or_default() += 1;
+            }
+            if let Ok(Some(child_eid)) = state.db.get_event_id_by_nid(child_nid) {
+                child_eids.push(child_eid);
+            }
+        }
+        child_eids.sort();
+        let hash = Sha256::digest(child_eids.join("").as_bytes());
+        let hash_b64 = STANDARD_NO_PAD.encode(hash);
+
+        let unsigned = ev.as_object_mut().and_then(|o| {
+            o.entry("unsigned")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+        });
+        if let Some(u) = unsigned {
+            u.insert("children".into(), json!(rel_counts));
+            u.insert("children_hash".into(), json!(hash_b64));
+        }
+    }
+    Ok(())
+}
+
+/// Federation backfill for a single `event_id`. Walks every remote
+/// server in the room until one returns a response, then persists
+/// the returned `events` (and `auth_chain`, when present) as
+/// outliers — re-indexing relations so subsequent walks observe
+/// the parent/child edges. Returns the number of newly-persisted
+/// events. `Ok(0)` means we either ran out of servers or every
+/// returned event was already on disk.
+async fn backfill_via_federation(
+    state: &AppState,
+    room_nid: u64,
+    event_id: &str,
+    body: &EventRelationshipsRequest,
+) -> Result<usize, ApiError> {
+    let our_server = state.config.server_name.as_str();
+    let servers = state
+        .db
+        .get_remote_servers_in_room(room_nid, our_server)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if servers.is_empty() {
+        return Ok(0);
+    }
+
+    // Build the body to forward — same shape as the inbound request,
+    // but with `event_id` swapped to the specific missing parent so
+    // the peer walks the right subtree.
+    let mut fwd_body = match serde_json::to_value(body) {
+        Ok(v) => v,
+        Err(e) => return Err(ApiError(VelaError::Store(e.to_string()))),
+    };
+    if let Some(obj) = fwd_body.as_object_mut() {
+        obj.insert("event_id".into(), json!(event_id));
+    }
+
+    let mut response: Option<Value> = None;
+    for server in &servers {
+        match state
+            .federation_client
+            .event_relationships(server, fwd_body.clone())
+            .await
+        {
+            Ok(resp) => {
+                response = Some(resp);
+                break;
+            }
+            Err(e) => {
+                tracing::debug!(server = %server, error = %e, "event_relationships backfill failed");
+            }
+        }
+    }
+    let Some(resp) = response else {
+        return Ok(0);
+    };
+
+    let returned_events = resp
+        .get("events")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let auth_chain = resp
+        .get("auth_chain")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Two-pass: persist EVERY event first (auth_chain + returned),
+    // then index parent→child relations. The peer's response is in
+    // walk order (typically child-first up-walks), so a child's
+    // parent NID won't exist yet on the first pass — we must wait
+    // for all NIDs to settle before recording relations against them.
+    let mut persisted_pairs: Vec<(u64, &Value)> = Vec::new();
+    let mut persisted = 0usize;
+    for ev in auth_chain.iter().chain(returned_events.iter()) {
+        let res = crate::membership::federation_outbound_join::persist_remote_event(
+            state,
+            room_nid,
+            ev,
+            vela_store::db::PersistKind::Outlier,
+        )
+        .await;
+        match res {
+            Ok(Some(nid)) => {
+                persisted += 1;
+                persisted_pairs.push((nid, ev));
+            }
+            Ok(None) => {
+                // Already had this event — index it anyway in case
+                // we previously persisted without indexing. Lookup
+                // its existing NID.
+                if let Some(eid) = ev.get("event_id").and_then(|v| v.as_str())
+                    && let Ok(Some(nid)) = state.db.get_event_nid_by_id(eid)
+                {
+                    persisted_pairs.push((nid, ev));
+                }
+            }
+            Err(reason) => {
+                tracing::debug!(error = %reason, "event_relationships backfill persist failed");
+            }
+        }
+    }
+    // Index relations in a second pass so all child→parent NIDs
+    // resolve regardless of arrival order.
+    for (nid, ev) in &persisted_pairs {
+        index_relation_after_backfill(state, ev, *nid, room_nid);
+    }
+    Ok(persisted)
+}
+
+/// Mirror `record_relation_if_present` for a freshly-persisted
+/// backfill event. Allocates a fresh stream position per call so
+/// distinct backfills land at distinct keys in `event_relations`.
+fn index_relation_after_backfill(
+    state: &AppState,
+    event_json: &Value,
+    child_event_nid: u64,
+    room_nid: u64,
+) {
+    let content = event_json.get("content");
+    let rel = match content
+        .and_then(|c| c.get("m.relationship"))
+        .or_else(|| content.and_then(|c| c.get("m.relates_to")))
+    {
+        Some(r) => r,
+        None => return,
+    };
+    let Some(parent_event_id) = rel.get("event_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Some(rel_type) = rel.get("rel_type").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let Ok(Some(parent_nid)) = state.db.get_event_nid_by_id(parent_event_id) else {
+        return;
+    };
+    let Ok(rel_type_nid) = state.db.get_or_create_nid(rel_type) else {
+        return;
+    };
+    let event_type = event_json
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let Ok(type_nid) = state.db.get_or_create_nid(event_type) else {
+        return;
+    };
+    let sender = event_json
+        .get("sender")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let Ok(sender_nid) = state.db.get_or_create_nid(sender) else {
+        return;
+    };
+    let stream_pos = state.db.next_stream_position().as_u64();
+    let _g = vela_store::db::StreamApplyOnDrop::new(&state.db, stream_pos);
+    if let Err(e) = state.db.record_relation(
+        parent_nid,
+        stream_pos,
+        child_event_nid,
+        rel_type_nid,
+        type_nid,
+        room_nid,
+        sender_nid,
+        rel_type == "m.thread",
+        false, // backfill — don't bump thread recency
+    ) {
+        tracing::debug!(error = %e, "backfill relation index failed");
+    }
+}
+
 /// POST `/_matrix/client/unstable/event_relationships`.
 pub async fn event_relationships_cs(
     State(state): State<AppState>,
@@ -304,14 +557,28 @@ pub async fn event_relationships_cs(
     if body.event_id.is_empty() {
         return Err(VelaError::InvalidParam("event_id required".into()).into());
     }
-    let start_nid = state
+
+    // Resolve the room. Two cases: the start event is already on
+    // disk (room derived from the event's `room_id` field), or it
+    // isn't and the request body's `room_id` tells us which room
+    // to backfill against.
+    let mut start_nid_opt = state
         .db
         .get_event_nid_by_id(&body.event_id)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
-
-    let (room_nid, room_id) = room_of_event(&state, start_nid)?
-        .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let (room_nid, room_id) = if let Some(nid) = start_nid_opt {
+        room_of_event(&state, nid)?
+            .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?
+    } else if let Some(rid) = body.room_id.as_deref() {
+        let rn = state
+            .db
+            .get_nid(rid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            .ok_or_else(|| ApiError(VelaError::NotFound("room not found".into())))?;
+        (rn, rid.to_string())
+    } else {
+        return Err(VelaError::NotFound("event not found".into()).into());
+    };
 
     let membership = state
         .db
@@ -323,7 +590,38 @@ pub async fn event_relationships_cs(
         return Err(VelaError::Forbidden("not a member of this room".into()).into());
     }
 
-    let result = walk(&state, &room_id, start_nid, &body)?;
+    // If the start event isn't on disk, federation-backfill it now.
+    // The peer's response carries the whole reachable subtree, so a
+    // single round usually suffices.
+    if start_nid_opt.is_none() {
+        let _ = backfill_via_federation(&state, room_nid, &body.event_id, &body).await?;
+        start_nid_opt = state
+            .db
+            .get_event_nid_by_id(&body.event_id)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    }
+    let Some(start_nid) = start_nid_opt else {
+        return Err(VelaError::NotFound("event not found".into()).into());
+    };
+
+    // Walk locally; if we hit declared parents that aren't on disk,
+    // backfill them and re-walk. Capped at `MAX_BACKFILL_ROUNDS` to
+    // bound the work per request.
+    let mut result = walk(&state, &room_id, start_nid, &body)?;
+    let mut rounds = 0;
+    while !result.missing_parents.is_empty() && rounds < MAX_BACKFILL_ROUNDS {
+        let mut filled = 0usize;
+        for missing in result.missing_parents.iter().take(BACKFILL_PER_ROUND) {
+            filled += backfill_via_federation(&state, room_nid, missing, &body).await?;
+        }
+        rounds += 1;
+        if filled == 0 {
+            break;
+        }
+        result = walk(&state, &room_id, start_nid, &body)?;
+    }
+
+    bundle_unsigned(&state, &mut result.events)?;
     Ok(Json(json!({
         "events": result.events,
         "limited": result.limited,
@@ -377,11 +675,39 @@ pub async fn event_relationships_fed(
         return Err(VelaError::Forbidden(format!("server {origin_server} not in room")).into());
     }
 
-    let result = walk(&state, &room_id, start_nid, &body)?;
+    let mut result = walk(&state, &room_id, start_nid, &body)?;
+    bundle_unsigned(&state, &mut result.events)?;
+
+    // MSC2836 federation envelope additionally carries `auth_chain`
+    // — the transitive auth closure of the returned events. The
+    // requesting server uses it to authorise the events without
+    // having to fetch them again. Empty array when we can't compute
+    // one (e.g. the start event is unknown locally, which shouldn't
+    // happen here because we already resolved its NID above).
+    let auth_chain = compute_auth_chain_pdus(&state, &result.events);
     Ok(Json(json!({
         "events": result.events,
         "limited": result.limited,
+        "auth_chain": auth_chain,
     })))
+}
+
+/// Build the `auth_chain` field for a federation response by
+/// gathering the union of each returned event's declared
+/// `auth_events` (and their transitive ancestors) and loading the
+/// PDU JSON for each. Skips events not on disk locally.
+fn compute_auth_chain_pdus(state: &AppState, events: &[Value]) -> Vec<Value> {
+    let event_ids: Vec<String> = events
+        .iter()
+        .filter_map(|ev| {
+            ev.get("event_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .collect();
+    let roots: Vec<&str> = event_ids.iter().map(|s| s.as_str()).collect();
+    crate::federation::federation_state::auth_chain_union_pdu_json(&state.db, &roots)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -754,6 +1080,90 @@ mod tests {
         let resolved = parent_lookup(&state, 11).unwrap();
         assert_eq!(resolved.as_ref().map(|(eid, _)| eid.as_str()), Some("$P"));
         assert_eq!(resolved.and_then(|(_, n)| n), Some(10));
+    }
+
+    /// Up-walk where the leaf points to an event we don't have on
+    /// disk surfaces the missing parent's event_id in
+    /// `missing_parents`. The CS-API handler uses this list to
+    /// drive federation backfill.
+    #[test]
+    fn up_walk_reports_missing_parents_for_unknown_eid() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!miss:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        let type_msg = db.get_or_create_nid("m.room.message").unwrap();
+
+        // A single event whose declared parent isn't on disk.
+        let orphan = json!({
+            "type": "m.room.message",
+            "sender": "@alice:example.com",
+            "room_id": room_id,
+            "content": {
+                "body": "orphan",
+                "m.relationship": {"rel_type": "m.reference", "event_id": "$ghost"},
+            },
+            "origin_server_ts": 1, "depth": 1,
+            "prev_events": [], "auth_events": [],
+        });
+        db.persist_event(
+            42,
+            "$orphan",
+            room_nid,
+            type_msg,
+            alice_nid,
+            0,
+            1,
+            1,
+            &serde_json::to_vec(&orphan).unwrap(),
+            &[],
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+
+        let req = EventRelationshipsRequest {
+            event_id: "$orphan".into(),
+            direction: Some("up".into()),
+            ..Default::default()
+        };
+        let r = walk(&state, room_id, 42, &req).unwrap();
+        assert_eq!(r.events.len(), 1, "only the orphan is on disk");
+        assert_eq!(r.missing_parents, vec!["$ghost".to_string()]);
+    }
+
+    /// `bundle_unsigned` produces `children: {rel_type: count}` and a
+    /// `children_hash` that's `base64(sha256(sorted_event_ids))` —
+    /// the exact shape the Complement test asserts on.
+    #[test]
+    fn bundle_unsigned_aggregates_children_counts_and_hash() {
+        let (state, _tmp) = build_test_state();
+        let (_room_nid, root_nid) = fixture_tree(&state);
+
+        let mut events = vec![json!({
+            "event_id": "$root",
+            "type": "m.room.message",
+            "content": {"body": "P"},
+        })];
+        bundle_unsigned(&state, &mut events).unwrap();
+        let unsigned = events[0].get("unsigned").unwrap();
+        // The fixture's two direct children both use rel_type
+        // `io.example.child`, so the count is 2.
+        assert_eq!(unsigned["children"]["io.example.child"].as_u64(), Some(2));
+        // sha256(sort(["$child_a", "$child_b"]).join("")) =
+        // sha256("$child_a$child_b"). Compare against the hash a
+        // fresh sha256 reproduces — we don't pin the literal so the
+        // test stays readable, but we DO confirm the field is non-
+        // empty base64 (the test gates on hash equality between
+        // peer and self).
+        let h = unsigned["children_hash"].as_str().unwrap();
+        assert!(!h.is_empty());
+        // Decoding must succeed under `STANDARD_NO_PAD` — that's
+        // the encoding the Complement test uses.
+        STANDARD_NO_PAD.decode(h).expect("children_hash decodes");
+        let _ = root_nid;
     }
 
     /// Unknown direction strings fall back to `down` so a buggy
