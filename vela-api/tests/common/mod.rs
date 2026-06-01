@@ -163,6 +163,7 @@ impl Harness {
                 push: vela_api::router::PushConfig {
                     allow_private_pushers: true,
                 },
+                max_delay_ms: vela_api::delayed_events::DEFAULT_MAX_DELAY_MS,
             }),
             room_locks: Arc::new(DashMap::new()),
             user_locks: Arc::new(DashMap::new()),

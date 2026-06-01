@@ -705,6 +705,18 @@ struct ServerSection {
     /// who want spec-modern-only deployments set this to `"10"` or
     /// higher. Below v6 is never supported regardless of this setting.
     minimum_room_version: String,
+    /// MSC4140 delayed-events upper bound (milliseconds). Default
+    /// 7 days. Operators wanting a tighter window can shrink it.
+    /// Setting `0` effectively disables the feature — every PUT
+    /// with `?org.matrix.msc4140.delay=` fails 400 — which is the
+    /// right outcome for deployments that don't want to operate the
+    /// scheduler at all.
+    #[serde(default = "default_max_delay_ms")]
+    max_delay_ms: u64,
+}
+
+fn default_max_delay_ms() -> u64 {
+    vela_api::delayed_events::DEFAULT_MAX_DELAY_MS
 }
 
 impl Default for ServerSection {
@@ -717,6 +729,7 @@ impl Default for ServerSection {
             tls: None,
             extra_ca_certs: Vec::new(),
             minimum_room_version: "6".to_string(),
+            max_delay_ms: default_max_delay_ms(),
         }
     }
 }
@@ -1080,6 +1093,7 @@ fn main() -> anyhow::Result<()> {
                 push: vela_api::router::PushConfig {
                     allow_private_pushers: config.push.allow_private_pushers,
                 },
+                max_delay_ms: config.server.max_delay_ms,
             }),
             room_locks: Arc::new(DashMap::new()),
             user_locks: Arc::new(DashMap::new()),

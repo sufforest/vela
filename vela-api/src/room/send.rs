@@ -44,9 +44,7 @@ pub async fn send_message(
     // `send_message_inner`).
     let content = body.map(|Json(v)| v).unwrap_or(Value::Null);
     if let Some(delay_ms) = ts_query.delay {
-        if !(1..=7 * 24 * 60 * 60 * 1000).contains(&delay_ms) {
-            return Err(VelaError::InvalidParam(format!("delay {delay_ms} out of range")).into());
-        }
+        crate::delayed_events::validate_delay_ms(delay_ms, state.config.max_delay_ms)?;
         // MSC4140 idempotency: a re-PUT with the same
         // `(user, device, room, event_type, txn_id)` returns the
         // existing `delay_id` — even when the body is absent (the
@@ -421,9 +419,7 @@ fn delayed_state_response(
     content: Value,
     delay_ms: u64,
 ) -> Result<Json<Value>, ApiError> {
-    if !(1..=7 * 24 * 60 * 60 * 1000).contains(&delay_ms) {
-        return Err(VelaError::InvalidParam(format!("delay {delay_ms} out of range")).into());
-    }
+    crate::delayed_events::validate_delay_ms(delay_ms, state.config.max_delay_ms)?;
     // Membership check up front. The fire-time send_state_inner
     // re-checks, but if the caller isn't currently a member we
     // surface that immediately rather than queuing a doomed event.

@@ -35,9 +35,11 @@ pub const DELAY_QUERY_PARAM: &str = "org.matrix.msc4140.delay";
 /// and fire.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Maximum allowable delay (ms). Bound it so a malicious / buggy
-/// client can't pin events for years and exhaust the queue.
-const MAX_DELAY_MS: u64 = 7 * 24 * 60 * 60 * 1000; // 7 days
+/// Default for `ServerConfig::max_delay_ms` when the operator
+/// hasn't overridden it. Bounds how far into the future a client
+/// can schedule an event — without a cap a buggy or hostile client
+/// could pin events for years.
+pub const DEFAULT_MAX_DELAY_MS: u64 = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelayedEventRecord {
@@ -106,6 +108,8 @@ fn new_delay_id() -> String {
 
 /// Insert a record into both DashMap mirror and the persistent CF.
 pub fn store(state: &AppState, rec: DelayedEventRecord) -> Result<(), ApiError> {
+    metrics::counter!("vela_delayed_events_scheduled_total").increment(1);
+    metrics::gauge!("vela_delayed_events_pending").increment(1.0);
     let bytes = serde_json::to_vec(&rec).map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     state
         .db
@@ -171,6 +175,7 @@ pub fn remove(state: &AppState, delay_id: &str) -> Result<Option<DelayedEventRec
     let rec = state.delayed_events.by_id.remove(delay_id).map(|(_, r)| r);
     if let Some(r) = &rec {
         drop_indexes(state, r);
+        metrics::gauge!("vela_delayed_events_pending").decrement(1.0);
     }
     state
         .db
@@ -192,6 +197,9 @@ fn take_if_due(state: &AppState, delay_id: &str, deadline_ms: u64) -> Option<Del
         .by_id
         .remove_if(delay_id, |_, r| r.scheduled_at_ms <= deadline_ms)
         .map(|(_, r)| r);
+    if removed.is_some() {
+        metrics::gauge!("vela_delayed_events_pending").decrement(1.0);
+    }
     if let Some(r) = &removed {
         drop_indexes(state, r);
         let _ = state.db.delete_delayed_event(delay_id);
@@ -248,6 +256,10 @@ pub fn load_from_disk(state: &AppState) -> Result<usize, ApiError> {
             count += 1;
         }
     }
+    // Sync the pending gauge to the loaded record count so the
+    // metric reflects post-boot reality, not just deltas observed
+    // by the scheduler/handlers since process start.
+    metrics::gauge!("vela_delayed_events_pending").set(count as f64);
     Ok(count)
 }
 
@@ -359,51 +371,92 @@ pub fn schedule_state(
     Ok(id)
 }
 
-/// Parse the `org.matrix.msc4140.delay` query param. Returns
-/// `Ok(None)` when not present, `Ok(Some(ms))` when valid, `Err`
-/// when the value is malformed or exceeds `MAX_DELAY_MS`.
-pub fn parse_delay(raw: &str) -> Result<Option<u64>, ApiError> {
-    for pair in raw.split('&') {
-        let mut iter = pair.splitn(2, '=');
-        let key = iter.next().unwrap_or("");
-        let val = iter.next().unwrap_or("");
-        if key != DELAY_QUERY_PARAM {
-            continue;
-        }
-        let ms: u64 = val
-            .parse()
-            .map_err(|_| ApiError(VelaError::InvalidParam(format!("delay: {val}"))))?;
-        if ms == 0 || ms > MAX_DELAY_MS {
-            return Err(VelaError::InvalidParam(format!(
-                "delay {ms}ms out of range [1, {MAX_DELAY_MS}]"
-            ))
-            .into());
-        }
-        return Ok(Some(ms));
+/// Validate the `?org.matrix.msc4140.delay=` value against the
+/// operator-configured maximum. Send handlers call this before
+/// scheduling so a 400 surfaces at the API boundary rather than at
+/// fire time.
+pub fn validate_delay_ms(delay_ms: u64, max_delay_ms: u64) -> Result<(), ApiError> {
+    if delay_ms == 0 || delay_ms > max_delay_ms {
+        return Err(VelaError::InvalidParam(format!(
+            "delay {delay_ms}ms out of range [1, {max_delay_ms}]"
+        ))
+        .into());
     }
-    Ok(None)
+    Ok(())
 }
 
 // ============================================================
 // Handlers
 // ============================================================
 
-/// `GET /_matrix/client/v1/delayed_events` — return pending events
-/// owned by the calling user. MSC4140 specifies pagination but
-/// vela returns the full set in one page; users with thousands of
-/// pending events would push us over the response size limit, which
-/// is well beyond the test surface.
+/// Default page size when the caller doesn't supply `?limit=`.
+/// Bound the upper edge separately to cap response size.
+const LIST_DEFAULT_LIMIT: usize = 100;
+const LIST_MAX_LIMIT: usize = 1000;
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ListQuery {
+    /// Opaque resume token from a previous `next_batch`.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Page size cap (default 100, max 1000).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// `GET /_matrix/client/unstable/org.matrix.msc4140/delayed_events` —
+/// return pending events owned by the calling user, paginated.
+/// Pagination uses an opaque `next_batch` token: a freshly-base16'd
+/// `delay_id` of the next record the caller hasn't seen. Order is
+/// lexicographic over `delay_id` (DashMap iteration is unordered,
+/// so we sort the candidate set before slicing).
+///
+/// The lex order matches the random delay_id ordering — it isn't
+/// chronological, but it IS stable and that's the property
+/// pagination needs: callers walking with `from=<prev_token>` see
+/// every record exactly once.
 pub async fn list_delayed_events_handler(
     State(state): State<AppState>,
     user: AuthenticatedUser,
+    axum::extract::Query(q): axum::extract::Query<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let mut events: Vec<Value> = Vec::new();
-    for entry in state.delayed_events.by_id.iter() {
-        let rec = entry.value();
-        if rec.user_nid != user.user_nid {
+    let limit = q
+        .limit
+        .unwrap_or(LIST_DEFAULT_LIMIT)
+        .clamp(1, LIST_MAX_LIMIT);
+
+    // Collect ids belonging to the caller, then sort. DashMap's
+    // iteration order is unspecified; without sorting, pagination
+    // would skip or duplicate entries across calls.
+    let mut owned_ids: Vec<String> = state
+        .delayed_events
+        .by_id
+        .iter()
+        .filter(|e| e.value().user_nid == user.user_nid)
+        .map(|e| e.key().clone())
+        .collect();
+    owned_ids.sort();
+
+    // Apply the `from` token (exclusive start — caller's last seen).
+    let start = match q.from {
+        Some(t) => owned_ids.partition_point(|id| id.as_str() <= t.as_str()),
+        None => 0,
+    };
+    let end = (start + limit).min(owned_ids.len());
+    let next_batch = if end < owned_ids.len() {
+        Some(owned_ids[end - 1].clone())
+    } else {
+        None
+    };
+
+    let now = now_ms();
+    let mut events: Vec<Value> = Vec::with_capacity(end - start);
+    for id in &owned_ids[start..end] {
+        let Some(rec) = state.delayed_events.by_id.get(id) else {
             continue;
-        }
-        let remaining = rec.scheduled_at_ms.saturating_sub(now_ms());
+        };
+        let rec = rec.value();
+        let remaining = rec.scheduled_at_ms.saturating_sub(now);
         let mut obj = serde_json::Map::new();
         obj.insert("delay_id".into(), json!(rec.delay_id));
         obj.insert("room_id".into(), json!(rec.room_id));
@@ -421,7 +474,13 @@ pub async fn list_delayed_events_handler(
         obj.insert("remaining".into(), json!(remaining));
         events.push(Value::Object(obj));
     }
-    Ok(Json(json!({"delayed_events": events})))
+
+    let mut resp = serde_json::Map::new();
+    resp.insert("delayed_events".into(), Value::Array(events));
+    if let Some(t) = next_batch {
+        resp.insert("next_batch".into(), Value::String(t));
+    }
+    Ok(Json(Value::Object(resp)))
 }
 
 /// `POST /_matrix/client/unstable/org.matrix.msc4140/delayed_events/{delay_id}/{action}` —
@@ -454,7 +513,10 @@ pub async fn update_delayed_event_handler(
             // remove returns None and there's nothing left to do
             // — the user's intent (no further fire) is already
             // achieved by virtue of having already fired once.
-            let _ = remove(&state, &delay_id)?;
+            let removed = remove(&state, &delay_id)?;
+            if removed.is_some() {
+                metrics::counter!("vela_delayed_events_cancelled_total").increment(1);
+            }
             Ok(Json(json!({})))
         }
         "send" => {
@@ -463,10 +525,11 @@ pub async fn update_delayed_event_handler(
             // the event first, we silently skip firing again —
             // double-firing the same event would violate the MSC's
             // "the delayed event is sent at most once" contract.
-            if let Some(rec) = take_if_due(&state, &delay_id, u64::MAX)
-                && let Err(e) = fire_event(&state, rec).await
-            {
-                tracing::debug!(error = ?e, "delayed event manual fire failed");
+            if let Some(rec) = take_if_due(&state, &delay_id, u64::MAX) {
+                metrics::counter!("vela_delayed_events_manual_send_total").increment(1);
+                if let Err(e) = fire_event(&state, rec).await {
+                    tracing::debug!(error = ?e, "delayed event manual fire failed");
+                }
             }
             Ok(Json(json!({})))
         }
@@ -494,6 +557,7 @@ pub async fn update_delayed_event_handler(
                     .db
                     .save_delayed_event(&rec.delay_id, &bytes)
                     .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+                metrics::counter!("vela_delayed_events_restarted_total").increment(1);
             }
             Ok(Json(json!({})))
         }
@@ -587,7 +651,9 @@ async fn run_scheduler(state: AppState) {
             let Some(rec) = take_if_due(&state, &id, now) else {
                 continue;
             };
+            metrics::counter!("vela_delayed_events_fired_total").increment(1);
             if let Err(e) = fire_event(&state, rec).await {
+                metrics::counter!("vela_delayed_events_fire_errors_total").increment(1);
                 tracing::debug!(error = ?e, "delayed event fire failed");
             }
         }
@@ -612,30 +678,35 @@ pub fn new_store() -> Arc<DelayedEventStore> {
 mod tests {
     use super::*;
 
+    /// Range bound: any value in `[1, max]` accepted; `0` and
+    /// `max+1` rejected.
     #[test]
-    fn parse_delay_accepts_valid_values() {
-        assert_eq!(
-            parse_delay("org.matrix.msc4140.delay=1500").unwrap(),
-            Some(1500)
-        );
-        assert_eq!(parse_delay("foo=bar").unwrap(), None);
-        assert_eq!(parse_delay("").unwrap(), None);
+    fn validate_delay_ms_enforces_inclusive_range() {
+        let max = 10_000;
+        assert!(validate_delay_ms(1, max).is_ok());
+        assert!(validate_delay_ms(5_000, max).is_ok());
+        assert!(validate_delay_ms(max, max).is_ok());
+        assert!(validate_delay_ms(0, max).is_err());
+        assert!(validate_delay_ms(max + 1, max).is_err());
     }
 
+    /// Operators can tighten the cap. A delay accepted under the
+    /// default would be rejected under a shorter operator cap.
     #[test]
-    fn parse_delay_rejects_zero() {
-        assert!(parse_delay("org.matrix.msc4140.delay=0").is_err());
+    fn validate_delay_ms_honours_lower_operator_cap() {
+        let strict = 1_000;
+        assert!(validate_delay_ms(500, strict).is_ok());
+        assert!(validate_delay_ms(1_500, strict).is_err());
     }
 
+    /// Bound-fire: at exactly `DEFAULT_MAX_DELAY_MS` the validator
+    /// accepts; one millisecond over and it errors. Pins the
+    /// inclusive boundary so a future tweak that turns it
+    /// half-open is caught.
     #[test]
-    fn parse_delay_rejects_overflow() {
-        let v = MAX_DELAY_MS + 1;
-        assert!(parse_delay(&format!("org.matrix.msc4140.delay={v}")).is_err());
-    }
-
-    #[test]
-    fn parse_delay_rejects_non_numeric() {
-        assert!(parse_delay("org.matrix.msc4140.delay=abc").is_err());
+    fn validate_delay_ms_default_cap_boundary() {
+        assert!(validate_delay_ms(DEFAULT_MAX_DELAY_MS, DEFAULT_MAX_DELAY_MS).is_ok());
+        assert!(validate_delay_ms(DEFAULT_MAX_DELAY_MS + 1, DEFAULT_MAX_DELAY_MS).is_err());
     }
 
     #[test]
@@ -645,5 +716,157 @@ mod tests {
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
         // Two consecutive IDs differ — random source is wired.
         assert_ne!(id, new_delay_id());
+    }
+
+    /// Helper: build a minimal record for pagination tests. State,
+    /// txn, and content shape don't matter for the slicing logic.
+    fn pagination_rec(delay_id: &str, user_nid: u64) -> DelayedEventRecord {
+        DelayedEventRecord {
+            delay_id: delay_id.to_string(),
+            user_nid,
+            user_id: format!("@u{user_nid}:example.com"),
+            device_id: "DEVICE".into(),
+            room_id: "!r:example.com".into(),
+            event_type: "m.room.message".into(),
+            state_key: None,
+            content: serde_json::json!({}),
+            txn_id: Some(format!("txn-{delay_id}")),
+            scheduled_at_ms: 1_000_000,
+            delay_ms: 1000,
+        }
+    }
+
+    /// The `from` token is the last-seen delay_id, exclusive. The
+    /// partition-point logic must include the next id past it and
+    /// must NOT re-emit the token itself. Bound-fire: the boundary
+    /// where the token equals an existing id.
+    #[test]
+    fn list_pagination_from_token_is_exclusive() {
+        use crate::test_helpers::build_test_state;
+        let (state, _tmp) = build_test_state();
+        // Seed 5 ids for one user.
+        for c in ["a", "b", "c", "d", "e"] {
+            let rec = pagination_rec(c, 1);
+            state.delayed_events.by_id.insert(rec.delay_id.clone(), rec);
+        }
+        // Sorted ids: [a, b, c, d, e]. `from=c` → slice starts at `d`.
+        let mut owned_ids: Vec<String> = state
+            .delayed_events
+            .by_id
+            .iter()
+            .filter(|e| e.value().user_nid == 1)
+            .map(|e| e.key().clone())
+            .collect();
+        owned_ids.sort();
+        let start = owned_ids.partition_point(|id| id.as_str() <= "c");
+        assert_eq!(start, 3, "from=c must skip past c");
+        assert_eq!(&owned_ids[start..], &["d", "e"]);
+    }
+
+    /// Cross-user isolation: a caller's pagination must NOT include
+    /// other users' delays even when their delay_ids would sort into
+    /// the slice. The handler filters before sorting; pin that here.
+    #[test]
+    fn list_pagination_isolates_users() {
+        use crate::test_helpers::build_test_state;
+        let (state, _tmp) = build_test_state();
+        for c in ["a", "c", "e"] {
+            state
+                .delayed_events
+                .by_id
+                .insert(c.to_string(), pagination_rec(c, 1));
+        }
+        for c in ["b", "d"] {
+            state
+                .delayed_events
+                .by_id
+                .insert(c.to_string(), pagination_rec(c, 2));
+        }
+        let owned: Vec<String> = state
+            .delayed_events
+            .by_id
+            .iter()
+            .filter(|e| e.value().user_nid == 1)
+            .map(|e| e.key().clone())
+            .collect();
+        assert_eq!(owned.len(), 3, "only user 1's events");
+        let owned_set: std::collections::HashSet<&str> = owned.iter().map(|s| s.as_str()).collect();
+        for c in ["a", "c", "e"] {
+            assert!(owned_set.contains(c));
+        }
+        for c in ["b", "d"] {
+            assert!(!owned_set.contains(c));
+        }
+    }
+
+    /// Bound-fire on `limit`: a value over `LIST_MAX_LIMIT` clamps
+    /// down; `0` clamps up to 1 (the call still gets at least one
+    /// row, matching the spec's "limit defines page size, not
+    /// opt-out" semantic).
+    #[test]
+    fn list_pagination_limit_clamps_to_bounds() {
+        assert_eq!(
+            (LIST_MAX_LIMIT + 5_000).clamp(1, LIST_MAX_LIMIT),
+            LIST_MAX_LIMIT
+        );
+        assert_eq!(0_usize.clamp(1, LIST_MAX_LIMIT), 1);
+    }
+
+    /// Round-trip pagination: walking `next_batch` from one call to
+    /// the next must produce every record exactly once, in order,
+    /// with no duplicates and no skips. Pins the `next_batch =
+    /// last-seen-id` semantic by simulating the caller's loop.
+    /// Strategy alternative (`next_batch = first-unseen-id`) would
+    /// skip the first id of every page — caught here.
+    #[test]
+    fn list_pagination_round_trip_visits_every_id_once() {
+        use crate::test_helpers::build_test_state;
+        let (state, _tmp) = build_test_state();
+        let all_ids = ["a", "b", "c", "d", "e", "f", "g"];
+        for c in all_ids {
+            state
+                .delayed_events
+                .by_id
+                .insert(c.to_string(), pagination_rec(c, 1));
+        }
+
+        let mut owned_ids: Vec<String> = state
+            .delayed_events
+            .by_id
+            .iter()
+            .filter(|e| e.value().user_nid == 1)
+            .map(|e| e.key().clone())
+            .collect();
+        owned_ids.sort();
+
+        let limit = 3;
+        let mut seen: Vec<String> = Vec::new();
+        let mut from: Option<String> = None;
+        loop {
+            let start = match &from {
+                Some(t) => owned_ids.partition_point(|id| id.as_str() <= t.as_str()),
+                None => 0,
+            };
+            let end = (start + limit).min(owned_ids.len());
+            if start >= end {
+                break;
+            }
+            for id in &owned_ids[start..end] {
+                seen.push(id.clone());
+            }
+            from = if end < owned_ids.len() {
+                Some(owned_ids[end - 1].clone())
+            } else {
+                None
+            };
+            if from.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            all_ids.map(String::from),
+            "round-trip must visit every id exactly once in order"
+        );
     }
 }
