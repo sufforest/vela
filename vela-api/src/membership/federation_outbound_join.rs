@@ -260,7 +260,7 @@ async fn bootstrap_remote_room(
         .or_else(|| send_join_resp.get("partial_state"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if partial_state {
+    let partial_state_servers: Vec<String> = if partial_state {
         let mut servers: Vec<String> = send_join_resp
             .get("servers_in_room")
             .and_then(|v| v.as_array())
@@ -278,20 +278,10 @@ async fn bootstrap_remote_room(
         if servers.is_empty() {
             servers.push(joining_server.to_string());
         }
-        if let Err(e) = state.db.set_partial_state_join(room_nid, &servers) {
-            warn!(error = %e, room = %room_id.as_str(), "failed to persist partial_state flag");
-        } else {
-            debug!(
-                room = %room_id.as_str(),
-                servers = ?servers,
-                "joined room with MSC3706 partial state; filler will complete in the background"
-            );
-            // Make sure the filler is running and wake it now so this
-            // room doesn't have to wait for the idle scan tick.
-            crate::federation::partial_state_filler::ensure_running(state);
-            crate::federation::partial_state_filler::notify_new_partial_room(state);
-        }
-    }
+        servers
+    } else {
+        Vec::new()
+    };
 
     // --- Auth chain (historical) ---
     // Outlier: events CF only — auth chain events are ancestors, never on
@@ -504,6 +494,30 @@ async fn bootstrap_remote_room(
         .map_err(|e| format!("state snapshot: {e}"))?;
     if let Some(prev_nid) = replaced_nid {
         let _ = state.db.record_state_replaces(join_event_nid, prev_nid);
+    }
+
+    // MSC3706 partial-state flag — set AFTER the join event is
+    // persisted as Live (which is what writes it into
+    // `room_extremities`). The filler's `pick_anchor_event_id`
+    // reads that CF; doing this earlier means the wake fires before
+    // any extremity exists, the filler retries with "no extremities",
+    // and the room stays partial until the next idle scan ~60s
+    // later (the MSC3902 EagerInitialSync subtest times out at 5s).
+    if partial_state {
+        if let Err(e) = state
+            .db
+            .set_partial_state_join(room_nid, &partial_state_servers)
+        {
+            warn!(error = %e, room = %room_id.as_str(), "failed to persist partial_state flag");
+        } else {
+            debug!(
+                room = %room_id.as_str(),
+                servers = ?partial_state_servers,
+                "joined room with MSC3706 partial state; filler will complete in the background"
+            );
+            crate::federation::partial_state_filler::ensure_running(state);
+            crate::federation::partial_state_filler::notify_new_partial_room(state);
+        }
     }
 
     // Set our own membership.
