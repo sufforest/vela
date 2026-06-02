@@ -23,6 +23,7 @@ use dashmap::DashMap;
 use serde_json::Value;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
+use vela_core::events::view::EventView;
 use vela_core::identifiers::Nid;
 
 use crate::router::AppState;
@@ -399,26 +400,111 @@ async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> 
     // declaring the room filled. Without this, an all-fail merge
     // (signatures mismatch, malformed JSON, etc.) would still clear
     // the partial-state flag and leave the room permanently incomplete.
-    let mut persisted: usize = 0;
+    //
+    // We also mirror `bootstrap_remote_room`'s post-processing:
+    // promote each state event into `room_state` (current state),
+    // populate the `memberships` index for member events, and stamp
+    // a state snapshot at each event. Without these steps the events
+    // exist as PDUs but neither `/joined_members`, `/state`, nor
+    // `set_membership`-driven federation paths can see the new
+    // members — they only show up in /sync via state delta.
+    let mut state_nids: Vec<u64> = Vec::new();
+    let mut memberships_to_set: Vec<(String, u8)> = Vec::new();
     let mut last_err = String::new();
     for ev in &state_events {
-        match crate::membership::federation_outbound_join::persist_remote_event(
+        let nid_result = crate::membership::federation_outbound_join::persist_remote_event(
             state,
             room_nid,
             ev,
             vela_store::db::PersistKind::StateBundleOnly,
         )
-        .await
+        .await;
+        let resolved_nid: Option<u64> = match nid_result {
+            Ok(Some(nid)) => Some(nid),
+            Ok(None) => {
+                // Already known (auth_chain pass above may have
+                // persisted it). Resolve to nid so we still update
+                // current state + snapshot below.
+                let parsed_version = state
+                    .db
+                    .get_room_version_typed(room_nid)
+                    .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
+                ev.as_object()
+                    .map(|obj| {
+                        vela_core::events::hash::compute_event_id_for_version(obj, parsed_version)
+                            .as_str()
+                            .to_string()
+                    })
+                    .and_then(|eid| state.db.get_event_nid_by_id(&eid).ok().flatten())
+            }
+            Err(e) => {
+                last_err = e;
+                None
+            }
+        };
+        let Some(nid) = resolved_nid else { continue };
+        state_nids.push(nid);
+        if let Some(obj) = ev.as_object()
+            && obj.event_type() == Some("m.room.member")
         {
-            Ok(_) => persisted += 1,
-            Err(e) => last_err = e,
+            let sk = obj.state_key().unwrap_or("");
+            let membership = obj.membership().unwrap_or("");
+            let b = match membership {
+                "join" => 1,
+                "invite" => 2,
+                "ban" => 3,
+                "knock" => 4,
+                _ => 0,
+            };
+            if !sk.is_empty() && b != 0 {
+                memberships_to_set.push((sk.to_string(), b));
+            }
         }
     }
-    if persisted == 0 {
+    if state_nids.is_empty() {
         return Err(format!(
             "no state events persisted ({} attempted; last error: {last_err})",
             state_events.len()
         ));
+    }
+    // Promote into current state (`room_state` CF) so /joined_members
+    // and /state see the new entries.
+    for nid in &state_nids {
+        let Some((header, _)) = state.db.get_event(*nid).ok().flatten() else {
+            continue;
+        };
+        let _ =
+            state
+                .db
+                .set_room_state_entry(room_nid, header.type_nid, header.state_key_nid, *nid);
+    }
+    // Stamp a snapshot at each new state event so /state-at-event and
+    // /messages backward-pagination return the right view.
+    for nid in &state_nids {
+        let _ = state.db.persist_state_snapshot(room_nid, *nid, &state_nids);
+    }
+    // Re-stamp the snapshot AT THE JOIN EVENT to include the
+    // newly-merged peer state. The bootstrap captured a partial-only
+    // snapshot there; clients calling `/members?at=<token-from-just-
+    // after-join>` walk back to the join's snapshot, so leaving it
+    // partial would surface a truncated member set even after the
+    // filler has cleared the flag. The post-merge snapshot = the
+    // peer's pre-join state PLUS the join event itself.
+    if let Ok(Some(join_nid)) = state.db.get_partial_join_event_nid(room_nid) {
+        let mut combined = state_nids.clone();
+        combined.push(join_nid);
+        let _ = state
+            .db
+            .persist_state_snapshot(room_nid, join_nid, &combined);
+    }
+    // Membership index drives `get_room_members` (and downstream
+    // /sync, /joined_members, federation routing).
+    for (member_user_id, b) in memberships_to_set {
+        let member_nid = state
+            .db
+            .get_or_create_nid(&member_user_id)
+            .map_err(|e| format!("db: {e}"))?;
+        let _ = state.db.set_membership(room_nid, member_nid, b);
     }
     Ok(())
 }

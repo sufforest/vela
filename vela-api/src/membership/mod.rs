@@ -818,19 +818,16 @@ pub async fn leave_room(
     // catch-up would race against the resync and the resident often
     // responds with garbage. Test:
     // `TestPartialStateJoin/Leave_during_resync/does_not_wait_for_resync`.
-    let resident_server = creator_server(&state, room_nid)?;
-    let (is_partial_state, _servers) = state
-        .db
-        .get_partial_state_info(room_nid)
-        .unwrap_or((false, Vec::new()));
-    if let Some(rs) = resident_server
-        && rs != state.config.server_name
-        && !is_partial_state
-    {
-        do_remote_leave(&state, &user, room_nid, &room_id, &rs).await?;
-        return Ok(Json(json!({})));
-    }
-
+    // Leave always goes through local emit: we sign the leave event
+    // ourselves and federate via the outbox. This works uniformly for
+    // full-state, partial-state, and just-cleared-partial-state rooms,
+    // and avoids the `make_leave`/`send_leave` round-trip which races
+    // against the partial-state filler. Previously the leave handler
+    // forked into `do_remote_leave` for non-partial federated rooms,
+    // but that path failed against rooms whose partial-state had just
+    // cleared (the resident peer's view hadn't caught up). The signed
+    // leave PDU reaches the resident through the normal /send broadcast
+    // — semantically equivalent and one fewer cross-server hop.
     emit_membership_event(&state, &user, room_nid, &room_id, "leave", None).await?;
 
     Ok(Json(json!({})))
