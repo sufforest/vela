@@ -173,18 +173,41 @@ async fn try_fill_one(
     if servers.is_empty() {
         return Err("no servers in room hint".into());
     }
-    // Pick an event_id to fetch state at: any extremity works (peers
-    // accept any anchor we know). The freshly-persisted join event
-    // is in there; if extremities advanced since the join the peer's
-    // state response will reflect that — also fine.
+    // Pick an event_id to fetch state at. We prefer the join's
+    // `prev_event` (= the resident peer's pre-join tip): that is the
+    // event the resident server indexed state at when it answered
+    // our `make_join`, and the only anchor MSC3902 Complement mocks
+    // accept. Real peers are more permissive but this is also the
+    // spec-preferred anchor — the `/state_ids` response describes
+    // "the state PRIOR to" the requested event.
     let event_id = pick_anchor_event_id(state, room_nid)?;
     let mut last_err = String::new();
     for server in servers {
-        match state
-            .federation_client
-            .state(server, room_id, &event_id)
-            .await
-        {
+        // MSC3902 / spec preference: try `/state_ids` first (lighter
+        // — peer returns event_ids, we materialise via `/event` per
+        // id). Fall back to `/state` (heavier full-PDU response) when
+        // /state_ids materialisation comes up incomplete (any
+        // auth_chain_id 404, or fewer than half of `pdu_ids` resolve).
+        // Auth-chain truncation is dangerous: a missing ancestor can
+        // make downstream auth checks reject legitimate events, so
+        // partial materialisation isn't acceptable on the auth side.
+        let assembled = fetch_state_via_state_ids(state, server, room_id, &event_id).await;
+        let resp = match assembled {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                debug!(
+                    %server,
+                    error = %e,
+                    "state_ids primary failed, falling back to /state"
+                );
+                state
+                    .federation_client
+                    .state(server, room_id, &event_id)
+                    .await
+                    .map_err(|fe| format!("{fe}"))
+            }
+        };
+        match resp {
             Ok(resp) => {
                 // persist_remote_event reaches into room_state; the
                 // existing federation paths serialise on
@@ -236,7 +259,25 @@ async fn try_fill_one(
     })
 }
 
+/// Pick the event_id to anchor `/state_ids` / `/state` at. Prefer the
+/// prev_event of the partial-state join (the resident peer's pre-join
+/// tip — the only anchor MSC3902 mocks accept, and the spec-correct
+/// "state PRIOR to this event" semantic). Fall back to the first
+/// room extremity if we don't have the join recorded — keeps the
+/// filler usable for partial-state records written before
+/// `join_event_nid` tracking landed.
 fn pick_anchor_event_id(state: &AppState, room_nid: u64) -> Result<String, String> {
+    if let Ok(Some(join_nid)) = state.db.get_partial_join_event_nid(room_nid) {
+        // The join's prev_event is the resident peer's pre-join tip
+        // — we know its event_id from the join's JSON but typically
+        // haven't persisted it locally. Read the id string directly
+        // rather than going through nid resolution.
+        if let Ok(Some(ids)) = state.db.get_prev_event_ids_from_json(join_nid)
+            && let Some(eid) = ids.into_iter().next()
+        {
+            return Ok(eid);
+        }
+    }
     let extremities = state
         .db
         .get_extremities(room_nid)
@@ -250,6 +291,85 @@ fn pick_anchor_event_id(state: &AppState, room_nid: u64) -> Result<String, Strin
         .get_event_id_by_nid(nid)
         .map_err(|e| format!("resolve nid: {e}"))?
         .ok_or_else(|| "extremity nid has no event_id".into())
+}
+
+/// Primary state fetch path. Calls `/state_ids` (lighter — peer
+/// returns event_id arrays), then materialises every id via
+/// `/event`. Returns a Value in the same shape `merge_state_response`
+/// already consumes (`{auth_chain: [pdu...], pdus: [pdu...]}`).
+///
+/// Spec field names are `auth_chain_ids` + `pdu_ids` (server-server
+/// `events.yaml`). Older peers may return `auth_chain` / `pdus` — we
+/// accept both.
+///
+/// Returns `Err` when materialisation comes up structurally
+/// incomplete (any `auth_chain_id` 404, OR fewer than half of
+/// `pdu_ids` resolve). Auth chain truncation is dangerous: a missing
+/// ancestor causes downstream auth checks to reject legitimate
+/// events. The caller falls back to `/state` (heavy full-PDU path)
+/// in that case.
+async fn fetch_state_via_state_ids(
+    state: &AppState,
+    server: &str,
+    room_id: &str,
+    event_id: &str,
+) -> Result<Value, String> {
+    let ids = state
+        .federation_client
+        .state_ids(server, room_id, event_id)
+        .await
+        .map_err(|e| format!("state_ids: {e}"))?;
+    let auth_ids: Vec<String> = ids
+        .get("auth_chain_ids")
+        .or_else(|| ids.get("auth_chain"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let pdu_ids: Vec<String> = ids
+        .get("pdu_ids")
+        .or_else(|| ids.get("pdus"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if pdu_ids.is_empty() {
+        return Err("state_ids: empty pdu_ids".into());
+    }
+    let mut auth_pdus: Vec<Value> = Vec::with_capacity(auth_ids.len());
+    for id in &auth_ids {
+        match state.federation_client.fetch_event_pdu(server, id).await {
+            Ok(p) => auth_pdus.push(p),
+            Err(e) => {
+                return Err(format!("auth_chain /event {id}: {e}"));
+            }
+        }
+    }
+    let mut pdu_pdus: Vec<Value> = Vec::with_capacity(pdu_ids.len());
+    let mut missing = 0usize;
+    for id in &pdu_ids {
+        match state.federation_client.fetch_event_pdu(server, id).await {
+            Ok(p) => pdu_pdus.push(p),
+            Err(_) => missing += 1,
+        }
+    }
+    if missing * 2 > pdu_ids.len() {
+        return Err(format!(
+            "state_ids: only {}/{} pdu_ids materialised",
+            pdu_pdus.len(),
+            pdu_ids.len()
+        ));
+    }
+    Ok(serde_json::json!({
+        "auth_chain": auth_pdus,
+        "pdus": pdu_pdus,
+    }))
 }
 
 async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> Result<(), String> {
@@ -460,6 +580,62 @@ mod tests {
 
         let got = pick_anchor_event_id(&state, room_nid).unwrap();
         assert_eq!(got, "$anchor");
+    }
+
+    /// When a partial-state join is recorded, `pick_anchor_event_id`
+    /// returns the prev_event of the join (the resident peer's
+    /// pre-join tip), NOT the join itself. That's the only anchor
+    /// MSC3902 Complement mocks accept, and the spec-correct
+    /// "state PRIOR to" semantic for `/state_ids`.
+    #[test]
+    fn pick_anchor_prefers_join_prev_event() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!psjanchor:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        let type_msg = db.get_or_create_nid("m.room.message").unwrap();
+        let type_member = db.get_or_create_nid("m.room.member").unwrap();
+
+        // Signed join event, prev_events points at "$resident_tip"
+        // — the resident peer's pre-join tip. We must NOT have
+        // persisted that event locally; the filler must still
+        // surface it as the anchor (it's what the peer indexes
+        // state at).
+        let _ = type_msg;
+        let join_body = json!({
+            "type": "m.room.member",
+            "sender": "@alice:example.com",
+            "state_key": "@alice:example.com",
+            "room_id": room_id,
+            "content": {"membership": "join"},
+            "origin_server_ts": 2, "depth": 2,
+            "prev_events": ["$resident_tip"],
+            "auth_events": [],
+        });
+        let join_nid = 1002;
+        db.persist_event(
+            join_nid,
+            "$ourjoin",
+            room_nid,
+            type_member,
+            alice_nid,
+            alice_nid,
+            2,
+            2,
+            &serde_json::to_vec(&join_body).unwrap(),
+            &[],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+
+        db.set_partial_state_join(room_nid, &["resident.example".into()], join_nid)
+            .unwrap();
+
+        let got = pick_anchor_event_id(&state, room_nid).unwrap();
+        assert_eq!(got, "$resident_tip");
     }
 
     /// `wake_sync_on_clear` allocates a fresh stream position and

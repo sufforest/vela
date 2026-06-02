@@ -818,6 +818,7 @@ mod tests {
         db.set_partial_state_join(
             room_nid,
             &["resident.example".into(), "peer.example".into()],
+            0,
         )
         .unwrap();
         let (partial, servers) = db.get_partial_state_info(room_nid).unwrap();
@@ -846,7 +847,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open(tmp.path()).unwrap());
         let room_nid = 9;
-        db.set_partial_state_join(room_nid, &[]).unwrap();
+        db.set_partial_state_join(room_nid, &[], 0).unwrap();
         let (partial, servers) = db.get_partial_state_info(room_nid).unwrap();
         assert!(partial);
         assert!(servers.is_empty());

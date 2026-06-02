@@ -504,9 +504,10 @@ async fn bootstrap_remote_room(
     // and the room stays partial until the next idle scan ~60s
     // later (the MSC3902 EagerInitialSync subtest times out at 5s).
     if partial_state {
-        if let Err(e) = state
-            .db
-            .set_partial_state_join(room_nid, &partial_state_servers)
+        if let Err(e) =
+            state
+                .db
+                .set_partial_state_join(room_nid, &partial_state_servers, join_event_nid)
         {
             warn!(error = %e, room = %room_id.as_str(), "failed to persist partial_state flag");
         } else {

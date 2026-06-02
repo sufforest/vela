@@ -1099,10 +1099,18 @@ impl Database {
     /// existing meta record (room_id + version stay intact). Called
     /// from the outbound send_join path when the remote responded with
     /// `partial_state: true`.
+    ///
+    /// `join_event_nid` is the nid of the signed join event we just
+    /// persisted. The filler walks one hop back along that event's
+    /// `prev_events` to pick the anchor for `/state_ids` and `/state`
+    /// — resident peers index state at the event they advertised in
+    /// `make_join`'s template (= the join's prev_event), not at our
+    /// signed join itself.
     pub fn set_partial_state_join(
         &self,
         room_nid: u64,
         servers_in_room: &[String],
+        join_event_nid: u64,
     ) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("room_meta").unwrap();
         let key = keys::encode_u64(room_nid);
@@ -1114,8 +1122,25 @@ impl Database {
         if let Some(obj) = record.as_object_mut() {
             obj.insert("partial_state".into(), serde_json::json!(true));
             obj.insert("servers_in_room".into(), serde_json::json!(servers_in_room));
+            obj.insert("join_event_nid".into(), serde_json::json!(join_event_nid));
         }
         self.db.put_cf(&cf, key, record.to_string().as_bytes())
+    }
+
+    /// MSC3706: nid of the signed join event that triggered the
+    /// partial-state flag, if recorded. Returns `None` for full-state
+    /// rooms or for partial-state records written before
+    /// `join_event_nid` was tracked (legacy / migration).
+    pub fn get_partial_join_event_nid(&self, room_nid: u64) -> Result<Option<u64>, rocksdb::Error> {
+        let cf = self.db.cf_handle("room_meta").unwrap();
+        let Some(bytes) = self.db.get_cf(&cf, keys::encode_u64(room_nid))? else {
+            return Ok(None);
+        };
+        let record: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        Ok(record.get("join_event_nid").and_then(|v| v.as_u64()))
     }
 
     /// MSC3706: lift the partial-state flag once the filler has merged
@@ -1134,6 +1159,7 @@ impl Database {
         if let Some(obj) = record.as_object_mut() {
             obj.remove("partial_state");
             obj.remove("servers_in_room");
+            obj.remove("join_event_nid");
         }
         self.db.put_cf(&cf, key, record.to_string().as_bytes())
     }
@@ -4805,6 +4831,33 @@ impl Database {
         }
     }
 
+    /// Read the prev_event `event_id` STRINGS from the stored event
+    /// JSON. Returns `None` if the event JSON is missing or doesn't
+    /// look like a PDU. Unlike `get_prev_events_from_json`, the
+    /// returned ids don't need to correspond to locally-known events
+    /// — useful for the partial-state filler, whose anchor is the
+    /// resident peer's pre-join tip (an event we know exists on the
+    /// peer but haven't persisted locally yet).
+    pub fn get_prev_event_ids_from_json(
+        &self,
+        event_nid: u64,
+    ) -> Result<Option<Vec<String>>, rocksdb::Error> {
+        let Some((_, json_bytes)) = self.get_event(event_nid)? else {
+            return Ok(None);
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(&json_bytes) else {
+            return Ok(None);
+        };
+        let Some(arr) = value.get("prev_events").and_then(|v| v.as_array()) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
+        ))
+    }
+
     /// Resolve prev_event NIDs by parsing the stored event JSON.
     /// `persist_event` only records prevs whose NIDs were resolvable at
     /// write time — for a federated join the prev_events are messages
@@ -7352,15 +7405,17 @@ mod partial_state_tests {
         let (db, _tmp) = fresh_db();
         let nid = db.get_or_create_nid("!r:x").unwrap();
         db.create_room_meta(nid, "!r:x", "12").unwrap();
-        db.set_partial_state_join(nid, &["a.example".into(), "b.example".into()])
+        db.set_partial_state_join(nid, &["a.example".into(), "b.example".into()], 42)
             .unwrap();
         let (partial, servers) = db.get_partial_state_info(nid).unwrap();
         assert!(partial);
         assert_eq!(servers, vec!["a.example".to_string(), "b.example".into()]);
+        assert_eq!(db.get_partial_join_event_nid(nid).unwrap(), Some(42));
         db.clear_partial_state(nid).unwrap();
         let (partial, servers) = db.get_partial_state_info(nid).unwrap();
         assert!(!partial);
         assert!(servers.is_empty());
+        assert_eq!(db.get_partial_join_event_nid(nid).unwrap(), None);
         // room_id + version must survive the clear.
         assert_eq!(db.get_room_version(nid).unwrap().as_deref(), Some("12"));
     }
@@ -7373,7 +7428,7 @@ mod partial_state_tests {
         // create_room_meta in the bootstrap sequence. The function
         // merges into whatever meta record already exists; absent →
         // creates a minimal one.
-        db.set_partial_state_join(nid, &["x.example".into()])
+        db.set_partial_state_join(nid, &["x.example".into()], 0)
             .unwrap();
         let (partial, servers) = db.get_partial_state_info(nid).unwrap();
         assert!(partial);
@@ -7387,7 +7442,7 @@ mod partial_state_tests {
         let r2 = db.get_or_create_nid("!r2:x").unwrap();
         db.create_room_meta(r1, "!r1:x", "12").unwrap();
         db.create_room_meta(r2, "!r2:x", "12").unwrap();
-        db.set_partial_state_join(r1, &["a.example".into()])
+        db.set_partial_state_join(r1, &["a.example".into()], 99)
             .unwrap();
         let listed = db.list_partial_state_rooms().unwrap();
         assert_eq!(listed.len(), 1);

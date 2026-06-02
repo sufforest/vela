@@ -2537,7 +2537,7 @@ mod tests {
         assert!(servers.is_empty());
 
         // Set partial-state with the resident server.
-        db.set_partial_state_join(room_nid, &["resident.example".into()])
+        db.set_partial_state_join(room_nid, &["resident.example".into()], 0)
             .unwrap();
         let (partial, servers) = db.get_partial_state_info(room_nid).unwrap();
         assert!(partial);
