@@ -40,7 +40,7 @@ jobs:
           df -h /
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # Cache the cargo registry + intermediate Rust build via BuildKit's
       # GHA cache backend. First build is ~10min cold; subsequent builds
