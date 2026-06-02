@@ -46,7 +46,7 @@ jobs:
       # GHA cache backend. First build is ~10min cold; subsequent builds
       # re-use the registry layer.
       - name: Build vela-complement image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: vela
           file: vela/complement/Dockerfile
