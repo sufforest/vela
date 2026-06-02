@@ -233,12 +233,22 @@ async fn try_fill_one(
                     .collect();
                 match merge_state_response(state, room_nid, &resp).await {
                     Ok(()) => {
+                        // Allocate ONE stream position and use it for
+                        // both the cleared-at stamp and the broadcast
+                        // wake. /sync's eager gating decides "force
+                        // full state if since < cleared_at"; reusing
+                        // the broadcast pos here guarantees a
+                        // long-poll woken by the broadcast carries a
+                        // `since` strictly less than `cleared_at` on
+                        // its post-wake rebuild.
+                        let pos = state.db.next_stream_position().as_u64();
+                        let _stream_guard = vela_store::db::StreamApplyOnDrop::new(&state.db, pos);
                         state
                             .db
-                            .clear_partial_state(room_nid)
+                            .clear_partial_state(room_nid, pos)
                             .map_err(|e| format!("clear flag: {e}"))?;
                         reconcile_device_lists(state, room_nid, &members_before);
-                        wake_sync_on_clear(state, room_nid);
+                        wake_sync_on_clear(state, room_nid, pos);
                         return Ok(true);
                     }
                     Err(e) => {
@@ -514,13 +524,11 @@ async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> 
 /// flips false, `rooms.join.<id>.state` now contains the full member
 /// set). Without this wake a client mid-long-poll sees the change
 /// only on its next scheduled refresh.
-fn wake_sync_on_clear(state: &AppState, room_nid: u64) {
-    let pos = state.db.next_stream_position().as_u64();
-    // Filler completion doesn't persist anything new — the state
-    // events were already merged before clear_partial_state. We still
-    // burn a stream position so the wake carries a value > any
-    // previously-returned `next_batch`.
-    let _stream_guard = vela_store::db::StreamApplyOnDrop::new(&state.db, pos);
+fn wake_sync_on_clear(state: &AppState, room_nid: u64, pos: u64) {
+    // The pos is allocated and applied by the caller (try_fill_one)
+    // so it can also be stamped into `partial_cleared_at` — the wake
+    // and the cleared_at must carry the same value for /sync's
+    // since-based gating to fire deterministically.
     if let Some(sender) = state.room_senders.get(&Nid(room_nid)) {
         let _ = sender.send(pos);
     }
@@ -724,29 +732,21 @@ mod tests {
         assert_eq!(got, "$resident_tip");
     }
 
-    /// `wake_sync_on_clear` allocates a fresh stream position and
-    /// broadcasts it on the room's `room_senders` channel. A /sync
-    /// long-poll subscribed before clear must observe the new pos
-    /// — without it, members_omitted=false is delivered only when
-    /// some other event in the room eventually wakes the poll.
+    /// `wake_sync_on_clear` publishes the caller-supplied stream pos
+    /// on the room's `room_senders` channel. A /sync long-poll
+    /// subscribed before clear must observe that pos — without it,
+    /// the partial-state→full transition is delivered only when some
+    /// other event in the room eventually wakes the poll.
     #[test]
-    fn wake_sync_on_clear_broadcasts_fresh_pos() {
+    fn wake_sync_on_clear_broadcasts_supplied_pos() {
         let (state, _tmp) = build_test_state();
         let room_nid = state.db.get_or_create_nid("!wake:example.com").unwrap();
-        // Install a broadcast channel for the room, simulating an
-        // active /sync subscription. The cap matches what the
-        // AppState boot path installs (the value isn't tested).
         let (tx, mut rx) = tokio::sync::broadcast::channel::<u64>(16);
         state.room_senders.insert(Nid(room_nid), tx);
 
-        let before = state.db.current_stream_position();
-        wake_sync_on_clear(&state, room_nid);
+        wake_sync_on_clear(&state, room_nid, 4242);
         let pos = rx.try_recv().expect("expected a wake on room_senders");
-        // The wake carries a stream pos strictly greater than the
-        // last-applied value at the moment of the wake. Comparing
-        // against `before` keeps the assertion stable under whatever
-        // background events the test harness may have allocated.
-        assert!(pos > before, "wake pos {pos} should exceed {before}");
+        assert_eq!(pos, 4242);
     }
 
     /// `_reset_for_test` flips the filler's `running` flag back to

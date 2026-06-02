@@ -348,6 +348,32 @@ pub(crate) fn build_sync_response_inner(
             continue;
         }
 
+        // MSC3902 / MSC3706 eager-sync gating. Eager clients (no
+        // `lazy_load_members`) MUST NOT see partial-state rooms — the
+        // member set is incomplete and the client would render mention
+        // autocomplete + DM grouping off the wrong roster. Skip them
+        // while partial; once the filler clears, force a full-state
+        // response on the first poll that crosses the clearance pos
+        // (`since < cleared_at`). Lazy clients keep the existing
+        // partial_state-true behaviour at the bottom of this loop.
+        let (partial, _servers) = state
+            .db
+            .get_partial_state_info(room_nid)
+            .unwrap_or((false, Vec::new()));
+        let cleared_at = state.db.get_partial_cleared_at(room_nid).unwrap_or(None);
+        if !lazy_load && partial {
+            continue;
+        }
+        // First eager /sync past clearance: pretend `since=None` so
+        // build_room_sync_for_user emits a full-state snapshot
+        // (not a state delta). The filler's merged events landed as
+        // `StateBundleOnly` without their own stream_pos, so the
+        // delta scan can't see them. Without this branch the eager
+        // client would carry the partial roster into perpetuity.
+        let force_full_state =
+            !lazy_load && !partial && cleared_at.is_some_and(|c| since.is_none_or(|s| s < c));
+        let effective_since = if force_full_state { None } else { since };
+
         // Honour the filter's timeline.limit at DB query time so
         // prev_batch is computed from the trimmed batch (not the
         // pre-trim one — that breaks /messages backward pagination).
@@ -369,7 +395,7 @@ pub(crate) fn build_sync_response_inner(
             state,
             room_nid,
             &room_id,
-            since,
+            effective_since,
             Some(user.user_nid),
             Some(&user.device_id),
             timeline_limit,
@@ -395,18 +421,17 @@ pub(crate) fn build_sync_response_inner(
         // since `since` MUST be omitted from `rooms.join` — sending them
         // back wastes bandwidth and confuses clients into thinking the
         // room timeline restarted. `full_state=true` overrides this and
-        // forces every joined room to appear.
-        if since.is_some() && !full_state && room_is_unchanged(&room_data) {
+        // forces every joined room to appear. The forced-full-state
+        // path (post-clearance) is also exempt — we want the room
+        // surfaced even when the local timeline didn't move.
+        if since.is_some() && !full_state && !force_full_state && room_is_unchanged(&room_data) {
             continue;
         }
         // MSC3706 client signal: surface `partial_state: true` so the
-        // client knows the membership list is incomplete and can
+        // lazy client knows the membership list is incomplete and can
         // soft-fail features that depend on full state (e.g. mention
-        // autocomplete) until the filler catches up.
-        let (partial, _servers) = state
-            .db
-            .get_partial_state_info(room_nid)
-            .unwrap_or((false, Vec::new()));
+        // autocomplete) until the filler catches up. Eager clients
+        // never reach this point with `partial=true` (gated above).
         if partial && let Some(obj) = room_data.as_object_mut() {
             obj.insert("partial_state".into(), json!(true));
         }
@@ -3462,5 +3487,111 @@ mod tests {
         assert!(room_is_unchanged(&empty_object));
         let only_summary = json!({"summary": {"m.joined_member_count": 1}});
         assert!(room_is_unchanged(&only_summary));
+    }
+
+    /// MSC3902 eager-sync gating: a partial-state room MUST NOT
+    /// appear in eager (no `lazy_load_members`) /sync until the
+    /// filler clears the flag. Once cleared, the room must appear on
+    /// the next eager poll whose `since` is strictly less than the
+    /// recorded `partial_cleared_at` — the per-room state delta
+    /// can't see the filler-merged events (they're persisted as
+    /// `StateBundleOnly` without their own stream_pos), so /sync
+    /// forces a full-state response on that one poll.
+    #[test]
+    fn eager_sync_skips_partial_room_then_emits_after_clear() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!part:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let user = fake_user(&state, "@al:example.com");
+        let type_create = db.get_or_create_nid("m.room.create").unwrap();
+        let type_member = db.get_or_create_nid("m.room.member").unwrap();
+        let skey_empty = db.get_or_create_nid("").unwrap();
+
+        // Minimal room: create + alice's join. Skip persist_state
+        // snapshotting — eager-sync gating only looks at partial
+        // state flags + the room's joined_room_nids set.
+        db.create_room_meta(room_nid, room_id, "12").unwrap();
+        db.persist_event(
+            10,
+            "$c",
+            room_nid,
+            type_create,
+            user.user_nid,
+            skey_empty,
+            1,
+            1,
+            &serde_json::to_vec(&serde_json::json!({
+                "type": "m.room.create",
+                "sender": "@al:example.com",
+                "state_key": "",
+                "room_id": room_id,
+                "content": {"room_version": "12"},
+                "origin_server_ts": 1, "depth": 1,
+                "prev_events": [], "auth_events": [],
+            }))
+            .unwrap(),
+            &[],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+        db.persist_event(
+            11,
+            "$j",
+            room_nid,
+            type_member,
+            user.user_nid,
+            user.user_nid,
+            2,
+            2,
+            &serde_json::to_vec(&serde_json::json!({
+                "type": "m.room.member",
+                "sender": "@al:example.com",
+                "state_key": "@al:example.com",
+                "room_id": room_id,
+                "content": {"membership": "join"},
+                "origin_server_ts": 2, "depth": 2,
+                "prev_events": ["$c"], "auth_events": ["$c"],
+            }))
+            .unwrap(),
+            &[10],
+            &[10],
+            true,
+            false,
+        )
+        .unwrap();
+        db.set_membership(room_nid, user.user_nid, 1).unwrap();
+        db.set_partial_state_join(room_nid, &["resident.example".into()], 11)
+            .unwrap();
+
+        // Eager initial sync: room must be omitted.
+        let resp = build_sync_response(&state, &user, &[room_nid], None).unwrap();
+        let has_room = resp
+            .pointer("/rooms/join")
+            .and_then(|v| v.as_object())
+            .is_some_and(|o| o.contains_key(room_id));
+        assert!(
+            !has_room,
+            "eager sync must omit partial-state room, got: {}",
+            resp.pointer("/rooms/join").unwrap()
+        );
+
+        // Clear at pos=99. Subsequent eager incremental with
+        // since=50 (< 99) must surface the room.
+        db.clear_partial_state(room_nid, 99).unwrap();
+        let resp_after = build_sync_response(&state, &user, &[room_nid], Some(50)).unwrap();
+        let has_room_after = resp_after
+            .pointer("/rooms/join")
+            .and_then(|v| v.as_object())
+            .is_some_and(|o| o.contains_key(room_id));
+        assert!(
+            has_room_after,
+            "eager sync past clearance must include the room, got: {}",
+            resp_after
+                .pointer("/rooms/join")
+                .unwrap_or(&serde_json::json!(null))
+        );
     }
 }

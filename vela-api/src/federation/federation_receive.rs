@@ -2545,7 +2545,7 @@ mod tests {
 
         // Clear flips back; the Check 5 path would now go through the
         // strict rejection.
-        db.clear_partial_state(room_nid).unwrap();
+        db.clear_partial_state(room_nid, 0).unwrap();
         let (partial, _) = db.get_partial_state_info(room_nid).unwrap();
         assert!(!partial);
     }

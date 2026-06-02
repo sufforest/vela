@@ -831,7 +831,7 @@ mod tests {
         );
 
         // clear_partial_state flips the flag back and drops the hints.
-        db.clear_partial_state(room_nid).unwrap();
+        db.clear_partial_state(room_nid, 0).unwrap();
         let (partial, servers) = db.get_partial_state_info(room_nid).unwrap();
         assert!(!partial);
         assert!(servers.is_empty());
