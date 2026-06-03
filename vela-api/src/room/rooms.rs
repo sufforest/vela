@@ -649,14 +649,19 @@ pub async fn create_room(
         crate::router::notify_user(&state, target_nid);
     }
 
-    if !state_event_nids.is_empty() {
+    // Stamp a state snapshot at EVERY state event we just persisted,
+    // not just the last one. `state_before_event` walks back through
+    // prev_events looking for a recorded snapshot; if the only snapshot
+    // is at the room's tip, /state and /state_ids return empty for any
+    // earlier anchor (notably the join's `prev_event`, which MSC3902
+    // and vela-vela federation queries use). The snapshot content
+    // (`state_event_nids`) is identical at each step because createRoom
+    // applies its events as a coherent block — the same set is the
+    // "post-state" at every event in the sequence.
+    for &nid in &state_event_nids {
         state
             .db
-            .persist_state_snapshot(
-                room_nid,
-                *state_event_nids.last().unwrap(),
-                &state_event_nids,
-            )
+            .persist_state_snapshot(room_nid, nid, &state_event_nids)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     }
 
