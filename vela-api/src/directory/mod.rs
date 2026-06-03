@@ -40,9 +40,10 @@ async fn resolve_local_alias(state: &AppState, alias: &str) -> Result<Json<Value
         .get_room_alias(alias)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
     {
+        let servers = servers_for_alias_response(state, &room_id);
         return Ok(Json(json!({
             "room_id": room_id,
-            "servers": [state.config.server_name],
+            "servers": servers,
         })));
     }
 
@@ -66,14 +67,52 @@ async fn resolve_local_alias(state: &AppState, alias: &str) -> Result<Json<Value
                 .get_room_alias(alias)
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         {
+            let servers = servers_for_alias_response(state, &room_id);
             return Ok(Json(json!({
                 "room_id": room_id,
-                "servers": [state.config.server_name],
+                "servers": servers,
             })));
         }
     }
 
     Err(ApiError(VelaError::NotFound("alias not found".into())))
+}
+
+/// Compute the `servers` list returned by `/directory/room/{alias}`.
+/// Spec wants every server that knows the room — clients use the
+/// list as join hints. Returns our own server plus any remote peers
+/// we can identify locally:
+///
+/// - Partial-state rooms: union in `servers_in_room` from the
+///   partial-state record (the resident peer's broadcast list at
+///   join time). MSC3902 tests rely on this — the directory query
+///   happens before the filler completes, so the local membership
+///   index doesn't yet list every peer.
+/// - Full-state rooms: union in every remote server with a joined
+///   member.
+fn servers_for_alias_response(state: &AppState, room_id: &str) -> Vec<String> {
+    let mut servers: Vec<String> = vec![state.config.server_name.clone()];
+    let Ok(Some(room_nid)) = state.db.get_nid(room_id) else {
+        return servers;
+    };
+    if let Ok((true, hint_servers)) = state.db.get_partial_state_info(room_nid) {
+        for s in hint_servers {
+            if s != state.config.server_name && !servers.iter().any(|x| x == &s) {
+                servers.push(s);
+            }
+        }
+    }
+    if let Ok(remotes) = state
+        .db
+        .get_remote_servers_in_room(room_nid, &state.config.server_name)
+    {
+        for s in remotes {
+            if !servers.iter().any(|x| x == &s) {
+                servers.push(s);
+            }
+        }
+    }
+    servers
 }
 
 async fn resolve_remote_alias(
