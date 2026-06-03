@@ -80,16 +80,37 @@ pub async fn search(
         // back, and Synapse/Element clients rely on this filtering.
         let mut candidates = resolve_shared_room_peers(&state, user.user_nid)?;
         candidates.extend(resolve_public_room_members(&state)?);
-        candidates.remove(&user.user_nid);
+        // Keep self in candidates so a directory search that targets
+        // the caller's own localpart (e.g. MSC3902's rocky-finds-rocky
+        // sanity check) returns a hit. `try_push_for_self` below
+        // narrows the substring check to the LOCALPART for the caller
+        // specifically, so unrelated searches for shared prefixes
+        // ("@user-…") don't accidentally surface the caller alongside
+        // the genuine match (TestRoomSpecificUsername*).
+        candidates.insert(user.user_nid);
         for peer_nid in candidates {
-            let Some(record) = state
+            // Local users have a row in the `users` CF. Remote peers
+            // (federation users vela has only ever seen via member
+            // events) don't, but the spec still wants them surfaced
+            // through the directory once we share a room — fall back
+            // to the user_id resolved from their nid so substring
+            // matches still hit. Displayname/avatar surface only when
+            // we've happened to ingest a profile elsewhere.
+            let record = state
                 .db
                 .get_user(peer_nid)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-            else {
-                continue;
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+            let record = match record {
+                Some(r) => r,
+                None => {
+                    let Ok(Some(uid)) = state.db.resolve_nid(peer_nid) else {
+                        continue;
+                    };
+                    json!({"user_id": uid})
+                }
             };
-            if try_push(&record, &term, limit, &mut matches) {
+            let is_self = peer_nid == user.user_nid;
+            if try_push_filtered(&record, &term, limit, is_self, &mut matches) {
                 truncated = true;
                 break;
             }
@@ -100,6 +121,40 @@ pub async fn search(
         "results": matches,
         "limited": truncated,
     })))
+}
+
+/// Caller-aware wrapper around `try_push` that narrows the substring
+/// match for the caller themselves to their LOCALPART. Without this
+/// filter, every search whose term overlaps the shared
+/// `@user-<n>-…` prefix Complement gives every test user would echo
+/// the caller back as a result (TestRoomSpecificUsername*); with it,
+/// a caller searching for their own localpart still gets a hit
+/// (MSC3902 sanity check).
+fn try_push_filtered(
+    record: &Value,
+    term_lc: &str,
+    limit: usize,
+    is_self: bool,
+    matches: &mut Vec<Value>,
+) -> bool {
+    if is_self {
+        let user_id = record.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
+        let displayname = record
+            .get("displayname")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let localpart = user_id
+            .strip_prefix('@')
+            .and_then(|s| s.split_once(':'))
+            .map(|(lp, _)| lp)
+            .unwrap_or("");
+        if !localpart.to_lowercase().contains(term_lc)
+            && !displayname.to_lowercase().contains(term_lc)
+        {
+            return false;
+        }
+    }
+    try_push(record, term_lc, limit, matches)
 }
 
 /// Inspect a user record; if it's active and matches `term`, append it
