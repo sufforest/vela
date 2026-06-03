@@ -658,14 +658,13 @@ async fn create_admin_room(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     crate::router::notify_user(state, bot_user_nid);
 
-    if !state_event_nids.is_empty() {
+    // Snapshot at every state event (matches createRoom). Without
+    // this, `state_before_event` returns empty for any anchor other
+    // than the tail, breaking remote joiners' partial-state filler.
+    for &nid in &state_event_nids {
         state
             .db
-            .persist_state_snapshot(
-                room_nid,
-                *state_event_nids.last().unwrap(),
-                &state_event_nids,
-            )
+            .persist_state_snapshot(room_nid, nid, &state_event_nids)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     }
 

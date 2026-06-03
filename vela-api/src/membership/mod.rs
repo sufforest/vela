@@ -808,26 +808,35 @@ pub async fn leave_room(
         return Err(VelaError::Forbidden("not in this room".into()).into());
     }
 
-    // If the room was created on a different server, the leave
-    // normally goes through the federation `make_leave`/`send_leave`
-    // flow so the resident server adds it to the authoritative DAG.
-    // One exception: partial-state joins (MSC3902). We already hold
-    // the user's own membership + the auth state locally, so we can
-    // build and sign the leave directly and federate it through the
-    // normal /send broadcast. Calling make_leave during the filler's
-    // catch-up would race against the resync and the resident often
-    // responds with garbage. Test:
-    // `TestPartialStateJoin/Leave_during_resync/does_not_wait_for_resync`.
-    // Leave always goes through local emit: we sign the leave event
-    // ourselves and federate via the outbox. This works uniformly for
-    // full-state, partial-state, and just-cleared-partial-state rooms,
-    // and avoids the `make_leave`/`send_leave` round-trip which races
-    // against the partial-state filler. Previously the leave handler
-    // forked into `do_remote_leave` for non-partial federated rooms,
-    // but that path failed against rooms whose partial-state had just
-    // cleared (the resident peer's view hadn't caught up). The signed
-    // leave PDU reaches the resident through the normal /send broadcast
-    // — semantically equivalent and one fewer cross-server hop.
+    // Pick the federation path based on what state we hold locally:
+    //
+    // - Currently joined (`current=1`) in any room: the join went
+    //   through bootstrap_remote_room (or createRoom for local rooms),
+    //   so we have the real m.room.create event_id and a full auth
+    //   chain. Local-emit signs a leave and federates via /send. This
+    //   is the only path that works for partial-state-cleared rooms
+    //   (`make_leave` races the filler and complement mocks often
+    //   don't register the handler — `TestPartialStateJoin/...`).
+    //
+    // - Invited or knocked (`current=2/4`) in a remote room: all we
+    //   have locally is a stripped invite-room-state with a synthetic
+    //   `$invite-stripped:…` create event. Under v12 (MSC4291) that
+    //   id doesn't match `room_id`, so building a leave that lists
+    //   the synthetic create in `auth_events` fails our own auth
+    //   check ("event room_id does not match m.room.create event id
+    //   (v12)"). Fall back to `make_leave`/`send_leave` on the
+    //   resident server; they have the real create and can build a
+    //   valid template for us to sign.
+    let resident_server = creator_server(&state, room_nid)?;
+    let needs_remote_leave = matches!(current, Some(2) | Some(4))
+        && resident_server
+            .as_deref()
+            .is_some_and(|rs| rs != state.config.server_name);
+    if needs_remote_leave && let Some(rs) = resident_server {
+        do_remote_leave(&state, &user, room_nid, &room_id, &rs).await?;
+        return Ok(Json(json!({})));
+    }
+
     emit_membership_event(&state, &user, room_nid, &room_id, "leave", None).await?;
 
     Ok(Json(json!({})))
