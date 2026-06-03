@@ -123,6 +123,20 @@ pub async fn make_join(
         }
     };
 
+    // MSC3902 / MSC3706: during partial state we don't have the full
+    // current-state needed to evaluate restricted-room authorisation,
+    // power_levels, or membership history. Refuse the request with
+    // 404 M_NOT_FOUND so the calling server retries against a fully-
+    // synced peer. Spec-mandated; complement's TestPartialStateJoin
+    // /Rejects_make_join_during_partial_join asserts the same.
+    if let Ok((true, _)) = state.db.get_partial_state_info(room_nid) {
+        return Err(err_response(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "room is currently in partial state",
+        ));
+    }
+
     // m.room.server_acl gate. Block banned origins from getting a join
     // template at all.
     crate::federation::server_acl::deny_if_blocked(&state, room_nid, &origin.0)?;
@@ -542,6 +556,16 @@ pub async fn send_join_v2(
             ));
         }
     };
+    // MSC3902 / MSC3706: reject send_join during partial state for
+    // the same reason as make_join — without the full membership +
+    // power_levels view we can't safely authorise a new join.
+    if let Ok((true, _)) = state.db.get_partial_state_info(room_nid) {
+        return Err(err_response(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "room is currently in partial state",
+        ));
+    }
     // Accept public + restricted/knock_restricted send_join; auth rule
     // 5.3.5 will enforce the join_authorised_via_users_server constraint
     // for restricted variants. Invite-only/knock-only rooms also accept

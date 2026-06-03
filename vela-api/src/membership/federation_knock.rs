@@ -81,6 +81,17 @@ pub async fn make_knock(
         )
     })?;
 
+    // MSC3902 / MSC3706: refuse make_knock during partial state. Same
+    // rationale as make_join — we lack the full state needed to
+    // authorise the knock against join_rules / server_acl.
+    if let Ok((true, _)) = state.db.get_partial_state_info(room_nid) {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "room is currently in partial state",
+        ));
+    }
+
     // m.room.server_acl gate.
     crate::federation::server_acl::deny_if_blocked(&state, room_nid, &origin.0)?;
 
@@ -177,6 +188,21 @@ pub async fn send_knock_v1(
     axum::extract::Extension(VerifiedBody(body)): axum::extract::Extension<VerifiedBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     debug!(%room_id, %event_id, origin = %origin.0, "send_knock v1");
+
+    // MSC3902 / MSC3706: refuse during partial state BEFORE body
+    // validation so the test can rely on the partial-state error
+    // surfacing even when the knock event payload itself is
+    // malformed (the spec test exercises both rejection paths
+    // through the same code path).
+    if let Ok(Some(room_nid)) = state.db.get_nid(&room_id)
+        && let Ok((true, _)) = state.db.get_partial_state_info(room_nid)
+    {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "M_NOT_FOUND",
+            "room is currently in partial state",
+        ));
+    }
 
     let event_json = body.ok_or_else(|| {
         err(
