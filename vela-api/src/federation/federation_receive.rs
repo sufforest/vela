@@ -61,8 +61,13 @@ impl PduOutcome {
 /// Process one PDU through the 6-check pipeline. Returns the outcome to
 /// report back to the sender.
 ///
+/// `origin` is the transaction's X-Matrix origin — the peer that just
+/// delivered this PDU to us. Threaded down to the relay broadcast so we
+/// don't echo the event back to them; safe to pass an empty string if
+/// the caller doesn't have an origin (e.g. internal callers / tests).
+///
 /// On Accepted / SoftFailed the event has been persisted. On Rejected it has not.
-pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutcome) {
+pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (String, PduOutcome) {
     // --- Check 1: format ---
     let obj = match pdu_json.as_object() {
         Some(o) => o,
@@ -671,6 +676,7 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
         &effective_pdu,
         &effective_event_json,
         soft_failed,
+        origin,
     )
     .await
     {
@@ -1098,6 +1104,7 @@ async fn persist_received_pdu(
     pdu: &Pdu,
     event_json: &Map<String, Value>,
     soft_failed: bool,
+    origin: &str,
 ) -> Result<(), String> {
     // Resolve type/sender/state_key NIDs.
     let type_nid = state
@@ -1292,8 +1299,11 @@ async fn persist_received_pdu(
         // a hub for the room's other peers; without this fan-out a
         // three-way room A→B→C never sees B's events arrive at C
         // unless B itself federates to C (and B doesn't always know
-        // who's in the room beyond its own peer list).
-        state.federation_sender.broadcast(room_nid, event_nid);
+        // who's in the room beyond its own peer list). Skip the
+        // transaction origin too — they just told us, no point echoing.
+        state
+            .federation_sender
+            .broadcast_excluding(room_nid, event_nid, Some(origin));
 
         // Push dispatch. The local-send path in send.rs does the same
         // — without this call, mobile clients get no notifications for
@@ -2420,7 +2430,7 @@ mod tests {
     #[tokio::test]
     async fn reject_non_object_pdu() {
         let (state, _tmp) = build_test_state();
-        let (_, outcome) = process_pdu(&state, &json!([1, 2, 3])).await;
+        let (_, outcome) = process_pdu(&state, &json!([1, 2, 3]), "test.example").await;
         assert!(matches!(outcome, PduOutcome::Rejected(ref r) if r.contains("not a JSON object")));
     }
 
@@ -2436,7 +2446,7 @@ mod tests {
             "prev_events": [],
             "auth_events": [],
         });
-        let (_, outcome) = process_pdu(&state, &pdu).await;
+        let (_, outcome) = process_pdu(&state, &pdu, "test.example").await;
         assert!(matches!(outcome, PduOutcome::Rejected(ref r) if r.contains("room_id")));
     }
 
@@ -2453,7 +2463,7 @@ mod tests {
             "prev_events": ["$some_prev"],
             "auth_events": ["$some_auth"],
         });
-        let (_, outcome) = process_pdu(&state, &pdu).await;
+        let (_, outcome) = process_pdu(&state, &pdu, "test.example").await;
         assert!(matches!(outcome, PduOutcome::Rejected(ref r) if r.contains("unknown room")));
     }
 
@@ -2471,7 +2481,7 @@ mod tests {
             "prev_events": [],
             "auth_events": [],
         });
-        let (_, outcome) = process_pdu(&state, &pdu).await;
+        let (_, outcome) = process_pdu(&state, &pdu, "test.example").await;
         match outcome {
             PduOutcome::Rejected(r) => assert!(
                 r.contains("m.room.create"),
@@ -2495,7 +2505,7 @@ mod tests {
             "prev_events": [],
             "auth_events": auth_events,
         });
-        let (_, outcome) = process_pdu(&state, &pdu).await;
+        let (_, outcome) = process_pdu(&state, &pdu, "test.example").await;
         assert!(matches!(outcome, PduOutcome::Rejected(ref r) if r.contains("auth_events")));
     }
 

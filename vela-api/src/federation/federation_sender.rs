@@ -157,6 +157,15 @@ impl FederationSender {
     /// back wastes work and trips strict mocks (Complement's
     /// HandleTransactionRequests treats unsolicited PDUs as failures).
     pub fn broadcast(&self, room_nid: u64, event_nid: u64) {
+        self.broadcast_excluding(room_nid, event_nid, None);
+    }
+
+    /// Same as `broadcast` but also skips `exclude_origin` — the
+    /// transaction origin that just delivered this PDU to us. Used by
+    /// the inbound /send relay path so we don't echo events straight
+    /// back to the peer that gave them to us; for events vela itself
+    /// authored there's no origin (caller passes `None`).
+    pub fn broadcast_excluding(&self, room_nid: u64, event_nid: u64, exclude_origin: Option<&str>) {
         if !self.enabled {
             return;
         }
@@ -171,11 +180,6 @@ impl FederationSender {
             }
         };
         let sender_domain = self.sender_domain_for_event(event_nid);
-        if let Some(domain) = sender_domain.as_deref()
-            && domain != self.our_server_name.as_str()
-        {
-            destinations.retain(|d| d != domain);
-        }
 
         // m.room.member events that change a remote user's membership
         // (typically ban / kick / leave) need to reach the target's
@@ -197,13 +201,23 @@ impl FederationSender {
         // the resident (and other peers) before the filler catches up.
         if let Ok((true, servers)) = self.db.get_partial_state_info(room_nid) {
             for s in servers {
-                if s != self.our_server_name
-                    && Some(s.as_str()) != sender_domain.as_deref()
-                    && !destinations.iter().any(|d| d == &s)
-                {
+                if s != self.our_server_name && !destinations.iter().any(|d| d == &s) {
                     destinations.push(s);
                 }
             }
+        }
+
+        // Apply exclusions AFTER all unions so the partial-state hint
+        // can't smuggle back the sender's or origin's server.
+        if let Some(domain) = sender_domain.as_deref()
+            && domain != self.our_server_name.as_str()
+        {
+            destinations.retain(|d| d != domain);
+        }
+        if let Some(origin) = exclude_origin
+            && origin != self.our_server_name.as_str()
+        {
+            destinations.retain(|d| d != origin);
         }
 
         if destinations.is_empty() {

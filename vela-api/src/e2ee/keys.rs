@@ -822,6 +822,21 @@ pub(crate) fn federate_device_list_update_for(
             Ok(servers) => destinations.extend(servers),
             Err(e) => tracing::warn!(error = %e, "device_list federate: room scan failed"),
         }
+        // MSC3902: for partial-state rooms the local memberships index
+        // doesn't list every peer the resident server already knows
+        // about. Union in `servers_in_room` from the partial-state
+        // record so device-list updates reach every server we KNOW
+        // (via the resident's hint) is in the room. Stale entries
+        // wash out once the filler completes and a regular sweep
+        // recomputes from current state. Spec test:
+        // TestPartialStateJoin/Outgoing_device_list_updates/...
+        if let Ok((true, hint_servers)) = state.db.get_partial_state_info(room_nid) {
+            for s in hint_servers {
+                if s != state.config.server_name {
+                    destinations.insert(s);
+                }
+            }
+        }
     }
     if destinations.is_empty() {
         return;

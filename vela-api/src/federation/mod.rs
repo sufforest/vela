@@ -474,10 +474,11 @@ pub async fn receive_transaction(
         String,
         crate::federation::federation_receive::PduOutcome,
     )> = Vec::with_capacity(MAX_PDUS_PER_TRANSACTION);
+    let origin_str = origin.0.clone();
     if by_room.len() <= 1 {
         for (_room_id, pdus_in_room) in by_room {
             for (idx, pdu) in pdus_in_room {
-                let (event_id, outcome) = process_pdu(&state, &pdu).await;
+                let (event_id, outcome) = process_pdu(&state, &pdu, &origin_str).await;
                 record_outcome(&state, &txn_id, &event_id, &outcome);
                 indexed_results.push((idx, event_id, outcome));
             }
@@ -487,6 +488,7 @@ pub async fn receive_transaction(
         for (_room_id, pdus_in_room) in by_room {
             let state_clone = state.clone();
             let txn_id_clone = txn_id.clone();
+            let origin_clone = origin_str.clone();
             set.spawn(async move {
                 let mut out: Vec<(
                     usize,
@@ -494,7 +496,7 @@ pub async fn receive_transaction(
                     crate::federation::federation_receive::PduOutcome,
                 )> = Vec::with_capacity(pdus_in_room.len());
                 for (idx, pdu) in pdus_in_room {
-                    let (event_id, outcome) = process_pdu(&state_clone, &pdu).await;
+                    let (event_id, outcome) = process_pdu(&state_clone, &pdu, &origin_clone).await;
                     record_outcome(&state_clone, &txn_id_clone, &event_id, &outcome);
                     out.push((idx, event_id, outcome));
                 }
