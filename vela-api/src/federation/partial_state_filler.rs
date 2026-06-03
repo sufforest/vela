@@ -478,15 +478,50 @@ async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> 
         ));
     }
     // Promote into current state (`room_state` CF) so /joined_members
-    // and /state see the new entries.
+    // and /state see the new entries — BUT only when the bundle's
+    // version of (type, state_key) is newer (by depth) than what we
+    // already have. The bundle is the resident peer's state at the
+    // join's `prev_event` — i.e. PRE-JOIN. It naturally carries the
+    // joining user's invite/knock as the m.room.member entry for our
+    // own user, which is OLDER than the join we just persisted as
+    // Live. Without this depth check, the merge clobbers our fresh
+    // JOIN with the bundle's INVITE and the joiner appears stuck in
+    // invite state on /sync. Same logic protects against bumping
+    // power_levels, name, etc. backwards if another local actor
+    // raced ahead of the resident peer.
+    let mut suppressed_keys: std::collections::HashSet<(u64, u64)> =
+        std::collections::HashSet::new();
     for nid in &state_nids {
         let Some((header, _)) = state.db.get_event(*nid).ok().flatten() else {
             continue;
         };
+        let new_depth = header.depth;
+        if let Ok(Some(existing_nid)) =
+            state
+                .db
+                .get_state_event_nid(room_nid, header.type_nid, header.state_key_nid)
+            && let Ok(Some((existing_header, _))) = state.db.get_event(existing_nid)
+            && existing_header.depth >= new_depth
+        {
+            suppressed_keys.insert((header.type_nid, header.state_key_nid));
+            continue;
+        }
         let _ =
             state
                 .db
                 .set_room_state_entry(room_nid, header.type_nid, header.state_key_nid, *nid);
+    }
+    // Filter memberships_to_set the same way — if the room_state
+    // promotion was suppressed for this user, the membership index
+    // mustn't be set backwards either.
+    let type_member_nid = state.db.get_or_create_nid("m.room.member").ok();
+    if let Some(member_type_nid) = type_member_nid {
+        memberships_to_set.retain(|(sk, _)| {
+            let Ok(Some(skey_nid)) = state.db.get_nid(sk) else {
+                return true;
+            };
+            !suppressed_keys.contains(&(member_type_nid, skey_nid))
+        });
     }
     // Stamp a snapshot at each new state event so /state-at-event and
     // /messages backward-pagination return the right view.
