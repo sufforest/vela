@@ -675,16 +675,96 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value) -> (String, PduOutc
     .await
     {
         Ok(()) => {
-            if soft_failed {
-                (effective_pdu.event_id, PduOutcome::SoftFailed)
-            } else {
+            if !soft_failed {
+                // MSC3902 lazy-loading visibility: during partial state,
+                // a remote user can author a timeline event whose
+                // m.room.member isn't in our local current state (the
+                // filler hasn't merged it). The event itself carries
+                // their member event in `auth_events`, so promote it
+                // into `room_state` now — without this, lazy /sync's
+                // member-event filter (timeline senders only) drops
+                // the membership and clients can't render the message
+                // with the right display name.
+                promote_sender_member_during_partial_state(state, room_nid, &effective_pdu);
                 (effective_pdu.event_id, PduOutcome::Accepted)
+            } else {
+                (effective_pdu.event_id, PduOutcome::SoftFailed)
             }
         }
         Err(e) => (
             effective_pdu.event_id,
             PduOutcome::Rejected(format!("persist failed: {e}")),
         ),
+    }
+}
+
+/// MSC3902: when an inbound timeline PDU lands during partial state and
+/// the sender's `m.room.member` isn't already in current room state,
+/// fish it out of the PDU's `auth_events` and promote it. The spec
+/// requires `auth_events` to list the sender's membership for every
+/// non-state PDU, so it's a known-good substitute for the missing
+/// state entry. No-op when the room isn't partial or the member entry
+/// is already present.
+fn promote_sender_member_during_partial_state(state: &AppState, room_nid: u64, pdu: &Pdu) {
+    if pdu.state_key.is_some() {
+        // The inbound event is itself a state event — its own
+        // persist path already updates room_state for its own
+        // (type, state_key). Nothing extra to do here.
+        return;
+    }
+    let (is_partial, _) = state
+        .db
+        .get_partial_state_info(room_nid)
+        .unwrap_or((false, Vec::new()));
+    if !is_partial {
+        return;
+    }
+    let Ok(Some(type_member_nid)) = state.db.get_nid("m.room.member") else {
+        return;
+    };
+    let Ok(Some(sender_skey_nid)) = state.db.get_nid(&pdu.sender) else {
+        return;
+    };
+    if let Ok(Some(_)) = state
+        .db
+        .get_state_event_nid(room_nid, type_member_nid, sender_skey_nid)
+    {
+        return;
+    }
+    // Find the sender's member event among auth_events. The spec
+    // mandates that every non-state PDU's auth_events include the
+    // sender's membership, so this should always succeed for a
+    // well-formed accepted event.
+    for aid in &pdu.auth_events {
+        let Some(json) =
+            crate::federation::federation_state::load_event_json_by_event_id(&state.db, aid)
+        else {
+            continue;
+        };
+        let Some(obj) = json.as_object() else {
+            continue;
+        };
+        let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let sk = obj.get("state_key").and_then(|v| v.as_str()).unwrap_or("");
+        if ty != "m.room.member" || sk != pdu.sender {
+            continue;
+        }
+        let Ok(Some(member_nid)) = state.db.get_event_nid_by_id(aid) else {
+            continue;
+        };
+        if let Err(e) =
+            state
+                .db
+                .set_room_state_entry(room_nid, type_member_nid, sender_skey_nid, member_nid)
+        {
+            warn!(
+                event_id = %pdu.event_id,
+                sender = %pdu.sender,
+                error = %e,
+                "MSC3902: promote sender member failed"
+            );
+        }
+        return;
     }
 }
 

@@ -150,6 +150,12 @@ impl FederationSender {
     /// Enqueue `event_nid` for delivery to every remote server in
     /// `room_nid`. Persists to the outbox before signalling the worker
     /// so a crash between persist and signal still gets retried.
+    ///
+    /// Excludes the event sender's home server — it already has the
+    /// event (either it authored it or, for events vela authored, the
+    /// sender's domain is our own and we already filter that). Echoing
+    /// back wastes work and trips strict mocks (Complement's
+    /// HandleTransactionRequests treats unsolicited PDUs as failures).
     pub fn broadcast(&self, room_nid: u64, event_nid: u64) {
         if !self.enabled {
             return;
@@ -164,6 +170,12 @@ impl FederationSender {
                 return;
             }
         };
+        let sender_domain = self.sender_domain_for_event(event_nid);
+        if let Some(domain) = sender_domain.as_deref()
+            && domain != self.our_server_name.as_str()
+        {
+            destinations.retain(|d| d != domain);
+        }
 
         // m.room.member events that change a remote user's membership
         // (typically ban / kick / leave) need to reach the target's
@@ -185,7 +197,10 @@ impl FederationSender {
         // the resident (and other peers) before the filler catches up.
         if let Ok((true, servers)) = self.db.get_partial_state_info(room_nid) {
             for s in servers {
-                if s != self.our_server_name && !destinations.iter().any(|d| d == &s) {
+                if s != self.our_server_name
+                    && Some(s.as_str()) != sender_domain.as_deref()
+                    && !destinations.iter().any(|d| d == &s)
+                {
                     destinations.push(s);
                 }
             }
@@ -306,6 +321,20 @@ impl FederationSender {
     /// Returns `None` for non-member events, locally-hosted targets,
     /// malformed state_keys, or DB read failures (we'd rather under-
     /// federate than crash the broadcast path).
+    /// Sender's home-server domain for an event, looked up from the
+    /// stored JSON. Used by `broadcast` to skip echoing back to the
+    /// peer that authored the event.
+    fn sender_domain_for_event(&self, event_nid: u64) -> Option<String> {
+        let (_, bytes) = self.db.get_event(event_nid).ok().flatten()?;
+        let event: Value = serde_json::from_slice(&bytes).ok()?;
+        let sender = event.get("sender")?.as_str()?;
+        let (_, server) = sender.split_once(':')?;
+        if server.is_empty() {
+            return None;
+        }
+        Some(server.to_string())
+    }
+
     fn target_server_for_member_event(&self, event_nid: u64) -> Option<String> {
         let (header, bytes) = self.db.get_event(event_nid).ok().flatten()?;
         let m_room_member_nid = self.db.get_nid("m.room.member").ok().flatten()?;

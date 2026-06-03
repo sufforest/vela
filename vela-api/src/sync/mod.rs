@@ -410,6 +410,14 @@ pub(crate) fn build_sync_response_inner(
             crate::sync::filters::apply_timeline_filter(&mut room_data, tf);
         }
         if lazy_load {
+            ensure_lazy_load_member_state(
+                state,
+                room_nid,
+                &room_id,
+                &mut room_data,
+                user,
+                use_state_after,
+            )?;
             crate::sync::filters::apply_lazy_load_state(
                 &mut room_data,
                 &user.user_id,
@@ -857,6 +865,119 @@ fn compute_state_delta(
         }
     }
     Ok(out)
+}
+
+/// Lazy-loading completion: ensure the room's `state.events` carries a
+/// `m.room.member` event for every sender appearing in `timeline.events`
+/// (plus the requesting user themselves). The state delta in
+/// `compute_state_delta` only includes member events that *transitioned*
+/// inside the (since, first_pos) window — for remote senders whose
+/// membership state landed via federation (partial-state filler, or the
+/// inbound-event "promote sender member" path) without a stream_pos,
+/// the delta misses them entirely and the client can't render the
+/// timeline with the right display names. Pull the missing entries
+/// from current room state and prepend them to `state.events`.
+///
+/// `apply_lazy_load_state` runs *after* this to trim non-relevant
+/// member events; this function only ADDS, never removes.
+fn ensure_lazy_load_member_state(
+    state: &AppState,
+    room_nid: u64,
+    room_id: &str,
+    room_data: &mut Value,
+    user: &AuthenticatedUser,
+    use_state_after: bool,
+) -> Result<(), ApiError> {
+    use std::collections::HashSet;
+
+    let needed: HashSet<String> = {
+        let mut s: HashSet<String> = room_data
+            .pointer("/timeline/events")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.get("sender").and_then(|x| x.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        s.insert(user.user_id.clone());
+        s
+    };
+    if needed.is_empty() {
+        return Ok(());
+    }
+    let state_pointer = if use_state_after {
+        "/state_after/events"
+    } else {
+        "/state/events"
+    };
+    let already: HashSet<String> = room_data
+        .pointer(state_pointer)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let ty = e.get("type").and_then(|v| v.as_str())?;
+                    if ty != "m.room.member" {
+                        return None;
+                    }
+                    e.get("state_key")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let Ok(Some(type_member_nid)) = state.db.get_nid("m.room.member") else {
+        return Ok(());
+    };
+    let mut to_add: Vec<Value> = Vec::new();
+    for sender in &needed {
+        if already.contains(sender) {
+            continue;
+        }
+        let Ok(Some(sender_nid)) = state.db.get_nid(sender) else {
+            continue;
+        };
+        let Ok(Some(member_nid)) =
+            state
+                .db
+                .get_state_event_nid(room_nid, type_member_nid, sender_nid)
+        else {
+            continue;
+        };
+        if let Some(ev) = crate::room::messages::load_client_event(state, member_nid, room_id)? {
+            to_add.push(ev);
+        }
+    }
+    if to_add.is_empty() {
+        return Ok(());
+    }
+    // Ensure the state object exists, then prepend the missing
+    // members (order isn't spec-significant, but keeping new entries
+    // at the front mirrors what state-delta callers expect to find).
+    let state_obj = match room_data.as_object_mut() {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+    let state_key = if use_state_after {
+        "state_after"
+    } else {
+        "state"
+    };
+    let state_field = state_obj
+        .entry(state_key.to_string())
+        .or_insert_with(|| serde_json::json!({"events": []}));
+    if let Some(events) = state_field
+        .as_object_mut()
+        .and_then(|obj| obj.get_mut("events"))
+        .and_then(|v| v.as_array_mut())
+    {
+        let mut prepended = to_add;
+        prepended.extend(std::mem::take(events));
+        *events = prepended;
+    }
+    Ok(())
 }
 
 fn build_room_sync_for_user(
