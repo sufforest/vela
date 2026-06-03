@@ -23,6 +23,7 @@ use dashmap::DashMap;
 use serde_json::Value;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
+use vela_core::events::view::EventView;
 use vela_core::identifiers::Nid;
 
 use crate::router::AppState;
@@ -173,18 +174,41 @@ async fn try_fill_one(
     if servers.is_empty() {
         return Err("no servers in room hint".into());
     }
-    // Pick an event_id to fetch state at: any extremity works (peers
-    // accept any anchor we know). The freshly-persisted join event
-    // is in there; if extremities advanced since the join the peer's
-    // state response will reflect that — also fine.
+    // Pick an event_id to fetch state at. We prefer the join's
+    // `prev_event` (= the resident peer's pre-join tip): that is the
+    // event the resident server indexed state at when it answered
+    // our `make_join`, and the only anchor MSC3902 Complement mocks
+    // accept. Real peers are more permissive but this is also the
+    // spec-preferred anchor — the `/state_ids` response describes
+    // "the state PRIOR to" the requested event.
     let event_id = pick_anchor_event_id(state, room_nid)?;
     let mut last_err = String::new();
     for server in servers {
-        match state
-            .federation_client
-            .state(server, room_id, &event_id)
-            .await
-        {
+        // MSC3902 / spec preference: try `/state_ids` first (lighter
+        // — peer returns event_ids, we materialise via `/event` per
+        // id). Fall back to `/state` (heavier full-PDU response) when
+        // /state_ids materialisation comes up incomplete (any
+        // auth_chain_id 404, or fewer than half of `pdu_ids` resolve).
+        // Auth-chain truncation is dangerous: a missing ancestor can
+        // make downstream auth checks reject legitimate events, so
+        // partial materialisation isn't acceptable on the auth side.
+        let assembled = fetch_state_via_state_ids(state, server, room_id, &event_id).await;
+        let resp = match assembled {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                debug!(
+                    %server,
+                    error = %e,
+                    "state_ids primary failed, falling back to /state"
+                );
+                state
+                    .federation_client
+                    .state(server, room_id, &event_id)
+                    .await
+                    .map_err(|fe| format!("{fe}"))
+            }
+        };
+        match resp {
             Ok(resp) => {
                 // persist_remote_event reaches into room_state; the
                 // existing federation paths serialise on
@@ -209,12 +233,22 @@ async fn try_fill_one(
                     .collect();
                 match merge_state_response(state, room_nid, &resp).await {
                     Ok(()) => {
+                        // Allocate ONE stream position and use it for
+                        // both the cleared-at stamp and the broadcast
+                        // wake. /sync's eager gating decides "force
+                        // full state if since < cleared_at"; reusing
+                        // the broadcast pos here guarantees a
+                        // long-poll woken by the broadcast carries a
+                        // `since` strictly less than `cleared_at` on
+                        // its post-wake rebuild.
+                        let pos = state.db.next_stream_position().as_u64();
+                        let _stream_guard = vela_store::db::StreamApplyOnDrop::new(&state.db, pos);
                         state
                             .db
-                            .clear_partial_state(room_nid)
+                            .clear_partial_state(room_nid, pos)
                             .map_err(|e| format!("clear flag: {e}"))?;
                         reconcile_device_lists(state, room_nid, &members_before);
-                        wake_sync_on_clear(state, room_nid);
+                        wake_sync_on_clear(state, room_nid, pos);
                         return Ok(true);
                     }
                     Err(e) => {
@@ -236,7 +270,25 @@ async fn try_fill_one(
     })
 }
 
+/// Pick the event_id to anchor `/state_ids` / `/state` at. Prefer the
+/// prev_event of the partial-state join (the resident peer's pre-join
+/// tip — the only anchor MSC3902 mocks accept, and the spec-correct
+/// "state PRIOR to this event" semantic). Fall back to the first
+/// room extremity if we don't have the join recorded — keeps the
+/// filler usable for partial-state records written before
+/// `join_event_nid` tracking landed.
 fn pick_anchor_event_id(state: &AppState, room_nid: u64) -> Result<String, String> {
+    if let Ok(Some(join_nid)) = state.db.get_partial_join_event_nid(room_nid) {
+        // The join's prev_event is the resident peer's pre-join tip
+        // — we know its event_id from the join's JSON but typically
+        // haven't persisted it locally. Read the id string directly
+        // rather than going through nid resolution.
+        if let Ok(Some(ids)) = state.db.get_prev_event_ids_from_json(join_nid)
+            && let Some(eid) = ids.into_iter().next()
+        {
+            return Ok(eid);
+        }
+    }
     let extremities = state
         .db
         .get_extremities(room_nid)
@@ -250,6 +302,85 @@ fn pick_anchor_event_id(state: &AppState, room_nid: u64) -> Result<String, Strin
         .get_event_id_by_nid(nid)
         .map_err(|e| format!("resolve nid: {e}"))?
         .ok_or_else(|| "extremity nid has no event_id".into())
+}
+
+/// Primary state fetch path. Calls `/state_ids` (lighter — peer
+/// returns event_id arrays), then materialises every id via
+/// `/event`. Returns a Value in the same shape `merge_state_response`
+/// already consumes (`{auth_chain: [pdu...], pdus: [pdu...]}`).
+///
+/// Spec field names are `auth_chain_ids` + `pdu_ids` (server-server
+/// `events.yaml`). Older peers may return `auth_chain` / `pdus` — we
+/// accept both.
+///
+/// Returns `Err` when materialisation comes up structurally
+/// incomplete (any `auth_chain_id` 404, OR fewer than half of
+/// `pdu_ids` resolve). Auth chain truncation is dangerous: a missing
+/// ancestor causes downstream auth checks to reject legitimate
+/// events. The caller falls back to `/state` (heavy full-PDU path)
+/// in that case.
+async fn fetch_state_via_state_ids(
+    state: &AppState,
+    server: &str,
+    room_id: &str,
+    event_id: &str,
+) -> Result<Value, String> {
+    let ids = state
+        .federation_client
+        .state_ids(server, room_id, event_id)
+        .await
+        .map_err(|e| format!("state_ids: {e}"))?;
+    let auth_ids: Vec<String> = ids
+        .get("auth_chain_ids")
+        .or_else(|| ids.get("auth_chain"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let pdu_ids: Vec<String> = ids
+        .get("pdu_ids")
+        .or_else(|| ids.get("pdus"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if pdu_ids.is_empty() {
+        return Err("state_ids: empty pdu_ids".into());
+    }
+    let mut auth_pdus: Vec<Value> = Vec::with_capacity(auth_ids.len());
+    for id in &auth_ids {
+        match state.federation_client.fetch_event_pdu(server, id).await {
+            Ok(p) => auth_pdus.push(p),
+            Err(e) => {
+                return Err(format!("auth_chain /event {id}: {e}"));
+            }
+        }
+    }
+    let mut pdu_pdus: Vec<Value> = Vec::with_capacity(pdu_ids.len());
+    let mut missing = 0usize;
+    for id in &pdu_ids {
+        match state.federation_client.fetch_event_pdu(server, id).await {
+            Ok(p) => pdu_pdus.push(p),
+            Err(_) => missing += 1,
+        }
+    }
+    if missing * 2 > pdu_ids.len() {
+        return Err(format!(
+            "state_ids: only {}/{} pdu_ids materialised",
+            pdu_pdus.len(),
+            pdu_ids.len()
+        ));
+    }
+    Ok(serde_json::json!({
+        "auth_chain": auth_pdus,
+        "pdus": pdu_pdus,
+    }))
 }
 
 async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> Result<(), String> {
@@ -279,26 +410,146 @@ async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> 
     // declaring the room filled. Without this, an all-fail merge
     // (signatures mismatch, malformed JSON, etc.) would still clear
     // the partial-state flag and leave the room permanently incomplete.
-    let mut persisted: usize = 0;
+    //
+    // We also mirror `bootstrap_remote_room`'s post-processing:
+    // promote each state event into `room_state` (current state),
+    // populate the `memberships` index for member events, and stamp
+    // a state snapshot at each event. Without these steps the events
+    // exist as PDUs but neither `/joined_members`, `/state`, nor
+    // `set_membership`-driven federation paths can see the new
+    // members — they only show up in /sync via state delta.
+    let mut state_nids: Vec<u64> = Vec::new();
+    let mut memberships_to_set: Vec<(String, u8)> = Vec::new();
     let mut last_err = String::new();
     for ev in &state_events {
-        match crate::membership::federation_outbound_join::persist_remote_event(
+        let nid_result = crate::membership::federation_outbound_join::persist_remote_event(
             state,
             room_nid,
             ev,
             vela_store::db::PersistKind::StateBundleOnly,
         )
-        .await
+        .await;
+        let resolved_nid: Option<u64> = match nid_result {
+            Ok(Some(nid)) => Some(nid),
+            Ok(None) => {
+                // Already known (auth_chain pass above may have
+                // persisted it). Resolve to nid so we still update
+                // current state + snapshot below.
+                let parsed_version = state
+                    .db
+                    .get_room_version_typed(room_nid)
+                    .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
+                ev.as_object()
+                    .map(|obj| {
+                        vela_core::events::hash::compute_event_id_for_version(obj, parsed_version)
+                            .as_str()
+                            .to_string()
+                    })
+                    .and_then(|eid| state.db.get_event_nid_by_id(&eid).ok().flatten())
+            }
+            Err(e) => {
+                last_err = e;
+                None
+            }
+        };
+        let Some(nid) = resolved_nid else { continue };
+        state_nids.push(nid);
+        if let Some(obj) = ev.as_object()
+            && obj.event_type() == Some("m.room.member")
         {
-            Ok(_) => persisted += 1,
-            Err(e) => last_err = e,
+            let sk = obj.state_key().unwrap_or("");
+            let membership = obj.membership().unwrap_or("");
+            let b = match membership {
+                "join" => 1,
+                "invite" => 2,
+                "ban" => 3,
+                "knock" => 4,
+                _ => 0,
+            };
+            if !sk.is_empty() && b != 0 {
+                memberships_to_set.push((sk.to_string(), b));
+            }
         }
     }
-    if persisted == 0 {
+    if state_nids.is_empty() {
         return Err(format!(
             "no state events persisted ({} attempted; last error: {last_err})",
             state_events.len()
         ));
+    }
+    // Promote into current state (`room_state` CF) so /joined_members
+    // and /state see the new entries — BUT only when the bundle's
+    // version of (type, state_key) is newer (by depth) than what we
+    // already have. The bundle is the resident peer's state at the
+    // join's `prev_event` — i.e. PRE-JOIN. It naturally carries the
+    // joining user's invite/knock as the m.room.member entry for our
+    // own user, which is OLDER than the join we just persisted as
+    // Live. Without this depth check, the merge clobbers our fresh
+    // JOIN with the bundle's INVITE and the joiner appears stuck in
+    // invite state on /sync. Same logic protects against bumping
+    // power_levels, name, etc. backwards if another local actor
+    // raced ahead of the resident peer.
+    let mut suppressed_keys: std::collections::HashSet<(u64, u64)> =
+        std::collections::HashSet::new();
+    for nid in &state_nids {
+        let Some((header, _)) = state.db.get_event(*nid).ok().flatten() else {
+            continue;
+        };
+        let new_depth = header.depth;
+        if let Ok(Some(existing_nid)) =
+            state
+                .db
+                .get_state_event_nid(room_nid, header.type_nid, header.state_key_nid)
+            && let Ok(Some((existing_header, _))) = state.db.get_event(existing_nid)
+            && existing_header.depth >= new_depth
+        {
+            suppressed_keys.insert((header.type_nid, header.state_key_nid));
+            continue;
+        }
+        let _ =
+            state
+                .db
+                .set_room_state_entry(room_nid, header.type_nid, header.state_key_nid, *nid);
+    }
+    // Filter memberships_to_set the same way — if the room_state
+    // promotion was suppressed for this user, the membership index
+    // mustn't be set backwards either.
+    let type_member_nid = state.db.get_or_create_nid("m.room.member").ok();
+    if let Some(member_type_nid) = type_member_nid {
+        memberships_to_set.retain(|(sk, _)| {
+            let Ok(Some(skey_nid)) = state.db.get_nid(sk) else {
+                return true;
+            };
+            !suppressed_keys.contains(&(member_type_nid, skey_nid))
+        });
+    }
+    // Stamp a snapshot at each new state event so /state-at-event and
+    // /messages backward-pagination return the right view.
+    for nid in &state_nids {
+        let _ = state.db.persist_state_snapshot(room_nid, *nid, &state_nids);
+    }
+    // Re-stamp the snapshot AT THE JOIN EVENT to include the
+    // newly-merged peer state. The bootstrap captured a partial-only
+    // snapshot there; clients calling `/members?at=<token-from-just-
+    // after-join>` walk back to the join's snapshot, so leaving it
+    // partial would surface a truncated member set even after the
+    // filler has cleared the flag. The post-merge snapshot = the
+    // peer's pre-join state PLUS the join event itself.
+    if let Ok(Some(join_nid)) = state.db.get_partial_join_event_nid(room_nid) {
+        let mut combined = state_nids.clone();
+        combined.push(join_nid);
+        let _ = state
+            .db
+            .persist_state_snapshot(room_nid, join_nid, &combined);
+    }
+    // Membership index drives `get_room_members` (and downstream
+    // /sync, /joined_members, federation routing).
+    for (member_user_id, b) in memberships_to_set {
+        let member_nid = state
+            .db
+            .get_or_create_nid(&member_user_id)
+            .map_err(|e| format!("db: {e}"))?;
+        let _ = state.db.set_membership(room_nid, member_nid, b);
     }
     Ok(())
 }
@@ -308,13 +559,11 @@ async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> 
 /// flips false, `rooms.join.<id>.state` now contains the full member
 /// set). Without this wake a client mid-long-poll sees the change
 /// only on its next scheduled refresh.
-fn wake_sync_on_clear(state: &AppState, room_nid: u64) {
-    let pos = state.db.next_stream_position().as_u64();
-    // Filler completion doesn't persist anything new — the state
-    // events were already merged before clear_partial_state. We still
-    // burn a stream position so the wake carries a value > any
-    // previously-returned `next_batch`.
-    let _stream_guard = vela_store::db::StreamApplyOnDrop::new(&state.db, pos);
+fn wake_sync_on_clear(state: &AppState, room_nid: u64, pos: u64) {
+    // The pos is allocated and applied by the caller (try_fill_one)
+    // so it can also be stamped into `partial_cleared_at` — the wake
+    // and the cleared_at must carry the same value for /sync's
+    // since-based gating to fire deterministically.
     if let Some(sender) = state.room_senders.get(&Nid(room_nid)) {
         let _ = sender.send(pos);
     }
@@ -462,29 +711,77 @@ mod tests {
         assert_eq!(got, "$anchor");
     }
 
-    /// `wake_sync_on_clear` allocates a fresh stream position and
-    /// broadcasts it on the room's `room_senders` channel. A /sync
-    /// long-poll subscribed before clear must observe the new pos
-    /// — without it, members_omitted=false is delivered only when
-    /// some other event in the room eventually wakes the poll.
+    /// When a partial-state join is recorded, `pick_anchor_event_id`
+    /// returns the prev_event of the join (the resident peer's
+    /// pre-join tip), NOT the join itself. That's the only anchor
+    /// MSC3902 Complement mocks accept, and the spec-correct
+    /// "state PRIOR to" semantic for `/state_ids`.
     #[test]
-    fn wake_sync_on_clear_broadcasts_fresh_pos() {
+    fn pick_anchor_prefers_join_prev_event() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!psjanchor:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        let type_msg = db.get_or_create_nid("m.room.message").unwrap();
+        let type_member = db.get_or_create_nid("m.room.member").unwrap();
+
+        // Signed join event, prev_events points at "$resident_tip"
+        // — the resident peer's pre-join tip. We must NOT have
+        // persisted that event locally; the filler must still
+        // surface it as the anchor (it's what the peer indexes
+        // state at).
+        let _ = type_msg;
+        let join_body = json!({
+            "type": "m.room.member",
+            "sender": "@alice:example.com",
+            "state_key": "@alice:example.com",
+            "room_id": room_id,
+            "content": {"membership": "join"},
+            "origin_server_ts": 2, "depth": 2,
+            "prev_events": ["$resident_tip"],
+            "auth_events": [],
+        });
+        let join_nid = 1002;
+        db.persist_event(
+            join_nid,
+            "$ourjoin",
+            room_nid,
+            type_member,
+            alice_nid,
+            alice_nid,
+            2,
+            2,
+            &serde_json::to_vec(&join_body).unwrap(),
+            &[],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+
+        db.set_partial_state_join(room_nid, &["resident.example".into()], join_nid)
+            .unwrap();
+
+        let got = pick_anchor_event_id(&state, room_nid).unwrap();
+        assert_eq!(got, "$resident_tip");
+    }
+
+    /// `wake_sync_on_clear` publishes the caller-supplied stream pos
+    /// on the room's `room_senders` channel. A /sync long-poll
+    /// subscribed before clear must observe that pos — without it,
+    /// the partial-state→full transition is delivered only when some
+    /// other event in the room eventually wakes the poll.
+    #[test]
+    fn wake_sync_on_clear_broadcasts_supplied_pos() {
         let (state, _tmp) = build_test_state();
         let room_nid = state.db.get_or_create_nid("!wake:example.com").unwrap();
-        // Install a broadcast channel for the room, simulating an
-        // active /sync subscription. The cap matches what the
-        // AppState boot path installs (the value isn't tested).
         let (tx, mut rx) = tokio::sync::broadcast::channel::<u64>(16);
         state.room_senders.insert(Nid(room_nid), tx);
 
-        let before = state.db.current_stream_position();
-        wake_sync_on_clear(&state, room_nid);
+        wake_sync_on_clear(&state, room_nid, 4242);
         let pos = rx.try_recv().expect("expected a wake on room_senders");
-        // The wake carries a stream pos strictly greater than the
-        // last-applied value at the moment of the wake. Comparing
-        // against `before` keeps the assertion stable under whatever
-        // background events the test harness may have allocated.
-        assert!(pos > before, "wake pos {pos} should exceed {before}");
+        assert_eq!(pos, 4242);
     }
 
     /// `_reset_for_test` flips the filler's `running` flag back to

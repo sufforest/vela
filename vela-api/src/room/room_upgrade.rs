@@ -354,14 +354,14 @@ pub async fn upgrade_room(
         .set_membership(new_room_nid, user.user_nid, 1)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     crate::router::notify_user(&state, user.user_nid);
-    if !state_event_nids.is_empty() {
+    // Snapshot at every state event (matches createRoom). A snapshot
+    // at only the tail leaves `state_before_event` returning empty for
+    // any earlier anchor, which breaks the partial-state filler on
+    // remote joiners querying /state_ids at the join's prev_event.
+    for &nid in &state_event_nids {
         state
             .db
-            .persist_state_snapshot(
-                new_room_nid,
-                *state_event_nids.last().unwrap(),
-                &state_event_nids,
-            )
+            .persist_state_snapshot(new_room_nid, nid, &state_event_nids)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     }
     let now_ms = std::time::SystemTime::now()

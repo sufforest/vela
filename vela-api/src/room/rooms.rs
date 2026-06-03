@@ -649,14 +649,19 @@ pub async fn create_room(
         crate::router::notify_user(&state, target_nid);
     }
 
-    if !state_event_nids.is_empty() {
+    // Stamp a state snapshot at EVERY state event we just persisted,
+    // not just the last one. `state_before_event` walks back through
+    // prev_events looking for a recorded snapshot; if the only snapshot
+    // is at the room's tip, /state and /state_ids return empty for any
+    // earlier anchor (notably the join's `prev_event`, which MSC3902
+    // and vela-vela federation queries use). The snapshot content
+    // (`state_event_nids`) is identical at each step because createRoom
+    // applies its events as a coherent block — the same set is the
+    // "post-state" at every event in the sequence.
+    for &nid in &state_event_nids {
         state
             .db
-            .persist_state_snapshot(
-                room_nid,
-                *state_event_nids.last().unwrap(),
-                &state_event_nids,
-            )
+            .persist_state_snapshot(room_nid, nid, &state_event_nids)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     }
 
@@ -752,6 +757,8 @@ pub async fn list_members(
         .get_nid(&room_id)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         .ok_or_else(|| ApiError(VelaError::NotFound("room not found".into())))?;
+
+    await_partial_state_clear(&state, room_nid).await;
 
     let membership = state
         .db
@@ -932,6 +939,69 @@ pub async fn list_room_aliases(
     Ok(Json(json!({"aliases": aliases})))
 }
 
+/// MSC3902 / MSC3706: block while the room is in partial-state, cap at
+/// 30s. Used by `/members` and `/joined_members` — complement uses
+/// these endpoints as the canonical "await resync" gates, and any
+/// non-blocking implementation hands clients a truncated member set
+/// while the filler is still catching up.
+///
+/// Race-aware: subscribes to the room's wake channel BEFORE the second
+/// flag read so a clear that fires between the first read and the
+/// subscribe is still observed (the filler's `wake_sync_on_clear`
+/// publishes on this same channel). Order: first-check → subscribe →
+/// second-check → loop.
+///
+/// On timeout, falls through and returns whatever the caller would
+/// have returned without the wait — better a stale member list than
+/// a hung client.
+async fn await_partial_state_clear(state: &AppState, room_nid: u64) {
+    let (partial, _) = state
+        .db
+        .get_partial_state_info(room_nid)
+        .unwrap_or((false, Vec::new()));
+    if !partial {
+        return;
+    }
+    let mut rx = {
+        let sender = state
+            .room_senders
+            .entry(Nid(room_nid))
+            .or_insert_with(|| tokio::sync::broadcast::channel::<u64>(64).0);
+        sender.value().subscribe()
+    };
+    let (still_partial, _) = state
+        .db
+        .get_partial_state_info(room_nid)
+        .unwrap_or((false, Vec::new()));
+    if !still_partial {
+        return;
+    }
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(30));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return,
+            recv = rx.recv() => {
+                // Lagged messages just mean we missed a wake — re-check
+                // the flag; if still partial, keep waiting. Closed
+                // means the room channel went away; stop waiting.
+                match recv {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let (still, _) = state
+                            .db
+                            .get_partial_state_info(room_nid)
+                            .unwrap_or((false, Vec::new()));
+                        if !still {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        }
+    }
+}
+
 /// GET /_matrix/client/v3/rooms/{roomId}/joined_members
 pub async fn joined_members(
     State(state): State<AppState>,
@@ -943,6 +1013,8 @@ pub async fn joined_members(
         .get_nid(&room_id)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         .ok_or_else(|| ApiError(VelaError::NotFound("room not found".into())))?;
+
+    await_partial_state_clear(&state, room_nid).await;
 
     let membership = state
         .db

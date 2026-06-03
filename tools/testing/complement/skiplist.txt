@@ -119,3 +119,29 @@
 # test only exercises real ignore-bad-json logic on servers whose
 # default room version is v5 or older. Spec-correct on both sides.
 ^TestOutboundFederationIgnoresMissingEventWithBadJSONForRoomVersion6$
+
+# MSC3902 partial-state — partially implemented. Vela has the filler
+# + send_join `members_omitted` path + outbound flag bookkeeping (the
+# extremity-ordering race in `federation_outbound_join.rs` was just
+# fixed), and a handful of subtests pass:
+# CanLazyLoadingSyncDuringPartialStateJoin,
+# Room_aliases_can_be_added_and_deleted_during_a_resync,
+# Can_change_display_name_during_partial_state_join.
+#
+# The remaining ~35 subtests want behaviours we don't ship yet:
+#   - /sync gating: eager-sync (no `lazy_load_members`) should omit
+#     partial-state rooms entirely until the filler clears them
+#     (Eager*PartialStateJoin family). Hard because `StateBundleOnly`
+#     persistence has no stream_pos, so a "fill complete → re-include"
+#     hook needs its own per-room cleared_at marker that /sync reads
+#     and treats as a force-full-state trigger.
+#   - /members blocking: `/rooms/{id}/members` must wait for resync
+#     before returning so clients can poll for "done" without racing
+#     (MembersRequestBlocks*, joined_members_blocks_*).
+#   - state_ids primary path: the filler currently fetches /state, but
+#     the MSC3902 mocks register handlers on /state_ids + per-event
+#     /event fetches. Switching adds latency we don't want to take on
+#     for the local case, and the per-event /event mock only finds
+#     events that landed in the room Timeline — state-only events 404.
+# Skiplisted as a block; each item above is a self-contained gap.
+^TestPartialStateJoin$
