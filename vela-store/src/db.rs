@@ -7545,6 +7545,91 @@ mod partial_state_tests {
             .unwrap();
         assert_eq!(db.get_partial_cleared_at(nid).unwrap(), None);
     }
+
+    /// `rewrite_state_at_event` reuses the existing snapshot id so a
+    /// descendant whose `event_state` inherits that id sees the
+    /// updated contents without being re-stamped. This is the core
+    /// invariant the MSC3902 filler depends on: timeline events
+    /// received via `/get_missing_events` during partial state
+    /// inherit the join event's bundle snapshot id, and on clear we
+    /// need them to see the full state without a forward sweep.
+    #[test]
+    fn rewrite_state_at_event_preserves_snapshot_id() {
+        let (db, _tmp) = fresh_db();
+        let room_nid = db.get_or_create_nid("!r:x").unwrap();
+        let event_nid = 100;
+        // Initial stamp creates snapshot id S; record what it is.
+        let s1 = db
+            .persist_state_snapshot(room_nid, event_nid, &[10, 20, 30])
+            .unwrap();
+        assert_eq!(
+            db.get_state_at_event(event_nid).unwrap(),
+            Some(vec![10, 20, 30])
+        );
+        // Rewrite the same event's snapshot. Same id, different bytes.
+        let s2 = db
+            .rewrite_state_at_event(room_nid, event_nid, &[10, 20, 30, 40, 50])
+            .unwrap();
+        assert_eq!(s1, s2);
+        assert_eq!(
+            db.get_state_at_event(event_nid).unwrap(),
+            Some(vec![10, 20, 30, 40, 50])
+        );
+    }
+
+    /// A descendant whose `event_state` was inherited from the
+    /// parent (no explicit stamp) sees the rewrite via the shared
+    /// snapshot id. This mirrors how `persist_event` writes
+    /// `event_state[event_nid] = parent's snapshot id` and is what
+    /// makes the in-place rewrite reach gap-fill events that arrived
+    /// during partial state.
+    #[test]
+    fn rewrite_state_at_event_propagates_to_inherited_children() {
+        let (db, _tmp) = fresh_db();
+        let room_nid = db.get_or_create_nid("!r:x").unwrap();
+        let parent_nid = 100;
+        let child_nid = 101;
+        let s = db
+            .persist_state_snapshot(room_nid, parent_nid, &[10, 20])
+            .unwrap();
+        // Simulate persist_event setting child's event_state to
+        // parent's snapshot id (the inheritance path).
+        let cf = db.db.cf_handle("event_state").unwrap();
+        db.db
+            .put_cf(&cf, keys::encode_u64(child_nid), keys::encode_u64(s))
+            .unwrap();
+        assert_eq!(
+            db.get_state_at_event(child_nid).unwrap(),
+            Some(vec![10, 20])
+        );
+        // Rewrite at parent. Child should see new contents.
+        db.rewrite_state_at_event(room_nid, parent_nid, &[10, 20, 30])
+            .unwrap();
+        assert_eq!(
+            db.get_state_at_event(child_nid).unwrap(),
+            Some(vec![10, 20, 30])
+        );
+    }
+
+    /// `rewrite_state_at_event` for an event with no recorded
+    /// snapshot falls back to `persist_state_snapshot` — the
+    /// behaviour the filler relies on at the edge case where the
+    /// join event has no inherited snapshot (no prev_events known
+    /// locally).
+    #[test]
+    fn rewrite_state_at_event_falls_back_when_no_snapshot() {
+        let (db, _tmp) = fresh_db();
+        let room_nid = db.get_or_create_nid("!r:x").unwrap();
+        let event_nid = 200;
+        assert!(db.get_state_at_event(event_nid).unwrap().is_none());
+        let _ = db
+            .rewrite_state_at_event(room_nid, event_nid, &[1, 2, 3])
+            .unwrap();
+        assert_eq!(
+            db.get_state_at_event(event_nid).unwrap(),
+            Some(vec![1, 2, 3])
+        );
+    }
 }
 
 #[cfg(test)]

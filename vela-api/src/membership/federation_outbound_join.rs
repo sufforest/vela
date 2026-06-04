@@ -261,59 +261,7 @@ async fn bootstrap_remote_room(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let partial_state_servers: Vec<String> = if partial_state {
-        // Order: the joining server first (it just responded to
-        // send_join — most likely source of the state), then the
-        // response's `servers_in_room` hint, then sender domains
-        // observed in the response's state + auth_chain. A peer that
-        // returns garbage on /state_ids (PartialStateJoinSyncsUsing
-        // OtherHomeservers) is the only one in `servers_in_room`, so
-        // the sender-domain pass is what lets the filler fall back to
-        // a healthy resident.
-        let mut servers: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        let push_if_new = |s: String, servers: &mut Vec<String>, seen: &mut HashSet<String>| {
-            if s == state.config.server_name {
-                return;
-            }
-            if seen.insert(s.clone()) {
-                servers.push(s);
-            }
-        };
-        push_if_new(joining_server.to_string(), &mut servers, &mut seen);
-        if let Some(arr) = send_join_resp
-            .get("servers_in_room")
-            .and_then(|v| v.as_array())
-        {
-            for v in arr {
-                if let Some(s) = v.as_str() {
-                    push_if_new(s.to_string(), &mut servers, &mut seen);
-                }
-            }
-        }
-        for ev_array in [
-            send_join_resp.get("state").and_then(|v| v.as_array()),
-            send_join_resp.get("auth_chain").and_then(|v| v.as_array()),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            for ev in ev_array {
-                let Some(sender) = ev.get("sender").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let Some((_, domain)) = sender.split_once(':') else {
-                    continue;
-                };
-                push_if_new(domain.to_string(), &mut servers, &mut seen);
-            }
-        }
-        if servers.is_empty() {
-            // Last-ditch: even our own domain was the only candidate.
-            // Push the joining server unconditionally so the filler
-            // has something to try.
-            servers.push(joining_server.to_string());
-        }
-        servers
+        build_partial_state_servers(send_join_resp, joining_server, &state.config.server_name)
     } else {
         Vec::new()
     };
@@ -762,6 +710,70 @@ pub(crate) async fn persist_remote_event(
 #[allow(dead_code)]
 fn _suppress_unused_room_version(_: RoomVersion, _: HashMap<u64, u64>) {}
 
+/// Build the list of remote homeservers the filler can target for a
+/// partial-state room. Order: the joining server first (it just
+/// responded to send_join — most likely source of the state), then
+/// the response's `servers_in_room` hint, then sender domains
+/// observed in the response's `state` + `auth_chain`. A peer that
+/// returns garbage on `/state_ids`
+/// (PartialStateJoinSyncsUsingOtherHomeservers wires this up by
+/// replying `{}` from the resident) is typically the only entry in
+/// `servers_in_room`, so the sender-domain pass is what lets the
+/// filler fall back to a healthy peer. Our own server is filtered
+/// throughout; the joining server is pushed back as a last-ditch
+/// entry if every other source was empty.
+pub(crate) fn build_partial_state_servers(
+    send_join_resp: &Value,
+    joining_server: &str,
+    our_server_name: &str,
+) -> Vec<String> {
+    let mut servers: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let push_if_new = |s: String, servers: &mut Vec<String>, seen: &mut HashSet<String>| {
+        if s == our_server_name {
+            return;
+        }
+        if seen.insert(s.clone()) {
+            servers.push(s);
+        }
+    };
+    push_if_new(joining_server.to_string(), &mut servers, &mut seen);
+    if let Some(arr) = send_join_resp
+        .get("servers_in_room")
+        .and_then(|v| v.as_array())
+    {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                push_if_new(s.to_string(), &mut servers, &mut seen);
+            }
+        }
+    }
+    for ev_array in [
+        send_join_resp.get("state").and_then(|v| v.as_array()),
+        send_join_resp.get("auth_chain").and_then(|v| v.as_array()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for ev in ev_array {
+            let Some(sender) = ev.get("sender").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some((_, domain)) = sender.split_once(':') else {
+                continue;
+            };
+            push_if_new(domain.to_string(), &mut servers, &mut seen);
+        }
+    }
+    if servers.is_empty() {
+        // Last-ditch: even our own domain was the only candidate.
+        // Push the joining server unconditionally so the filler has
+        // something to try.
+        servers.push(joining_server.to_string());
+    }
+    servers
+}
+
 /// Sort a batch of events by `depth` ascending so ancestors come first.
 /// Events without a parsable depth sort to the front.
 fn sort_by_depth(mut events: Vec<Value>) -> Vec<Value> {
@@ -772,4 +784,91 @@ fn sort_by_depth(mut events: Vec<Value>) -> Vec<Value> {
             .unwrap_or(0)
     });
     events
+}
+
+#[cfg(test)]
+mod build_partial_state_servers_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The joining server lands first even when the response's
+    /// `servers_in_room` puts another peer ahead of it — try_fill_one
+    /// hits the joining server's /state_ids first because that's the
+    /// peer that just returned the send_join state.
+    #[test]
+    fn joining_server_comes_first() {
+        let resp = json!({
+            "servers_in_room": ["resident.example", "joining.example"],
+        });
+        let got = build_partial_state_servers(&resp, "joining.example", "us.example");
+        assert_eq!(got[0], "joining.example");
+    }
+
+    /// Sender domains observed in the response's `state` and
+    /// `auth_chain` flow into the list after the explicit hint. The
+    /// filler needs this when the resident peer is the only entry in
+    /// `servers_in_room` and goes silent — sender-mined domains are
+    /// the only other peers the joining server can ask. Closes
+    /// TestPartialStateJoin/PartialStateJoinSyncsUsingOtherHomeservers.
+    #[test]
+    fn mines_sender_domains_from_state_and_auth_chain() {
+        let resp = json!({
+            "servers_in_room": ["resident.example"],
+            "state": [
+                {"sender": "@charlie:other.example"},
+                {"sender": "@derek:resident.example"},
+            ],
+            "auth_chain": [
+                {"sender": "@elsie:third.example"},
+            ],
+        });
+        let got = build_partial_state_servers(&resp, "joining.example", "us.example");
+        assert!(got.contains(&"other.example".to_string()));
+        assert!(got.contains(&"third.example".to_string()));
+        // resident.example appeared in both the hint and a state
+        // event sender — present exactly once.
+        assert_eq!(got.iter().filter(|s| *s == "resident.example").count(), 1);
+    }
+
+    /// Our own server name is filtered everywhere — joining_server,
+    /// hint, or sender domain. Without this the filler would address
+    /// itself, hit its own partial-state 403 on /state_ids, and burn
+    /// a probe per cycle.
+    #[test]
+    fn filters_our_own_server_name() {
+        let resp = json!({
+            "servers_in_room": ["us.example", "real.example"],
+            "state": [{"sender": "@alice:us.example"}],
+        });
+        let got = build_partial_state_servers(&resp, "us.example", "us.example");
+        assert!(!got.iter().any(|s| s == "us.example"));
+        assert!(got.contains(&"real.example".to_string()));
+    }
+
+    /// A response with no `servers_in_room`, no `state`, and no
+    /// `auth_chain` still produces a non-empty list — the joining
+    /// server is pushed back as a last-ditch entry so the filler
+    /// always has at least one address to try.
+    #[test]
+    fn last_ditch_joining_server_when_response_is_empty() {
+        let resp = json!({});
+        let got = build_partial_state_servers(&resp, "joining.example", "us.example");
+        assert_eq!(got, vec!["joining.example"]);
+    }
+
+    /// Malformed sender strings (no colon, empty domain) are skipped
+    /// without crashing — we mine through whatever the peer sends us.
+    #[test]
+    fn ignores_malformed_senders() {
+        let resp = json!({
+            "state": [
+                {"sender": "no-colon-here"},
+                {"sender": ""},
+                {},
+                {"sender": "@alice:good.example"},
+            ],
+        });
+        let got = build_partial_state_servers(&resp, "joining.example", "us.example");
+        assert!(got.contains(&"good.example".to_string()));
+    }
 }
