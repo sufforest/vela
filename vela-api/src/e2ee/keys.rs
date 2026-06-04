@@ -1164,26 +1164,49 @@ pub fn record_device_changes_on_leave(state: &AppState, departing_nid: u64, room
         crate::router::notify_user(state, departing_nid);
     }
 
-    // If a REMOTE user is leaving and this was their last room shared
-    // with any local observer, drop their cached /user/keys/query
-    // response. Spec test
-    // Device_list_no_longer_tracked_when_new_member_leaves_partial_state_room
-    // asserts that the very next /keys/query for the departed user
-    // hits the federation again — the cache would otherwise mask the
-    // fact that we're no longer "tracking" them.
-    if !leaver_is_local {
+    // Drop any cached `/user/keys/query` response for a remote peer
+    // whose last shared room with us just collapsed — either because
+    // the peer themself left (REMOTE leaver direction) or because the
+    // last local user in their room is leaving (LOCAL leaver
+    // direction). In both shapes the peer's home server is now under
+    // no obligation to send us m.device_list_update EDUs for them, so
+    // anything we hold is permanently stale. Spec tests:
+    // Device_list_no_longer_tracked_when_new_member_leaves_partial_state_room,
+    // TestDeviceListUpdates/when_leaving_a_room_with_a_remote_user.
+    let mut candidates: Vec<u64> = Vec::new();
+    if leaver_is_local {
+        // Local user is leaving — check every remote peer they shared
+        // this room with.
+        for &peer in &members {
+            if peer == departing_nid {
+                continue;
+            }
+            let Ok(Some(uid)) = state.db.resolve_nid(peer) else {
+                continue;
+            };
+            if uid
+                .split_once(':')
+                .map(|(_, d)| d != our_server)
+                .unwrap_or(false)
+            {
+                candidates.push(peer);
+            }
+        }
+    } else {
+        // Remote user is leaving — check only that peer.
+        candidates.push(departing_nid);
+    }
+    for peer_nid in candidates {
         let still_shared = state
             .db
-            .get_user_joined_rooms(departing_nid)
+            .get_user_joined_rooms(peer_nid)
             .map(|rooms| {
                 rooms
                     .iter()
                     .any(|&r| r != room_nid && room_has_local_member(state, r))
             })
             .unwrap_or(false);
-        if !still_shared
-            && let Err(e) = state.db.invalidate_remote_user_keys_cache(departing_nid)
-        {
+        if !still_shared && let Err(e) = state.db.invalidate_remote_user_keys_cache(peer_nid) {
             tracing::debug!(error = %e, "invalidate_remote_user_keys_cache on leave failed");
         }
     }
