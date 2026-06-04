@@ -123,7 +123,10 @@ pub async fn query_keys(
     let mut self_signing_keys: Map<String, Value> = Map::new();
     let mut user_signing_keys: Map<String, Value> = Map::new();
 
-    // Partition users by home server.
+    // Partition users by home server. For remote users, consult the
+    // per-user cache first — a cache hit means the last
+    // `/user/keys/query` response is still fresh (no
+    // m.device_list_update EDU or full-room-leave has invalidated it).
     let our_server = &state.config.server_name;
     let mut by_remote: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
     for (user_id, device_ids) in &body.device_keys {
@@ -140,6 +143,35 @@ pub async fn query_keys(
                 )?;
             }
             Some(server) => {
+                // Pre-existing members of a partial-state room don't
+                // exist in our `memberships` index yet — the bundle
+                // omits them and we won't learn about them until the
+                // filler completes. For those users we must federate
+                // every /keys/query (no caching) because we don't
+                // even know they're tracking us yet. New joiners
+                // (delivered via /send → process_pdu → set_membership)
+                // ARE in memberships and cache normally.
+                if let Ok(Some(user_nid)) = state.db.get_nid(user_id) {
+                    let known_member = state
+                        .db
+                        .get_user_joined_rooms(user_nid)
+                        .map(|r| !r.is_empty())
+                        .unwrap_or(false);
+                    if known_member
+                        && let Ok(Some(cached)) = state.db.get_remote_user_keys_cache(user_nid)
+                    {
+                        fold_cached_remote_user(
+                            &cached,
+                            user_id,
+                            device_ids,
+                            &mut device_keys_response,
+                            &mut master_keys,
+                            &mut self_signing_keys,
+                            &mut user_signing_keys,
+                        );
+                        continue;
+                    }
+                }
                 by_remote
                     .entry(server.to_string())
                     .or_default()
@@ -150,6 +182,8 @@ pub async fn query_keys(
     }
 
     // One federation call per remote server, fan out concurrently.
+    // Persist the per-user pieces of each response into the cache so
+    // the next /keys/query for the same user short-circuits above.
     if !by_remote.is_empty() {
         let mut futures = Vec::with_capacity(by_remote.len());
         for (server, device_keys_for_server) in by_remote {
@@ -162,13 +196,16 @@ pub async fn query_keys(
         }
         for (server, resp) in futures::future::join_all(futures).await {
             match resp {
-                Ok(v) => merge_remote_keys_response(
-                    v,
-                    &mut device_keys_response,
-                    &mut master_keys,
-                    &mut self_signing_keys,
-                    &mut user_signing_keys,
-                ),
+                Ok(v) => {
+                    persist_remote_keys_response_to_cache(&state, &v);
+                    merge_remote_keys_response(
+                        v,
+                        &mut device_keys_response,
+                        &mut master_keys,
+                        &mut self_signing_keys,
+                        &mut user_signing_keys,
+                    );
+                }
                 Err(e) => {
                     tracing::debug!(remote = %server, error = %e, "remote /keys/query failed");
                 }
@@ -270,6 +307,105 @@ pub(crate) fn fold_local_user_keys(
         user_signing_keys.insert(user_id.to_string(), k.clone());
     }
     Ok(())
+}
+
+/// Project a single remote user's cached `/user/keys/query` payload
+/// into the C2S response maps. The cache value is shaped per-user (see
+/// `cache_remote_user_keys` in `vela-store`); we filter the `devices`
+/// map to the requested `device_ids` (empty = all) and forward the
+/// cross-signing keys verbatim.
+fn fold_cached_remote_user(
+    cached: &Value,
+    user_id: &str,
+    device_ids: &[String],
+    device_keys_response: &mut Map<String, Value>,
+    master_keys: &mut Map<String, Value>,
+    self_signing_keys: &mut Map<String, Value>,
+    user_signing_keys: &mut Map<String, Value>,
+) {
+    let Some(obj) = cached.as_object() else {
+        return;
+    };
+    if let Some(devices) = obj.get("devices").and_then(|v| v.as_object()) {
+        if device_ids.is_empty() {
+            device_keys_response.insert(user_id.to_string(), Value::Object(devices.clone()));
+        } else {
+            let mut filtered = Map::new();
+            for did in device_ids {
+                if let Some(k) = devices.get(did) {
+                    filtered.insert(did.clone(), k.clone());
+                }
+            }
+            if !filtered.is_empty() {
+                device_keys_response.insert(user_id.to_string(), Value::Object(filtered));
+            }
+        }
+    }
+    if let Some(mk) = obj.get("master_key") {
+        master_keys.insert(user_id.to_string(), mk.clone());
+    }
+    if let Some(sk) = obj.get("self_signing_key") {
+        self_signing_keys.insert(user_id.to_string(), sk.clone());
+    }
+    if let Some(uk) = obj.get("user_signing_key") {
+        user_signing_keys.insert(user_id.to_string(), uk.clone());
+    }
+}
+
+/// Split a federation `/user/keys/query` response into its per-user
+/// pieces and write each piece into the remote-device cache. Each
+/// piece is the shape `fold_cached_remote_user` expects to read back.
+fn persist_remote_keys_response_to_cache(state: &AppState, response: &Value) {
+    let Some(obj) = response.as_object() else {
+        return;
+    };
+    let mut per_user: HashMap<String, Map<String, Value>> = HashMap::new();
+    if let Some(devs) = obj.get("device_keys").and_then(|v| v.as_object()) {
+        for (uid, devices) in devs {
+            per_user
+                .entry(uid.clone())
+                .or_default()
+                .insert("devices".into(), devices.clone());
+        }
+    }
+    for (response_key, target_key) in [
+        ("master_keys", "master_key"),
+        ("self_signing_keys", "self_signing_key"),
+        ("user_signing_keys", "user_signing_key"),
+    ] {
+        if let Some(map) = obj.get(response_key).and_then(|v| v.as_object()) {
+            for (uid, k) in map {
+                per_user
+                    .entry(uid.clone())
+                    .or_default()
+                    .insert(target_key.into(), k.clone());
+            }
+        }
+    }
+    for (uid, payload) in per_user {
+        let Ok(user_nid) = state.db.get_or_create_nid(&uid) else {
+            continue;
+        };
+        // Symmetric with the read path: only cache users whose local
+        // membership tells us they belong to a room with a local
+        // observer. Caching a pre-existing partial-state member's
+        // response here would leak across the filler-clear boundary —
+        // the first /keys/query after clear must refetch so the
+        // observer learns whatever the resident peer surfaced about
+        // the user during the partial-state window.
+        let known_member = state
+            .db
+            .get_user_joined_rooms(user_nid)
+            .map(|r| !r.is_empty())
+            .unwrap_or(false);
+        if !known_member {
+            continue;
+        }
+        let value = Value::Object(payload);
+        if let Err(e) = state.db.cache_remote_user_keys(user_nid, &value) {
+            tracing::debug!(%uid, error = %e, "cache_remote_user_keys failed");
+        }
+    }
 }
 
 /// Fold a remote `/user/keys/query` response into the per-user maps
@@ -1027,6 +1163,52 @@ pub fn record_device_changes_on_leave(state: &AppState, departing_nid: u64, room
     if leaver_is_local {
         crate::router::notify_user(state, departing_nid);
     }
+
+    // If a REMOTE user is leaving and this was their last room shared
+    // with any local observer, drop their cached /user/keys/query
+    // response. Spec test
+    // Device_list_no_longer_tracked_when_new_member_leaves_partial_state_room
+    // asserts that the very next /keys/query for the departed user
+    // hits the federation again — the cache would otherwise mask the
+    // fact that we're no longer "tracking" them.
+    if !leaver_is_local {
+        let still_shared = state
+            .db
+            .get_user_joined_rooms(departing_nid)
+            .map(|rooms| {
+                rooms
+                    .iter()
+                    .any(|&r| r != room_nid && room_has_local_member(state, r))
+            })
+            .unwrap_or(false);
+        if !still_shared
+            && let Err(e) = state.db.invalidate_remote_user_keys_cache(departing_nid)
+        {
+            tracing::debug!(error = %e, "invalidate_remote_user_keys_cache on leave failed");
+        }
+    }
+}
+
+/// True if `room_nid` has at least one currently-joined member on our
+/// server. Used by `record_device_changes_on_leave` to decide whether
+/// a departing remote user still shares any room with us — if not,
+/// their device-key cache is dropped because we stop "tracking" them.
+fn room_has_local_member(state: &AppState, room_nid: u64) -> bool {
+    let Ok(members) = state.db.get_room_members(room_nid) else {
+        return false;
+    };
+    let our_server = state.config.server_name.as_str();
+    for m in members {
+        if let Ok(Some(uid)) = state.db.resolve_nid(m)
+            && uid
+                .split_once(':')
+                .map(|(_, d)| d == our_server)
+                .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Push `m.device_list_update` EDUs for every device the local user

@@ -89,6 +89,16 @@ async fn handle_device_list_update(state: &AppState, origin: &str, content: &Val
         }
     }
 
+    // Drop any cached /user/keys/query response for this user — the
+    // EDU is itself the "your cache is stale" signal regardless of
+    // whether the EDU carries device keys or not. Without this the
+    // C2S /keys/query short-circuit in `query_keys` keeps returning
+    // the pre-update keys until a membership change or restart wipes
+    // the cache.
+    if let Err(e) = state.db.invalidate_remote_user_keys_cache(user_nid) {
+        warn!(error = %e, "invalidate_remote_user_keys_cache failed; continuing");
+    }
+
     // Find local users sharing a room with the changed user. They
     // need to learn that the remote user's device list moved.
     let remote_user_rooms = match state.db.get_user_joined_rooms(user_nid) {
@@ -115,6 +125,16 @@ async fn handle_device_list_update(state: &AppState, origin: &str, content: &Val
     }
 
     if observer_nids.is_empty() {
+        // No local observers means the user's `memberships` row hasn't
+        // been set yet (typically because the partial-state bundle
+        // omitted them). Buffer the EDU so the filler's post-clear
+        // reconcile can re-surface the change once the user becomes
+        // observable. CanReceiveDeviceListUpdateDuringPartialStateJoin
+        // and Device_list_tracking_for_pre-existing_members_in_partial_
+        // state_room both rely on this replay path.
+        if let Err(e) = state.db.mark_pending_partial_device_list_edu(user_nid) {
+            warn!(error = %e, %user_id, "mark_pending_partial_device_list_edu failed");
+        }
         return;
     }
 
