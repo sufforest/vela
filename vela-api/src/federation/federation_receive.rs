@@ -941,62 +941,72 @@ async fn compute_state_at_event(
     // `/state_ids` returns `{auth_chain_ids, pdu_ids}`. We use only
     // pdu_ids (current state) — auth_chain validation already ran in
     // Check 4.
-    if state_sets.iter().all(|sm| sm.is_empty())
-        && let Ok(state_resp) = state
+    // Target the deepest unknown ancestor we can walk to from `event`,
+    // not the trigger itself. Synapse-style mocks (and synapse's own
+    // resolution path) register handlers at a SPECIFIC event — usually
+    // the boundary between what we have and what we don't — and 4xx on
+    // anything else. Calling on the trigger 4xx's and strands the
+    // event; walking back via prev_events to the boundary matches the
+    // handler shape. TestCorruptedAuthChain wires this expectation up.
+    if state_sets.iter().all(|sm| sm.is_empty()) {
+        let boundary = find_state_ids_boundary(state, event);
+        let resp_result = state
             .federation_client
-            .state_ids(origin, &event.room_id, &event.event_id)
-            .await
-    {
-        // Don't set last_gap_fill_pos here. /state_ids only fetches state
-        // events (persisted as outliers, no stream_pos), so they don't
-        // affect /sync timeline rendering. Setting the gap marker on
-        // every state-only fallback wedges the /sync gap filter for any
-        // user whose since predated the fallback — bob's hs2 hits
-        // /state_ids routinely when state can't be anchored, and the
-        // resulting filter drops post-fallback live events that the
-        // user does need to see.
-        let pdu_ids = state_resp
-            .get("pdu_ids")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let mut sm: StateMap = StateMap::new();
-        let budget = new_fetch_budget();
-        for v in pdu_ids {
-            let Some(eid) = v.as_str() else { continue };
-            if state.db.get_event_nid_by_id(eid).ok().flatten().is_none()
-                && let Ok(pdu_value) = state.federation_client.fetch_event_pdu(origin, eid).await
-            {
-                let _ = persist_fetched_event(
-                    state,
-                    &pdu_value,
-                    origin,
-                    budget.clone(),
-                    FetchKind::AuthChain,
-                )
-                .await;
-            }
-            let nid = match state.db.get_event_nid_by_id(eid).ok().flatten() {
-                Some(n) => n,
-                None => continue,
-            };
-            let Ok(Some((header, _))) = state.db.get_event(nid) else {
-                continue;
-            };
-            let et = match state.db.resolve_nid(header.type_nid).ok().flatten() {
-                Some(s) => s,
-                None => continue,
-            };
-            let sk = state
-                .db
-                .resolve_nid(header.state_key_nid)
-                .ok()
-                .flatten()
+            .state_ids(origin, &event.room_id, &boundary)
+            .await;
+        if let Ok(state_resp) = resp_result {
+            // Don't set last_gap_fill_pos here. /state_ids only fetches state
+            // events (persisted as outliers, no stream_pos), so they don't
+            // affect /sync timeline rendering. Setting the gap marker on
+            // every state-only fallback wedges the /sync gap filter for any
+            // user whose since predated the fallback — bob's hs2 hits
+            // /state_ids routinely when state can't be anchored, and the
+            // resulting filter drops post-fallback live events that the
+            // user does need to see.
+            let pdu_ids = state_resp
+                .get("pdu_ids")
+                .and_then(|v| v.as_array())
+                .cloned()
                 .unwrap_or_default();
-            sm.insert((et, sk), eid.to_string());
-        }
-        if !sm.is_empty() {
-            state_sets = vec![sm];
+            let mut sm: StateMap = StateMap::new();
+            let budget = new_fetch_budget();
+            for v in pdu_ids {
+                let Some(eid) = v.as_str() else { continue };
+                if state.db.get_event_nid_by_id(eid).ok().flatten().is_none()
+                    && let Ok(pdu_value) =
+                        state.federation_client.fetch_event_pdu(origin, eid).await
+                {
+                    let _ = persist_fetched_event(
+                        state,
+                        &pdu_value,
+                        origin,
+                        budget.clone(),
+                        FetchKind::AuthChain,
+                    )
+                    .await;
+                }
+                let nid = match state.db.get_event_nid_by_id(eid).ok().flatten() {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let Ok(Some((header, _))) = state.db.get_event(nid) else {
+                    continue;
+                };
+                let et = match state.db.resolve_nid(header.type_nid).ok().flatten() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let sk = state
+                    .db
+                    .resolve_nid(header.state_key_nid)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                sm.insert((et, sk), eid.to_string());
+            }
+            if !sm.is_empty() {
+                state_sets = vec![sm];
+            }
         }
     }
 
@@ -2191,15 +2201,34 @@ async fn persist_fetched_event_inner(
         let auth_pdu = match load_pdu_by_event_id(state, aev_id) {
             Some(p) => p,
             None => {
-                // Missing — recursively fetch. If the recursion fails (budget
-                // exhausted, remote error), we drop this fetched event.
-                if let Err(e) =
+                // Missing — recursively fetch. Try /event_auth first;
+                // if the peer doesn't serve it, fall back to
+                // /state_ids at the deepest unknown prev_event we
+                // can walk to from target. The two endpoints
+                // together cover synapse / dendrite / Complement
+                // mocks.
+                let event_auth_err =
                     fetch_auth_chain(state, origin, &target_pdu.room_id, aev_id, budget.clone())
                         .await
+                        .err();
+                // /state_ids fallback only for timeline gap-fill —
+                // chain-ingestion (FetchKind::AuthChain) recursion at
+                // every node would explode O(chain × prev_walk) on
+                // peers that 404 unfamiliar event_ids. /event_auth's
+                // single response already covers the chain in one
+                // shot for the AuthChain path.
+                if matches!(kind, FetchKind::MissingTimeline)
+                    && load_pdu_by_event_id(state, aev_id).is_none()
                 {
-                    let reason = format!("recursive fetch of auth {aev_id} failed: {e}");
-                    let _ = state.db.mark_event_rejected(&target_pdu.event_id, &reason);
-                    return Err(reason);
+                    let boundary = find_state_ids_boundary(state, &target_pdu);
+                    let _ = fetch_auth_via_state_ids(
+                        state,
+                        origin,
+                        &target_pdu.room_id,
+                        &boundary,
+                        budget.clone(),
+                    )
+                    .await;
                 }
                 match load_pdu_by_event_id(state, aev_id) {
                     Some(p) => p,
@@ -2213,6 +2242,8 @@ async fn persist_fetched_event_inner(
                         let is_rejected = state.db.is_event_rejected(aev_id).unwrap_or(false);
                         let reason = if is_rejected {
                             format!("auth_event {aev_id} is rejected")
+                        } else if let Some(e) = event_auth_err {
+                            format!("recursive fetch of auth {aev_id} failed: {e}")
                         } else {
                             format!("auth event {aev_id} still missing after recursive fetch")
                         };

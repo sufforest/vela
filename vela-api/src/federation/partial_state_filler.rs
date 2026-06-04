@@ -183,73 +183,67 @@ async fn try_fill_one(
     // "the state PRIOR to" the requested event.
     let event_id = pick_anchor_event_id(state, room_nid)?;
     let mut last_err = String::new();
-    for server in servers {
-        // MSC3902 / spec preference: try `/state_ids` first (lighter
-        // — peer returns event_ids, we materialise via `/event` per
-        // id). Fall back to `/state` (heavier full-PDU response) when
-        // /state_ids materialisation comes up incomplete (any
-        // auth_chain_id 404, or fewer than half of `pdu_ids` resolve).
-        // Auth-chain truncation is dangerous: a missing ancestor can
-        // make downstream auth checks reject legitimate events, so
-        // partial materialisation isn't acceptable on the auth side.
-        let assembled = fetch_state_via_state_ids(state, server, room_id, &event_id).await;
-        let resp = match assembled {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                debug!(
-                    %server,
-                    error = %e,
-                    "state_ids primary failed, falling back to /state"
-                );
-                state
+    // Two passes: first try /state_ids on every server, then fall back
+    // to /state across servers. Falling back to /state on the SAME
+    // server before trying the next peer punishes a peer that returns
+    // garbage on /state_ids (PartialStateJoinSyncsUsingOtherHomeservers
+    // wires this up by replying `{}` from the resident) — the peer's
+    // /state mock often isn't registered and the call is logged as
+    // UnexpectedRequest, failing the test. Walking siblings first lets
+    // a healthy peer fill the room before we widen the search.
+    let modes: [&str; 2] = ["state_ids", "state"];
+    for mode in &modes {
+        for server in servers {
+            let probe = match *mode {
+                "state_ids" => fetch_state_via_state_ids(state, server, room_id, &event_id).await,
+                "state" => state
                     .federation_client
                     .state(server, room_id, &event_id)
                     .await
-                    .map_err(|fe| format!("{fe}"))
-            }
-        };
-        match resp {
-            Ok(resp) => {
-                // persist_remote_event reaches into room_state; the
-                // existing federation paths serialise on
-                // state.room_locks per room. Take that here too so
-                // a concurrent federation_receive can't race with
-                // the merge.
-                let lock = state
-                    .room_locks
-                    .entry(Nid(room_nid))
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                    .clone();
-                let _guard = lock.lock().await;
-                match merge_state_response(state, room_nid, &resp).await {
-                    Ok(outcome) => {
-                        // Allocate ONE stream position and use it for
-                        // both the cleared-at stamp and the broadcast
-                        // wake. /sync's eager gating decides "force
-                        // full state if since < cleared_at"; reusing
-                        // the broadcast pos here guarantees a
-                        // long-poll woken by the broadcast carries a
-                        // `since` strictly less than `cleared_at` on
-                        // its post-wake rebuild.
-                        let pos = state.db.next_stream_position().as_u64();
-                        let _stream_guard = vela_store::db::StreamApplyOnDrop::new(&state.db, pos);
-                        state
-                            .db
-                            .clear_partial_state(room_nid, pos)
-                            .map_err(|e| format!("clear flag: {e}"))?;
-                        reconcile_device_lists(state, room_nid, &outcome.newly_added_user_nids);
-                        wake_sync_on_clear(state, room_nid, pos);
-                        return Ok(true);
-                    }
-                    Err(e) => {
-                        last_err = format!("merge from {server}: {e}");
-                        continue;
-                    }
+                    .map_err(|fe| format!("{fe}")),
+                _ => unreachable!(),
+            };
+            let resp = match probe {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!(%server, mode, error = %e, "filler probe failed");
+                    last_err = format!("{mode} from {server}: {e}");
+                    continue;
                 }
-            }
-            Err(e) => {
-                last_err = format!("fetch from {server}: {e}");
-                continue;
+            };
+            // persist_remote_event reaches into room_state; the
+            // existing federation paths serialise on state.room_locks
+            // per room. Take that here too so a concurrent
+            // federation_receive can't race with the merge.
+            let lock = state
+                .room_locks
+                .entry(Nid(room_nid))
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone();
+            let _guard = lock.lock().await;
+            match merge_state_response(state, room_nid, &resp).await {
+                Ok(outcome) => {
+                    // Allocate ONE stream position and use it for both
+                    // the cleared-at stamp and the broadcast wake.
+                    // /sync's eager gating decides "force full state
+                    // if since < cleared_at"; reusing the broadcast
+                    // pos here guarantees a long-poll woken by the
+                    // broadcast carries a `since` strictly less than
+                    // `cleared_at` on its post-wake rebuild.
+                    let pos = state.db.next_stream_position().as_u64();
+                    let _stream_guard = vela_store::db::StreamApplyOnDrop::new(&state.db, pos);
+                    state
+                        .db
+                        .clear_partial_state(room_nid, pos)
+                        .map_err(|e| format!("clear flag: {e}"))?;
+                    reconcile_device_lists(state, room_nid, &outcome.newly_added_user_nids);
+                    wake_sync_on_clear(state, room_nid, pos);
+                    return Ok(true);
+                }
+                Err(e) => {
+                    last_err = format!("merge from {server}: {e}");
+                    continue;
+                }
             }
         }
     }
@@ -561,12 +555,20 @@ async fn merge_state_response(
     // partial would surface a truncated member set even after the
     // filler has cleared the flag. The post-merge snapshot = the
     // peer's pre-join state PLUS the join event itself.
+    //
+    // `rewrite_state_at_event` overwrites the existing snapshot in
+    // place rather than allocating a fresh id. Timeline events that
+    // arrived during partial state (e.g. via /get_missing_events)
+    // inherited the join's bundle snapshot id at persist time; without
+    // an in-place rewrite, /state_ids at any of those events would
+    // resolve back to the stale bundle state after the filler
+    // completed, even though the join event itself reads correctly.
     if let Ok(Some(join_nid)) = state.db.get_partial_join_event_nid(room_nid) {
         let mut combined = state_nids.clone();
         combined.push(join_nid);
         let _ = state
             .db
-            .persist_state_snapshot(room_nid, join_nid, &combined);
+            .rewrite_state_at_event(room_nid, join_nid, &combined);
     }
     // Membership index drives `get_room_members` (and downstream
     // /sync, /joined_members, federation routing).
