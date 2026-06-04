@@ -2634,6 +2634,38 @@ impl Database {
         Ok(snapshot_nid)
     }
 
+    /// Overwrite the snapshot currently pointed-to by `event_nid` instead of
+    /// allocating a new one. Used by the partial-state filler at clear time:
+    /// timeline events received during partial state inherited the join
+    /// event's bundle snapshot id via `event_state`, so re-pointing the
+    /// join's entry to a fresh snapshot would leave every descendant looking
+    /// at the stale bundle state. Overwriting the existing snapshot's bytes
+    /// propagates the full state to every event that inherited the same id.
+    /// Falls back to `persist_state_snapshot` if no snapshot is recorded yet.
+    pub fn rewrite_state_at_event(
+        &self,
+        room_nid: u64,
+        event_nid: u64,
+        state_event_nids: &[u64],
+    ) -> Result<u64, rocksdb::Error> {
+        let cf_event_state = self.db.cf_handle("event_state").unwrap();
+        let snapshot_nid = match self
+            .db
+            .get_cf(&cf_event_state, keys::encode_u64(event_nid))?
+        {
+            Some(b) => keys::decode_u64(&b),
+            None => return self.persist_state_snapshot(room_nid, event_nid, state_event_nids),
+        };
+        let cf_snapshots = self.db.cf_handle("state_snapshots").unwrap();
+        self.db.put_cf(
+            &cf_snapshots,
+            keys::encode_u64(snapshot_nid),
+            keys::encode_u64_array(state_event_nids),
+        )?;
+        let _ = room_nid;
+        Ok(snapshot_nid)
+    }
+
     /// Update the room bump timestamp.
     pub fn update_room_bump(
         &self,

@@ -124,18 +124,15 @@
 # are grouped below by the gap they're waiting on. Run via
 # `./tests/msc3902` (PACKAGES in run.sh).
 
-# Inbound event with one or more missing prev_events during partial
-# state — vela accepts and surfaces the event, but the post-clear
-# /state_ids check returns one fewer state event than the resident
-# expects. `state_before_event` walks back through prev_events
-# looking for a snapshot; for events that arrived via /get_missing_
-# events the inherited snapshot isn't quite right yet.
-^TestPartialStateJoin/CanReceiveEventsWith(MissingParents|HalfMissingParents|HalfMissingGrandparents)DuringPartialStateJoin$
-
-# Multi-server filler fallback — when the resident peer returns
-# garbage on /state_ids, vela should try the join-event sender's
-# domain (the joining server's view of who else is in the room).
-^TestPartialStateJoin/PartialStateJoinSyncsUsingOtherHomeservers$
+# Inbound event whose missing prev's auth_event sits only behind a
+# /state_ids handler the mock keys to a deep ancestor (here event A,
+# two hops back through B). vela's auth-fetch fallback targets the
+# direct unknown prev (B) and the mock 404s; walking deeper requires
+# /get_missing_events to run before Check 4 so the boundary search
+# can step through freshly-persisted ancestors. Reordering broke the
+# sibling tests via long auth-chain recursion; left for a focused
+# follow-up.
+^TestPartialStateJoin/CanReceiveEventsWithHalfMissingGrandparentsDuringPartialStateJoin$
 
 # State-integrity reconciliation on filler complete — events that
 # vela rejected during partial state (no auth chain visibility) must

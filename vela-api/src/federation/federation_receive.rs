@@ -2191,15 +2191,26 @@ async fn persist_fetched_event_inner(
         let auth_pdu = match load_pdu_by_event_id(state, aev_id) {
             Some(p) => p,
             None => {
-                // Missing — recursively fetch. If the recursion fails (budget
-                // exhausted, remote error), we drop this fetched event.
-                if let Err(e) =
+                // Missing — recursively fetch. Try /event_auth first;
+                // if the peer doesn't serve it, fall back to
+                // /state_ids at the deepest unknown prev_event we
+                // can walk to from target. The two endpoints
+                // together cover synapse / dendrite / Complement
+                // mocks.
+                let event_auth_err =
                     fetch_auth_chain(state, origin, &target_pdu.room_id, aev_id, budget.clone())
                         .await
-                {
-                    let reason = format!("recursive fetch of auth {aev_id} failed: {e}");
-                    let _ = state.db.mark_event_rejected(&target_pdu.event_id, &reason);
-                    return Err(reason);
+                        .err();
+                if load_pdu_by_event_id(state, aev_id).is_none() {
+                    let boundary = find_state_ids_boundary(state, &target_pdu);
+                    let _ = fetch_auth_via_state_ids(
+                        state,
+                        origin,
+                        &target_pdu.room_id,
+                        &boundary,
+                        budget.clone(),
+                    )
+                    .await;
                 }
                 match load_pdu_by_event_id(state, aev_id) {
                     Some(p) => p,
@@ -2213,6 +2224,8 @@ async fn persist_fetched_event_inner(
                         let is_rejected = state.db.is_event_rejected(aev_id).unwrap_or(false);
                         let reason = if is_rejected {
                             format!("auth_event {aev_id} is rejected")
+                        } else if let Some(e) = event_auth_err {
+                            format!("recursive fetch of auth {aev_id} failed: {e}")
                         } else {
                             format!("auth event {aev_id} still missing after recursive fetch")
                         };

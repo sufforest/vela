@@ -16,7 +16,7 @@
 //! as-is and `send_join`. Auth rule 5.3.5 enforces the authoriser has
 //! invite power when the event is persisted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
@@ -261,21 +261,56 @@ async fn bootstrap_remote_room(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let partial_state_servers: Vec<String> = if partial_state {
-        let mut servers: Vec<String> = send_join_resp
+        // Order: the joining server first (it just responded to
+        // send_join — most likely source of the state), then the
+        // response's `servers_in_room` hint, then sender domains
+        // observed in the response's state + auth_chain. A peer that
+        // returns garbage on /state_ids (PartialStateJoinSyncsUsing
+        // OtherHomeservers) is the only one in `servers_in_room`, so
+        // the sender-domain pass is what lets the filler fall back to
+        // a healthy resident.
+        let mut servers: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let push_if_new = |s: String, servers: &mut Vec<String>, seen: &mut HashSet<String>| {
+            if s == state.config.server_name {
+                return;
+            }
+            if seen.insert(s.clone()) {
+                servers.push(s);
+            }
+        };
+        push_if_new(joining_server.to_string(), &mut servers, &mut seen);
+        if let Some(arr) = send_join_resp
             .get("servers_in_room")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // Defensive fallback: a misbehaving resident could claim
-        // partial_state with an empty servers_in_room list. Without
-        // at least one target, the filler retries forever. The
-        // joining server we just talked to obviously has the state,
-        // so use it as the lone fallback.
+        {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    push_if_new(s.to_string(), &mut servers, &mut seen);
+                }
+            }
+        }
+        for ev_array in [
+            send_join_resp.get("state").and_then(|v| v.as_array()),
+            send_join_resp.get("auth_chain").and_then(|v| v.as_array()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for ev in ev_array {
+                let Some(sender) = ev.get("sender").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some((_, domain)) = sender.split_once(':') else {
+                    continue;
+                };
+                push_if_new(domain.to_string(), &mut servers, &mut seen);
+            }
+        }
         if servers.is_empty() {
+            // Last-ditch: even our own domain was the only candidate.
+            // Push the joining server unconditionally so the filler
+            // has something to try.
             servers.push(joining_server.to_string());
         }
         servers
