@@ -57,11 +57,24 @@ pub struct StateQuery {
 /// GET /_matrix/federation/v1/state/{roomId}?event_id=...
 pub async fn get_state(
     State(state): State<AppState>,
-    Path(_room_id): Path<String>,
+    Path(room_id): Path<String>,
     Query(q): Query<StateQuery>,
     axum::extract::Extension(origin): axum::extract::Extension<XMatrixOrigin>,
 ) -> Result<Json<Value>, StatusCode> {
     debug!(event_id = %q.event_id, origin = %origin.0, "federation /state request");
+
+    // MSC3902: while the room is partial-state we don't have the full
+    // membership at any post-join event. Refuse rather than return a
+    // confidently-wrong incomplete state — the caller (typically a
+    // joining server's filler) will retry or fall back to another
+    // peer. Mirrors how Complement's MSC3902 mocks behave from the
+    // remote side; spec test
+    // TestPartialStateJoin/CanReceiveEvents*PartialStateJoin.
+    if let Ok(Some(room_nid)) = state.db.get_nid(&room_id)
+        && let Ok((true, _)) = state.db.get_partial_state_info(room_nid)
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     // state_before_event runs state_res which is CPU-bound — isolate from
     // the async runtime via spawn_blocking.
@@ -100,11 +113,19 @@ pub async fn get_state(
 /// GET /_matrix/federation/v1/state_ids/{roomId}?event_id=...
 pub async fn get_state_ids(
     State(state): State<AppState>,
-    Path(_room_id): Path<String>,
+    Path(room_id): Path<String>,
     Query(q): Query<StateQuery>,
     axum::extract::Extension(origin): axum::extract::Extension<XMatrixOrigin>,
 ) -> Result<Json<Value>, StatusCode> {
     debug!(event_id = %q.event_id, origin = %origin.0, "federation /state_ids request");
+
+    // MSC3902: refuse while the room is partial-state (see get_state
+    // for the rationale). Same condition, same response.
+    if let Ok(Some(room_nid)) = state.db.get_nid(&room_id)
+        && let Ok((true, _)) = state.db.get_partial_state_info(room_nid)
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     // CPU isolation as in get_state.
     let db = state.db.clone();

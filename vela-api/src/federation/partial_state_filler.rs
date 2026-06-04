@@ -221,18 +221,8 @@ async fn try_fill_one(
                     .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                     .clone();
                 let _guard = lock.lock().await;
-                // Capture the membership set BEFORE the merge so we
-                // can diff against the post-merge set and notify
-                // local users about newly-known peers (MSC3706
-                // device_list reconciliation).
-                let members_before: std::collections::HashSet<u64> = state
-                    .db
-                    .get_room_members(room_nid)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
                 match merge_state_response(state, room_nid, &resp).await {
-                    Ok(()) => {
+                    Ok(outcome) => {
                         // Allocate ONE stream position and use it for
                         // both the cleared-at stamp and the broadcast
                         // wake. /sync's eager gating decides "force
@@ -247,7 +237,7 @@ async fn try_fill_one(
                             .db
                             .clear_partial_state(room_nid, pos)
                             .map_err(|e| format!("clear flag: {e}"))?;
-                        reconcile_device_lists(state, room_nid, &members_before);
+                        reconcile_device_lists(state, room_nid, &outcome.newly_added_user_nids);
                         wake_sync_on_clear(state, room_nid, pos);
                         return Ok(true);
                     }
@@ -383,7 +373,25 @@ async fn fetch_state_via_state_ids(
     }))
 }
 
-async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> Result<(), String> {
+/// Result of a successful `merge_state_response`: the user nids whose
+/// `m.room.member` event was **newly** persisted by the merge (i.e. we
+/// did not already have the event locally as an outlier from the
+/// auth-chain pass). These are the only peers `reconcile_device_lists`
+/// should notify — for peers who were already known via the bundle
+/// auth-chain, the device-list-change signalling has already been
+/// scheduled through other paths (e.g. the m.device_list_update EDU
+/// fanout), and re-firing here surfaces them as spurious
+/// device_lists.changed entries.
+#[derive(Default)]
+struct MergeOutcome {
+    newly_added_user_nids: Vec<u64>,
+}
+
+async fn merge_state_response(
+    state: &AppState,
+    room_nid: u64,
+    resp: &Value,
+) -> Result<MergeOutcome, String> {
     let auth_chain = resp
         .get("auth_chain")
         .and_then(|v| v.as_array())
@@ -420,6 +428,10 @@ async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> 
     // members — they only show up in /sync via state delta.
     let mut state_nids: Vec<u64> = Vec::new();
     let mut memberships_to_set: Vec<(String, u8)> = Vec::new();
+    // Tracks user nids whose member event was newly persisted by this
+    // pass — used by reconcile_device_lists to scope its
+    // device_lists.changed signalling.
+    let mut newly_added_user_nids: Vec<u64> = Vec::new();
     let mut last_err = String::new();
     for ev in &state_events {
         let nid_result = crate::membership::federation_outbound_join::persist_remote_event(
@@ -429,6 +441,7 @@ async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> 
             vela_store::db::PersistKind::StateBundleOnly,
         )
         .await;
+        let was_newly_persisted = matches!(&nid_result, Ok(Some(_)));
         let resolved_nid: Option<u64> = match nid_result {
             Ok(Some(nid)) => Some(nid),
             Ok(None) => {
@@ -468,6 +481,18 @@ async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> 
             };
             if !sk.is_empty() && b != 0 {
                 memberships_to_set.push((sk.to_string(), b));
+                // Track this user as newly-known ONLY if the member
+                // event itself wasn't already in our store from the
+                // auth_chain pass — auth-chain members are already
+                // visible to the bundle's snapshot, and re-announcing
+                // them as device_lists.changed surfaces stale
+                // notifications.
+                if was_newly_persisted
+                    && b == 1
+                    && let Ok(user_nid) = state.db.get_or_create_nid(sk)
+                {
+                    newly_added_user_nids.push(user_nid);
+                }
             }
         }
     }
@@ -500,6 +525,7 @@ async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> 
             state
                 .db
                 .get_state_event_nid(room_nid, header.type_nid, header.state_key_nid)
+            && existing_nid != *nid
             && let Ok(Some((existing_header, _))) = state.db.get_event(existing_nid)
             && existing_header.depth >= new_depth
         {
@@ -551,7 +577,9 @@ async fn merge_state_response(state: &AppState, room_nid: u64, resp: &Value) -> 
             .map_err(|e| format!("db: {e}"))?;
         let _ = state.db.set_membership(room_nid, member_nid, b);
     }
-    Ok(())
+    Ok(MergeOutcome {
+        newly_added_user_nids,
+    })
 }
 
 /// Wake any /sync long-polls blocked on this room. Filler completion
@@ -579,18 +607,18 @@ pub fn _reset_for_test(state: &AppState) {
         .store(false, std::sync::atomic::Ordering::Release);
 }
 
-/// MSC3706 device_list reconciliation. When the filler completes,
-/// the room may now include peers our local users hadn't seen
-/// before — their /sync responses still report the OLD member set
-/// because the device_list_changes stream wasn't updated when the
-/// filler's state events landed. Iterate the diff and post one
-/// device-key-change notification per newly-known peer, observable
-/// by every local member of the room.
-fn reconcile_device_lists(
-    state: &AppState,
-    room_nid: u64,
-    members_before: &std::collections::HashSet<u64>,
-) {
+/// MSC3706 device_list reconciliation. The filler just merged a batch
+/// of state events; `newly_added_user_nids` lists the users whose
+/// `m.room.member` event we persisted for the FIRST time as part of
+/// the merge (i.e. not already in our store as an outlier from the
+/// bundle's auth_chain). Those are the only peers our local users
+/// genuinely "didn't know about" — re-firing for already-known peers
+/// surfaces spurious `device_lists.changed` entries that don't
+/// correspond to any actual device change.
+fn reconcile_device_lists(state: &AppState, room_nid: u64, newly_added_user_nids: &[u64]) {
+    if newly_added_user_nids.is_empty() {
+        return;
+    }
     let members_after = match state.db.get_room_members(room_nid) {
         Ok(m) => m,
         Err(e) => {
@@ -598,19 +626,20 @@ fn reconcile_device_lists(
             return;
         }
     };
-    let new_peers: Vec<u64> = members_after
+    // Filter to peers who are still actually joined to the room post-
+    // merge. Defensive — a member event could in principle be applied
+    // and then immediately superseded by a later leave landing in the
+    // same batch.
+    let members_after_set: std::collections::HashSet<u64> = members_after.iter().copied().collect();
+    let new_peers: Vec<u64> = newly_added_user_nids
         .iter()
         .copied()
-        .filter(|m| !members_before.contains(m))
+        .filter(|n| members_after_set.contains(n))
         .collect();
     if new_peers.is_empty() {
         return;
     }
-    // Local observers = every member of this room hosted on us. The
-    // pre-merge members_before contains our local users that were
-    // already joined (creator + invitees we knew about + ourselves);
-    // post-merge members_after may also contain newly-discovered
-    // remote users. Iterate the union and keep only local ones.
+    // Local observers = every member of this room hosted on us.
     let our_server = state.config.server_name.as_str();
     let mut local_observers: Vec<u64> = Vec::new();
     for m in &members_after {

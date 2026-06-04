@@ -313,10 +313,19 @@ async fn handle_direct_to_device(state: &AppState, origin: &str, content: &Value
         };
 
         for (device_id, msg_content) in per_device {
-            // Wildcard fan-out: send to all known devices.
+            // Wildcard fan-out: send to all of the user's registered
+            // devices. `list_devices` (the registration index) is the
+            // right surface here, NOT `get_all_device_keys` — a freshly
+            // logged-in client has a `devices` entry but won't have
+            // uploaded E2EE keys yet, and dropping that case loses
+            // legitimate non-encrypted to-device traffic (m.room_key_
+            // request retries, MSC3902 test EDUs, etc.).
             if device_id == "*" {
-                if let Ok(devices) = state.db.get_all_device_keys(target_user_nid) {
-                    for (did, _) in &devices {
+                if let Ok(devices) = state.db.list_devices(target_user_nid) {
+                    for dev in &devices {
+                        let Some(did) = dev.get("device_id").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
                         let _ = state.db.queue_to_device(
                             target_user_nid,
                             did,
