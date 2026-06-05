@@ -2605,6 +2605,101 @@ impl Database {
         )
     }
 
+    /// Drop `room_state[room_nid][type_nid][state_key_nid]`. Used by
+    /// `revert_state_event` when reverting a state event that had no
+    /// prior occupant (state_replaces returns None — the soft-failed
+    /// event was the first of its (type, state_key)).
+    pub fn clear_room_state_entry(
+        &self,
+        room_nid: u64,
+        type_nid: u64,
+        state_key_nid: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("room_state").unwrap();
+        self.db.delete_cf(
+            &cf,
+            keys::encode_u64_triple(room_nid, type_nid, state_key_nid),
+        )
+    }
+
+    /// Undo a state event's effect on `room_state` (and `memberships`,
+    /// for `m.room.member`). Used by the MSC3902 re-verify sweep on
+    /// filler clear: when an event that vela optimistically accepted
+    /// during partial state turns out to be soft-failed under the
+    /// full state, we step its slot back to whatever it had
+    /// previously displaced.
+    ///
+    /// We only revert if `event_nid` is STILL the live state entry —
+    /// some later event may already have overwritten it (e.g. a
+    /// follow-up valid kick after a bogus one), in which case the
+    /// chain is self-correcting and we don't touch it.
+    ///
+    /// Returns `Ok(Some(prior_nid))` if a prior occupant was restored,
+    /// `Ok(None)` if the entry was simply cleared (no prior occupant
+    /// or already overwritten).
+    pub fn revert_state_event(
+        &self,
+        room_nid: u64,
+        event_nid: u64,
+    ) -> Result<Option<u64>, rocksdb::Error> {
+        let Some((header, _)) = self.get_event(event_nid)? else {
+            return Ok(None);
+        };
+        if header.state_key_nid == 0 && self.resolve_nid(header.type_nid)?.is_none() {
+            // Not a state event at all (state_key empty AND type
+            // unresolvable — shouldn't happen but guards against
+            // accidental calls).
+            return Ok(None);
+        }
+        // Re-verify the slot still points at this event before
+        // touching it.
+        let live = self.get_state_event_nid(room_nid, header.type_nid, header.state_key_nid)?;
+        if live != Some(event_nid) {
+            return Ok(None);
+        }
+        let replaced = self.get_replaced_state_nid(event_nid)?;
+        if let Some(prior_nid) = replaced {
+            self.set_room_state_entry(room_nid, header.type_nid, header.state_key_nid, prior_nid)?;
+        } else {
+            self.clear_room_state_entry(room_nid, header.type_nid, header.state_key_nid)?;
+        }
+        // If this was an m.room.member event, snap the per-user
+        // memberships index back to the prior membership too. The
+        // index is what `get_room_members`, `/joined_members`, and
+        // the federation-routing fan-out read from; without this
+        // revert the user would still appear as kicked (or whatever
+        // the soft-failed transition declared).
+        if let Some("m.room.member") = self.resolve_nid(header.type_nid)?.as_deref() {
+            let user_nid = match self.resolve_nid(header.state_key_nid)? {
+                Some(uid) => self.get_or_create_nid(&uid)?,
+                None => return Ok(replaced),
+            };
+            let prior_membership = match replaced {
+                Some(prior_nid) => {
+                    let prior_pdu = self.get_event(prior_nid)?;
+                    prior_pdu
+                        .and_then(|(_h, bytes)| serde_json::from_slice::<Value>(&bytes).ok())
+                        .and_then(|v| {
+                            v.get("content")
+                                .and_then(|c| c.get("membership"))
+                                .and_then(|m| m.as_str())
+                                .map(|s| match s {
+                                    "join" => 1u8,
+                                    "invite" => 2,
+                                    "ban" => 3,
+                                    "knock" => 4,
+                                    _ => 0,
+                                })
+                        })
+                        .unwrap_or(0)
+                }
+                None => 0,
+            };
+            self.set_membership(room_nid, user_nid, prior_membership)?;
+        }
+        Ok(replaced)
+    }
+
     pub fn persist_state_snapshot(
         &self,
         room_nid: u64,
@@ -4862,6 +4957,136 @@ impl Database {
         self.db.delete_cf(&cf, keys::encode_u64(user_nid))
     }
 
+    // --- MSC3902 state-integrity: tentative-accept tracking ---
+
+    /// Status byte recorded with each `partial_state_pending_events`
+    /// entry. `Accepted` means the event passed our partial-state
+    /// best-guess check and its state effect (if any) is currently
+    /// reflected in `room_state` / `memberships`. `SoftFailedAtSend`
+    /// means we accepted the event into the timeline but the check
+    /// failed under our partial view, so we marked it `soft_failed`
+    /// and did NOT apply its state effect. The filler-clear
+    /// re-verify sweep needs the original status to know whether to
+    /// promote (failed → now-passes) or revert (accepted → now-fails).
+    pub const PARTIAL_PENDING_ACCEPTED: u8 = 0;
+    pub const PARTIAL_PENDING_SOFT_FAILED_AT_SEND: u8 = 1;
+
+    /// Record that `event_nid` arrived for a partial-state room and
+    /// will need re-verification once the filler clears.
+    pub fn mark_partial_state_pending_event(
+        &self,
+        room_nid: u64,
+        event_nid: u64,
+        status: u8,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("partial_state_pending_events").unwrap();
+        self.db
+            .put_cf(&cf, keys::encode_u64_pair(room_nid, event_nid), [status])
+    }
+
+    /// Drain (drop) the room's pending-events set and return each
+    /// `(event_nid, status_byte)` to the caller for re-verification.
+    /// We delete-after-collect rather than collect-then-delete-each
+    /// so a crash mid-sweep leaves the surviving entries on disk for
+    /// the next filler clear to retry.
+    pub fn drain_partial_state_pending_events(
+        &self,
+        room_nid: u64,
+    ) -> Result<Vec<(u64, u8)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("partial_state_pending_events").unwrap();
+        let prefix = keys::encode_u64(room_nid);
+        let mut out: Vec<(u64, u8)> = Vec::new();
+        let iter = self.db.prefix_iterator_cf(&cf, prefix);
+        for item in iter {
+            let (key, val) = item?;
+            if key.len() < 16 || key[..8] != prefix[..] {
+                break;
+            }
+            let event_nid = keys::decode_u64(&key[8..16]);
+            let status = val.first().copied().unwrap_or(0);
+            out.push((event_nid, status));
+        }
+        let mut batch = WriteBatch::default();
+        for (event_nid, _) in &out {
+            batch.delete_cf(&cf, keys::encode_u64_pair(room_nid, *event_nid));
+        }
+        self.db.write(batch)?;
+        Ok(out)
+    }
+
+    /// True if `event_nid` is in the room's pending-events set. Used
+    /// by tests and by the filler to assert idempotency.
+    pub fn has_partial_state_pending_event(
+        &self,
+        room_nid: u64,
+        event_nid: u64,
+    ) -> Result<bool, rocksdb::Error> {
+        let cf = self.db.cf_handle("partial_state_pending_events").unwrap();
+        Ok(self
+            .db
+            .get_cf(&cf, keys::encode_u64_pair(room_nid, event_nid))?
+            .is_some())
+    }
+
+    // --- MSC3902 state-integrity: outbound device-list replay ---
+
+    /// Queue a missed outbound m.device_list_update content payload
+    /// for replay once the filler clears. Called from
+    /// `federate_device_list_update_for` when the destination set
+    /// would otherwise have skipped a peer due to partial-state
+    /// belief.
+    pub fn mark_partial_state_pending_dlu(
+        &self,
+        room_nid: u64,
+        user_nid: u64,
+        stream_id: u64,
+        content: &Value,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("partial_state_pending_dlu").unwrap();
+        let mut key = Vec::with_capacity(24);
+        key.extend_from_slice(&keys::encode_u64(room_nid));
+        key.extend_from_slice(&keys::encode_u64(user_nid));
+        key.extend_from_slice(&keys::encode_u64(stream_id));
+        self.db.put_cf(&cf, &key, content.to_string().as_bytes())
+    }
+
+    /// Drain the room's queued device-list updates. Returns each
+    /// `(user_nid, stream_id, content_value)` in stream_id order so
+    /// replays preserve the original sequence even when multiple
+    /// users changed during the partial-state window.
+    pub fn drain_partial_state_pending_dlu(
+        &self,
+        room_nid: u64,
+    ) -> Result<Vec<(u64, u64, Value)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("partial_state_pending_dlu").unwrap();
+        let prefix = keys::encode_u64(room_nid);
+        let mut out: Vec<(u64, u64, Value)> = Vec::new();
+        let iter = self.db.prefix_iterator_cf(&cf, prefix);
+        for item in iter {
+            let (key, val) = item?;
+            if key.len() < 24 || key[..8] != prefix[..] {
+                break;
+            }
+            let user_nid = keys::decode_u64(&key[8..16]);
+            let stream_id = keys::decode_u64(&key[16..24]);
+            let content: Value = match serde_json::from_slice(&val) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            out.push((user_nid, stream_id, content));
+        }
+        let mut batch = WriteBatch::default();
+        for (user_nid, stream_id, _) in &out {
+            let mut key = Vec::with_capacity(24);
+            key.extend_from_slice(&keys::encode_u64(room_nid));
+            key.extend_from_slice(&keys::encode_u64(*user_nid));
+            key.extend_from_slice(&keys::encode_u64(*stream_id));
+            batch.delete_cf(&cf, &key);
+        }
+        self.db.write(batch)?;
+        Ok(out)
+    }
+
     // --- E2EE: Device key changes ---
 
     /// Record that `changed_user_nid`'s device / cross-signing keys have
@@ -5210,6 +5435,46 @@ impl Database {
             }
         }
         Ok(servers.into_iter().collect())
+    }
+
+    /// Like `get_remote_servers_in_room` but includes domains for users
+    /// with ANY membership state (joined, invited, left, banned,
+    /// knocked) — not just currently-joined. Used by
+    /// `federate_device_list_update_for` to decide whether a
+    /// partial-state `servers_in_room` hint should be unioned in: if
+    /// we already have a local record for a server (even just a
+    /// left/banned one), the local view is authoritative and the
+    /// hint should be dropped. Without this we'd keep sending
+    /// device-list updates to peers we've definitively learned are
+    /// no longer in the room. Spec test:
+    /// Outgoing_device_list_updates/incorrectly_(kicked|absent)_*.
+    pub fn get_room_observed_member_servers(
+        &self,
+        room_nid: u64,
+        our_server_name: &str,
+    ) -> Result<std::collections::HashSet<String>, rocksdb::Error> {
+        use std::collections::HashSet;
+        let cf = self.db.cf_handle("memberships").unwrap();
+        let prefix = keys::encode_u64(room_nid);
+        let mut servers: HashSet<String> = HashSet::new();
+        let iter = self.db.prefix_iterator_cf(&cf, prefix);
+        for item in iter {
+            let (key, _val) = item?;
+            if key.len() < 16 || key[..8] != prefix[..] {
+                break;
+            }
+            let user_nid = keys::decode_u64(&key[8..16]);
+            let Some(user_id) = self.resolve_nid(user_nid)? else {
+                continue;
+            };
+            if let Some((_, domain)) = user_id.split_once(':')
+                && domain != our_server_name
+                && !domain.is_empty()
+            {
+                servers.insert(domain.to_string());
+            }
+        }
+        Ok(servers)
     }
 
     // --- Meta operations ---
@@ -5790,6 +6055,16 @@ impl Database {
     pub fn is_soft_failed(&self, event_nid: u64) -> Result<bool, rocksdb::Error> {
         let cf = self.db.cf_handle("soft_failed_events").unwrap();
         Ok(self.db.get_cf(&cf, event_nid.to_be_bytes())?.is_some())
+    }
+
+    /// Drop the soft-fail marker for `event_nid`. Used by the
+    /// MSC3902 re-verify sweep: if an event was soft-failed under
+    /// the partial-state view but re-verification under full state
+    /// passes, we unmark it so /event and /sync stop filtering it
+    /// out. Idempotent.
+    pub fn unmark_soft_failed(&self, event_nid: u64) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("soft_failed_events").unwrap();
+        self.db.delete_cf(&cf, event_nid.to_be_bytes())
     }
 
     // --- Rejected event tracking ---
@@ -7533,6 +7808,280 @@ mod remote_device_keys_cache_tests {
             db.get_remote_user_keys_cache(b).unwrap(),
             Some(json!({"v": 2}))
         );
+    }
+}
+
+#[cfg(test)]
+mod partial_state_pending_events_tests {
+    use super::*;
+
+    fn fresh_db() -> (Database, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        (db, tmp)
+    }
+
+    /// A marked event surfaces in the drain with its status byte
+    /// intact. The drain is the only read path the filler uses, so
+    /// this is the load-bearing round-trip.
+    #[test]
+    fn round_trip_marks_and_drains() {
+        let (db, _tmp) = fresh_db();
+        let room_nid = 7;
+        db.mark_partial_state_pending_event(room_nid, 100, Database::PARTIAL_PENDING_ACCEPTED)
+            .unwrap();
+        db.mark_partial_state_pending_event(
+            room_nid,
+            200,
+            Database::PARTIAL_PENDING_SOFT_FAILED_AT_SEND,
+        )
+        .unwrap();
+        let mut drained = db.drain_partial_state_pending_events(room_nid).unwrap();
+        drained.sort_by_key(|(nid, _)| *nid);
+        assert_eq!(
+            drained,
+            vec![
+                (100, Database::PARTIAL_PENDING_ACCEPTED),
+                (200, Database::PARTIAL_PENDING_SOFT_FAILED_AT_SEND),
+            ]
+        );
+    }
+
+    /// Drain wipes the room's entries. A second drain returns
+    /// nothing; the filler is allowed to call this defensively each
+    /// clear without leaking state into the next partial-join.
+    #[test]
+    fn drain_is_destructive() {
+        let (db, _tmp) = fresh_db();
+        db.mark_partial_state_pending_event(1, 10, Database::PARTIAL_PENDING_ACCEPTED)
+            .unwrap();
+        let _ = db.drain_partial_state_pending_events(1).unwrap();
+        let again = db.drain_partial_state_pending_events(1).unwrap();
+        assert!(again.is_empty());
+    }
+
+    /// Drain is per-room: a sibling room's entries survive a drain
+    /// of room A. Without this we'd accidentally re-verify events
+    /// from rooms whose filler hasn't fired yet.
+    #[test]
+    fn drain_does_not_leak_across_rooms() {
+        let (db, _tmp) = fresh_db();
+        db.mark_partial_state_pending_event(1, 10, Database::PARTIAL_PENDING_ACCEPTED)
+            .unwrap();
+        db.mark_partial_state_pending_event(2, 20, Database::PARTIAL_PENDING_ACCEPTED)
+            .unwrap();
+        let drained_room1 = db.drain_partial_state_pending_events(1).unwrap();
+        assert_eq!(
+            drained_room1,
+            vec![(10, Database::PARTIAL_PENDING_ACCEPTED)]
+        );
+        assert!(
+            db.has_partial_state_pending_event(2, 20).unwrap(),
+            "room 2's entry must survive room 1's drain"
+        );
+    }
+
+    /// `has_partial_state_pending_event` agrees with mark+drain.
+    /// Used by tests and by future idempotency guards.
+    #[test]
+    fn has_matches_mark_and_drain() {
+        let (db, _tmp) = fresh_db();
+        assert!(!db.has_partial_state_pending_event(1, 10).unwrap());
+        db.mark_partial_state_pending_event(1, 10, Database::PARTIAL_PENDING_ACCEPTED)
+            .unwrap();
+        assert!(db.has_partial_state_pending_event(1, 10).unwrap());
+        let _ = db.drain_partial_state_pending_events(1).unwrap();
+        assert!(!db.has_partial_state_pending_event(1, 10).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod revert_state_event_tests {
+    use super::*;
+
+    fn fresh_db() -> (Database, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        (db, tmp)
+    }
+
+    /// Persist a minimal m.room.member event so `revert_state_event`
+    /// has something to read for headers, state-key resolution, and
+    /// membership JSON parsing. Returns the event_nid.
+    fn plant_member_event(
+        db: &Database,
+        event_id: &str,
+        room_nid: u64,
+        user_id: &str,
+        membership: &str,
+    ) -> u64 {
+        let type_nid = db.get_or_create_nid("m.room.member").unwrap();
+        let user_nid = db.get_or_create_nid(user_id).unwrap();
+        let event_nid = db.next_nid().unwrap();
+        let body = serde_json::json!({
+            "type": "m.room.member",
+            "state_key": user_id,
+            "sender": user_id,
+            "room_id": "!r:x",
+            "content": {"membership": membership},
+            "origin_server_ts": 1u64,
+            "depth": 1u64,
+            "prev_events": [],
+            "auth_events": [],
+        });
+        db.persist_event(
+            event_nid,
+            event_id,
+            room_nid,
+            type_nid,
+            user_nid,
+            user_nid,
+            1,
+            1,
+            &serde_json::to_vec(&body).unwrap(),
+            &[],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+        event_nid
+    }
+
+    /// Reverting a member event with a recorded `state_replaces`
+    /// link points room_state back at the prior member event AND
+    /// snaps the per-user membership index back to the prior
+    /// membership byte. This is the load-bearing case for
+    /// State_rejected_incorrectly's bad-kick scenario.
+    #[test]
+    fn revert_restores_prior_member_and_membership_byte() {
+        let (db, _tmp) = fresh_db();
+        let room_nid = db.get_or_create_nid("!r:x").unwrap();
+        let type_nid = db.get_or_create_nid("m.room.member").unwrap();
+        let elsie_nid = db.get_or_create_nid("@elsie:x").unwrap();
+        let prior = plant_member_event(&db, "$prior", room_nid, "@elsie:x", "join");
+        let kick = plant_member_event(&db, "$kick", room_nid, "@elsie:x", "leave");
+        db.set_room_state_entry(room_nid, type_nid, elsie_nid, kick)
+            .unwrap();
+        db.set_membership(room_nid, elsie_nid, 0).unwrap();
+        db.record_state_replaces(kick, prior).unwrap();
+
+        let returned = db.revert_state_event(room_nid, kick).unwrap();
+        assert_eq!(returned, Some(prior));
+        assert_eq!(
+            db.get_state_event_nid(room_nid, type_nid, elsie_nid)
+                .unwrap(),
+            Some(prior)
+        );
+        assert_eq!(
+            db.get_membership(room_nid, elsie_nid).unwrap(),
+            Some(1),
+            "membership index should snap back to join (1)"
+        );
+    }
+
+    /// A state event that displaces nothing (no `state_replaces`
+    /// link) reverts to a CLEARED room_state slot, and the
+    /// membership index drops to "leave" (0) since there's no prior
+    /// member to restore. Covers the soft-failed-first-of-its-kind
+    /// case (e.g. a bogus first power_levels update).
+    #[test]
+    fn revert_with_no_prior_clears_slot() {
+        let (db, _tmp) = fresh_db();
+        let room_nid = db.get_or_create_nid("!r:x").unwrap();
+        let type_nid = db.get_or_create_nid("m.room.member").unwrap();
+        let user_nid = db.get_or_create_nid("@u:x").unwrap();
+        let only = plant_member_event(&db, "$only", room_nid, "@u:x", "join");
+        db.set_room_state_entry(room_nid, type_nid, user_nid, only)
+            .unwrap();
+        db.set_membership(room_nid, user_nid, 1).unwrap();
+
+        let returned = db.revert_state_event(room_nid, only).unwrap();
+        assert_eq!(returned, None);
+        assert_eq!(
+            db.get_state_event_nid(room_nid, type_nid, user_nid)
+                .unwrap(),
+            None
+        );
+        assert_eq!(db.get_membership(room_nid, user_nid).unwrap(), Some(0));
+    }
+
+    /// If a later state event has already overwritten the slot,
+    /// reverting the earlier event is a no-op. Without this the
+    /// re-verify sweep could clobber a now-valid state event with a
+    /// historical revert. Returns None so the caller can tell.
+    #[test]
+    fn revert_no_op_when_slot_already_overwritten() {
+        let (db, _tmp) = fresh_db();
+        let room_nid = db.get_or_create_nid("!r:x").unwrap();
+        let type_nid = db.get_or_create_nid("m.room.member").unwrap();
+        let user_nid = db.get_or_create_nid("@u:x").unwrap();
+        let prior = plant_member_event(&db, "$prior", room_nid, "@u:x", "join");
+        let kick = plant_member_event(&db, "$kick", room_nid, "@u:x", "leave");
+        let rejoin = plant_member_event(&db, "$rejoin", room_nid, "@u:x", "join");
+        db.set_room_state_entry(room_nid, type_nid, user_nid, rejoin)
+            .unwrap();
+        db.set_membership(room_nid, user_nid, 1).unwrap();
+        db.record_state_replaces(kick, prior).unwrap();
+
+        let returned = db.revert_state_event(room_nid, kick).unwrap();
+        assert_eq!(returned, None);
+        assert_eq!(
+            db.get_state_event_nid(room_nid, type_nid, user_nid)
+                .unwrap(),
+            Some(rejoin),
+            "slot should still point at the post-revert valid event"
+        );
+        assert_eq!(db.get_membership(room_nid, user_nid).unwrap(), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod partial_state_pending_dlu_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fresh_db() -> (Database, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        (db, tmp)
+    }
+
+    /// A queued payload reads back intact and the drain returns
+    /// items in stream-id order so replays preserve sequence.
+    #[test]
+    fn drain_returns_stream_id_ordered() {
+        let (db, _tmp) = fresh_db();
+        db.mark_partial_state_pending_dlu(1, 100, 30, &json!({"v": "c"}))
+            .unwrap();
+        db.mark_partial_state_pending_dlu(1, 100, 10, &json!({"v": "a"}))
+            .unwrap();
+        db.mark_partial_state_pending_dlu(1, 100, 20, &json!({"v": "b"}))
+            .unwrap();
+        let drained = db.drain_partial_state_pending_dlu(1).unwrap();
+        assert_eq!(
+            drained,
+            vec![
+                (100, 10, json!({"v": "a"})),
+                (100, 20, json!({"v": "b"})),
+                (100, 30, json!({"v": "c"})),
+            ]
+        );
+    }
+
+    /// Drain wipes the room's queue and is per-room. Mirrors the
+    /// pending-events guarantee.
+    #[test]
+    fn drain_is_destructive_and_per_room() {
+        let (db, _tmp) = fresh_db();
+        db.mark_partial_state_pending_dlu(1, 10, 1, &json!({}))
+            .unwrap();
+        db.mark_partial_state_pending_dlu(2, 20, 1, &json!({}))
+            .unwrap();
+        let _ = db.drain_partial_state_pending_dlu(1).unwrap();
+        assert!(db.drain_partial_state_pending_dlu(1).unwrap().is_empty());
+        let room2 = db.drain_partial_state_pending_dlu(2).unwrap();
+        assert_eq!(room2.len(), 1, "room 2's queue must survive room 1's drain");
     }
 }
 

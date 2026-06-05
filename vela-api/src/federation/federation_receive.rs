@@ -367,6 +367,25 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
         );
     }
 
+    // MSC3902 state-integrity reconciliation: during a partial-state
+    // window the bundle's state view is intentionally incomplete, so
+    // Check 4 / Check 5 may reject events that the FULL state will
+    // accept (`State_rejected_incorrectly`) or accept events that the
+    // full state will reject (`State_accepted_incorrectly`,
+    // `Rejected_events_remain_rejected_after_resync`). Spec posture:
+    // accept everything optimistically into the timeline, mark
+    // failing checks as soft-failed (so /event returns 404 and /sync
+    // filters them), and re-verify on filler clear. We capture the
+    // partial-state flag once here and let downstream checks flip
+    // `soft_failed_at_send` instead of returning Rejected.
+    let is_partial_state_room = state
+        .db
+        .get_partial_state_info(room_nid)
+        .map(|(p, _)| p)
+        .unwrap_or(false);
+    let mut soft_failed_at_send = false;
+    let mut partial_skip_check5 = false;
+
     // --- Check 4: auth rules against auth_events ---
     // Build a state view from the event's auth_events. On a missing auth event,
     // attempt a bounded fetch from the sender's server via /event_auth.
@@ -468,10 +487,24 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
     );
     let auth_fn = |t: &str, sk: &str| auth_state.get(&(t.to_string(), sk.to_string()));
     if let Err(AuthError::Rejected(reason)) = check_auth(&effective_pdu, &auth_fn) {
-        return (
-            effective_pdu.event_id.clone(),
-            PduOutcome::Rejected(format!("auth_events check failed: {reason}")),
-        );
+        if is_partial_state_room {
+            // Accept into the timeline as soft-failed; re-verify on
+            // filler clear. Skip Check 5 too: state-at-event would
+            // run on the same incomplete bundle and pile a second
+            // unhelpful soft-fail reason on top.
+            debug!(
+                event_id = %effective_pdu.event_id,
+                %reason,
+                "auth_events check failed in partial-state room — accepting as soft-failed"
+            );
+            soft_failed_at_send = true;
+            partial_skip_check5 = true;
+        } else {
+            return (
+                effective_pdu.event_id.clone(),
+                PduOutcome::Rejected(format!("auth_events check failed: {reason}")),
+            );
+        }
     }
 
     // If any prev_event is missing locally, attempt to fill the gap by
@@ -525,98 +558,105 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
 
     // --- Check 5: state-at-event ---
     // Resolve state from each prev_event's state_snapshot via state_res v2.
-    match compute_state_at_event(state, &effective_pdu, &sender_domain, fetch_budget.clone()).await
-    {
-        Ok(Some(mut state_at_event)) => {
-            // v12 (MSC4291): m.room.create isn't a state event in the
-            // post-state snapshot, so it's absent from the resolved
-            // state_at_event map. The auth-check rules read the create
-            // event for the creator identity; without injection, every
-            // federated PDU would fail Check 5 with "no m.room.create
-            // in state" — which is exactly what TestSyncTimelineGap hit.
-            crate::federation::federation_state::ensure_create_in_state(
-                &state.db,
-                room_nid,
-                &mut state_at_event,
-            );
-            // MSC3706 partial-state safety: if the room is still
-            // filling and state-at-event lacks the sender's
-            // m.room.member, fall back to their auth_events
-            // copy. Spec mandates auth_events contains the
-            // sender's membership for every non-state PDU, so
-            // this is a known-good substitute. No-op when state
-            // already has it.
-            crate::federation::federation_state::ensure_sender_member_in_state(
-                &state.db,
-                &effective_pdu.sender,
-                &effective_pdu.auth_events,
-                &mut state_at_event,
-            );
-            let sf = |t: &str, sk: &str| state_at_event.get(&(t.to_string(), sk.to_string()));
-            if let Err(AuthError::Rejected(reason)) = check_auth(&effective_pdu, &sf) {
-                let keys: Vec<String> = state_at_event
-                    .keys()
-                    .map(|(t, sk)| format!("{t}/{sk}"))
-                    .collect();
-                warn!(
-                    event_id = %effective_pdu.event_id,
-                    sender = %effective_pdu.sender,
-                    prev_events = ?effective_pdu.prev_events,
-                    state_at_event_keys = ?keys,
-                    %reason,
-                    "state-at-event check failed"
+    // Skipped when Check 4 already soft-failed this event in a
+    // partial-state room (same incomplete view would soft-fail it
+    // again with a less-useful reason).
+    if partial_skip_check5 {
+        // intentional fall-through
+    } else {
+        match compute_state_at_event(state, &effective_pdu, &sender_domain, fetch_budget.clone())
+            .await
+        {
+            Ok(Some(mut state_at_event)) => {
+                // v12 (MSC4291): m.room.create isn't a state event in the
+                // post-state snapshot, so it's absent from the resolved
+                // state_at_event map. The auth-check rules read the create
+                // event for the creator identity; without injection, every
+                // federated PDU would fail Check 5 with "no m.room.create
+                // in state" — which is exactly what TestSyncTimelineGap hit.
+                crate::federation::federation_state::ensure_create_in_state(
+                    &state.db,
+                    room_nid,
+                    &mut state_at_event,
                 );
-                return (
-                    effective_pdu.event_id.clone(),
-                    PduOutcome::Rejected(format!("state-at-event check failed: {reason}")),
+                // MSC3706 partial-state safety: if the room is still
+                // filling and state-at-event lacks the sender's
+                // m.room.member, fall back to their auth_events
+                // copy. Spec mandates auth_events contains the
+                // sender's membership for every non-state PDU, so
+                // this is a known-good substitute. No-op when state
+                // already has it.
+                crate::federation::federation_state::ensure_sender_member_in_state(
+                    &state.db,
+                    &effective_pdu.sender,
+                    &effective_pdu.auth_events,
+                    &mut state_at_event,
                 );
+                let sf = |t: &str, sk: &str| state_at_event.get(&(t.to_string(), sk.to_string()));
+                if let Err(AuthError::Rejected(reason)) = check_auth(&effective_pdu, &sf) {
+                    let keys: Vec<String> = state_at_event
+                        .keys()
+                        .map(|(t, sk)| format!("{t}/{sk}"))
+                        .collect();
+                    warn!(
+                        event_id = %effective_pdu.event_id,
+                        sender = %effective_pdu.sender,
+                        prev_events = ?effective_pdu.prev_events,
+                        state_at_event_keys = ?keys,
+                        %reason,
+                        "state-at-event check failed"
+                    );
+                    if is_partial_state_room {
+                        soft_failed_at_send = true;
+                    } else {
+                        return (
+                            effective_pdu.event_id.clone(),
+                            PduOutcome::Rejected(format!("state-at-event check failed: {reason}")),
+                        );
+                    }
+                }
             }
-        }
-        Ok(None) => {
-            if effective_pdu.prev_events.is_empty() {
-                // No prev_events at all — only valid for m.room.create,
-                // which we don't accept over federation anyway.
-                return (
-                    effective_pdu.event_id.clone(),
-                    PduOutcome::Rejected("no prev_events".into()),
-                );
+            Ok(None) => {
+                if effective_pdu.prev_events.is_empty() {
+                    // No prev_events at all — only valid for m.room.create,
+                    // which we don't accept over federation anyway.
+                    return (
+                        effective_pdu.event_id.clone(),
+                        PduOutcome::Rejected("no prev_events".into()),
+                    );
+                }
+                // Every prev_event is rejected/missing — skip the
+                // state-at-event check. Check 4 already validated the
+                // event against its declared auth_events, which is the
+                // only authoritative anchor we have. Mirrors Synapse's
+                // outlier path: accept the event so it can show up in
+                // /sync timelines without contributing to current state.
             }
-            // Every prev_event is rejected/missing — skip the
-            // state-at-event check. Check 4 already validated the
-            // event against its declared auth_events, which is the
-            // only authoritative anchor we have. Mirrors Synapse's
-            // outlier path: accept the event so it can show up in
-            // /sync timelines without contributing to current state.
-        }
-        Err(reason) => {
-            // Partial-state rooms hit "unknown prev_event" frequently
-            // while the filler is catching up — those events are
-            // legitimate (the resident vouches via Check 4 against
-            // declared auth_events) and rejecting them on the
-            // resolution-failed path means a mid-resync ban / kick /
-            // join never lands. MSC3902 expects the homeserver to
-            // accept these and resolve once the resync completes.
-            let is_partial_state = state
-                .db
-                .get_partial_state_info(room_nid)
-                .map(|(p, _)| p)
-                .unwrap_or(false);
-            if is_partial_state {
-                debug!(
-                    event_id = %effective_pdu.event_id,
-                    reason = %reason,
-                    "state-at-event resolution failed in partial-state room — accepting via declared auth_events"
-                );
-            } else {
-                error!(
-                    event_id = %effective_pdu.event_id,
-                    error = %reason,
-                    "state-at-event resolution failed"
-                );
-                return (
-                    effective_pdu.event_id.clone(),
-                    PduOutcome::Rejected("state-at-event resolution failed".into()),
-                );
+            Err(reason) => {
+                // Partial-state rooms hit "unknown prev_event" frequently
+                // while the filler is catching up — those events are
+                // legitimate (the resident vouches via Check 4 against
+                // declared auth_events) and rejecting them on the
+                // resolution-failed path means a mid-resync ban / kick /
+                // join never lands. MSC3902 expects the homeserver to
+                // accept these and resolve once the resync completes.
+                if is_partial_state_room {
+                    debug!(
+                        event_id = %effective_pdu.event_id,
+                        reason = %reason,
+                        "state-at-event resolution failed in partial-state room — accepting via declared auth_events"
+                    );
+                } else {
+                    error!(
+                        event_id = %effective_pdu.event_id,
+                        error = %reason,
+                        "state-at-event resolution failed"
+                    );
+                    return (
+                        effective_pdu.event_id.clone(),
+                        PduOutcome::Rejected("state-at-event resolution failed".into()),
+                    );
+                }
             }
         }
     }
@@ -645,15 +685,11 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
     // never reaches /sync). Treat partial-state Check 6 failures as
     // accepts; full state reconciliation happens at filler completion.
     let cs_failed = cs_outcome.is_err();
-    let is_partial_state = state
-        .db
-        .get_partial_state_info(room_nid)
-        .map(|(p, _)| p)
-        .unwrap_or(false);
-    let soft_failed = cs_failed && !is_partial_state;
+    let soft_failed = soft_failed_at_send || (cs_failed && !is_partial_state_room);
     if soft_failed {
         let reason = match &cs_outcome {
             Err(AuthError::Rejected(r)) => r.clone(),
+            _ if soft_failed_at_send => "partial-state check 4/5 fail".to_string(),
             _ => "unknown".to_string(),
         };
         let keys: Vec<String> = current_state
@@ -681,6 +717,28 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
     .await
     {
         Ok(()) => {
+            // MSC3902: record the event for the filler's re-verify
+            // sweep. Acceptances and partial-state soft-fails alike
+            // need re-checking once full state arrives. Cases:
+            //   - status = ACCEPTED → if re-verify FAILS we revert the
+            //     state effect and mark soft_failed.
+            //   - status = SOFT_FAILED_AT_SEND → if re-verify PASSES
+            //     we unmark soft_failed and apply the state effect.
+            if is_partial_state_room
+                && let Ok(Some(event_nid)) = state.db.get_event_nid_by_id(&effective_pdu.event_id)
+            {
+                let status = if soft_failed_at_send {
+                    vela_store::db::Database::PARTIAL_PENDING_SOFT_FAILED_AT_SEND
+                } else {
+                    vela_store::db::Database::PARTIAL_PENDING_ACCEPTED
+                };
+                if let Err(e) = state
+                    .db
+                    .mark_partial_state_pending_event(room_nid, event_nid, status)
+                {
+                    warn!(error = %e, "mark_partial_state_pending_event failed");
+                }
+            }
             if !soft_failed {
                 // MSC3902 lazy-loading visibility: during partial state,
                 // a remote user can author a timeline event whose
@@ -692,6 +750,16 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
                 // the membership and clients can't render the message
                 // with the right display name.
                 promote_sender_member_during_partial_state(state, room_nid, &effective_pdu);
+                (effective_pdu.event_id, PduOutcome::Accepted)
+            } else if is_partial_state_room {
+                // During partial state, MUST return Accepted (not
+                // SoftFailed) in the /send response. Synapse-style
+                // MustSendTransaction fails the test on any per-PDU
+                // error field, and the spec posture for
+                // partial-state soft-fails is exactly "tentatively
+                // accept; reconcile later". The soft_failed flag is
+                // still set on the persisted row so /event and /sync
+                // filter the event until re-verification clears it.
                 (effective_pdu.event_id, PduOutcome::Accepted)
             } else {
                 (effective_pdu.event_id, PduOutcome::SoftFailed)

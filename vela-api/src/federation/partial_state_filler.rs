@@ -236,6 +236,8 @@ async fn try_fill_one(
                         .db
                         .clear_partial_state(room_nid, pos)
                         .map_err(|e| format!("clear flag: {e}"))?;
+                    reverify_pending_events(state, room_nid).await;
+                    replay_pending_dlu(state, room_nid).await;
                     reconcile_device_lists(state, room_nid, &outcome.newly_added_user_nids);
                     wake_sync_on_clear(state, room_nid, pos);
                     return Ok(true);
@@ -726,6 +728,202 @@ fn reconcile_device_lists(state: &AppState, room_nid: u64, newly_joined_remote_n
         observers = local_observers.len(),
         "MSC3706 device_list reconciliation fired",
     );
+}
+
+/// Resolve the first prev_event that has a recorded snapshot and
+/// return that snapshot's `state_event_nids` list. Used by the
+/// re-verify sweep to read "the world before this event" against
+/// the now-corrected state. Returns `None` if no prev_event has a
+/// usable snapshot.
+fn pick_prev_snapshot(
+    db: &vela_store::db::Database,
+    prev_event_ids: &[String],
+) -> Option<Vec<u64>> {
+    for prev_id in prev_event_ids {
+        let Ok(Some(prev_nid)) = db.get_event_nid_by_id(prev_id) else {
+            continue;
+        };
+        if let Ok(Some(snapshot)) = db.get_state_at_event(prev_nid) {
+            return Some(snapshot);
+        }
+    }
+    None
+}
+
+/// MSC3902 state-integrity reconciliation. Walks the room's
+/// `partial_state_pending_events` set IN ARRIVAL ORDER and rebuilds
+/// each event's snapshot from its prev_events' (now-updated)
+/// snapshots. The chain processes front-to-back so descendants
+/// observe the corrected state when their turn comes — the natural
+/// fold of `rewrite_state_at_event` from PR #133 flows down the
+/// timeline. For each event we also flip the soft-failed marker and
+/// apply/revert the state effect:
+///   - ACCEPTED + re-verify PASS → leave alone; snapshot still
+///     correct after the rebuild.
+///   - ACCEPTED + re-verify FAIL → mark soft-failed, revert state
+///     effect, snapshot rebuilt WITHOUT this event.
+///   - SOFT_FAILED_AT_SEND + re-verify PASS → unmark soft-failed,
+///     promote state effect, snapshot rebuilt WITH this event.
+///   - SOFT_FAILED_AT_SEND + re-verify FAIL → leave soft-failed;
+///     snapshot rebuilt WITHOUT this event.
+async fn reverify_pending_events(state: &AppState, room_nid: u64) {
+    use vela_core::auth_rules::{AuthError, check_auth};
+    let mut pending = match state.db.drain_partial_state_pending_events(room_nid) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "drain_partial_state_pending_events failed");
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+    pending.sort_by_key(|(nid, _)| *nid);
+    for (event_nid, status) in pending {
+        let Some(event_id) = state.db.get_event_id_by_nid(event_nid).ok().flatten() else {
+            continue;
+        };
+        let Some(pdu) =
+            crate::federation::federation_state::load_pdu_by_event_id(&state.db, &event_id)
+        else {
+            continue;
+        };
+        // Build state-before-event from prev_events' CURRENT
+        // snapshots. Earlier iterations of this sweep have already
+        // updated those snapshots; reading them here gives us the
+        // post-revert / post-promote view downstream events will see.
+        let prev_snapshot = pick_prev_snapshot(&state.db, &pdu.prev_events);
+        // Re-run check_auth against the same state-at-event view
+        // that downstream readers will use. state_before_event runs
+        // state_res over each prev's snapshot — for sweep-time the
+        // simpler "use the first prev's snapshot directly" matches
+        // because we process in arrival order and inherited
+        // snapshots have already been corrected.
+        let state_at_event =
+            match crate::federation::federation_state::state_before_event(&state.db, &event_id) {
+                Ok(Some(m)) => m,
+                Ok(None) | Err(_) => continue,
+            };
+        let mut state_at_event = state_at_event;
+        crate::federation::federation_state::ensure_create_in_state(
+            &state.db,
+            room_nid,
+            &mut state_at_event,
+        );
+        crate::federation::federation_state::ensure_sender_member_in_state(
+            &state.db,
+            &pdu.sender,
+            &pdu.auth_events,
+            &mut state_at_event,
+        );
+        let sf = |t: &str, sk: &str| state_at_event.get(&(t.to_string(), sk.to_string()));
+        let passes = !matches!(check_auth(&pdu, &sf), Err(AuthError::Rejected(_)));
+
+        let header = state.db.get_event(event_nid).ok().flatten().map(|(h, _)| h);
+
+        // Apply the soft-fail / state-effect transitions.
+        match (status, passes) {
+            (vela_store::db::Database::PARTIAL_PENDING_ACCEPTED, false) => {
+                if let Err(e) = state.db.mark_soft_failed(event_nid) {
+                    warn!(error = %e, %event_id, "mark_soft_failed (re-verify) failed");
+                }
+                if pdu.state_key.is_some()
+                    && let Err(e) = state.db.revert_state_event(room_nid, event_nid)
+                {
+                    warn!(error = %e, %event_id, "revert_state_event failed");
+                }
+                debug!(%event_id, "MSC3902 re-verify: soft-failed previously-accepted event");
+            }
+            (vela_store::db::Database::PARTIAL_PENDING_SOFT_FAILED_AT_SEND, true) => {
+                if let Err(e) = state.db.unmark_soft_failed(event_nid) {
+                    warn!(error = %e, %event_id, "unmark_soft_failed failed");
+                }
+                if pdu.state_key.is_some()
+                    && let Some(h) = &header
+                    && let Err(e) = state.db.promote_state_event(
+                        room_nid,
+                        event_nid,
+                        h.type_nid,
+                        h.state_key_nid,
+                    )
+                {
+                    warn!(error = %e, %event_id, "promote_state_event (re-verify) failed");
+                }
+                debug!(%event_id, "MSC3902 re-verify: promoted previously-soft-failed event");
+            }
+            _ => {}
+        }
+
+        // Rebuild THIS event's snapshot in place via the inherited
+        // snapshot id. Effective state = prev_snapshot, with this
+        // event's (type, sk) overwriting if this is a non-soft-
+        // failed state event. Writing through rewrite_state_at_event
+        // preserves the snapshot_nid so descendants who inherited
+        // it pick up the new content for free.
+        if let Some(mut content) = prev_snapshot {
+            let is_now_soft_failed = state.db.is_soft_failed(event_nid).unwrap_or(false);
+            if pdu.state_key.is_some()
+                && !is_now_soft_failed
+                && let Some(h) = &header
+            {
+                content.retain(|nid| {
+                    state
+                        .db
+                        .get_event(*nid)
+                        .ok()
+                        .flatten()
+                        .map(|(eh, _)| {
+                            eh.type_nid != h.type_nid || eh.state_key_nid != h.state_key_nid
+                        })
+                        .unwrap_or(true)
+                });
+                content.push(event_nid);
+            }
+            if let Err(e) = state
+                .db
+                .rewrite_state_at_event(room_nid, event_nid, &content)
+            {
+                warn!(error = %e, %event_id, "rewrite_state_at_event (sweep) failed");
+            }
+        }
+    }
+}
+
+/// MSC3902 outbound device-list replay. Drains the room's queued
+/// missed updates and re-fires each to every server now eligible
+/// per the post-clear `servers_in_room` view. Closes the
+/// `Outgoing_device_list_updates/incorrectly_*` cluster.
+async fn replay_pending_dlu(state: &AppState, room_nid: u64) {
+    let pending = match state.db.drain_partial_state_pending_dlu(room_nid) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "drain_partial_state_pending_dlu failed");
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let our_server = state.config.server_name.as_str();
+    let destinations: Vec<String> = state
+        .db
+        .get_remote_servers_in_room(room_nid, our_server)
+        .unwrap_or_default();
+    if destinations.is_empty() {
+        // No remote member knows about this room post-clear — nothing
+        // to do. The queued payloads are dropped (already drained).
+        return;
+    }
+    for (_user_nid, _stream_id, content) in pending {
+        for dest in &destinations {
+            if let Err(e) = state.db.enqueue_device_list_outbound(dest, &content) {
+                warn!(target = %dest, error = %e, "device_list replay enqueue failed");
+                continue;
+            }
+            state.federation_sender.notify_destination(dest);
+        }
+    }
+    debug!(room_nid, "MSC3902 device-list replay fired");
 }
 
 #[cfg(test)]
