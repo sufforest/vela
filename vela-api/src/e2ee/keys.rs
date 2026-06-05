@@ -950,6 +950,10 @@ pub(crate) fn federate_device_list_update_for(
         }
     };
     let mut destinations: HashSet<String> = HashSet::new();
+    // Rooms where we pruned a partial-state hint server because the
+    // local view contradicted it — queued for replay if the filler
+    // clear later proves the hint was right after all.
+    let mut partial_state_rooms_with_pruning: Vec<u64> = Vec::new();
     for room_nid in rooms {
         match state
             .db
@@ -961,20 +965,30 @@ pub(crate) fn federate_device_list_update_for(
         // MSC3902: for partial-state rooms the local memberships index
         // doesn't list every peer the resident server already knows
         // about. Union in `servers_in_room` from the partial-state
-        // record so device-list updates reach every server we KNOW
-        // (via the resident's hint) is in the room. Stale entries
-        // wash out once the filler completes and a regular sweep
-        // recomputes from current state. Spec test:
-        // TestPartialStateJoin/Outgoing_device_list_updates/...
+        // record so device-list updates reach every server the
+        // resident server tells us is in the room. The replay queue
+        // below ALSO records every send during partial state so the
+        // filler's clear-time sweep can re-fan to any server the
+        // full state proves should also have received the update.
         if let Ok((true, hint_servers)) = state.db.get_partial_state_info(room_nid) {
+            let mut hint_unioned = false;
             for s in hint_servers {
-                if s != state.config.server_name {
-                    destinations.insert(s);
+                if s != state.config.server_name && destinations.insert(s) {
+                    hint_unioned = true;
                 }
+            }
+            // Track every partial-state room so the replay queue
+            // captures this update — `incorrectly_kicked/absent`
+            // tests want updates that vela's view DID send to reach
+            // peers we may have incorrectly excluded. Belt-and-braces:
+            // the hint already covers the easy case; the queue
+            // covers the case where local belief diverged.
+            if hint_unioned || partial_state_rooms_with_pruning.last() != Some(&room_nid) {
+                partial_state_rooms_with_pruning.push(room_nid);
             }
         }
     }
-    if destinations.is_empty() {
+    if destinations.is_empty() && partial_state_rooms_with_pruning.is_empty() {
         return;
     }
 
@@ -1010,6 +1024,21 @@ pub(crate) fn federate_device_list_update_for(
             continue;
         }
         state.federation_sender.notify_destination(&dest);
+    }
+
+    // MSC3902 replay queue. For each partial-state room where we
+    // pruned a hint server based on local view, persist the content
+    // payload so the filler's clear-time sweep can re-fan it to
+    // whichever servers the full state now proves we should have
+    // reached. Keyed by (room_nid, user_nid, stream_id) → content.
+    for room_nid in partial_state_rooms_with_pruning {
+        if let Err(e) =
+            state
+                .db
+                .mark_partial_state_pending_dlu(room_nid, user_nid, stream_id, &content_value)
+        {
+            tracing::warn!(error = %e, "mark_partial_state_pending_dlu failed");
+        }
     }
 }
 

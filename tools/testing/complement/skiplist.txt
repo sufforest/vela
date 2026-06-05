@@ -121,13 +121,12 @@
 # follow-up.
 ^TestPartialStateJoin/CanReceiveEventsWithHalfMissingGrandparentsDuringPartialStateJoin$
 
-# State-integrity reconciliation on filler complete — events that
-# vela rejected during partial state (no auth chain visibility) must
-# be re-evaluated once full state arrives, and the converse for
-# events accepted that the full state would reject.
+# Resync_completes_even_when_events_arrive_before_their_prev_events
+# stresses the receive path with 100 outliers + 2 timeline events.
+# The optimistic-accept primitive helps but the test's specific
+# expectation around outlier promotion order remains a separate
+# correctness gap that this PR doesn't yet close.
 ^TestPartialStateJoin/Resync_completes_even_when_events_arrive_before_their_prev_events$
-^TestPartialStateJoin/Rejected_events_remain_rejected_after_resync$
-^TestPartialStateJoin/State_(accepted|rejected)_incorrectly$
 
 # Outgoing device-list updates to "incorrectly absent" / "incorrectly
 # kicked" servers — needs a deferred-track-and-reconcile pass so an

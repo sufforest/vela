@@ -1142,6 +1142,22 @@ pub async fn get_event(
         }
     };
 
+    // Soft-failed events are persisted but MUST NOT be visible to
+    // clients via direct /event lookup or /sync — per spec
+    // §Soft failure and Complement
+    // TestPartialStateJoin/State_(accepted|rejected)_incorrectly,
+    // which assert 404 on the event_id of a soft-failed entry. The
+    // MSC3902 re-verify sweep flips this marker on or off as full
+    // state arrives; whatever its current state, that's the truth
+    // we serve.
+    if state
+        .db
+        .is_soft_failed(event_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    {
+        return Err(VelaError::NotFound("event not found".into()).into());
+    }
+
     let visibility = current_history_visibility(&state, room_nid)?;
     let membership = state
         .db

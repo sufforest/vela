@@ -237,4 +237,29 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // device_lists.changed for the user, which always invalidates
     // here first.
     "remote_device_keys_cache",
+    // MSC3902 state-integrity reconciliation: events accepted (or
+    // soft-failed) during a partial-state window that need to be
+    // re-verified once the filler completes. Key:
+    // `[room_nid:8] | [event_nid:8]`. Value: 1 byte status —
+    //   0 = accepted (state effect applied at /send time)
+    //   1 = soft-failed (state effect NOT applied at /send time)
+    // On filler clear the re-verify sweep drains the room's entries:
+    // passed events stay accepted (or get promoted if they were soft-
+    // failed); failed events get soft-failed and their state effect
+    // reverted via `state_replaces`. Spec tests:
+    // State_accepted_incorrectly, State_rejected_incorrectly,
+    // Rejected_events_remain_rejected_after_resync.
+    "partial_state_pending_events",
+    // MSC3902 device-list replay buffer: outbound m.device_list_
+    // update content for a LOCAL user that didn't reach every
+    // resident peer because vela's partial-state view of the
+    // memberships excluded them. Key:
+    // `[room_nid:8] | [user_nid:8] | [stream_id:8]`. Value: JSON
+    // content as it would be enqueued to a remote server's outbox.
+    // On filler clear the re-verify sweep recomputes destinations
+    // from the now-full state and replays each pending entry to any
+    // server it didn't originally reach. Spec tests:
+    // Outgoing_device_list_updates/Device_list_updates_reach_
+    // incorrectly_(kicked|absent)_*.
+    "partial_state_pending_dlu",
 ];
