@@ -386,6 +386,21 @@ async fn merge_state_response(
     room_nid: u64,
     resp: &Value,
 ) -> Result<MergeOutcome, String> {
+    // Snapshot membership BEFORE the merge so reconcile_device_lists
+    // can fire only for users genuinely joined by this pass. Users
+    // already in the bundle's `state` (bootstrap set their
+    // membership) had `device_lists.changed` surfaced via the normal
+    // `handle_device_list_update` observer path during partial state;
+    // re-announcing them post-clear shows up as a spurious entry on
+    // /sync and trips CheckOff-style tests
+    // (CanReceiveDeviceListUpdateDuringPartialStateJoin).
+    let members_before: std::collections::HashSet<u64> = state
+        .db
+        .get_room_members(room_nid)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
     let auth_chain = resp
         .get("auth_chain")
         .and_then(|v| v.as_array())
@@ -579,8 +594,38 @@ async fn merge_state_response(
             .map_err(|e| format!("db: {e}"))?;
         let _ = state.db.set_membership(room_nid, member_nid, b);
     }
+
+    // Compute the membership diff for reconcile: members joined as a
+    // result of this merge AND hosted on a remote server. Local users
+    // can't have device lists "appear" via the filler — they manage
+    // their own state — and pre-existing remote members already saw
+    // their EDU-driven notifications during partial state.
+    let our_server = state.config.server_name.as_str();
+    let mut newly_joined_remote_nids: Vec<u64> = Vec::new();
+    let members_after = state.db.get_room_members(room_nid).unwrap_or_default();
+    for nid in &members_after {
+        if members_before.contains(nid) {
+            continue;
+        }
+        if let Ok(Some(uid)) = state.db.resolve_nid(*nid)
+            && let Some((_, domain)) = uid.split_once(':')
+            && domain != our_server
+        {
+            newly_joined_remote_nids.push(*nid);
+        }
+    }
+    // The persist-path "newly_added_user_nids" tracked nid additions
+    // only when the member EVENT was freshly persisted; users known
+    // from the auth_chain pass but with no `memberships` row (the
+    // common partial-state case for pre-existing peers) were missed.
+    // Union them in so the reconcile covers both shapes.
+    for nid in &newly_added_user_nids {
+        if !newly_joined_remote_nids.contains(nid) && !members_before.contains(nid) {
+            newly_joined_remote_nids.push(*nid);
+        }
+    }
     Ok(MergeOutcome {
-        newly_added_user_nids,
+        newly_added_user_nids: newly_joined_remote_nids,
     })
 }
 
@@ -617,8 +662,8 @@ pub fn _reset_for_test(state: &AppState) {
 /// genuinely "didn't know about" — re-firing for already-known peers
 /// surfaces spurious `device_lists.changed` entries that don't
 /// correspond to any actual device change.
-fn reconcile_device_lists(state: &AppState, room_nid: u64, newly_added_user_nids: &[u64]) {
-    if newly_added_user_nids.is_empty() {
+fn reconcile_device_lists(state: &AppState, room_nid: u64, newly_joined_remote_nids: &[u64]) {
+    if newly_joined_remote_nids.is_empty() {
         return;
     }
     let members_after = match state.db.get_room_members(room_nid) {
@@ -628,19 +673,6 @@ fn reconcile_device_lists(state: &AppState, room_nid: u64, newly_added_user_nids
             return;
         }
     };
-    // Filter to peers who are still actually joined to the room post-
-    // merge. Defensive — a member event could in principle be applied
-    // and then immediately superseded by a later leave landing in the
-    // same batch.
-    let members_after_set: std::collections::HashSet<u64> = members_after.iter().copied().collect();
-    let new_peers: Vec<u64> = newly_added_user_nids
-        .iter()
-        .copied()
-        .filter(|n| members_after_set.contains(n))
-        .collect();
-    if new_peers.is_empty() {
-        return;
-    }
     // Local observers = every member of this room hosted on us.
     let our_server = state.config.server_name.as_str();
     let mut local_observers: Vec<u64> = Vec::new();
@@ -657,7 +689,21 @@ fn reconcile_device_lists(state: &AppState, room_nid: u64, newly_added_user_nids
     if local_observers.is_empty() {
         return;
     }
-    for &peer_nid in &new_peers {
+    // Only fire for newly-joined remote users who actually had a
+    // device-list update buffered during partial state. Surfacing
+    // every remote member as `device_lists.changed` would be
+    // conservative-but-wrong: the CanReceiveDeviceListUpdate test
+    // uses strict CheckOff and fails on any unexpected entry, and
+    // most pre-existing members never sent an EDU at all.
+    let mut notified = 0usize;
+    for &peer_nid in newly_joined_remote_nids {
+        let had_pending = state
+            .db
+            .has_pending_partial_device_list_edu(peer_nid)
+            .unwrap_or(false);
+        if !had_pending {
+            continue;
+        }
         let stream_pos = state.db.next_stream_position().as_u64();
         let _stream_guard = vela_store::db::StreamApplyOnDrop::new(&state.db, stream_pos);
         if let Err(e) = state
@@ -667,13 +713,16 @@ fn reconcile_device_lists(state: &AppState, room_nid: u64, newly_added_user_nids
             warn!(error = %e, peer_nid, "device_list reconciliation: notify failed");
             continue;
         }
+        let _ = state.db.clear_pending_partial_device_list_edu(peer_nid);
         for &nid in &local_observers {
             crate::router::notify_user(state, nid);
         }
+        notified += 1;
     }
     debug!(
         room_nid,
-        new_peers = new_peers.len(),
+        candidates = newly_joined_remote_nids.len(),
+        notified,
         observers = local_observers.len(),
         "MSC3706 device_list reconciliation fired",
     );

@@ -4770,6 +4770,98 @@ impl Database {
         Ok(result)
     }
 
+    // --- E2EE: Pending partial-state device-list EDU buffer ---
+
+    /// Mark a remote user as having sent an m.device_list_update EDU
+    /// during a partial-state window in which we had no observable
+    /// rooms shared with them. The filler's post-clear reconcile
+    /// drains this set so the just-known members surface in
+    /// `device_lists.changed` on the next /sync.
+    pub fn mark_pending_partial_device_list_edu(
+        &self,
+        user_nid: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self
+            .db
+            .cf_handle("pending_partial_device_list_edu")
+            .unwrap();
+        self.db.put_cf(&cf, keys::encode_u64(user_nid), b"")
+    }
+
+    /// True if `user_nid` has a buffered partial-state EDU pending
+    /// replay. Read by `reconcile_device_lists` to scope its post-
+    /// clear notifications to users whose device list actually moved
+    /// during the resync window.
+    pub fn has_pending_partial_device_list_edu(
+        &self,
+        user_nid: u64,
+    ) -> Result<bool, rocksdb::Error> {
+        let cf = self
+            .db
+            .cf_handle("pending_partial_device_list_edu")
+            .unwrap();
+        Ok(self.db.get_cf(&cf, keys::encode_u64(user_nid))?.is_some())
+    }
+
+    /// Drop a pending-EDU marker after it's been replayed. Idempotent.
+    pub fn clear_pending_partial_device_list_edu(
+        &self,
+        user_nid: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self
+            .db
+            .cf_handle("pending_partial_device_list_edu")
+            .unwrap();
+        self.db.delete_cf(&cf, keys::encode_u64(user_nid))
+    }
+
+    // --- E2EE: Remote device keys cache ---
+
+    /// Cache the `/user/keys/query` response for a remote user. The
+    /// payload is the full response shape we'd return to a C2S
+    /// caller: `devices` map plus the three cross-signing keys when
+    /// present. Subsequent C2S `/keys/query` calls for this user
+    /// short-circuit at `get_remote_user_keys_cache` instead of
+    /// firing a federation round-trip. Invalidated by
+    /// `invalidate_remote_user_keys_cache` on every inbound
+    /// m.device_list_update EDU for the user (and on membership
+    /// transitions that drop the user out of every shared room).
+    pub fn cache_remote_user_keys(
+        &self,
+        user_nid: u64,
+        payload: &Value,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("remote_device_keys_cache").unwrap();
+        self.db.put_cf(
+            &cf,
+            keys::encode_u64(user_nid),
+            payload.to_string().as_bytes(),
+        )
+    }
+
+    /// Look up a cached `/user/keys/query` response for a remote
+    /// user. `None` means "miss" — caller federates.
+    pub fn get_remote_user_keys_cache(
+        &self,
+        user_nid: u64,
+    ) -> Result<Option<Value>, rocksdb::Error> {
+        let cf = self.db.cf_handle("remote_device_keys_cache").unwrap();
+        match self.db.get_cf(&cf, keys::encode_u64(user_nid))? {
+            Some(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+            None => Ok(None),
+        }
+    }
+
+    /// Drop any cached `/user/keys/query` response for the user. Fired
+    /// by `handle_device_list_update` (any inbound m.device_list_update
+    /// EDU is a "your cache is stale" signal regardless of what the EDU
+    /// itself carries) and by the membership path when the user leaves
+    /// every shared room.
+    pub fn invalidate_remote_user_keys_cache(&self, user_nid: u64) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("remote_device_keys_cache").unwrap();
+        self.db.delete_cf(&cf, keys::encode_u64(user_nid))
+    }
+
     // --- E2EE: Device key changes ---
 
     /// Record that `changed_user_nid`'s device / cross-signing keys have
@@ -7357,6 +7449,89 @@ mod stream_recovery_tests {
             nids.iter().next().copied(),
             Some(resolved),
             "persisted NID disagrees with returned NIDs"
+        );
+    }
+}
+
+#[cfg(test)]
+mod remote_device_keys_cache_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fresh_db() -> (Database, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        (db, tmp)
+    }
+
+    /// Round-trip: a cached payload reads back byte-identical.
+    /// This is the property the C2S `/keys/query` short-circuit
+    /// depends on.
+    #[test]
+    fn round_trip_cached_payload() {
+        let (db, _tmp) = fresh_db();
+        let user_nid = db.get_or_create_nid("@alice:remote").unwrap();
+        let payload = json!({
+            "devices": {"DEV_A": {"keys": {"ed25519:DEV_A": "abc"}}},
+            "master_key": {"keys": {"ed25519:m": "def"}},
+        });
+        db.cache_remote_user_keys(user_nid, &payload).unwrap();
+        let got = db.get_remote_user_keys_cache(user_nid).unwrap();
+        assert_eq!(got, Some(payload));
+    }
+
+    /// A user with nothing cached returns None. Without this the
+    /// /keys/query path can't tell "no cache" apart from "empty
+    /// devices set" and either always federates or never federates.
+    #[test]
+    fn cache_miss_returns_none() {
+        let (db, _tmp) = fresh_db();
+        let user_nid = db.get_or_create_nid("@bob:remote").unwrap();
+        assert_eq!(db.get_remote_user_keys_cache(user_nid).unwrap(), None);
+    }
+
+    /// `invalidate_remote_user_keys_cache` drops the entry. EDU loss
+    /// regression: an m.device_list_update for a user must wipe the
+    /// cache so the next /keys/query refetches.
+    #[test]
+    fn invalidate_drops_cache() {
+        let (db, _tmp) = fresh_db();
+        let user_nid = db.get_or_create_nid("@carol:remote").unwrap();
+        db.cache_remote_user_keys(user_nid, &json!({"devices": {}}))
+            .unwrap();
+        assert!(db.get_remote_user_keys_cache(user_nid).unwrap().is_some());
+        db.invalidate_remote_user_keys_cache(user_nid).unwrap();
+        assert_eq!(db.get_remote_user_keys_cache(user_nid).unwrap(), None);
+    }
+
+    /// Invalidating an already-absent user is a no-op, not an error
+    /// — the leave path may invalidate users we never cached.
+    #[test]
+    fn invalidate_absent_user_is_noop() {
+        let (db, _tmp) = fresh_db();
+        let user_nid = db.get_or_create_nid("@dave:remote").unwrap();
+        assert!(db.invalidate_remote_user_keys_cache(user_nid).is_ok());
+    }
+
+    /// Re-caching overwrites; two distinct users don't collide. The
+    /// CF is per-user-nid keyed so the absence of any cross-user
+    /// leakage is structural, but lock it down with a test in case
+    /// the key encoding ever changes.
+    #[test]
+    fn distinct_users_isolated_overwrite() {
+        let (db, _tmp) = fresh_db();
+        let a = db.get_or_create_nid("@a:remote").unwrap();
+        let b = db.get_or_create_nid("@b:remote").unwrap();
+        db.cache_remote_user_keys(a, &json!({"v": 1})).unwrap();
+        db.cache_remote_user_keys(b, &json!({"v": 2})).unwrap();
+        db.cache_remote_user_keys(a, &json!({"v": 3})).unwrap();
+        assert_eq!(
+            db.get_remote_user_keys_cache(a).unwrap(),
+            Some(json!({"v": 3}))
+        );
+        assert_eq!(
+            db.get_remote_user_keys_cache(b).unwrap(),
+            Some(json!({"v": 2}))
         );
     }
 }

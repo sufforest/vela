@@ -135,10 +135,15 @@
 # server actually IS still in the room.
 ^TestPartialStateJoin/Outgoing_device_list_updates/Device_list_updates_reach_incorrectly_(kicked|absent)_servers_once_partial_state_join_completes(_even_though_remote_server_left_room)?$
 
-# Device-list tracking sub-suite — none pass yet; the whole family
-# needs the same track-and-reconcile pass + a remote-user
-# user_devices tracking layer that updates on filler clear.
-^TestPartialStateJoin/Device_list_tracking/
+# Device-list tracking — remaining subtests need the same
+# state-integrity reconciliation as the State_ tests above so vela
+# can re-evaluate "incorrectly believed to be in room" once full
+# state arrives; the simpler cases (pre-existing-member EDU
+# replay, new-member tracking, leave detection) are now covered by
+# the cache + pending-EDU buffer.
+^TestPartialStateJoin/Device_list_tracking/Device_list_tracking_when_pre-existing_members_in_partial_state_room_join_another_shared_room$
+^TestPartialStateJoin/Device_list_tracking/Device_list_no_longer_tracked_for_user_incorrectly_believed_to_be_in_room$
+^TestPartialStateJoin/Device_list_tracking/Device_list_tracking_for_user_incorrectly_believed_to_be_in_room_when_they_rejoin_after_partial_state_join_completes$
 
 # Leave_during_resync/can_be_triggered_by_remote_ban — sibling
 # subtests pass; this one wants the ban event to land before the

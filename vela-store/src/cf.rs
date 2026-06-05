@@ -211,4 +211,30 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // In-memory DashMap on AppState mirrors this CF for fast scheduler
     // scans; the CF is the source of truth across restarts.
     "delayed_events",
+    // Pending m.device_list_update EDUs received during a partial
+    // state join. When such an EDU arrives for a remote user we don't
+    // yet have a `memberships` row for (the bundle omitted them),
+    // `handle_device_list_update`'s observer walk finds nobody and
+    // the notification would be lost. We record the user_nid here
+    // instead; on filler-clear the device_list reconcile sweeps the
+    // pending set so the now-known members surface in
+    // device_lists.changed on the next /sync. Key: user_nid u64 BE.
+    // Value: empty marker. Cleared per-user on replay.
+    "pending_partial_device_list_edu",
+    // Cached `/user/keys/query` responses for REMOTE users, keyed by
+    // their nid. Value: serde JSON of
+    //   { "devices": { device_id: device_keys, ... },
+    //     "master_key"?: cross_signing_key,
+    //     "self_signing_key"?: cross_signing_key,
+    //     "user_signing_key"?: cross_signing_key }
+    // Vela's C2S `/keys/query` consults this cache before fanning out
+    // a federation call — without it, every encrypted-room client hits
+    // the network on every key fetch. The cache is invalidated by
+    // `handle_device_list_update` (any inbound m.device_list_update EDU
+    // for the user) and by membership changes that drop the user out
+    // of every room shared with a local observer. EDU loss is
+    // tolerated: clients refetch on the next /sync that surfaces
+    // device_lists.changed for the user, which always invalidates
+    // here first.
+    "remote_device_keys_cache",
 ];
