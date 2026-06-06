@@ -1,3 +1,4 @@
+pub mod diagnose;
 pub mod media;
 pub mod membership;
 pub mod rooms;

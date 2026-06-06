@@ -71,6 +71,11 @@ enum Cmd {
     /// flags the kind of drift that surfaces as 403 "sender is not
     /// joined" while the pre-check passes.
     DiagnoseMembership { room_id: String, user_id: String },
+    /// Health probe: database stream position, partial-state rooms
+    /// still resyncing, federation outbound queues, recent activity.
+    /// One screen, useful right after a deploy or when a friend says
+    /// "is the server up?"
+    Diagnose,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -90,6 +95,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::DiagnoseMembership { room_id, user_id } => {
             cmd::membership::run(&db, &room_id, &user_id)
         }
+        Cmd::Diagnose => cmd::diagnose::run(&db),
     }
 }
 
