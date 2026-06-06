@@ -91,6 +91,43 @@ pub fn ensure_create_in_state(
 /// the sender's member entry, this is a no-op. We only fill the
 /// hole; we never overwrite (so a later leave/ban present in
 /// state is respected).
+/// True if any event in `auth_events` is an m.room.member event for
+/// `sender` declaring membership ∈ {join, invite, knock}. Used by
+/// the Check 5 self-leave exemption: when state-at-event has been
+/// poisoned by an upstream optimistically-accepted bad-kick, the
+/// real self-leave's auth_events still carry proof of the sender's
+/// actual prior membership. The auth rule requires invite/join/knock;
+/// if the auth chain shows one of those, the leave is consistent with
+/// the sender's authoritative-but-not-yet-resynced view.
+pub fn auth_events_declare_prior_membership_allowing_leave(
+    db: &Database,
+    sender: &str,
+    auth_events: &[String],
+) -> bool {
+    for aid in auth_events {
+        let Some(json) = load_event_json_by_event_id(db, aid) else {
+            continue;
+        };
+        let Some(obj) = json.as_object() else {
+            continue;
+        };
+        let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let sk = obj.get("state_key").and_then(|v| v.as_str()).unwrap_or("");
+        if ty != "m.room.member" || sk != sender {
+            continue;
+        }
+        let mem = obj
+            .get("content")
+            .and_then(|c| c.get("membership"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if matches!(mem, "join" | "invite" | "knock") {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn ensure_sender_member_in_state(
     db: &Database,
     sender: &str,
