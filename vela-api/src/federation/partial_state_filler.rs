@@ -905,17 +905,40 @@ async fn replay_pending_dlu(state: &AppState, room_nid: u64) {
         return;
     }
     let our_server = state.config.server_name.as_str();
-    let destinations: Vec<String> = state
+    // Union currently-joined remotes with every remote we observed
+    // holding any membership during the partial-state window. The
+    // "even_though_remote_server_left_room" variants of the
+    // incorrectly_(kicked|absent) tests leave the room before the
+    // filler clears — get_remote_servers_in_room alone would skip
+    // them. The device-list update was emitted while they were
+    // members; spec requires us to deliver it now.
+    let mut full_destinations: std::collections::HashSet<String> = state
         .db
         .get_remote_servers_in_room(room_nid, our_server)
-        .unwrap_or_default();
-    if destinations.is_empty() {
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if let Ok(observed) = state
+        .db
+        .get_room_observed_member_servers(room_nid, our_server)
+    {
+        full_destinations.extend(observed);
+    }
+    if full_destinations.is_empty() {
         // No remote member knows about this room post-clear — nothing
         // to do. The queued payloads are dropped (already drained).
         return;
     }
-    for (_user_nid, _stream_id, content) in pending {
-        for dest in &destinations {
+    for (_user_nid, _stream_id, content, sent_to) in pending {
+        // Subtract destinations that already received the live
+        // emission. Without this, the departed-servers test sees a
+        // double-delivery on the same stream_id: the live send went
+        // to server2 via the hint union, and we'd resend here.
+        let already: std::collections::HashSet<String> = sent_to.into_iter().collect();
+        for dest in &full_destinations {
+            if already.contains(dest) {
+                continue;
+            }
             if let Err(e) = state.db.enqueue_device_list_outbound(dest, &content) {
                 warn!(target = %dest, error = %e, "device_list replay enqueue failed");
                 continue;

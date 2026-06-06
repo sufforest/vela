@@ -1347,7 +1347,18 @@ async fn persist_received_pdu(
             .db
             .mark_soft_failed(event_nid)
             .map_err(|e| format!("db: {e}"))?;
-    } else {
+    }
+
+    // Notify local sync listeners. /sync surfaces soft-failed events
+    // (no filter), and during MSC3902 partial state an optimistically
+    // soft-failed event may flip to accepted on re-verify, so the
+    // wake-up needs to fire either way. Without it, alice's
+    // long-poll never sees a partial-state ban/leave landing.
+    if let Some(sender_ch) = state.room_senders.get(&Nid(room_nid)) {
+        let _ = sender_ch.send(stream_pos);
+    }
+
+    if !soft_failed {
         // If this is a redaction and the target is on-disk, apply a marker
         // when the sender is actually allowed to redact it. Missing-target
         // case is logged and skipped; back-filling later is future work.
@@ -1360,11 +1371,6 @@ async fn persist_received_pdu(
             state, pdu, event_nid, stream_pos, type_nid, room_nid, sender_nid,
         );
 
-        // Notify local sync listeners only for non-soft-failed events.
-        if let Some(sender_ch) = state.room_senders.get(&Nid(room_nid)) {
-            let _ = sender_ch.send(stream_pos);
-        }
-
         // Relay to other resident remotes. The peer that sent us this
         // PDU only knows about the destinations IT could reach. We're
         // a hub for the room's other peers; without this fan-out a
@@ -1372,9 +1378,23 @@ async fn persist_received_pdu(
         // unless B itself federates to C (and B doesn't always know
         // who's in the room beyond its own peer list). Skip the
         // transaction origin too — they just told us, no point echoing.
-        state
-            .federation_sender
-            .broadcast_excluding(room_nid, event_nid, Some(origin));
+        //
+        // Suppressed during partial state. Optimistic-accept means
+        // we can't yet tell a valid event from a soft-fail-bound one,
+        // and forwarding a doomed event to peers is a spec violation
+        // — the resident server is authoritative for fanout until
+        // our resync completes. Closes
+        // Outgoing_device_list_updates/Device_list_updates_reach_incorrectly_kicked_*.
+        let is_partial = state
+            .db
+            .get_partial_state_info(room_nid)
+            .map(|(p, _)| p)
+            .unwrap_or(false);
+        if !is_partial {
+            state
+                .federation_sender
+                .broadcast_excluding(room_nid, event_nid, Some(origin));
+        }
 
         // Push dispatch. The local-send path in send.rs does the same
         // — without this call, mobile clients get no notifications for

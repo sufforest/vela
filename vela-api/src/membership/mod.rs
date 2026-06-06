@@ -219,6 +219,16 @@ async fn do_join(
         return Ok(Json(json!({"room_id": room_id.as_str()})));
     }
 
+    // A locally-recorded ban must reject any rejoin attempt before we
+    // touch the remote side. Without this, a federated room would fall
+    // through to do_remote_join, and a resident server that hasn't yet
+    // propagated the ban back to itself can return 200, surfacing as
+    // an incorrect-but-successful rejoin.
+    if current == Some(3) {
+        // 3 = ban
+        return Err(VelaError::Forbidden("user is banned from the room".into()).into());
+    }
+
     // Federated invite case: the room NID exists locally because we
     // persisted an invite (plus stripped state) delivered via
     // /_matrix/federation/v2/invite, but the room is actually hosted
@@ -3189,6 +3199,38 @@ mod tests {
         .expect_err("unknown room is 404");
         let msg = format!("{}", err.0);
         assert!(msg.contains("not found"), "want not-found, got {msg}");
+    }
+
+    /// /join on a room where the caller is locally banned must return
+    /// 403 — the local ban state takes precedence over any rejoin
+    /// attempt, federated or otherwise. Pins the partial-state
+    /// `Leave_during_resync/can_be_triggered_by_remote_ban` regression.
+    #[tokio::test]
+    async fn join_room_rejects_banned_user() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!banned-rejoin:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let user_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        db.set_membership(room_nid, user_nid, 3).unwrap(); // ban
+
+        let err = join_room(
+            State(state.clone()),
+            user(user_nid, "@alice:example.com"),
+            Path(room_id.to_string()),
+            RawQuery(None),
+            Bytes::new(),
+        )
+        .await
+        .expect_err("banned rejoin must be forbidden");
+        match err {
+            ApiError(VelaError::Forbidden(reason)) => {
+                assert!(reason.contains("banned"), "reason: {reason}");
+            }
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+        // Membership unchanged — guard must not silently overwrite ban.
+        assert_eq!(db.get_membership(room_nid, user_nid).unwrap(), Some(3));
     }
 
     /// `membership_u8` maps spec strings to the internal byte

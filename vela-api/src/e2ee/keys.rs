@@ -1018,6 +1018,7 @@ pub(crate) fn federate_device_list_update_for(
     }
     let content_value = Value::Object(content);
 
+    let sent_destinations: Vec<String> = destinations.iter().cloned().collect();
     for dest in destinations {
         if let Err(e) = state.db.enqueue_device_list_outbound(&dest, &content_value) {
             tracing::warn!(target = %dest, error = %e, "device_list enqueue failed");
@@ -1030,13 +1031,17 @@ pub(crate) fn federate_device_list_update_for(
     // pruned a hint server based on local view, persist the content
     // payload so the filler's clear-time sweep can re-fan it to
     // whichever servers the full state now proves we should have
-    // reached. Keyed by (room_nid, user_nid, stream_id) → content.
+    // reached. Records the live destinations so the replay skips
+    // duplicate delivery to peers that already received this stream_id.
+    // Keyed by (room_nid, user_nid, stream_id) → {content, sent_to}.
     for room_nid in partial_state_rooms_with_pruning {
-        if let Err(e) =
-            state
-                .db
-                .mark_partial_state_pending_dlu(room_nid, user_nid, stream_id, &content_value)
-        {
+        if let Err(e) = state.db.mark_partial_state_pending_dlu(
+            room_nid,
+            user_nid,
+            stream_id,
+            &content_value,
+            &sent_destinations,
+        ) {
             tracing::warn!(error = %e, "mark_partial_state_pending_dlu failed");
         }
     }
