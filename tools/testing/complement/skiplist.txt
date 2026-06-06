@@ -89,16 +89,6 @@
 # unauthenticated download endpoint disabled by default).
 ^TestMediaWithoutFileName/parallel/Can_download_without_a_file_name_over_federation$
 
-# MSC4297 state-resolution v2.1. The new algorithm ("conflicted
-# subgraph" derivation) materially changes how state res handles
-# auth chains across forks, with fairly subtle convergence
-# requirements. We're on v2 and have deferred v2.1 — it's the
-# single biggest blast-radius change we could make to event
-# acceptance, and we're not taking it on as part of the parity
-# sprint. Skiplisted until/unless we choose to do that work.
-^TestMSC4297StateResolutionV2_1_includes_conflicted_subgraph$
-^TestMSC4297StateResolutionV2_1_starts_from_empty_set$
-
 # Complement test is incompatible with v12-default servers: it uses
 # `alice.GetDefaultRoomVersion(t)` for the room (we return v12) but
 # signs the "bad" event as RoomVersionV5, and gomatrixserverlib's v5
@@ -111,18 +101,17 @@
 # are grouped below by the gap they're waiting on. Run via
 # `./tests/msc3902` (PACKAGES in run.sh).
 
-# Resync_completes_even_when_events_arrive_before_their_prev_events
-# stresses the receive path with 100 outliers + 2 timeline events.
-# The optimistic-accept primitive helps but the test's specific
-# expectation around outlier promotion order remains a separate
-# correctness gap that this PR doesn't yet close.
-^TestPartialStateJoin/Resync_completes_even_when_events_arrive_before_their_prev_events$
-
-# Outgoing device-list updates to "incorrectly absent" / "incorrectly
-# kicked" servers — needs a deferred-track-and-reconcile pass so an
-# EDU sent during partial state lands once the filler reveals the
-# server actually IS still in the room.
-^TestPartialStateJoin/Outgoing_device_list_updates/Device_list_updates_reach_incorrectly_(kicked|absent)_servers_once_partial_state_join_completes(_even_though_remote_server_left_room)?$
+# Outgoing device-list update to an "incorrectly kicked" server when
+# that server has since left the partial-state room. The remaining
+# corner case in the outgoing-DLU cluster: the bad-kick is accepted
+# at receive (state-at-event doesn't see derek=leave because the
+# partial-state snapshot at alice's join is missing derek's member
+# event) so the server2 self-leave that comes next is itself
+# soft-failed, which means alice's /sync never surfaces the leave
+# during partial state and the test setup times out. Fixing this
+# needs a partial-state snapshot that includes ALL pre-join member
+# events from send_join, not just the joining user's chain.
+^TestPartialStateJoin/Outgoing_device_list_updates/Device_list_updates_reach_incorrectly_kicked_servers_once_partial_state_join_completes_even_though_remote_server_left_room$
 
 # Device-list tracking — remaining subtests need the same
 # state-integrity reconciliation as the State_ tests above so vela
@@ -134,7 +123,3 @@
 ^TestPartialStateJoin/Device_list_tracking/Device_list_no_longer_tracked_for_user_incorrectly_believed_to_be_in_room$
 ^TestPartialStateJoin/Device_list_tracking/Device_list_tracking_for_user_incorrectly_believed_to_be_in_room_when_they_rejoin_after_partial_state_join_completes$
 
-# Leave_during_resync/can_be_triggered_by_remote_ban — sibling
-# subtests pass; this one wants the ban event to land before the
-# partial state clears, which races our current eager-merge path.
-^TestPartialStateJoin/Leave_during_resync/can_be_triggered_by_remote_ban$

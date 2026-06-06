@@ -5041,26 +5041,37 @@ impl Database {
         user_nid: u64,
         stream_id: u64,
         content: &Value,
+        already_sent: &[String],
     ) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("partial_state_pending_dlu").unwrap();
         let mut key = Vec::with_capacity(24);
         key.extend_from_slice(&keys::encode_u64(room_nid));
         key.extend_from_slice(&keys::encode_u64(user_nid));
         key.extend_from_slice(&keys::encode_u64(stream_id));
-        self.db.put_cf(&cf, &key, content.to_string().as_bytes())
+        // Envelope: {content, sent_to}. sent_to lets the filler-clear
+        // replay skip destinations that already received the live
+        // emission, so the departed-servers test doesn't see a
+        // double-delivery on the same stream_id.
+        let envelope = serde_json::json!({
+            "content": content,
+            "sent_to": already_sent,
+        });
+        self.db.put_cf(&cf, &key, envelope.to_string().as_bytes())
     }
 
     /// Drain the room's queued device-list updates. Returns each
-    /// `(user_nid, stream_id, content_value)` in stream_id order so
-    /// replays preserve the original sequence even when multiple
-    /// users changed during the partial-state window.
+    /// `(user_nid, stream_id, content_value, already_sent)` in
+    /// stream_id order so replays preserve the original sequence even
+    /// when multiple users changed during the partial-state window.
+    /// `already_sent` is the set of destinations that received the
+    /// live emission and must be excluded from replay.
     pub fn drain_partial_state_pending_dlu(
         &self,
         room_nid: u64,
-    ) -> Result<Vec<(u64, u64, Value)>, rocksdb::Error> {
+    ) -> Result<Vec<(u64, u64, Value, Vec<String>)>, rocksdb::Error> {
         let cf = self.db.cf_handle("partial_state_pending_dlu").unwrap();
         let prefix = keys::encode_u64(room_nid);
-        let mut out: Vec<(u64, u64, Value)> = Vec::new();
+        let mut out: Vec<(u64, u64, Value, Vec<String>)> = Vec::new();
         let iter = self.db.prefix_iterator_cf(&cf, prefix);
         for item in iter {
             let (key, val) = item?;
@@ -5069,14 +5080,32 @@ impl Database {
             }
             let user_nid = keys::decode_u64(&key[8..16]);
             let stream_id = keys::decode_u64(&key[16..24]);
-            let content: Value = match serde_json::from_slice(&val) {
+            let envelope: Value = match serde_json::from_slice(&val) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            out.push((user_nid, stream_id, content));
+            // Legacy entries (pre-envelope) stored the content
+            // directly. Detect by absence of the "content" key and
+            // fall back to using the whole value as content.
+            let (content, sent_to): (Value, Vec<String>) = match envelope.get("content") {
+                Some(c) => {
+                    let sent_to = envelope
+                        .get("sent_to")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|s| s.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (c.clone(), sent_to)
+                }
+                None => (envelope, Vec::new()),
+            };
+            out.push((user_nid, stream_id, content, sent_to));
         }
         let mut batch = WriteBatch::default();
-        for (user_nid, stream_id, _) in &out {
+        for (user_nid, stream_id, _, _) in &out {
             let mut key = Vec::with_capacity(24);
             key.extend_from_slice(&keys::encode_u64(room_nid));
             key.extend_from_slice(&keys::encode_u64(*user_nid));
@@ -8052,19 +8081,19 @@ mod partial_state_pending_dlu_tests {
     #[test]
     fn drain_returns_stream_id_ordered() {
         let (db, _tmp) = fresh_db();
-        db.mark_partial_state_pending_dlu(1, 100, 30, &json!({"v": "c"}))
+        db.mark_partial_state_pending_dlu(1, 100, 30, &json!({"v": "c"}), &[])
             .unwrap();
-        db.mark_partial_state_pending_dlu(1, 100, 10, &json!({"v": "a"}))
+        db.mark_partial_state_pending_dlu(1, 100, 10, &json!({"v": "a"}), &[])
             .unwrap();
-        db.mark_partial_state_pending_dlu(1, 100, 20, &json!({"v": "b"}))
+        db.mark_partial_state_pending_dlu(1, 100, 20, &json!({"v": "b"}), &[])
             .unwrap();
         let drained = db.drain_partial_state_pending_dlu(1).unwrap();
         assert_eq!(
             drained,
             vec![
-                (100, 10, json!({"v": "a"})),
-                (100, 20, json!({"v": "b"})),
-                (100, 30, json!({"v": "c"})),
+                (100, 10, json!({"v": "a"}), Vec::<String>::new()),
+                (100, 20, json!({"v": "b"}), Vec::<String>::new()),
+                (100, 30, json!({"v": "c"}), Vec::<String>::new()),
             ]
         );
     }
@@ -8074,14 +8103,62 @@ mod partial_state_pending_dlu_tests {
     #[test]
     fn drain_is_destructive_and_per_room() {
         let (db, _tmp) = fresh_db();
-        db.mark_partial_state_pending_dlu(1, 10, 1, &json!({}))
+        db.mark_partial_state_pending_dlu(1, 10, 1, &json!({}), &[])
             .unwrap();
-        db.mark_partial_state_pending_dlu(2, 20, 1, &json!({}))
+        db.mark_partial_state_pending_dlu(2, 20, 1, &json!({}), &[])
             .unwrap();
         let _ = db.drain_partial_state_pending_dlu(1).unwrap();
         assert!(db.drain_partial_state_pending_dlu(1).unwrap().is_empty());
         let room2 = db.drain_partial_state_pending_dlu(2).unwrap();
         assert_eq!(room2.len(), 1, "room 2's queue must survive room 1's drain");
+    }
+
+    /// Legacy entries (PR #135 format) stored the content directly
+    /// without the envelope wrapper. After upgrade those entries must
+    /// still drain cleanly so we don't lose them or send Null
+    /// payloads to peers.
+    #[test]
+    fn drain_handles_legacy_pre_envelope_entries() {
+        let (db, _tmp) = fresh_db();
+        // Write a raw legacy value (the old put_cf bypassed the
+        // envelope; emulate it by writing through the raw CF).
+        let cf = db.db.cf_handle("partial_state_pending_dlu").unwrap();
+        let mut key = Vec::with_capacity(24);
+        key.extend_from_slice(&keys::encode_u64(7));
+        key.extend_from_slice(&keys::encode_u64(99));
+        key.extend_from_slice(&keys::encode_u64(1));
+        let legacy = json!({"user_id": "@u:x", "stream_id": 1, "deleted": false});
+        db.db
+            .put_cf(&cf, &key, legacy.to_string().as_bytes())
+            .unwrap();
+
+        let drained = db.drain_partial_state_pending_dlu(7).unwrap();
+        assert_eq!(drained.len(), 1);
+        let (_, _, content, sent_to) = drained.into_iter().next().unwrap();
+        assert_eq!(content, legacy, "content must round-trip unwrapped");
+        assert!(sent_to.is_empty(), "legacy entries have no sent_to");
+    }
+
+    /// `sent_to` round-trips so the replay can exclude destinations
+    /// that already received the live emission.
+    #[test]
+    fn drain_returns_sent_to_set() {
+        let (db, _tmp) = fresh_db();
+        db.mark_partial_state_pending_dlu(
+            1,
+            100,
+            5,
+            &json!({"v": "x"}),
+            &["a.example".to_string(), "b.example".to_string()],
+        )
+        .unwrap();
+        let drained = db.drain_partial_state_pending_dlu(1).unwrap();
+        assert_eq!(drained.len(), 1);
+        let (_, _, content, sent_to) = drained.into_iter().next().unwrap();
+        assert_eq!(content, json!({"v": "x"}));
+        let mut sorted = sent_to;
+        sorted.sort();
+        assert_eq!(sorted, vec!["a.example", "b.example"]);
     }
 }
 
