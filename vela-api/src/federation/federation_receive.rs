@@ -2575,12 +2575,37 @@ pub async fn persist_join_event(
         .promote_state_event(room_nid, event_nid, type_nid, state_key_nid)
         .map_err(|e| format!("db: {e}"))?;
 
+    // A remote user we ALREADY track (joined to another room with
+    // us, or buffered an EDU we couldn't yet route because the
+    // partial-state bundle omitted them) just expanded their
+    // footprint into this room. Local observers who newly share
+    // with them need a /sync signal — the joiner's
+    // m.device_list_update EDU only fires on key changes, not on
+    // membership changes, so without this hook a
+    // charlie-in-partial-state-room joining a second non-partial
+    // room stays invisible in device_lists.changed until they
+    // actually rotate a key. Skipping when the user is fresh-to-us
+    // preserves the EDU-only signal for
+    // TestDeviceListsUpdateOverFederation/good_connectivity.
+    let was_already_tracked = state
+        .db
+        .get_user_joined_rooms(state_key_nid)
+        .map(|rooms| rooms.iter().any(|&r| r != room_nid))
+        .unwrap_or(false)
+        || state
+            .db
+            .has_pending_partial_device_list_edu(state_key_nid)
+            .unwrap_or(false);
     // Update membership tracking.
     state
         .db
         .set_membership(room_nid, state_key_nid, 1)
         .map_err(|e| format!("db: {e}"))?;
     crate::router::notify_user(state, state_key_nid);
+
+    if was_already_tracked {
+        crate::e2ee::keys::record_device_changes_on_join(state, state_key_nid, room_nid);
+    }
 
     // Notify local sync listeners.
     if let Some(sender_ch) = state.room_senders.get(&Nid(room_nid)) {

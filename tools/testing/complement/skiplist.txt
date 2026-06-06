@@ -113,15 +113,4 @@
 # events from send_join, not just the joining user's chain.
 ^TestPartialStateJoin/Outgoing_device_list_updates/Device_list_updates_reach_incorrectly_kicked_servers_once_partial_state_join_completes_even_though_remote_server_left_room$
 
-# Cross-room device-list tracking signal: when a remote user already
-# in a partial-state room with alice joins another (non-partial)
-# shared room with alice, alice's /sync should see them in
-# device_lists.changed. Firing record_device_changes_on_join from
-# the inbound send_join handler would close this but also leaks the
-# joiner into TestDeviceListsUpdateOverFederation/good_connectivity
-# (the joiner's own m.device_list_update EDU already carries the
-# signal, and a second write surfaces a duplicate). Needs a
-# tracking-state-transition gate: fire only when the joiner was
-# tracked via partial-state and now becomes fully tracked.
-^TestPartialStateJoin/Device_list_tracking/Device_list_tracking_when_pre-existing_members_in_partial_state_room_join_another_shared_room$
 
