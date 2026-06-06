@@ -8128,7 +8128,9 @@ mod partial_state_pending_dlu_tests {
         key.extend_from_slice(&keys::encode_u64(99));
         key.extend_from_slice(&keys::encode_u64(1));
         let legacy = json!({"user_id": "@u:x", "stream_id": 1, "deleted": false});
-        db.db.put_cf(&cf, &key, legacy.to_string().as_bytes()).unwrap();
+        db.db
+            .put_cf(&cf, &key, legacy.to_string().as_bytes())
+            .unwrap();
 
         let drained = db.drain_partial_state_pending_dlu(7).unwrap();
         assert_eq!(drained.len(), 1);
