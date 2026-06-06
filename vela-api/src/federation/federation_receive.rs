@@ -1320,7 +1320,8 @@ async fn persist_received_pdu(
             // the new peer until the resync ends (sometimes minutes
             // later). Outside partial-state the joining server's
             // own m.device_list_update EDU covers this signal, so
-            // we don't fire here to avoid double-counting.
+            // we don't fire here to avoid double-counting
+            // (TestDeviceListsUpdateOverFederation/good_connectivity).
             let became_joined = !was_joined && membership_byte == 1;
             if became_joined {
                 let room_is_partial = state

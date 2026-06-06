@@ -840,14 +840,27 @@ async fn reverify_pending_events(state: &AppState, room_nid: u64) {
                 }
                 if pdu.state_key.is_some()
                     && let Some(h) = &header
-                    && let Err(e) = state.db.promote_state_event(
+                {
+                    if let Err(e) = state.db.promote_state_event(
                         room_nid,
                         event_nid,
                         h.type_nid,
                         h.state_key_nid,
-                    )
-                {
-                    warn!(error = %e, %event_id, "promote_state_event (re-verify) failed");
+                    ) {
+                        warn!(error = %e, %event_id, "promote_state_event (re-verify) failed");
+                    }
+                    // promote_state_event only touches room_state +
+                    // state_replaces. The live receive path mirrors
+                    // m.room.member transitions into the memberships
+                    // index and the device-list cache (see
+                    // federation_receive.rs:1287); without this hook
+                    // a re-verified kick leaves elsie in the
+                    // memberships CF + her remote_device_keys_cache
+                    // entry stale. Drives
+                    // Device_list_no_longer_tracked_for_user_incorrectly_believed_to_be_in_room.
+                    if pdu.event_type == "m.room.member" {
+                        apply_member_event_effects(state, room_nid, &pdu);
+                    }
                 }
                 debug!(%event_id, "MSC3902 re-verify: promoted previously-soft-failed event");
             }
@@ -886,6 +899,41 @@ async fn reverify_pending_events(state: &AppState, room_nid: u64) {
                 warn!(error = %e, %event_id, "rewrite_state_at_event (sweep) failed");
             }
         }
+    }
+}
+
+/// Mirror an m.room.member transition into the memberships index and
+/// device-list cache. The receive path (`persist_received_pdu`) does
+/// this inline; the re-verify sweep needs the same effects when it
+/// promotes a previously-soft-failed kick/leave so observers stop
+/// seeing the target as a member and the target's
+/// remote_device_keys_cache is dropped if our last shared room with
+/// them just collapsed.
+fn apply_member_event_effects(state: &AppState, room_nid: u64, pdu: &vela_core::events::pdu::Pdu) {
+    let Some(target_user_id) = pdu.state_key.as_deref() else {
+        return;
+    };
+    let Ok(target_nid) = state.db.get_or_create_nid(target_user_id) else {
+        return;
+    };
+    let membership_str = pdu
+        .content
+        .get("membership")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let new_byte: u8 = match membership_str {
+        "join" => 1,
+        "invite" => 2,
+        "ban" => 3,
+        "knock" => 4,
+        _ => 0,
+    };
+    let prior = state.db.get_membership(room_nid, target_nid).ok().flatten();
+    let _ = state.db.set_membership(room_nid, target_nid, new_byte);
+    let was_joined = prior == Some(1);
+    let became_non_member = matches!(new_byte, 0 | 3);
+    if was_joined && became_non_member {
+        crate::e2ee::keys::record_device_changes_on_leave(state, target_nid, room_nid);
     }
 }
 
