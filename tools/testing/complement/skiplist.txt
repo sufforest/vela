@@ -44,17 +44,6 @@
 # from a v2 creation, which is server-specific.
 ^TestRoomCreate/Parallel/POST_/createRoom_creates_a_room_with_the_given_version$
 
-# TestCorruptedAuthChain — synapse-shaped test: the mock's /state_ids
-# handler asserts the request targets a specific deep ancestor
-# (stateIDsEvent), reachable only by running /get_missing_events
-# BEFORE the auth-event /state_ids fallback walks for a boundary.
-# Vela's order is Check 4 (auth) → gap-fill → Check 5 (state), so
-# the auth-side fallback targets gmeEvent (the direct unknown prev)
-# and the mock's must.Equal fails. Reordering gap-fill earlier
-# broke the simpler partial-state tests via a still-unidentified
-# 10s hang in process_pdu — left for a focused follow-up.
-^TestCorruptedAuthChain$
-
 
 # --- Deferred spec bugs ---
 # Listed here only because the fix requires non-trivial new
@@ -100,17 +89,5 @@
 # MSC3902 partial-state — most subtests pass; the remaining failures
 # are grouped below by the gap they're waiting on. Run via
 # `./tests/msc3902` (PACKAGES in run.sh).
-
-# Outgoing device-list update to an "incorrectly kicked" server when
-# that server has since left the partial-state room. The remaining
-# corner case in the outgoing-DLU cluster: the bad-kick is accepted
-# at receive (state-at-event doesn't see derek=leave because the
-# partial-state snapshot at alice's join is missing derek's member
-# event) so the server2 self-leave that comes next is itself
-# soft-failed, which means alice's /sync never surfaces the leave
-# during partial state and the test setup times out. Fixing this
-# needs a partial-state snapshot that includes ALL pre-join member
-# events from send_join, not just the joining user's chain.
-^TestPartialStateJoin/Outgoing_device_list_updates/Device_list_updates_reach_incorrectly_kicked_servers_once_partial_state_join_completes_even_though_remote_server_left_room$
 
 

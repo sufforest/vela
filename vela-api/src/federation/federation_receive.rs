@@ -599,7 +599,44 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
                         %reason,
                         "state-at-event check failed"
                     );
-                    if is_partial_state_room {
+                    // Self-leave exemption during partial state.
+                    // When a prior optimistically-accepted state event
+                    // has poisoned state_at_event (e.g. a bad-kick
+                    // moved the sender to leave), the sender's own
+                    // /leave from the resident server's view fails
+                    // check_auth with "self-leave requires
+                    // invite/join/knock". The event's own auth_events
+                    // declare the sender WAS join/invite/knock, which
+                    // is exactly the prior-state proof the auth rule
+                    // needs. Accept rather than soft-fail; the
+                    // filler-clear re-verify will demote it back if
+                    // full state shows it was bogus. Without this the
+                    // self-leave persists as Outlier with no
+                    // stream_pos, alice's /sync never surfaces it
+                    // during partial state, and the setup phase of
+                    // Outgoing_device_list_updates/Device_list_updates_reach_incorrectly_kicked_servers_once_partial_state_join_completes_even_though_remote_server_left_room
+                    // times out before FinishStateRequest can fire.
+                    let is_self_leave = effective_pdu.event_type == "m.room.member"
+                        && effective_pdu.state_key.as_deref() == Some(&effective_pdu.sender)
+                        && effective_event_json
+                            .get("content")
+                            .and_then(|c| c.get("membership"))
+                            .and_then(|m| m.as_str())
+                            == Some("leave");
+                    let exempt = is_partial_state_room
+                        && is_self_leave
+                        && crate::federation::federation_state::auth_events_declare_prior_membership_allowing_leave(
+                            &state.db,
+                            &effective_pdu.sender,
+                            &effective_pdu.auth_events,
+                        );
+                    if exempt {
+                        debug!(
+                            event_id = %effective_pdu.event_id,
+                            sender = %effective_pdu.sender,
+                            "partial-state self-leave exemption: accepting despite check_auth fail; re-verify will reconcile"
+                        );
+                    } else if is_partial_state_room {
                         soft_failed_at_send = true;
                     } else {
                         return (
@@ -1029,8 +1066,40 @@ async fn compute_state_at_event(
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
+            let auth_chain_ids = state_resp
+                .get("auth_chain_ids")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
             let mut sm: StateMap = StateMap::new();
             let budget = new_fetch_budget();
+            // Walk auth_chain_ids first so any corrupted-but-still-
+            // referenced auth event (e.g. TestCorruptedAuthChain's
+            // eventB which the peer 404s) gets probed before pdu_ids
+            // sources its state. Persisted as outliers — they back-
+            // stop auth checks but don't appear in the resolved
+            // state map below. The peer is authoritative; we just
+            // make sure the chain is on disk.
+            for v in &auth_chain_ids {
+                let Some(eid) = v.as_str() else { continue };
+                if state.db.get_event_nid_by_id(eid).ok().flatten().is_some() {
+                    continue;
+                }
+                if !consume_budget(&budget) {
+                    warn!("budget exhausted during /state_ids auth_chain ingestion");
+                    break;
+                }
+                if let Ok(pdu_value) = state.federation_client.fetch_event_pdu(origin, eid).await {
+                    let _ = persist_fetched_event(
+                        state,
+                        &pdu_value,
+                        origin,
+                        budget.clone(),
+                        FetchKind::AuthChain,
+                    )
+                    .await;
+                }
+            }
             for v in pdu_ids {
                 let Some(eid) = v.as_str() else { continue };
                 if state.db.get_event_nid_by_id(eid).ok().flatten().is_none()
