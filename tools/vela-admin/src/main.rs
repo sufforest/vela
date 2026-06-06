@@ -46,6 +46,15 @@ enum Cmd {
     Users,
     /// List rooms with member count and human-readable name (if any).
     Rooms,
+    /// Top rooms by most-recent activity. Useful for "what's hot
+    /// right now" debugging — a quiet friend-group homeserver may
+    /// have hundreds of rooms but only a handful are live.
+    RoomsTop {
+        /// Cap results so a server with thousands of rooms doesn't
+        /// pretty-print itself into a hang.
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
     /// Show one room's state events.
     Room {
         /// Full `!opaque:server` or v12 `!hash` room id.
@@ -75,6 +84,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Stats => cmd::stats::run(&db),
         Cmd::Users => cmd::users::run(&db),
         Cmd::Rooms => cmd::rooms::run(&db),
+        Cmd::RoomsTop { limit } => cmd::rooms::run_top(&db, limit),
         Cmd::Room { room_id } => cmd::rooms::run_one(&db, &room_id),
         Cmd::Media { limit } => cmd::media::run(&db, limit),
         Cmd::DiagnoseMembership { room_id, user_id } => {
