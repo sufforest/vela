@@ -111,16 +111,6 @@
 # are grouped below by the gap they're waiting on. Run via
 # `./tests/msc3902` (PACKAGES in run.sh).
 
-# Inbound event whose missing prev's auth_event sits only behind a
-# /state_ids handler the mock keys to a deep ancestor (here event A,
-# two hops back through B). vela's auth-fetch fallback targets the
-# direct unknown prev (B) and the mock 404s; walking deeper requires
-# /get_missing_events to run before Check 4 so the boundary search
-# can step through freshly-persisted ancestors. Reordering broke the
-# sibling tests via long auth-chain recursion; left for a focused
-# follow-up.
-^TestPartialStateJoin/CanReceiveEventsWithHalfMissingGrandparentsDuringPartialStateJoin$
-
 # Resync_completes_even_when_events_arrive_before_their_prev_events
 # stresses the receive path with 100 outliers + 2 timeline events.
 # The optimistic-accept primitive helps but the test's specific

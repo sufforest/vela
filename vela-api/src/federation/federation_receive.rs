@@ -404,8 +404,50 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
             );
         }
     }
-    let mut auth_state: HashMap<(String, String), Pdu> = HashMap::new();
     let fetch_budget = new_fetch_budget();
+
+    // /get_missing_events runs BEFORE Check 4. Two reasons:
+    //   (1) Check 4's /state_ids fallback picks a boundary via
+    //       `find_state_ids_boundary(target)`, which walks
+    //       `target.prev_events`. If a direct prev is unknown
+    //       it stops there; for HalfMissingGrandparents, the
+    //       mock only registers a /state_ids handler at a
+    //       deeper ancestor, so we have to gap-fill the direct
+    //       prev first to let the boundary walk reach it.
+    //   (2) The companion fix in `persist_fetched_event_inner`
+    //       tries `/event/{aev_id}` directly before falling
+    //       back to `/event_auth` + `/state_ids` — without this
+    //       a gated mock /state_ids handler burns a 10s HTTP
+    //       timeout per missing auth event.
+    let mut missing_prev = false;
+    for pid in &effective_pdu.prev_events {
+        if state.db.get_event_nid_by_id(pid).ok().flatten().is_none()
+            && !state.db.is_event_rejected(pid).unwrap_or(false)
+        {
+            missing_prev = true;
+            break;
+        }
+    }
+    if missing_prev {
+        let earliest_ids = get_room_extremity_ids(state, room_nid).unwrap_or_default();
+        if let Err(e) = fetch_missing_events(
+            state,
+            &sender_domain,
+            &effective_pdu.room_id,
+            &effective_pdu.event_id,
+            &earliest_ids,
+            fetch_budget.clone(),
+        )
+        .await
+        {
+            debug!(error = %e, "fetch_missing_events failed");
+        }
+        state
+            .last_gap_fill_pos
+            .insert(room_nid, state.db.current_stream_position());
+    }
+
+    let mut auth_state: HashMap<(String, String), Pdu> = HashMap::new();
     for aev_id in &effective_pdu.auth_events {
         let pdu_opt = load_pdu_by_event_id(state, aev_id).or({
             // Not found locally — will fetch below.
@@ -505,55 +547,6 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
                 PduOutcome::Rejected(format!("auth_events check failed: {reason}")),
             );
         }
-    }
-
-    // If any prev_event is missing locally, attempt to fill the gap by
-    // calling /get_missing_events on the sender's server. This lets us
-    // accept events whose ancestors we haven't seen yet — without this,
-    // the very next federated message after a missed transaction is
-    // permanently unrootable.
-    let mut missing_prev = false;
-    for pid in &effective_pdu.prev_events {
-        if state.db.get_event_nid_by_id(pid).ok().flatten().is_none()
-            && !state.db.is_event_rejected(pid).unwrap_or(false)
-        {
-            // Genuinely missing — try to fill the gap. A prev that's
-            // marked rejected isn't "missing" in the sense that warrants
-            // a /get_missing_events probe; the upstream server already
-            // told us about it (it just didn't pass auth). Calling
-            // /get_missing_events for a known-rejected ancestor confuses
-            // peers and trips Complement's UnexpectedRequestsAreErrors
-            // (TestInboundFederationRejectsEventsWithRejectedAuthEvents).
-            missing_prev = true;
-            break;
-        }
-    }
-    if missing_prev {
-        let earliest_ids = get_room_extremity_ids(state, room_nid).unwrap_or_default();
-        if let Err(e) = fetch_missing_events(
-            state,
-            &sender_domain,
-            &effective_pdu.room_id,
-            &effective_pdu.event_id,
-            &earliest_ids,
-            fetch_budget.clone(),
-        )
-        .await
-        {
-            // Don't reject yet — let check 5 surface a clearer per-event
-            // error if any prev is still missing. Some remotes return an
-            // empty list and we still succeed if events arrived via other
-            // paths.
-            debug!(error = %e, "fetch_missing_events failed");
-        }
-        // Mark the room as having had a gap fill at the current stream
-        // position. /sync uses this to flag the next batch as `limited`
-        // for users whose `since` predates the fill — per spec, when
-        // the homeserver had to gap-fill, the timeline events alone are
-        // inadequate and limited=true signals that to the client.
-        state
-            .last_gap_fill_pos
-            .insert(room_nid, state.db.current_stream_position());
     }
 
     // --- Check 5: state-at-event ---
@@ -1921,12 +1914,19 @@ async fn fetch_auth_via_state_ids(
     }
     let mut accepted = 0usize;
     for eid in &ids {
+        // Only spend budget on events we ACTUALLY need to fetch.
+        // The previous "consume budget per iteration" pattern
+        // exhausted the budget on already-loaded auth_chain entries
+        // and stopped the loop before reaching events that actually
+        // 404 — TestCorruptedAuthChain wants vela to hit /event/B
+        // even though B sits 100 entries deep behind events that
+        // are already on disk from send_join.
+        if state.db.get_event_nid_by_id(eid).ok().flatten().is_some() {
+            continue;
+        }
         if !consume_budget(&budget) {
             warn!("budget exhausted during /state_ids ingestion");
             break;
-        }
-        if state.db.get_event_nid_by_id(eid).ok().flatten().is_some() {
-            continue;
         }
         match state.federation_client.fetch_event_pdu(origin, eid).await {
             Ok(ev_json) => {
@@ -2275,16 +2275,67 @@ async fn persist_fetched_event_inner(
                 // can walk to from target. The two endpoints
                 // together cover synapse / dendrite / Complement
                 // mocks.
-                let event_auth_err =
+                // Direct /event/{aev_id} first. It's the cheapest
+                // path — one round-trip, one event — and avoids two
+                // problems with /event_auth:
+                //   (1) spec: /event_auth returns the auth CHAIN
+                //       (ancestors only); aev itself stays missing
+                //       even on success, so we'd then need /event
+                //       anyway.
+                //   (2) Complement's HalfMissingGrandparents mock
+                //       runs with UnexpectedRequestsAreErrors=true
+                //       and only registers /state_ids + /state +
+                //       /event — calling /event_auth at all fails
+                //       the test outright.
+                // Lightweight outlier persist of the response. We
+                // deliberately do NOT recurse on the fetched event's
+                // own auth_events here: TestCorruptedAuthChain's
+                // chain is 100+ deep, the recursion would saturate
+                // the FetchBudget on chained alice rejoin events and
+                // never reach the broken link.
+                let event_fetch_err = if load_pdu_by_event_id(state, aev_id).is_none() {
+                    match state
+                        .federation_client
+                        .fetch_event_pdu(origin, aev_id)
+                        .await
+                    {
+                        Ok(pdu_value) => {
+                            let room_id = pdu_value
+                                .get("room_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&target_pdu.room_id);
+                            if let Ok(Some(rn)) = state.db.get_nid(room_id) {
+                                let _ =
+                                    crate::membership::federation_outbound_join::persist_remote_event(
+                                        state,
+                                        rn,
+                                        &pdu_value,
+                                        vela_store::db::PersistKind::Outlier,
+                                    )
+                                    .await;
+                            }
+                            None
+                        }
+                        Err(e) => Some(format!("/event: {e}")),
+                    }
+                } else {
+                    None
+                };
+                // If /event came up short — peer 404s the specific
+                // id but might still serve the auth chain via
+                // /event_auth — try the chain fetch.
+                let event_auth_err = if load_pdu_by_event_id(state, aev_id).is_none() {
                     fetch_auth_chain(state, origin, &target_pdu.room_id, aev_id, budget.clone())
                         .await
-                        .err();
-                // /state_ids fallback only for timeline gap-fill —
-                // chain-ingestion (FetchKind::AuthChain) recursion at
-                // every node would explode O(chain × prev_walk) on
-                // peers that 404 unfamiliar event_ids. /event_auth's
-                // single response already covers the chain in one
-                // shot for the AuthChain path.
+                        .err()
+                } else {
+                    None
+                };
+                // /state_ids fallback only for timeline gap-fill AND
+                // only when both prior fetches came up empty —
+                // chain-ingestion (FetchKind::AuthChain) recursion
+                // at every node would explode O(chain × prev_walk)
+                // on peers that 404 unfamiliar event_ids.
                 if matches!(kind, FetchKind::MissingTimeline)
                     && load_pdu_by_event_id(state, aev_id).is_none()
                 {
@@ -2298,6 +2349,10 @@ async fn persist_fetched_event_inner(
                     )
                     .await;
                 }
+                // Suppress unused warnings — these surface in the
+                // reason string further below only if every fetch
+                // came up empty.
+                let _ = event_fetch_err;
                 match load_pdu_by_event_id(state, aev_id) {
                     Some(p) => p,
                     None => {
