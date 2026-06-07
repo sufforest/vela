@@ -1564,6 +1564,15 @@ fn history_visibility_permits(
         return Ok(true);
     }
 
+    // A user can always see their OWN m.room.member events (their join,
+    // leave, etc.) regardless of visibility mode — otherwise, under
+    // `joined`/`invited`, the snapshot at their own leave event already
+    // shows them as left, so they'd never see the event that removed them.
+    // Matches Synapse's history-visibility filter.
+    if event_is_own_member_event(state, user_nid, event_nid)? {
+        return Ok(true);
+    }
+
     let at_event = membership_at_event(state, room_nid, user_nid, event_nid)?;
 
     // Rule 2: "If the user's membership was join, allow." Applies to
@@ -1592,6 +1601,46 @@ fn history_visibility_permits(
         // as the shared branch.
         _ => Ok(matches!(membership, Some(0) | Some(1))),
     }
+}
+
+/// True iff `event_nid` is `user_nid`'s own `m.room.member` event
+/// (type `m.room.member`, state_key == the user's id). Used by
+/// history-visibility filtering to always surface a user's own
+/// membership transitions.
+fn event_is_own_member_event(
+    state: &AppState,
+    user_nid: u64,
+    event_nid: u64,
+) -> Result<bool, ApiError> {
+    let Some((header, _)) = state
+        .db
+        .get_event(event_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(false);
+    };
+    let Some(member_type_nid) = state
+        .db
+        .get_nid("m.room.member")
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(false);
+    };
+    let Some(user_id) = state
+        .db
+        .resolve_nid(user_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(false);
+    };
+    let Some(user_sk_nid) = state
+        .db
+        .get_nid(&user_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(false);
+    };
+    Ok(header.type_nid == member_type_nid && header.state_key_nid == user_sk_nid)
 }
 
 /// Look up the user's `m.room.member` value in the room state as it
