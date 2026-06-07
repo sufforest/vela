@@ -1797,8 +1797,15 @@ async fn try_apply_redaction_marker(
         {
             Ok(pdu_value) => {
                 let budget = new_fetch_budget();
+                // FetchKind::Backfill (vs AuthChain) lands the target
+                // as BackfillTimeline so it gets a stream_pos and
+                // shows up in /sync — not just /messages. The target
+                // is by construction historical (peer 200'd /event
+                // for an event_id we don't have on the live path),
+                // so the no-extremity posture is correct: it doesn't
+                // belong on the forward DAG tip.
                 if let Err(e) =
-                    persist_fetched_event(state, &pdu_value, origin, budget, FetchKind::AuthChain)
+                    persist_fetched_event(state, &pdu_value, origin, budget, FetchKind::Backfill)
                         .await
                 {
                     warn!(target = %target_id, origin = %origin, error = %e,

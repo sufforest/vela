@@ -1297,6 +1297,14 @@ pub fn federate_device_lists_on_join(
         }
     };
     if destinations.is_empty() {
+        // Partial-state rooms intentionally fall through here: the
+        // joiner doesn't yet know who the resident considers "in the
+        // room," and the partial_state_filler's
+        // reconcile_device_lists pass will fan out once the filler
+        // clears (using the pending-EDU buffer). Forcing an EDU out
+        // now via the hint surfaces unexpected device_list_update
+        // EDUs on the resident mock side and breaks the broader
+        // TestPartialStateJoin/CanSend… family.
         return;
     }
 
