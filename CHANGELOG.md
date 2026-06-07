@@ -10,6 +10,20 @@ minor versions.
 
 ### Added
 
+- **Room summary (MSC3266).** `GET /_matrix/client/v1/rooms/{roomIdOrAlias}/summary`
+  (and the `im.nheko.summary` unstable path) lets clients preview a room
+  before joining. Resolves aliases, gates visibility via the existing
+  peek rules (members/invitees always; otherwise public/knock/
+  world-readable/allow-list), returns the caller's `membership`, and
+  serves unauthenticated requests for world-readable rooms only.
+- **Batch device delete.** `POST /_matrix/client/v3/delete_devices`
+  with the same UIA discipline as single-device delete; ids the caller
+  doesn't own are skipped instead of failing the whole batch.
+- **`/.well-known/matrix/support`.** Serves admin/security contacts and
+  a support page from a new `[support]` config section (MSC1929);
+  returns 404 when unconfigured.
+- **`m.get_login_token` capability** advertised as disabled so clients
+  hide the cross-device-login affordance we don't implement.
 - **`?server=` on `/publicRooms`.** GET/POST `/_matrix/client/v3/publicRooms`
   now accept the `server` query param. When set to a remote homeserver
   name, vela forwards the request via

@@ -75,6 +75,28 @@ struct Config {
     push: PushSection,
     #[serde(default)]
     appservice: AppServiceSection,
+    #[serde(default)]
+    support: SupportSection,
+}
+
+/// `[support]` section — drives `.well-known/matrix/support` (MSC1929 /
+/// spec v1.10). Empty (the default) means the endpoint 404s. Operators
+/// publishing abuse/security contacts populate `contacts` and/or
+/// `support_page`.
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default)]
+struct SupportSection {
+    contacts: Vec<SupportContactSection>,
+    support_page: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(default)]
+struct SupportContactSection {
+    matrix_id: Option<String>,
+    email_address: Option<String>,
+    /// `m.role.admin` or `m.role.security` per spec.
+    role: Option<String>,
 }
 
 /// `[appservice]` section. File-based application-service preload.
@@ -1092,6 +1114,19 @@ fn main() -> anyhow::Result<()> {
                 },
                 push: vela_api::router::PushConfig {
                     allow_private_pushers: config.push.allow_private_pushers,
+                },
+                support: vela_api::router::SupportConfig {
+                    contacts: config
+                        .support
+                        .contacts
+                        .iter()
+                        .map(|c| vela_api::router::SupportContact {
+                            matrix_id: c.matrix_id.clone(),
+                            email_address: c.email_address.clone(),
+                            role: c.role.clone(),
+                        })
+                        .collect(),
+                    support_page: config.support.support_page.clone(),
                 },
                 max_delay_ms: config.server.max_delay_ms,
             }),

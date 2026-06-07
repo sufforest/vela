@@ -78,6 +78,45 @@ pub async fn well_known(State(state): State<AppState>) -> Json<Value> {
     Json(Value::Object(out))
 }
 
+/// `GET /.well-known/matrix/support` (MSC1929 / spec v1.10).
+///
+/// Static admin/security contact discovery. Returns 404 when the
+/// operator hasn't configured any contacts or a support page — the
+/// spec lets clients treat an empty doc as "no info", but a 404 avoids
+/// advertising a meaningless empty `{}`.
+pub async fn well_known_support(State(state): State<AppState>) -> impl IntoResponse {
+    let support = &state.config.support;
+    if support.is_empty() {
+        return (StatusCode::NOT_FOUND, Json(json!({}))).into_response();
+    }
+
+    let mut out = serde_json::Map::new();
+    if !support.contacts.is_empty() {
+        let contacts: Vec<Value> = support
+            .contacts
+            .iter()
+            .map(|c| {
+                let mut m = serde_json::Map::new();
+                if let Some(v) = &c.matrix_id {
+                    m.insert("matrix_id".to_string(), json!(v));
+                }
+                if let Some(v) = &c.email_address {
+                    m.insert("email_address".to_string(), json!(v));
+                }
+                if let Some(v) = &c.role {
+                    m.insert("role".to_string(), json!(v));
+                }
+                Value::Object(m)
+            })
+            .collect();
+        out.insert("contacts".to_string(), Value::Array(contacts));
+    }
+    if let Some(page) = &support.support_page {
+        out.insert("support_page".to_string(), json!(page));
+    }
+    Json(Value::Object(out)).into_response()
+}
+
 pub async fn versions(State(state): State<AppState>) -> Json<Value> {
     // We implement the v1.18 CS-API surface + sliding sync (MSC4186).
     // Advertising older versions too lets clients pinned to v1.12–v1.17

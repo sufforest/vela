@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 
 use vela_core::error::VelaError;
 use vela_core::events::view::EventView;
+use vela_core::identifiers::RoomId;
 
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::error::ApiError;
@@ -619,6 +620,94 @@ pub(crate) fn summarize_room(
     }
 
     Ok(Value::Object(out))
+}
+
+/// `GET /_matrix/client/v1/rooms/{roomIdOrAlias}/summary` (MSC3266).
+///
+/// Room preview before joining. Resolves an alias to a room id, gates
+/// visibility (members + invitees always; otherwise public / knock /
+/// world-readable / allow-list-qualified via `can_peek`), and returns
+/// the same field set as the hierarchy summary minus the space-only
+/// `children_state`. Unauthenticated callers are served world-readable
+/// rooms only.
+///
+/// Federation fallback (summarising a room we don't host) is not yet
+/// wired up — such rooms 404 for now.
+pub(crate) async fn room_summary(
+    State(state): State<AppState>,
+    user: Option<AuthenticatedUser>,
+    Path(room_id_or_alias): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let room_id = if room_id_or_alias.starts_with('#') {
+        crate::membership::resolve_alias(&state, &room_id_or_alias)
+            .await?
+            .0
+    } else {
+        RoomId::parse(&room_id_or_alias)
+            .map_err(|_| ApiError(VelaError::NotFound("unknown room".into())))?
+    };
+
+    let Some(room_nid) = state
+        .db
+        .get_nid(room_id.as_str())
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Err(ApiError(VelaError::NotFound("unknown room".into())));
+    };
+
+    // We only summarise rooms we actually host. A NID can exist for a
+    // room we've merely seen referenced (e.g. via an m.space.child);
+    // treat those as not-found until federation summary is wired up.
+    if !has_local_state(&state, room_nid) {
+        return Err(ApiError(VelaError::NotFound("unknown room".into())));
+    }
+
+    let user_nid = user.as_ref().map(|u| u.user_nid);
+    let allowed = match user_nid {
+        Some(nid) => can_peek(&state, room_nid, nid)?,
+        // Unauthenticated: world-readable rooms only.
+        None => is_world_readable(&state, room_nid),
+    };
+    if !allowed {
+        // 404 (not 403) so we don't leak the existence of rooms the
+        // caller isn't allowed to see.
+        return Err(ApiError(VelaError::NotFound("unknown room".into())));
+    }
+
+    let mut summary = summarize_room(&state, room_nid, room_id.as_str(), &[])?;
+    if let Some(obj) = summary.as_object_mut() {
+        // children_state is hierarchy-only; not part of MSC3266.
+        obj.remove("children_state");
+        if let Some(nid) = user_nid
+            && let Some(m) = state
+                .db
+                .get_membership(room_nid, nid)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            && let Some(s) = membership_str(m)
+        {
+            obj.insert("membership".into(), json!(s));
+        }
+    }
+    Ok(Json(summary))
+}
+
+fn is_world_readable(state: &AppState, room_nid: u64) -> bool {
+    read_content(state, room_nid, "m.room.history_visibility", "")
+        .as_ref()
+        .and_then(|c| c.get("history_visibility"))
+        .and_then(|v| v.as_str())
+        == Some("world_readable")
+}
+
+fn membership_str(m: u8) -> Option<&'static str> {
+    match m {
+        0 => Some("leave"),
+        1 => Some("join"),
+        2 => Some("invite"),
+        3 => Some("ban"),
+        4 => Some("knock"),
+        _ => None,
+    }
 }
 
 /// True iff `room_nid`'s `m.room.create` event has `type:

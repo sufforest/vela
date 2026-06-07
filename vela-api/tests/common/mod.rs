@@ -42,6 +42,7 @@ pub struct ConfigOverrides {
     pub encrypt_by_default: vela_api::router::EncryptByDefault,
     pub oidc: vela_api::router::OidcConfig,
     pub public_base_url: Option<String>,
+    pub support: vela_api::router::SupportConfig,
 }
 
 impl Default for ConfigOverrides {
@@ -55,6 +56,7 @@ impl Default for ConfigOverrides {
             encrypt_by_default: vela_api::router::EncryptByDefault::Off,
             oidc: vela_api::router::OidcConfig::default(),
             public_base_url: None,
+            support: vela_api::router::SupportConfig::default(),
         }
     }
 }
@@ -163,6 +165,7 @@ impl Harness {
                 push: vela_api::router::PushConfig {
                     allow_private_pushers: true,
                 },
+                support: overrides.support.clone(),
                 max_delay_ms: vela_api::delayed_events::DEFAULT_MAX_DELAY_MS,
             }),
             room_locks: Arc::new(DashMap::new()),

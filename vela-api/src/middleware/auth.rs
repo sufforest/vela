@@ -92,6 +92,27 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
     }
 }
 
+/// Optional authentication: `Option<AuthenticatedUser>` in a handler
+/// signature yields `None` when no token is presented at all, but still
+/// rejects (401) a token that is present but invalid. Used by endpoints
+/// the spec allows unauthenticated for world-readable rooms (e.g.
+/// MSC3266 room summary) while keeping bad-token requests honest.
+impl axum::extract::OptionalFromRequestParts<AppState> for AuthenticatedUser {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        if extract_token(parts).is_none() {
+            return Ok(None);
+        }
+        <AuthenticatedUser as FromRequestParts<AppState>>::from_request_parts(parts, state)
+            .await
+            .map(Some)
+    }
+}
+
 /// Validate `token` against the IdP, provision the user+device on
 /// first touch, and return an `AuthenticatedUser`. Each failure mode
 /// maps to a distinct ApiError so clients see the right status:
