@@ -40,22 +40,33 @@ pub async fn attempt_backfill(
         return 0;
     }
 
-    // Pick any remote server in the room.
-    let candidates = match state
+    // Pick any remote server in the room. Union the partial-state
+    // hint: after an `omit_members=true` send_join the memberships
+    // CF is empty for the resident's users, so a pure
+    // `get_remote_servers_in_room` returns no candidates and
+    // /messages can't backfill history from the resident.
+    let mut candidate_set: std::collections::BTreeSet<String> = match state
         .db
         .get_remote_servers_in_room(room_nid, &state.config.server_name)
     {
-        Ok(c) => c,
+        Ok(c) => c.into_iter().collect(),
         Err(e) => {
             debug!(error = %e, "backfill: failed to list remote servers");
             return 0;
         }
     };
-
-    if candidates.is_empty() {
+    if let Ok((true, hint)) = state.db.get_partial_state_info(room_nid) {
+        for s in hint {
+            if s != state.config.server_name {
+                candidate_set.insert(s);
+            }
+        }
+    }
+    if candidate_set.is_empty() {
         // Local-only room — nothing to backfill.
         return 0;
     }
+    let candidates: Vec<String> = candidate_set.into_iter().collect();
 
     let ev_ids: Vec<&str> = from_event_ids.iter().map(|s| s.as_str()).collect();
 

@@ -102,11 +102,17 @@ impl EduStream for ReceiptStream {
 
             // Filter: only fan out to destinations that share this room.
             // Spec: "Read receipts […] sent to all servers in the room."
-            let servers = match db.get_remote_servers_in_room(room_nid, &self.our_server_name) {
-                Ok(s) => s,
+            // Partial-state rooms don't have the resident's members
+            // in the memberships CF yet; honour the partial-state
+            // hint as a valid "in the room" signal too.
+            let in_room = match db.get_remote_servers_in_room(room_nid, &self.our_server_name) {
+                Ok(s) => s.iter().any(|s| s == destination),
                 Err(_) => continue,
-            };
-            if !servers.iter().any(|s| s == destination) {
+            } || matches!(
+                db.get_partial_state_info(room_nid),
+                Ok((true, ref hint)) if hint.iter().any(|s| s == destination)
+            );
+            if !in_room {
                 continue;
             }
             // server_acl: skip if WE are denied by the room's ACL —
