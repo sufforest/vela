@@ -106,6 +106,10 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     "presence_activity_index",
     "federation_outbox",
     "federation_edu_cursor",
+    // Per-user notification history for GET /v3/notifications. Key
+    // `user_nid(8 BE) || stream_pos(8 BE)`, value JSON
+    // `{room_id, event_id, event_stream_pos, actions, tweaks, ts}`.
+    "user_notifications",
     "receipts_stream",
     "presence_stream",
     "to_device_outbound",

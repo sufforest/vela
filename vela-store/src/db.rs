@@ -196,6 +196,10 @@ pub struct Database {
     /// locally-originated presence change. Same shape and rationale
     /// as `receipts_stream_counter`.
     pub(crate) presence_stream_counter: AtomicU64,
+    /// Global monotonic position for `user_notifications` rows (keyed
+    /// `(user_nid, pos)`). Shared across users so positions are unique;
+    /// recovered from the CF at open.
+    pub(crate) notifications_stream_counter: AtomicU64,
 }
 
 impl Database {
@@ -246,6 +250,7 @@ impl Database {
             safe_stream_pos: AtomicU64::new(0),
             receipts_stream_counter: AtomicU64::new(1),
             presence_stream_counter: AtomicU64::new(1),
+            notifications_stream_counter: AtomicU64::new(1),
             snapshot_nid_counter: PersistedCounter::ephemeral(1),
         })
     }
@@ -359,6 +364,7 @@ impl Database {
         }
         let receipts_stream_counter = recover_max_receipts_stream(&db).unwrap_or(1);
         let presence_stream_counter = recover_max_presence_stream(&db).unwrap_or(1);
+        let notifications_stream_counter = recover_max_user_notifications(&db).unwrap_or(1);
 
         let this = Self {
             db,
@@ -374,6 +380,7 @@ impl Database {
             snapshot_nid_counter,
             receipts_stream_counter: AtomicU64::new(receipts_stream_counter),
             presence_stream_counter: AtomicU64::new(presence_stream_counter),
+            notifications_stream_counter: AtomicU64::new(notifications_stream_counter),
         };
         // Migrate any pre-per-room outbox entries left over from before
         // the federation_sender refactor. No-op on fresh DBs.
@@ -3838,6 +3845,193 @@ impl Database {
         )
     }
 
+    /// Set (`Some`) or delete (`None`) an extended profile field (MSC4133)
+    /// under the user's `profile_fields` object. No-op when the user record
+    /// is absent.
+    pub fn set_profile_field(
+        &self,
+        user_nid: u64,
+        key: &str,
+        value: Option<Value>,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("users").unwrap();
+        let mut record = match self.db.get_cf(&cf, keys::encode_u64(user_nid))? {
+            Some(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap_or(serde_json::json!({})),
+            None => return Ok(()),
+        };
+        let obj = record.as_object_mut().unwrap();
+        let fields = obj
+            .entry("profile_fields")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(fobj) = fields.as_object_mut() {
+            match value {
+                Some(v) => {
+                    fobj.insert(key.to_string(), v);
+                }
+                None => {
+                    fobj.remove(key);
+                }
+            }
+        }
+        self.db.put_cf(
+            &cf,
+            keys::encode_u64(user_nid),
+            record.to_string().as_bytes(),
+        )
+    }
+
+    /// Read one extended profile field (MSC4133). `None` when the user or
+    /// the field is absent.
+    pub fn get_profile_field(
+        &self,
+        user_nid: u64,
+        key: &str,
+    ) -> Result<Option<Value>, rocksdb::Error> {
+        let cf = self.db.cf_handle("users").unwrap();
+        let record = match self.db.get_cf(&cf, keys::encode_u64(user_nid))? {
+            Some(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap_or(serde_json::json!({})),
+            None => return Ok(None),
+        };
+        Ok(record
+            .get("profile_fields")
+            .and_then(|f| f.get(key))
+            .cloned())
+    }
+
+    /// All extended profile fields (MSC4133) for merging into the
+    /// full-profile response. Empty map when none.
+    pub fn get_profile_fields(
+        &self,
+        user_nid: u64,
+    ) -> Result<serde_json::Map<String, Value>, rocksdb::Error> {
+        let cf = self.db.cf_handle("users").unwrap();
+        let record = match self.db.get_cf(&cf, keys::encode_u64(user_nid))? {
+            Some(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap_or(serde_json::json!({})),
+            None => return Ok(serde_json::Map::new()),
+        };
+        Ok(record
+            .get("profile_fields")
+            .and_then(|f| f.as_object())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    // --- Notifications (GET /v3/notifications) ---
+
+    /// Append a notification row for `user_nid`; returns the assigned global
+    /// stream position. `event_stream_pos` is the event's room timeline
+    /// position, stored so the read flag can be computed without a scan.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_notification(
+        &self,
+        user_nid: u64,
+        room_id: &str,
+        event_id: &str,
+        event_stream_pos: Option<u64>,
+        actions: &Value,
+        tweaks: &std::collections::HashMap<String, Value>,
+        ts_ms: u64,
+    ) -> Result<u64, rocksdb::Error> {
+        let cf = self.db.cf_handle("user_notifications").unwrap();
+        let pos = self
+            .notifications_stream_counter
+            .fetch_add(1, Ordering::Relaxed);
+        let row = serde_json::json!({
+            "room_id": room_id,
+            "event_id": event_id,
+            "event_stream_pos": event_stream_pos,
+            "actions": actions,
+            "tweaks": tweaks,
+            "ts": ts_ms,
+        });
+        let key = keys::encode_u64_pair(user_nid, pos);
+        self.db.put_cf(&cf, key, row.to_string().as_bytes())?;
+        Ok(pos)
+    }
+
+    /// List `user_nid`'s notifications with global position strictly greater
+    /// than `from`, newest-scanned-last, up to `limit`. Returns `(rows, next)`
+    /// where `next` is the highest position scanned (the pagination cursor).
+    pub fn list_user_notifications(
+        &self,
+        user_nid: u64,
+        from: u64,
+        limit: usize,
+        only_highlight: bool,
+    ) -> Result<(Vec<(u64, Value)>, u64), rocksdb::Error> {
+        let cf = self.db.cf_handle("user_notifications").unwrap();
+        let start = keys::encode_u64_pair(user_nid, from.saturating_add(1));
+        let iter = self
+            .db
+            .iterator_cf(&cf, IteratorMode::From(&start, rocksdb::Direction::Forward));
+        let mut out = Vec::new();
+        let mut cursor = from;
+        for item in iter {
+            let (key, val) = item?;
+            if key.len() < 16 {
+                break;
+            }
+            let (un, pos) = keys::decode_u64_pair(&key);
+            if un != user_nid {
+                break;
+            }
+            cursor = pos;
+            let row: Value = match serde_json::from_slice(&val) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if only_highlight
+                && !row
+                    .get("tweaks")
+                    .and_then(|t| t.get("highlight"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            out.push((pos, row));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok((out, cursor))
+    }
+
+    /// Find an event's stream position in a room by scanning room_timeline
+    /// backward. Callers look up the newest event (push dispatch) or a recent
+    /// read receipt, both near the live end, so this terminates quickly.
+    /// `None` if the event isn't in the room's stream timeline.
+    pub fn event_stream_pos(
+        &self,
+        room_nid: u64,
+        event_id: &str,
+    ) -> Result<Option<u64>, rocksdb::Error> {
+        let target = match self.get_event_nid_by_id(event_id)? {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+        let cf = self.db.cf_handle("room_timeline").unwrap();
+        let end_key = keys::encode_u64_pair(room_nid, u64::MAX);
+        let iter = self.db.iterator_cf(
+            &cf,
+            IteratorMode::From(&end_key, rocksdb::Direction::Reverse),
+        );
+        for item in iter {
+            let (key, val) = item?;
+            if key.len() < 16 {
+                continue;
+            }
+            let (rn, sp) = keys::decode_u64_pair(&key);
+            if rn != room_nid {
+                break;
+            }
+            if keys::decode_u64(&val) == target {
+                return Ok(Some(sp));
+            }
+        }
+        Ok(None)
+    }
+
     // --- Account data operations ---
 
     pub fn get_account_data(
@@ -6630,6 +6824,25 @@ fn recover_max_presence_stream(db: &DB) -> Option<u64> {
     iter.next()
         .and_then(|r| r.ok())
         .map(|(key, _)| keys::decode_u64(&key) + 1)
+}
+
+/// Recover the global notification stream counter. The CF is keyed
+/// `(user_nid, pos)`, so the max position is the second u64 across all
+/// keys — a one-time full scan at open (the notification history is
+/// bounded; positions are unique because the counter is global).
+fn recover_max_user_notifications(db: &DB) -> Option<u64> {
+    let cf = db.cf_handle("user_notifications")?;
+    let mut max = 0u64;
+    for item in db.iterator_cf(&cf, IteratorMode::Start) {
+        let (key, _) = item.ok()?;
+        if key.len() >= 16 {
+            let pos = keys::decode_u64(&key[8..16]);
+            if pos > max {
+                max = pos;
+            }
+        }
+    }
+    Some(max + 1)
 }
 
 /// Outbox key prefix for one destination. Includes the trailing 0xff

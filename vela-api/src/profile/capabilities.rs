@@ -27,6 +27,8 @@ pub async fn get_capabilities(
             },
             "m.set_displayname": {"enabled": true},
             "m.set_avatar_url": {"enabled": true},
+            // MSC4133 extended profile fields.
+            "uk.tcpip.msc4133.profile_fields": {"enabled": true},
             "m.3pid_changes": {"enabled": false},
             // We don't implement POST /login/get_token (cross-device
             // login token minting); advertise it disabled so clients

@@ -10,6 +10,19 @@ minor versions.
 
 ### Added
 
+- **Notification history.** `GET /_matrix/client/v3/notifications` returns a
+  paginated list of past notifications (with `from` / `limit` / `only=highlight`).
+  Rows are persisted whenever a push rule matches for a local recipient — even
+  when no push gateway is registered — and the `read` flag is computed at query
+  time from the user's `m.read` receipt / `m.fully_read` marker.
+- **Extended profile fields (MSC4133).** `GET/PUT/DELETE
+  /_matrix/client/v3/profile/{userId}/{keyName}` for arbitrary profile fields
+  (timezone, pronouns, …) alongside the standard `displayname`/`avatar_url`;
+  the full-profile response folds them in. Owner-only writes, size-bounded.
+- **`GET /_matrix/client/v1/auth_metadata` (MSC2965).** Relays the configured
+  IdP's OAuth authorization-server metadata, falling back to an issuer-only
+  document if the IdP is unreachable; 404 when delegated auth is off.
+
 - **Faster remote joins (MSC3706 + MSC3902 partial state).** Joining a
   large federated room no longer blocks on downloading its full member
   list. vela requests a join with `omit_members=true`, becomes joinable
@@ -167,6 +180,16 @@ minor versions.
   OpenTelemetry stack to 0.32 with tracing-opentelemetry 0.33.
 - **`vela-api` reorganised into per-domain folders** (`auth`, `room`,
   `sync`, `federation`, …) instead of one flat module tree.
+
+### Security
+
+- **`/messages` could leak pre-join history.** `GET /rooms/{r}/messages`
+  applied only a coarse departed-member cap, with no per-event
+  history-visibility check (the gate `/event` and `/context` already use). In
+  a room with `history_visibility: joined` or `invited`, a member could page
+  backward and read events from before they joined/were invited. Both the
+  timeline and DAG-backfill paths now gate each event by the user's
+  membership at that event; `shared` / `world_readable` are unaffected.
 
 ### Fixed
 

@@ -10,6 +10,7 @@
 //! gateway latency. Failures are logged and dropped — retries and
 //! backoff are out of scope for now (push is best-effort by design).
 
+pub mod notifications;
 pub mod pushers;
 pub mod pushrules;
 
@@ -92,36 +93,24 @@ async fn dispatch_inner(
     // room's notifications.room threshold (default 50). Constant across
     // recipients, so compute once.
     let sender_power_level = crate::membership::user_power(state, room_nid, &sender).unwrap_or(0);
-    let notifications_room_level =
-        crate::membership::read_state_value_pub(state, room_nid, "m.room.power_levels", "")
-            .ok()
-            .flatten()
-            .and_then(|pl| {
-                pl.get("content")
-                    .and_then(|c| c.get("notifications"))
-                    .and_then(|n| n.get("room"))
-                    .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
-            })
-            .unwrap_or(50);
+    let notifications_room_level = crate::membership::notifications_room_level(state, room_nid);
+
+    // Event-level facts for persisted notifications. `event_stream_pos` is
+    // the just-persisted event, so the backward scan finds it immediately.
+    let event_stream_pos = state.db.event_stream_pos(room_nid, event_id).ok().flatten();
+    let event_ts = event
+        .get("origin_server_ts")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     for member_nid in members {
         if member_nid == sender_nid {
             continue;
         }
-        let pushers = match state.db.list_pushers(member_nid) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(user_nid = member_nid, error = %e, "list_pushers failed");
-                continue;
-            }
-        };
-        if pushers.is_empty() {
-            continue;
-        }
 
-        // Resolve this recipient's rule set + display name, then ask the
-        // evaluator whether the event should notify. This is where
-        // per-room mute and suppress_notices actually kick in.
+        // Evaluate this recipient's push rules FIRST — independent of whether
+        // they have a push gateway, since /notifications records the match
+        // either way (a user with no pusher still reads their notifications).
         let rules = match crate::push::pushrules::load_user_rules(state, member_nid) {
             Ok(r) => r,
             Err(e) => {
@@ -147,6 +136,39 @@ async fn dispatch_inner(
         if !action.notify {
             continue;
         }
+
+        // Persist for GET /notifications — local recipients only (remote
+        // members don't read notifications from us).
+        let is_local = recipient_user_id
+            .strip_prefix('@')
+            .and_then(|s| s.split_once(':'))
+            .map(|(_, srv)| srv == state.config.server_name)
+            .unwrap_or(false);
+        if is_local {
+            let mut actions = vec![json!("notify")];
+            for (k, v) in &action.tweaks {
+                actions.push(json!({"set_tweak": k, "value": v}));
+            }
+            if let Err(e) = state.db.append_notification(
+                member_nid,
+                room_id,
+                event_id,
+                event_stream_pos,
+                &Value::Array(actions),
+                &action.tweaks,
+                event_ts,
+            ) {
+                warn!(user_nid = member_nid, error = %e, "append_notification failed");
+            }
+        }
+
+        let pushers = match state.db.list_pushers(member_nid) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(user_nid = member_nid, error = %e, "list_pushers failed");
+                continue;
+            }
+        };
 
         for pusher in pushers {
             let Some(url) = pusher

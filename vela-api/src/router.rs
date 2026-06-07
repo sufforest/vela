@@ -423,6 +423,10 @@ pub fn build_router(state: AppState) -> Router {
             "/_matrix/client/v1/auth_issuer",
             get(discovery::auth_issuer),
         )
+        .route(
+            "/_matrix/client/v1/auth_metadata",
+            get(discovery::auth_metadata),
+        )
         // Ops — Prometheus scrape (no auth; front with reverse proxy in prod).
         .route("/_vela/metrics", get(crate::metrics::scrape))
         // Ops — health/liveness probe (no auth, intentionally outside
@@ -510,6 +514,20 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/_matrix/client/v3/profile/{userId}/avatar_url",
             get(profile::get_avatar_url).put(profile::set_avatar_url),
+        )
+        // MSC4133 extended profile fields. Static displayname/avatar_url
+        // routes above take precedence; this catches all other keys.
+        .route(
+            "/_matrix/client/v3/profile/{userId}/{keyName}",
+            get(profile::get_profile_field)
+                .put(profile::set_profile_field)
+                .delete(profile::delete_profile_field),
+        )
+        .route(
+            "/_matrix/client/unstable/uk.tcpip.msc4133/profile/{userId}/{keyName}",
+            get(profile::get_profile_field)
+                .put(profile::set_profile_field)
+                .delete(profile::delete_profile_field),
         )
         // Account data
         .route(
@@ -764,6 +782,10 @@ pub fn build_router(state: AppState) -> Router {
         // Pushers
         .route("/_matrix/client/v3/pushers", get(pushers::get_pushers))
         .route("/_matrix/client/v3/pushers/set", post(pushers::set_pusher))
+        .route(
+            "/_matrix/client/v3/notifications",
+            get(crate::push::notifications::get_notifications),
+        )
         // Sync filters
         .route(
             "/_matrix/client/v3/user/{userId}/filter",

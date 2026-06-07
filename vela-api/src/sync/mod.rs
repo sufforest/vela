@@ -1528,17 +1528,7 @@ pub(crate) fn compute_unread_counts(
     // notifications.room threshold (default 50) is constant per room; the
     // sender's power level is set per event in the loop below (MSC3952
     // @room highlight gate).
-    let notifications_room_level =
-        crate::membership::read_state_value_pub(state, room_nid, "m.room.power_levels", "")
-            .ok()
-            .flatten()
-            .and_then(|pl| {
-                pl.get("content")
-                    .and_then(|c| c.get("notifications"))
-                    .and_then(|n| n.get("room"))
-                    .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
-            })
-            .unwrap_or(50);
+    let notifications_room_level = crate::membership::notifications_room_level(state, room_nid);
     let mut push_ctx = vela_core::push_rules::RoomContext {
         joined_member_count,
         recipient_display_name: displayname,

@@ -142,6 +142,8 @@ pub async fn versions(State(state): State<AppState>) -> Json<Value> {
         ("org.matrix.msc4143".to_string(), json!(true)),
         // MSC4155 (server-side invite filtering).
         ("org.matrix.msc4155".to_string(), json!(true)),
+        // MSC4133 (extended profile fields).
+        ("uk.tcpip.msc4133".to_string(), json!(true)),
         ("org.matrix.msc4222".to_string(), json!(true)),
         ("io.element.msc4306".to_string(), json!(true)),
         ("io.element.msc4308".to_string(), json!(true)),
@@ -187,4 +189,60 @@ pub async fn auth_issuer(State(state): State<AppState>) -> axum::response::Respo
         body.insert("account".to_string(), json!(url));
     }
     Json(Value::Object(body)).into_response()
+}
+
+/// MSC2965 `GET /_matrix/client/v1/auth_metadata`. Returns the IdP's
+/// RFC 8414 OAuth authorization-server metadata (token/authorization
+/// endpoints, JWKS, supported scopes, …). vela doesn't hold those itself,
+/// so it relays the issuer's `/.well-known/oauth-authorization-server`;
+/// on any fetch failure it falls back to a minimal `{issuer, account}`
+/// doc so clients can at least discover the issuer. 404 when delegated
+/// auth is off. The issuer is operator-configured (not user input), so
+/// the outbound fetch is not an SSRF vector.
+pub async fn auth_metadata(State(state): State<AppState>) -> axum::response::Response {
+    if !state.config.oidc.enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "errcode": "M_NOT_FOUND",
+                "error": "this homeserver does not delegate authentication",
+            })),
+        )
+            .into_response();
+    }
+
+    let issuer = state.config.oidc.issuer.trim_end_matches('/');
+    let url = format!("{issuer}/.well-known/oauth-authorization-server");
+
+    if let Some(mut doc) = fetch_idp_metadata(&url).await
+        && let Some(obj) = doc.as_object_mut()
+    {
+        obj.entry("issuer".to_string())
+            .or_insert_with(|| json!(state.config.oidc.issuer));
+        if let Some(acct) = &state.config.oidc.account_management_url {
+            obj.entry("account_management_uri".to_string())
+                .or_insert_with(|| json!(acct));
+        }
+        return Json(doc).into_response();
+    }
+
+    // Fallback: issuer + account only.
+    let mut body = serde_json::Map::new();
+    body.insert("issuer".to_string(), json!(state.config.oidc.issuer));
+    if let Some(acct) = &state.config.oidc.account_management_url {
+        body.insert("account_management_uri".to_string(), json!(acct));
+    }
+    Json(Value::Object(body)).into_response()
+}
+
+async fn fetch_idp_metadata(url: &str) -> Option<Value> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<Value>().await.ok()
 }
