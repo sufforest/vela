@@ -1392,14 +1392,29 @@ async fn try_fetch_event_from_federation(
     }
 
     let our_server = state.config.server_name.as_str();
-    let peers = state
+    // Union currently-known-joined remotes with the partial-state
+    // hint: `omit_members=true` send_join leaves memberships empty
+    // until the filler completes, so without the union a /event
+    // probe right after a federated join would 404 even though the
+    // resident server can answer.
+    let mut peer_set: std::collections::BTreeSet<String> = state
         .db
         .get_remote_servers_in_room(room_nid, our_server)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    if peers.is_empty() {
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        .into_iter()
+        .collect();
+    if let Ok((true, hint)) = state.db.get_partial_state_info(room_nid) {
+        for s in hint {
+            if s != our_server {
+                peer_set.insert(s);
+            }
+        }
+    }
+    if peer_set.is_empty() {
         // Local-only room — no peer can have this event.
         return Err(VelaError::NotFound("event not found".into()).into());
     }
+    let peers: Vec<String> = peer_set.into_iter().collect();
 
     let budget = crate::federation::federation_receive::new_fetch_budget();
     for peer in &peers {

@@ -63,6 +63,13 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // rejection reason as the value (debugging aid).
     "rejected_events",
     "event_redactions",
+    // Pending redactions waiting for their target to land. Key is the
+    // target event_id string; value is the redactor's event_nid. When
+    // the target arrives via a later /send/{txn}, the receive path
+    // checks this CF and applies the marker. Backstops the "redaction
+    // arrives before target" race that
+    // `try_apply_redaction_marker` would otherwise silently drop.
+    "pending_redactions",
     "user_membership_pos",
     "event_relations",
     // O(1) count of children per (parent_event_nid, rel_type_nid).

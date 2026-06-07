@@ -210,13 +210,32 @@ async fn remote_timestamp_to_event(
     ts: u64,
     dir: &str,
 ) -> Option<Value> {
-    let candidates = state
+    // Union currently-known-joined remote servers with the
+    // partial-state hint: an `omit_members=true` send_join leaves
+    // the memberships CF without other-server members until the
+    // filler completes, so a pure get_remote_servers_in_room would
+    // return an empty list right after a federated join and we'd
+    // skip the federation fallback entirely. The hint carries the
+    // resident server's notion of who else is in the room — that's
+    // exactly who can answer /timestamp_to_event for events that
+    // predate our join.
+    let mut candidates: std::collections::BTreeSet<String> = state
         .db
         .get_remote_servers_in_room(room_nid, &state.config.server_name)
-        .ok()?;
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if let Ok((true, hint)) = state.db.get_partial_state_info(room_nid) {
+        for s in hint {
+            if s != state.config.server_name {
+                candidates.insert(s);
+            }
+        }
+    }
     if candidates.is_empty() {
         return None;
     }
+    let candidates: Vec<String> = candidates.into_iter().collect();
     for server in &candidates {
         let resp = match state
             .federation_client

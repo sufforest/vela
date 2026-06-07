@@ -1430,11 +1430,20 @@ async fn persist_received_pdu(
 
     if !soft_failed {
         // If this is a redaction and the target is on-disk, apply a marker
-        // when the sender is actually allowed to redact it. Missing-target
-        // case is logged and skipped; back-filling later is future work.
+        // when the sender is actually allowed to redact it. When the
+        // target is unknown locally (the redaction arrived before its
+        // target via /send/{txn}), try a one-shot /event/{id} fetch
+        // against the origin server, then park the redactor so a later
+        // target arrival can apply the marker retroactively.
         if pdu.event_type == "m.room.redaction" {
-            try_apply_redaction_marker(state, room_nid, pdu, event_nid);
+            try_apply_redaction_marker(state, room_nid, pdu, event_nid, origin).await;
         }
+
+        // If THIS event is the target of a previously-parked
+        // redaction, apply that redaction now. Handles the
+        // redaction-before-target race that
+        // `try_apply_redaction_marker` parked on the prior path.
+        apply_parked_redaction_for_target(state, room_nid, &pdu.event_id, event_nid);
 
         // Index any m.relates_to so /relations sees federated children too.
         try_record_relation(
@@ -1679,16 +1688,144 @@ fn try_record_relation(
 /// event itself is still persisted and federated. Missing targets may be
 /// back-filled in a future pass; insufficient-power redactions from remote
 /// servers are simply no-ops per spec.
-fn try_apply_redaction_marker(state: &AppState, room_nid: u64, pdu: &Pdu, redactor_nid: u64) {
+/// When `target_event_id` arrives via /send/{txn} and we have a
+/// previously-parked redaction for it, apply the marker now.
+/// Mirrors the core of `try_apply_redaction_marker` (auth check +
+/// `mark_redacted_by` + relation bookkeeping) but skips the /event
+/// fetch — we just persisted the target, it's on disk by
+/// construction.
+fn apply_parked_redaction_for_target(
+    state: &AppState,
+    room_nid: u64,
+    target_event_id: &str,
+    target_event_nid: u64,
+) {
+    let redactor_nid = match state.db.take_pending_redaction(target_event_id) {
+        Ok(Some(n)) => n,
+        Ok(None) => return,
+        Err(e) => {
+            warn!(target = %target_event_id, error = %e,
+                "take_pending_redaction failed; redactor stays parked");
+            return;
+        }
+    };
+    let redactor_pdu = match state.db.get_event(redactor_nid).ok().flatten() {
+        Some((_, bytes)) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => match v.as_object() {
+                Some(obj) => match Pdu::from_json(String::new(), obj) {
+                    Some(p) => p,
+                    None => return,
+                },
+                None => return,
+            },
+            Err(_) => return,
+        },
+        None => return,
+    };
+    let target_pdu = match load_pdu_by_event_id(state, target_event_id) {
+        Some(p) => p,
+        None => return,
+    };
+    let create_pdu = match load_current_state_pdu(state, room_nid, "m.room.create", "") {
+        Some(p) => p,
+        None => return,
+    };
+    let pl_pdu = load_current_state_pdu(state, room_nid, "m.room.power_levels", "");
+    let state_fn = |t: &str, sk: &str| -> Option<&Pdu> {
+        match (t, sk) {
+            ("m.room.create", "") => Some(&create_pdu),
+            ("m.room.power_levels", "") => pl_pdu.as_ref(),
+            _ => None,
+        }
+    };
+    if !vela_core::auth_rules::can_apply_redaction(
+        &redactor_pdu.sender,
+        &target_pdu.sender,
+        &state_fn,
+        &create_pdu,
+    ) {
+        debug!(target = %target_event_id, "parked redaction failed auth check at target arrival");
+        return;
+    }
+    if let Err(e) = state.db.mark_redacted_by(target_event_nid, redactor_nid) {
+        warn!(target = %target_event_id, error = %e,
+            "mark_redacted_by (parked) failed");
+        return;
+    }
+    if let Some(rel) = target_pdu.content.get("m.relates_to")
+        && let Some(parent_event_id) = rel.get("event_id").and_then(|v| v.as_str())
+        && let Some(rel_type) = rel.get("rel_type").and_then(|v| v.as_str())
+        && let Ok(Some(parent_nid)) = state.db.get_event_nid_by_id(parent_event_id)
+        && let Ok(Some(rel_type_nid)) = state.db.get_nid(rel_type)
+    {
+        let _ = state.db.relation_redacted(parent_nid, rel_type_nid);
+    }
+    debug!(target = %target_event_id, "applied parked redaction after target arrival");
+}
+
+async fn try_apply_redaction_marker(
+    state: &AppState,
+    room_nid: u64,
+    pdu: &Pdu,
+    redactor_nid: u64,
+    origin: &str,
+) {
     // v11+: redacts lives in content.redacts.
     let target_id = match pdu.content.get("redacts").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return,
     };
 
+    // Out-of-order redaction backfill: if the target arrives later
+    // via /send/{txn}, the live path would silently drop the marker
+    // and the target would render unredacted forever. Try /event/{id}
+    // against the origin first; it's a one-shot best-effort fetch
+    // with its own budget. A peer 404 or persist failure still falls
+    // through to the same drop the pre-fix path took — but at warn
+    // level so the operator can see when the backfill probe missed.
+    if state
+        .db
+        .get_event_nid_by_id(target_id)
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        match state
+            .federation_client
+            .fetch_event_pdu(origin, target_id)
+            .await
+        {
+            Ok(pdu_value) => {
+                let budget = new_fetch_budget();
+                if let Err(e) =
+                    persist_fetched_event(state, &pdu_value, origin, budget, FetchKind::AuthChain)
+                        .await
+                {
+                    warn!(target = %target_id, origin = %origin, error = %e,
+                        "redaction backfill: persist_fetched_event failed");
+                }
+            }
+            Err(e) => {
+                warn!(target = %target_id, origin = %origin, error = %e,
+                    "redaction backfill: /event probe failed");
+            }
+        }
+    }
+
     let target_nid = match state.db.get_event_nid_by_id(target_id) {
         Ok(Some(n)) => n,
-        _ => return,
+        _ => {
+            // Probe missed (peer 404'd or returned garbage). Park
+            // the redactor so the receive path applies it
+            // retroactively when /send/{txn} eventually delivers
+            // the target.
+            if let Err(e) = state.db.park_pending_redaction(target_id, redactor_nid) {
+                warn!(target = %target_id, error = %e, "park_pending_redaction failed");
+            } else {
+                debug!(target = %target_id, "parked redaction for later target arrival");
+            }
+            return;
+        }
     };
     let target_pdu = match load_pdu_by_event_id(state, target_id) {
         Some(p) if p.room_id == pdu.room_id => p,

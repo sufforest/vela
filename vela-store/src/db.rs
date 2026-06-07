@@ -3283,6 +3283,42 @@ impl Database {
         }
     }
 
+    /// Park a redaction whose target event_id isn't on disk yet. Read
+    /// back when the target arrives via a later /send/{txn} so the
+    /// marker fires retroactively. Multiple redactions racing for the
+    /// same target overwrite the value — last-writer-wins matches the
+    /// existing `event_redactions` semantics (first marker wins for
+    /// already-on-disk targets via the `already_redacted` short-circuit,
+    /// and any later one is idempotent).
+    pub fn park_pending_redaction(
+        &self,
+        target_event_id: &str,
+        redactor_event_nid: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("pending_redactions").unwrap();
+        self.db.put_cf(
+            &cf,
+            target_event_id.as_bytes(),
+            keys::encode_u64(redactor_event_nid),
+        )
+    }
+
+    /// Pop any parked redactor for the just-persisted target. Returns
+    /// the redactor event_nid and removes the entry — the caller
+    /// applies the marker via `mark_redacted_by` + relation bookkeeping.
+    pub fn take_pending_redaction(
+        &self,
+        target_event_id: &str,
+    ) -> Result<Option<u64>, rocksdb::Error> {
+        let cf = self.db.cf_handle("pending_redactions").unwrap();
+        let key = target_event_id.as_bytes();
+        let val = self.db.get_cf(&cf, key)?;
+        if val.is_some() {
+            self.db.delete_cf(&cf, key)?;
+        }
+        Ok(val.map(|b| keys::decode_u64(&b)))
+    }
+
     // --- Event relations (m.relates_to) ---
 
     /// Record that `child_event_nid` relates to `parent_event_nid` via
@@ -8159,6 +8195,48 @@ mod partial_state_pending_dlu_tests {
         let mut sorted = sent_to;
         sorted.sort();
         assert_eq!(sorted, vec!["a.example", "b.example"]);
+    }
+}
+
+#[cfg(test)]
+mod pending_redaction_tests {
+    use super::*;
+
+    fn fresh_db() -> (Database, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        (db, tmp)
+    }
+
+    #[test]
+    fn park_then_take_returns_redactor_and_consumes_entry() {
+        let (db, _tmp) = fresh_db();
+        db.park_pending_redaction("$target_event_id", 42).unwrap();
+        let taken = db.take_pending_redaction("$target_event_id").unwrap();
+        assert_eq!(taken, Some(42));
+        // Second take is empty — entry was consumed.
+        let again = db.take_pending_redaction("$target_event_id").unwrap();
+        assert!(again.is_none(), "take must be destructive");
+    }
+
+    #[test]
+    fn take_with_no_park_returns_none() {
+        let (db, _tmp) = fresh_db();
+        let taken = db.take_pending_redaction("$never_parked").unwrap();
+        assert!(taken.is_none());
+    }
+
+    /// Last writer wins when multiple redactions race for the same
+    /// target before it lands. Matches the existing
+    /// `event_redactions` posture: only one marker can be applied
+    /// per target via `mark_redacted_by`, and the first one that
+    /// makes it onto disk via the receive path wins downstream.
+    #[test]
+    fn park_overwrites_existing_entry_for_same_target() {
+        let (db, _tmp) = fresh_db();
+        db.park_pending_redaction("$target", 100).unwrap();
+        db.park_pending_redaction("$target", 200).unwrap();
+        assert_eq!(db.take_pending_redaction("$target").unwrap(), Some(200));
     }
 }
 
