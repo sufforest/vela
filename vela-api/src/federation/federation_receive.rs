@@ -1430,10 +1430,12 @@ async fn persist_received_pdu(
 
     if !soft_failed {
         // If this is a redaction and the target is on-disk, apply a marker
-        // when the sender is actually allowed to redact it. Missing-target
-        // case is logged and skipped; back-filling later is future work.
+        // when the sender is actually allowed to redact it. When the
+        // target is unknown locally (the redaction arrived before its
+        // target via /send/{txn}), try a one-shot /event/{id} fetch
+        // against the origin server before giving up.
         if pdu.event_type == "m.room.redaction" {
-            try_apply_redaction_marker(state, room_nid, pdu, event_nid);
+            try_apply_redaction_marker(state, room_nid, pdu, event_nid, origin).await;
         }
 
         // Index any m.relates_to so /relations sees federated children too.
@@ -1679,12 +1681,54 @@ fn try_record_relation(
 /// event itself is still persisted and federated. Missing targets may be
 /// back-filled in a future pass; insufficient-power redactions from remote
 /// servers are simply no-ops per spec.
-fn try_apply_redaction_marker(state: &AppState, room_nid: u64, pdu: &Pdu, redactor_nid: u64) {
+async fn try_apply_redaction_marker(
+    state: &AppState,
+    room_nid: u64,
+    pdu: &Pdu,
+    redactor_nid: u64,
+    origin: &str,
+) {
     // v11+: redacts lives in content.redacts.
     let target_id = match pdu.content.get("redacts").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return,
     };
+
+    // Out-of-order redaction backfill: if the target arrives later
+    // via /send/{txn}, the live path would silently drop the marker
+    // and the target would render unredacted forever. Try /event/{id}
+    // against the origin first; it's a one-shot best-effort fetch
+    // with its own budget. A peer 404 or persist failure still falls
+    // through to the same drop the pre-fix path took — but at warn
+    // level so the operator can see when the backfill probe missed.
+    if state
+        .db
+        .get_event_nid_by_id(target_id)
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        match state
+            .federation_client
+            .fetch_event_pdu(origin, target_id)
+            .await
+        {
+            Ok(pdu_value) => {
+                let budget = new_fetch_budget();
+                if let Err(e) =
+                    persist_fetched_event(state, &pdu_value, origin, budget, FetchKind::AuthChain)
+                        .await
+                {
+                    warn!(target = %target_id, origin = %origin, error = %e,
+                        "redaction backfill: persist_fetched_event failed");
+                }
+            }
+            Err(e) => {
+                warn!(target = %target_id, origin = %origin, error = %e,
+                    "redaction backfill: /event probe failed");
+            }
+        }
+    }
 
     let target_nid = match state.db.get_event_nid_by_id(target_id) {
         Ok(Some(n)) => n,
