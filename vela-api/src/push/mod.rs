@@ -88,6 +88,22 @@ async fn dispatch_inner(
 
     let room_member_count = members.len() as u64;
 
+    // @room mention gate (MSC3952): the sender's effective power vs the
+    // room's notifications.room threshold (default 50). Constant across
+    // recipients, so compute once.
+    let sender_power_level = crate::membership::user_power(state, room_nid, &sender).unwrap_or(0);
+    let notifications_room_level =
+        crate::membership::read_state_value_pub(state, room_nid, "m.room.power_levels", "")
+            .ok()
+            .flatten()
+            .and_then(|pl| {
+                pl.get("content")
+                    .and_then(|c| c.get("notifications"))
+                    .and_then(|n| n.get("room"))
+                    .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
+            })
+            .unwrap_or(50);
+
     for member_nid in members {
         if member_nid == sender_nid {
             continue;
@@ -124,6 +140,8 @@ async fn dispatch_inner(
             joined_member_count: room_member_count,
             recipient_display_name: display_name,
             recipient_user_id: recipient_user_id.clone(),
+            sender_power_level,
+            notifications_room_level,
         };
         let action = vela_core::push_rules::evaluate(&event, &rules, &ctx);
         if !action.notify {

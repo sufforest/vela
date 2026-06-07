@@ -90,7 +90,16 @@ minor versions.
   before joining. Resolves aliases, gates visibility via the existing
   peek rules (members/invitees always; otherwise public/knock/
   world-readable/allow-list), returns the caller's `membership`, and
-  serves unauthenticated requests for world-readable rooms only.
+  serves unauthenticated requests for world-readable rooms only. Rooms we
+  don't host are summarised over federation (the hierarchy root from a
+  `via` / known candidate server), so previewing a remote room works for
+  authenticated callers.
+- **Intentional mentions (MSC3952).** `m.mentions` is now honoured for
+  push: `.m.rule.is_user_mention` notifies a user listed in
+  `content.m.mentions.user_ids`, and `.m.rule.is_room_mention` handles
+  `@room` — but only when the sender's power level meets the room's
+  `notifications.room` threshold, so low-power users can't @room-spam.
+  Highlight counts in `/sync` reflect the same rules.
 - **Batch device delete.** `POST /_matrix/client/v3/delete_devices`
   with the same UIA discipline as single-device delete; ids the caller
   doesn't own are skipped instead of failing the whole batch.
@@ -161,6 +170,11 @@ minor versions.
 
 ### Fixed
 
+- **Push-rule keys with escaped dots weren't resolved.** The condition
+  key parser split on every `.`, so a key like `content.m\.mentions.room`
+  (whose `m.mentions` segment contains a literal dot) never matched.
+  It now honours `\.` / `\\` escaping, which the MSC3952 mention rules
+  depend on.
 - **Federated messages didn't trigger push notifications.** The push
   dispatch path only ran on locally-sent events; when a remote user
   sent a message to a federated room, every local member's mobile

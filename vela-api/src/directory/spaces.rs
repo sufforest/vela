@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 
 use crate::middleware::json::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -631,64 +631,123 @@ pub(crate) fn summarize_room(
 /// `children_state`. Unauthenticated callers are served world-readable
 /// rooms only.
 ///
-/// Federation fallback (summarising a room we don't host) is not yet
-/// wired up — such rooms 404 for now.
+/// For rooms we don't host, falls back to fetching the federation
+/// hierarchy root from a candidate server (`via` hints + alias servers +
+/// known remote members + the room-id domain) and returning its summary.
+/// The federation fallback is authenticated-only — we won't drive an
+/// outbound federation fetch on behalf of an anonymous caller.
 pub(crate) async fn room_summary(
     State(state): State<AppState>,
     user: Option<AuthenticatedUser>,
     Path(room_id_or_alias): Path<String>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
-    let room_id = if room_id_or_alias.starts_with('#') {
-        crate::membership::resolve_alias(&state, &room_id_or_alias)
-            .await?
-            .0
-    } else {
-        RoomId::parse(&room_id_or_alias)
-            .map_err(|_| ApiError(VelaError::NotFound("unknown room".into())))?
-    };
+    // MSC3266 `via` server hints (repeated query param).
+    let mut hints = crate::membership::parse_query_values(raw_query.as_deref(), "via");
 
-    let Some(room_nid) = state
+    let (room_id, alias_servers) = if room_id_or_alias.starts_with('#') {
+        crate::membership::resolve_alias(&state, &room_id_or_alias).await?
+    } else {
+        let rid = RoomId::parse(&room_id_or_alias)
+            .map_err(|_| ApiError(VelaError::NotFound("unknown room".into())))?;
+        (rid, Vec::new())
+    };
+    hints.extend(alias_servers);
+
+    let room_nid = state
         .db
         .get_nid(room_id.as_str())
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-    else {
-        return Err(ApiError(VelaError::NotFound("unknown room".into())));
-    };
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
-    // We only summarise rooms we actually host. A NID can exist for a
-    // room we've merely seen referenced (e.g. via an m.space.child);
-    // treat those as not-found until federation summary is wired up.
-    if !has_local_state(&state, room_nid) {
-        return Err(ApiError(VelaError::NotFound("unknown room".into())));
-    }
-
-    let user_nid = user.as_ref().map(|u| u.user_nid);
-    let allowed = match user_nid {
-        Some(nid) => can_peek(&state, room_nid, nid)?,
-        // Unauthenticated: world-readable rooms only.
-        None => is_world_readable(&state, room_nid),
-    };
-    if !allowed {
-        // 404 (not 403) so we don't leak the existence of rooms the
-        // caller isn't allowed to see.
-        return Err(ApiError(VelaError::NotFound("unknown room".into())));
-    }
-
-    let mut summary = summarize_room(&state, room_nid, room_id.as_str(), &[])?;
-    if let Some(obj) = summary.as_object_mut() {
-        // children_state is hierarchy-only; not part of MSC3266.
-        obj.remove("children_state");
-        if let Some(nid) = user_nid
-            && let Some(m) = state
-                .db
-                .get_membership(room_nid, nid)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-            && let Some(s) = membership_str(m)
-        {
-            obj.insert("membership".into(), json!(s));
+    // Resident room with full local state → answer from our own store.
+    if let Some(room_nid) = room_nid
+        && has_local_state(&state, room_nid)
+    {
+        let user_nid = user.as_ref().map(|u| u.user_nid);
+        let allowed = match user_nid {
+            Some(nid) => can_peek(&state, room_nid, nid)?,
+            // Unauthenticated: world-readable rooms only.
+            None => is_world_readable(&state, room_nid),
+        };
+        if !allowed {
+            // 404 (not 403) so we don't leak the existence of rooms the
+            // caller isn't allowed to see.
+            return Err(ApiError(VelaError::NotFound("unknown room".into())));
         }
+
+        let mut summary = summarize_room(&state, room_nid, room_id.as_str(), &[])?;
+        if let Some(obj) = summary.as_object_mut() {
+            // children_state is hierarchy-only; not part of MSC3266.
+            obj.remove("children_state");
+            if let Some(nid) = user_nid
+                && let Some(m) = state
+                    .db
+                    .get_membership(room_nid, nid)
+                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                && let Some(s) = membership_str(m)
+            {
+                obj.insert("membership".into(), json!(s));
+            }
+        }
+        return Ok(Json(summary));
     }
-    Ok(Json(summary))
+
+    // Non-resident room: federation fallback, authenticated callers only.
+    if user.is_none() {
+        return Err(ApiError(VelaError::NotFound("unknown room".into())));
+    }
+    if let Some(nid) = room_nid {
+        hints.extend(crate::membership::remote_servers_in_room(&state, nid)?);
+    }
+    // The room-id's own domain is a reasonable last-resort candidate.
+    if let Some((_, domain)) = room_id.as_str().split_once(':') {
+        hints.push(domain.to_string());
+    }
+    let candidates = dedup_drop_self(hints, &state.config.server_name);
+    fetch_remote_summary(&state, room_id.as_str(), &candidates).await
+}
+
+/// De-duplicate a candidate-server list preserving order, dropping our own
+/// name and empties.
+fn dedup_drop_self(servers: Vec<String>, own: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    servers
+        .into_iter()
+        .filter(|s| !s.is_empty() && s != own)
+        .filter(|s| seen.insert(s.clone()))
+        .collect()
+}
+
+/// Fetch a remote room's summary via the federation hierarchy endpoint
+/// (reference servers have no dedicated federation `/summary`). Returns the
+/// hierarchy response's `room` chunk minus the hierarchy-only fields. Tries
+/// candidates in order; 404 if none answer.
+async fn fetch_remote_summary(
+    state: &AppState,
+    room_id: &str,
+    candidates: &[String],
+) -> Result<Json<Value>, ApiError> {
+    const MAX_CANDIDATES: usize = 5;
+    for server in candidates.iter().take(MAX_CANDIDATES) {
+        let Ok(hierarchy) = state
+            .federation_client
+            .fetch_hierarchy(server, room_id)
+            .await
+        else {
+            continue;
+        };
+        let Some(room) = hierarchy.get("room").and_then(|r| r.as_object()) else {
+            continue;
+        };
+        let mut obj = room.clone();
+        // children_state / allowed_room_ids are hierarchy-only.
+        obj.remove("children_state");
+        obj.remove("allowed_room_ids");
+        obj.entry("room_id".to_string())
+            .or_insert_with(|| json!(room_id));
+        return Ok(Json(Value::Object(obj)));
+    }
+    Err(ApiError(VelaError::NotFound("unknown room".into())))
 }
 
 fn is_world_readable(state: &AppState, room_nid: u64) -> bool {

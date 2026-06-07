@@ -517,7 +517,10 @@ fn invite_sender_server(
 /// resident), then any joined member's domain. Used when a client passes
 /// `?server_name=` listing only ourselves and we need an alternate
 /// resident to drive make_join.
-fn remote_servers_in_room(state: &AppState, room_nid: u64) -> Result<Vec<String>, ApiError> {
+pub(crate) fn remote_servers_in_room(
+    state: &AppState,
+    room_nid: u64,
+) -> Result<Vec<String>, ApiError> {
     let our_server = state.config.server_name.as_str();
     let mut out: Vec<String> = Vec::new();
     if let Some(create) = read_state_value(state, room_nid, "m.room.create", "")?

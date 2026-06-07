@@ -45,6 +45,12 @@ pub struct RoomContext {
     /// The recipient's Matrix user id (`@alice:example.com`). Used for
     /// user-mention / user-name conditions.
     pub recipient_user_id: String,
+    /// The event sender's effective power level. Drives
+    /// `sender_notification_permission` (the @room mention gate).
+    pub sender_power_level: i64,
+    /// The room's `notifications.room` power-level threshold (default 50).
+    /// A sender at or above this may trigger `.m.rule.is_room_mention`.
+    pub notifications_room_level: i64,
 }
 
 /// Evaluate `rules` (a `{override: [...], content: [...], room: [...], sender: [...], underride: [...]}`
@@ -148,22 +154,70 @@ fn match_one_condition(cond: &Value, event: &Value, ctx: &RoomContext) -> bool {
             };
             member_count_matches(ctx.joined_member_count, is_spec)
         }
-        // Not implemented (sender_notification_permission, event_property_contains,
-        // m.call.notify): returning false means the rule doesn't match, which is
-        // safer than false-positive notifications.
+        // MSC3952 intentional mentions: the array at `key` must contain
+        // `value`. When `value` is omitted we test for the recipient's own
+        // mxid — the spec's `.m.rule.is_user_mention` templates each user's
+        // id into the rule; Vela keeps one shared default rule and resolves
+        // the recipient from the eval context instead (same approach as
+        // `contains_display_name`).
+        "event_property_contains" => {
+            let Some(key) = cond.get("key").and_then(|v| v.as_str()) else {
+                return false;
+            };
+            let recipient = Value::String(ctx.recipient_user_id.clone());
+            let expected = cond.get("value").unwrap_or(&recipient);
+            json_pointer_get(event, key)
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .is_some_and(|arr| arr.iter().any(|item| item == expected))
+        }
+        // MSC3952 @room gate: the event sender's power level must be at or
+        // above the room's `notifications.<key>` threshold. We only model
+        // the `room` key (the only one the spec defines today).
+        "sender_notification_permission" => {
+            let key = cond.get("key").and_then(|v| v.as_str()).unwrap_or("room");
+            if key != "room" {
+                return false;
+            }
+            ctx.sender_power_level >= ctx.notifications_room_level
+        }
+        // Not implemented (m.call.notify): returning false means the rule
+        // doesn't match, which is safer than false-positive notifications.
         _ => false,
     }
 }
 
-/// Resolve a Matrix-style dotted key path (`content.body`, `content.m.relates_to.rel_type`)
-/// by splitting on unescaped dots. Matrix allows `\.` to embed literal dots
-/// but the default rules don't use it — we handle the simple case.
+/// Resolve a Matrix-style dotted key path (`content.body`,
+/// `content.m\.mentions.user_ids`) by splitting on unescaped dots. Per the
+/// spec, `\.` embeds a literal dot and `\\` a literal backslash — required
+/// for keys like `m.mentions` whose own name contains a dot (MSC3952).
 fn json_pointer_get(event: &Value, key: &str) -> Option<Value> {
     let mut cursor = event;
-    for part in key.split('.') {
-        cursor = cursor.get(part)?;
+    for part in split_unescaped_dots(key) {
+        cursor = cursor.get(&part)?;
     }
     Some(cursor.clone())
+}
+
+/// Split a push-rule key on unescaped `.`, unescaping `\.` → `.` and
+/// `\\` → `\` within each segment.
+fn split_unescaped_dots(key: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut chars = key.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            '.' => parts.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    parts.push(cur);
+    parts
 }
 
 /// Matrix glob: `*` matches any substring, `?` any single character.
@@ -345,6 +399,42 @@ pub fn default_global_rules() -> Value {
                 }],
                 "actions": ["dont_notify"],
             },
+            // MSC3952 intentional user mention: notify when the recipient is
+            // listed in content.m.mentions.user_ids. Takes priority over the
+            // deprecated text-matching rules below. (No explicit `value` —
+            // the evaluator fills in the recipient's mxid.)
+            {
+                "rule_id": ".m.rule.is_user_mention",
+                "default": true,
+                "enabled": true,
+                "conditions": [{
+                    "kind": "event_property_contains",
+                    "key": "content.m\\.mentions.user_ids",
+                }],
+                "actions": [
+                    "notify",
+                    {"set_tweak": "sound", "value": "default"},
+                    {"set_tweak": "highlight"},
+                ],
+            },
+            // MSC3952 intentional @room mention: notify when content.m.mentions
+            // .room is true AND the sender has power to notify the room
+            // (notifications.room, default 50). Gates @room spam from
+            // low-power users.
+            {
+                "rule_id": ".m.rule.is_room_mention",
+                "default": true,
+                "enabled": true,
+                "conditions": [
+                    {
+                        "kind": "event_property_is",
+                        "key": "content.m\\.mentions.room",
+                        "value": true,
+                    },
+                    {"kind": "sender_notification_permission", "key": "room"},
+                ],
+                "actions": ["notify", {"set_tweak": "highlight"}],
+            },
             // Display-name mention (deprecated but still a Matrix default).
             {
                 "rule_id": ".m.rule.contains_display_name",
@@ -489,7 +579,59 @@ mod tests {
             joined_member_count: 3,
             recipient_display_name: display_name.map(|s| s.to_string()),
             recipient_user_id: "@bob:example.com".into(),
+            sender_power_level: 0,
+            notifications_room_level: 50,
         }
+    }
+
+    // MSC3952 intentional mention. `m.mentions` carries a literal dot in
+    // its key, exercising the escaped-key path.
+    fn mention_event(user_ids: &[&str], room: bool) -> Value {
+        json!({
+            "type": "m.room.message",
+            "sender": "@alice:example.com",
+            "room_id": "!room:example.com",
+            "content": {
+                "msgtype": "m.text",
+                "body": "hey",
+                "m.mentions": { "user_ids": user_ids, "room": room },
+            },
+        })
+    }
+
+    #[test]
+    fn is_user_mention_highlights_recipient() {
+        let ev = mention_event(&["@bob:example.com"], false);
+        let r = evaluate(&ev, &default_global_rules(), &ctx(None));
+        assert!(r.notify);
+        assert!(r.tweaks.contains_key("highlight"));
+    }
+
+    #[test]
+    fn unmentioned_user_notifies_without_highlight() {
+        // @carol mentioned, not @bob → plain-message notify, no highlight.
+        let ev = mention_event(&["@carol:example.com"], false);
+        let r = evaluate(&ev, &default_global_rules(), &ctx(None));
+        assert!(r.notify);
+        assert!(!r.tweaks.contains_key("highlight"));
+    }
+
+    #[test]
+    fn room_mention_with_power_highlights() {
+        let ev = mention_event(&[], true);
+        let mut c = ctx(None);
+        c.sender_power_level = 50; // == notifications.room threshold
+        let r = evaluate(&ev, &default_global_rules(), &c);
+        assert!(r.notify);
+        assert!(r.tweaks.contains_key("highlight"));
+    }
+
+    #[test]
+    fn room_mention_without_power_not_highlighted() {
+        // sender_power_level 0 < 50 → @room gate fails; no highlight.
+        let ev = mention_event(&[], true);
+        let r = evaluate(&ev, &default_global_rules(), &ctx(None));
+        assert!(!r.tweaks.contains_key("highlight"));
     }
 
     #[test]
