@@ -1525,10 +1525,26 @@ pub(crate) fn compute_unread_counts(
         .db
         .count_room_members_by_membership(room_nid, 1)
         .unwrap_or(0);
-    let push_ctx = vela_core::push_rules::RoomContext {
+    // notifications.room threshold (default 50) is constant per room; the
+    // sender's power level is set per event in the loop below (MSC3952
+    // @room highlight gate).
+    let notifications_room_level =
+        crate::membership::read_state_value_pub(state, room_nid, "m.room.power_levels", "")
+            .ok()
+            .flatten()
+            .and_then(|pl| {
+                pl.get("content")
+                    .and_then(|c| c.get("notifications"))
+                    .and_then(|n| n.get("room"))
+                    .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
+            })
+            .unwrap_or(50);
+    let mut push_ctx = vela_core::push_rules::RoomContext {
         joined_member_count,
         recipient_display_name: displayname,
         recipient_user_id: user_id_str.clone(),
+        sender_power_level: 0,
+        notifications_room_level,
     };
 
     for (idx, ev) in timeline_events.iter().enumerate() {
@@ -1541,6 +1557,8 @@ pub(crate) fn compute_unread_counts(
         if !matches!(ev_type, "m.room.message" | "m.room.encrypted") {
             continue;
         }
+        push_ctx.sender_power_level =
+            crate::membership::user_power(state, room_nid, sender).unwrap_or(0);
         let action = vela_core::push_rules::evaluate(ev, &rules, &push_ctx);
         let highlights = action
             .tweaks

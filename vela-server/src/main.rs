@@ -1426,8 +1426,6 @@ fn init_tracing(cfg: &TracingSection) -> Option<OtelShutdownGuard> {
         return None;
     };
 
-    use opentelemetry_otlp::WithExportConfig;
-
     // Install the W3C trace-context propagator globally so vela-api's
     // inject/extract helpers (used in signed_request and the federation
     // auth middleware) round-trip the `traceparent` header.
@@ -1435,19 +1433,9 @@ fn init_tracing(cfg: &TracingSection) -> Option<OtelShutdownGuard> {
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
     );
 
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(endpoint)
-        .build()
-        .expect("OTLP exporter builds");
-    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(
-            opentelemetry_sdk::Resource::builder()
-                .with_service_name("vela")
-                .build(),
-        )
-        .build();
+    // Provider construction lives in vela-api so the OTLP export path is
+    // covered by an integration test (vela-api/tests/otlp_export.rs).
+    let provider = vela_api::otel::build_tracer_provider(endpoint);
     opentelemetry::global::set_tracer_provider(provider.clone());
     let tracer = opentelemetry::trace::TracerProvider::tracer(&provider, "vela");
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);

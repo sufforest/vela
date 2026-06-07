@@ -13,7 +13,12 @@ description = "Vela's HTTP API surface: client-server, server-server, applicatio
 # remote-originated trace. Requires the binary to also enable the
 # matching `otel` feature on vela-server so the global propagator and
 # tracer provider are installed.
-otel = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
 
 # Re-export `crate::test_helpers::build_test_state*` to out-of-crate
 # consumers (currently `tools/testing/smoketest-rs`). Pulls `tempfile`
@@ -56,6 +61,8 @@ hickory-resolver = { workspace = true }
 futures = { workspace = true }
 form_urlencoded = "1"
 opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 # Pulled in only when `test-harness` is on. In-crate tests rely on the
 # dev-dependency entry below, which is always available under `cargo test`.
@@ -68,6 +75,12 @@ serde_urlencoded = "0.7"
 # Integration tests need ServerSigningKey + canonical JSON for signing
 # federation requests from stub remote servers.
 base64 = { workspace = true }
+# Mock OTLP gRPC collector for the `otel`-gated otlp_export integration
+# test (tests/otlp_export.rs). opentelemetry-proto provides the generated
+# TraceService server stub; tonic/prost host it.
+tonic = "0.14"
+prost = "0.14"
+opentelemetry-proto = { version = "0.32", features = ["gen-tonic", "trace"] }
 
 [lints]
 workspace = true

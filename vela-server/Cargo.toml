@@ -28,7 +28,6 @@ prometheus = ["dep:metrics-exporter-prometheus"]
 otel = [
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",
-    "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
     "vela-api/otel",
 ]
@@ -57,7 +56,6 @@ serde_json = { workspace = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
-opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 
 [lints]

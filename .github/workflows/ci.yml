@@ -168,6 +168,8 @@ jobs:
       # (opentelemetry, tonic). Make sure it builds and tests pass.
       - name: cargo test --features otel
         run: cargo test -p vela-server --features otel --locked
+      - name: cargo test --features otel (vela-api OTLP export)
+        run: cargo test -p vela-api --features otel --test otlp_export --locked
 
   smoketest:
     # Real-client smoke test (ruma-client) against vela on an ephemeral
