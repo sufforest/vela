@@ -237,6 +237,17 @@ fn federate_device_list_deletes(state: &AppState, user: &AuthenticatedUser, devi
             Ok(servers) => destinations.extend(servers),
             Err(e) => tracing::warn!(error = %e, "deactivate: room scan failed"),
         }
+        // A partial-state room's `memberships` rows for the
+        // resident's users haven't materialised yet — union in the
+        // hint so a self-deactivate right after a federated join
+        // still reaches every peer the resident vouched for.
+        if let Ok((true, hint)) = state.db.get_partial_state_info(room_nid) {
+            for s in hint {
+                if s != state.config.server_name {
+                    destinations.insert(s);
+                }
+            }
+        }
     }
     if destinations.is_empty() {
         return;

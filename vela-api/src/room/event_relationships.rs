@@ -470,13 +470,27 @@ async fn backfill_via_federation(
     body: &EventRelationshipsRequest,
 ) -> Result<usize, ApiError> {
     let our_server = state.config.server_name.as_str();
-    let servers = state
+    // Union currently-known-joined remotes with the partial-state
+    // hint so a MSC2836 relationships walk right after a federated
+    // join can still reach the resident server (memberships CF is
+    // empty for the resident's users until the filler clears).
+    let mut server_set: std::collections::BTreeSet<String> = state
         .db
         .get_remote_servers_in_room(room_nid, our_server)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    if servers.is_empty() {
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        .into_iter()
+        .collect();
+    if let Ok((true, hint)) = state.db.get_partial_state_info(room_nid) {
+        for s in hint {
+            if s != our_server {
+                server_set.insert(s);
+            }
+        }
+    }
+    if server_set.is_empty() {
         return Ok(0);
     }
+    let servers: Vec<String> = server_set.into_iter().collect();
 
     // Build the body to forward — same shape as the inbound request,
     // but with `event_id` swapped to the specific missing parent so
