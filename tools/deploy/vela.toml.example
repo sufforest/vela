@@ -111,6 +111,18 @@ allow_public_rooms_over_federation = false
 # offline_after  = "30min"
 # sweep_interval = "60s"
 
+# [support]
+# Served at GET /.well-known/matrix/support (MSC1929 / spec v1.10) so
+# clients and abuse-handling tooling can find who to contact. Leave the
+# whole section out and the endpoint returns 404. Each contact needs at
+# least one of matrix_id / email_address; role is "m.role.admin" or
+# "m.role.security". support_page is an optional help URL.
+# support_page = "https://example.com/matrix-support"
+# [[support.contacts]]
+# matrix_id     = "@admin:example.com"
+# email_address = "admin@example.com"
+# role          = "m.role.admin"
+
 # --- vela-managed TLS (alternative to running Caddy in front) -------------
 # Uncomment if you'd rather vela terminate TLS directly instead of
 # putting a reverse proxy in front. You become responsible for cert

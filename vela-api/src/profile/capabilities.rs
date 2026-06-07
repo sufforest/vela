@@ -28,6 +28,11 @@ pub async fn get_capabilities(
             "m.set_displayname": {"enabled": true},
             "m.set_avatar_url": {"enabled": true},
             "m.3pid_changes": {"enabled": false},
+            // We don't implement POST /login/get_token (cross-device
+            // login token minting); advertise it disabled so clients
+            // hide the "sign in on another device" affordance rather
+            // than calling an endpoint that 404s.
+            "m.get_login_token": {"enabled": false},
             // MSC4140: advertise the upper bound on delayed-event
             // delays so clients can validate before issuing the PUT.
             // Both keys until MSC4140 stabilises — clients during

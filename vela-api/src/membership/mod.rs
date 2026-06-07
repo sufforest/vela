@@ -99,7 +99,10 @@ fn parse_optional_body(bytes: &Bytes) -> Result<Option<Value>, ApiError> {
     Ok(Some(v))
 }
 
-async fn resolve_alias(state: &AppState, alias: &str) -> Result<(RoomId, Vec<String>), ApiError> {
+pub(crate) async fn resolve_alias(
+    state: &AppState,
+    alias: &str,
+) -> Result<(RoomId, Vec<String>), ApiError> {
     // Try local first
     if let Some(room_id_str) = state
         .db

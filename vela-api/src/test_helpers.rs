@@ -87,6 +87,7 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
             push: crate::router::PushConfig {
                 allow_private_pushers: true,
             },
+            support: crate::router::SupportConfig::default(),
             max_delay_ms: crate::delayed_events::DEFAULT_MAX_DELAY_MS,
         }),
         room_locks: Arc::new(DashMap::new()),

@@ -158,18 +158,87 @@ pub async fn delete_device(
         )));
     }
 
+    purge_device(&state, user.user_nid, &device_id)?;
+    Ok(Json(json!({})))
+}
+
+/// Delete one device's tokens, record, and MSC3890 device-local
+/// notification settings. Shared by the single and batch delete paths.
+///
+/// MSC3890: device-local notification settings live in account_data
+/// keyed by the device_id and stop being useful once the device is
+/// gone, so tombstone the entry as part of the device deletion.
+fn purge_device(state: &AppState, user_nid: u64, device_id: &str) -> Result<(), ApiError> {
     state
         .db
-        .delete_device_tokens(user.user_nid, &device_id)
+        .delete_device_tokens(user_nid, device_id)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    let _ = state.db.delete_device(user.user_nid, &device_id);
-    // MSC3890: device-local notification settings live in account_data
-    // keyed by the device_id and stop being useful once the device is
-    // gone, so tombstone the entry as part of the device deletion.
-    crate::auth::logout::purge_msc3890_local_notification_settings_pub(
-        &state,
-        user.user_nid,
-        &device_id,
-    );
+    let _ = state.db.delete_device(user_nid, device_id);
+    crate::auth::logout::purge_msc3890_local_notification_settings_pub(state, user_nid, device_id);
+    Ok(())
+}
+
+/// `POST /_matrix/client/v3/delete_devices`
+///
+/// Batch device deletion. Same UIA discipline as the single-device
+/// delete: a bare request (or one without `auth`) gets a 401 challenge,
+/// and the completed UIA identifier must match the caller. Devices in
+/// the list that don't belong to the caller are silently skipped
+/// (Synapse parity) rather than failing the whole batch — the caller
+/// can only ever target their own devices, so an unknown id is a no-op.
+pub async fn delete_devices(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    body_bytes: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let body: Value = if body_bytes.is_empty() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_slice(&body_bytes).map_err(|e| {
+            ApiError(VelaError::NotJson(format!(
+                "request body is not valid JSON: {e}"
+            )))
+        })?
+    };
+
+    uia::require_password_auth(&state, &body)?;
+
+    let auth_user = body
+        .pointer("/auth/identifier/user")
+        .and_then(|v| v.as_str())
+        .or_else(|| body.pointer("/auth/user").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let auth_user_id = if auth_user.starts_with('@') {
+        auth_user.to_lowercase()
+    } else {
+        format!("@{}:{}", auth_user.to_lowercase(), state.config.server_name)
+    };
+    if auth_user_id != user.user_id {
+        return Err(ApiError(VelaError::Forbidden(
+            "UIA identifier does not match the caller".into(),
+        )));
+    }
+
+    let devices = body
+        .get("devices")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| ApiError(VelaError::BadJson("missing 'devices' array".into())))?;
+
+    for device in devices {
+        let Some(device_id) = device.as_str() else {
+            continue;
+        };
+        // Only act on devices the caller actually owns; skip anything
+        // else so a stray id can't fail the whole batch.
+        if state
+            .db
+            .get_device(user.user_nid, device_id)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            .is_some()
+        {
+            purge_device(&state, user.user_nid, device_id)?;
+        }
+    }
+
     Ok(Json(json!({})))
 }

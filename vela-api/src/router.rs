@@ -124,6 +124,9 @@ pub struct ServerConfig {
     pub presence: PresenceConfig,
     /// Outbound push gateway posture. See `PushConfig`.
     pub push: PushConfig,
+    /// `.well-known/matrix/support` contacts + support page. Empty →
+    /// the endpoint 404s.
+    pub support: SupportConfig,
     /// MSC4140 max delay (ms) accepted on `?org.matrix.msc4140.delay=`.
     /// Caps how far into the future a client can schedule an event.
     /// Default: 7 days. Setting `0` disables the feature — every
@@ -198,6 +201,33 @@ pub struct RtcConfig {
     pub livekit_api_key: String,
     pub livekit_secret: String,
     pub jwt_ttl_seconds: u32,
+}
+
+/// `.well-known/matrix/support` contents (MSC1929 / spec v1.10).
+///
+/// Empty by default; when the operator sets neither a contact nor a
+/// support page, the endpoint returns 404 rather than advertising an
+/// empty document (the spec says clients treat a present-but-empty
+/// response as "no info", but a 404 is cleaner and unambiguous).
+#[derive(Clone, Default)]
+pub struct SupportConfig {
+    /// Each entry needs at least one of `matrix_id` / `email_address`,
+    /// plus an optional `role` (`m.role.admin` or `m.role.security`).
+    pub contacts: Vec<SupportContact>,
+    pub support_page: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct SupportContact {
+    pub matrix_id: Option<String>,
+    pub email_address: Option<String>,
+    pub role: Option<String>,
+}
+
+impl SupportConfig {
+    pub fn is_empty(&self) -> bool {
+        self.contacts.is_empty() && self.support_page.is_none()
+    }
 }
 
 /// MSC3861 OIDC delegated-auth posture.
@@ -379,6 +409,10 @@ pub fn build_router(state: AppState) -> Router {
     let router = Router::new()
         // Discovery (no auth)
         .route("/.well-known/matrix/client", get(discovery::well_known))
+        .route(
+            "/.well-known/matrix/support",
+            get(discovery::well_known_support),
+        )
         .route("/_matrix/client/versions", get(discovery::versions))
         // MSC3861 phase 1 — clients probe this to learn whether vela
         // delegates auth to an external OIDC issuer. Returns 200 with
@@ -689,6 +723,16 @@ pub fn build_router(state: AppState) -> Router {
             "/_matrix/client/v1/rooms/{room_id}/hierarchy",
             get(crate::directory::spaces::hierarchy),
         )
+        // Room summary (MSC3266). Stable v1 path + the unstable
+        // im.nheko.summary alias still used by Element.
+        .route(
+            "/_matrix/client/v1/rooms/{room_id}/summary",
+            get(crate::directory::spaces::room_summary),
+        )
+        .route(
+            "/_matrix/client/unstable/im.nheko.summary/rooms/{room_id}/summary",
+            get(crate::directory::spaces::room_summary),
+        )
         // Push rules (stub)
         .route(
             "/_matrix/client/v3/pushrules/",
@@ -737,6 +781,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         // Device management
         .route("/_matrix/client/v3/devices", get(devices::list_devices))
+        .route(
+            "/_matrix/client/v3/delete_devices",
+            post(devices::delete_devices),
+        )
         .route(
             "/_matrix/client/v3/devices/{device_id}",
             get(devices::get_device)
