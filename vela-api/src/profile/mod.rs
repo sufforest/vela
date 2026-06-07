@@ -81,8 +81,152 @@ pub async fn get_profile(
     if let Some(avatar) = record.get("avatar_url") {
         obj.insert("avatar_url".into(), avatar.clone());
     }
+    // MSC4133: fold extended fields into the full-profile response.
+    if let Ok(fields) = state.db.get_profile_fields(user_nid) {
+        for (k, v) in fields {
+            obj.insert(k, v);
+        }
+    }
 
     Ok(Json(response))
+}
+
+/// MSC4133 extended-profile size guards.
+const MAX_PROFILE_KEY_LEN: usize = 255;
+const MAX_PROFILE_VALUE_BYTES: usize = 64 * 1024;
+
+/// GET /_matrix/client/v3/profile/{userId}/{keyName} (MSC4133)
+pub async fn get_profile_field(
+    State(state): State<AppState>,
+    Path((user_id, key)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    // Standard keys are normally served by the dedicated routes (axum
+    // prefers the static segments); delegate here too for safety.
+    if key == "displayname" {
+        return get_displayname(State(state), Path(user_id)).await;
+    }
+    if key == "avatar_url" {
+        return get_avatar_url(State(state), Path(user_id)).await;
+    }
+
+    if !is_local_user(&user_id, &state.config.server_name) {
+        let server = user_server(&user_id)
+            .ok_or_else(|| ApiError(VelaError::NotFound("malformed user id".into())))?;
+        let resp = state
+            .federation_client
+            .query_profile(server, &user_id, Some(&key))
+            .await
+            .map_err(federation_profile_err)?;
+        return Ok(Json(resp));
+    }
+
+    let user_nid = state
+        .db
+        .get_nid(&user_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        .ok_or_else(|| ApiError(VelaError::NotFound("user not found".into())))?;
+    let value = state
+        .db
+        .get_profile_field(user_nid, &key)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        .ok_or_else(|| ApiError(VelaError::NotFound("profile field not found".into())))?;
+    Ok(Json(json!({ key: value })))
+}
+
+/// PUT /_matrix/client/v3/profile/{userId}/{keyName} (MSC4133).
+/// Body is `{ "<keyName>": <value> }`.
+pub async fn set_profile_field(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path((user_id, key)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    if user.user_id != user_id {
+        return Err(VelaError::Forbidden("can only set own profile".into()).into());
+    }
+    let value = body
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| ApiError(VelaError::BadJson(format!("body missing '{key}' field"))))?;
+
+    // Standard keys keep their member-event propagation via the dedicated
+    // setters.
+    if key == "displayname" {
+        let displayname = value.as_str().map(|s| s.to_string());
+        return set_displayname(
+            State(state),
+            user,
+            Path(user_id),
+            Json(SetDisplaynameRequest { displayname }),
+        )
+        .await;
+    }
+    if key == "avatar_url" {
+        let avatar_url = value.as_str().map(|s| s.to_string());
+        return set_avatar_url(
+            State(state),
+            user,
+            Path(user_id),
+            Json(SetAvatarUrlRequest { avatar_url }),
+        )
+        .await;
+    }
+
+    if key.len() > MAX_PROFILE_KEY_LEN {
+        return Err(VelaError::BadJson("profile field key too long".into()).into());
+    }
+    if value.to_string().len() > MAX_PROFILE_VALUE_BYTES {
+        return Err(VelaError::BadJson("profile field value too large".into()).into());
+    }
+
+    state
+        .db
+        .set_profile_field(user.user_nid, &key, Some(value))
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    Ok(Json(json!({})))
+}
+
+/// DELETE /_matrix/client/v3/profile/{userId}/{keyName} (MSC4133).
+/// Idempotent: deleting a missing key still returns 200.
+pub async fn delete_profile_field(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path((user_id, key)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    if user.user_id != user_id {
+        return Err(VelaError::Forbidden("can only set own profile".into()).into());
+    }
+    // Clearing a standard key: blank it and propagate so member events stay
+    // consistent. (No static DELETE route exists for these, so they land
+    // here.)
+    if key == "displayname" {
+        return set_displayname(
+            State(state),
+            user,
+            Path(user_id),
+            Json(SetDisplaynameRequest {
+                displayname: Some(String::new()),
+            }),
+        )
+        .await;
+    }
+    if key == "avatar_url" {
+        return set_avatar_url(
+            State(state),
+            user,
+            Path(user_id),
+            Json(SetAvatarUrlRequest {
+                avatar_url: Some(String::new()),
+            }),
+        )
+        .await;
+    }
+
+    state
+        .db
+        .set_profile_field(user.user_nid, &key, None)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    Ok(Json(json!({})))
 }
 
 /// GET /_matrix/client/v3/profile/{userId}/displayname

@@ -86,6 +86,20 @@ pub async fn get_messages(
         _ => return Err(VelaError::Forbidden("not a member of this room".into()).into()),
     };
 
+    // History-visibility: `leave_cap` only bounds the *recent* end (events
+    // after a departed user left). It does NOT bound the *pre-join* start,
+    // so without a per-event gate a member of a `joined`/`invited` room
+    // could page backwards into history from before they joined. Apply the
+    // same per-event check `/event` and `/context` use. The check is only
+    // needed for joined/invited (and shared-while-not-currently-member);
+    // world_readable and shared/unknown-while-member permit the whole range.
+    let visibility = current_history_visibility(&state, room_nid)?;
+    let needs_hv_filter = match visibility.as_str() {
+        "world_readable" => false,
+        "joined" | "invited" => true,
+        _ => !matches!(membership, Some(0) | Some(1)),
+    };
+
     let limit = query.limit.unwrap_or(10).min(100);
     let dir = query.dir.as_deref().unwrap_or("b");
 
@@ -96,7 +110,7 @@ pub async fn get_messages(
     if dir == "b"
         && let Some(Cursor::DagFromEvent(eid)) = &cursor
     {
-        return paginate_dag(&state, &room_id_str, room_nid, eid, limit).await;
+        return paginate_dag(&state, &room_id_str, room_nid, user.user_nid, eid, limit).await;
     }
 
     // --- Branch 2: Forward / backwards via the stream-position timeline ---
@@ -174,10 +188,27 @@ pub async fn get_messages(
     let mut end_token = String::new();
 
     for (i, (stream_pos, event_nid)) in events.iter().enumerate() {
+        // Tokens advance over every *scanned* position (not just included
+        // events) so pagination keeps making progress when the gate drops
+        // events at a page boundary — otherwise the client re-scans the
+        // same filtered events forever.
         if i == 0 {
             start_token = format!("s{stream_pos}");
         }
         end_token = format!("s{stream_pos}");
+
+        if needs_hv_filter
+            && !history_visibility_permits(
+                &state,
+                room_nid,
+                user.user_nid,
+                membership,
+                &visibility,
+                *event_nid,
+            )?
+        {
+            continue;
+        }
 
         if let Some(client_event) = load_client_event_with_relations(
             &state,
@@ -268,7 +299,15 @@ pub async fn get_messages(
             // follow an `e{member_event}` cursor through a separate
             // round-trip. (TestJumpToDateEndpoint federation
             // paginate-after-timestamp subtests.)
-            return paginate_dag(&state, &room_id_str, room_nid, &entry_eid, limit).await;
+            return paginate_dag(
+                &state,
+                &room_id_str,
+                room_nid,
+                user.user_nid,
+                &entry_eid,
+                limit,
+            )
+            .await;
         }
     }
 
@@ -490,9 +529,24 @@ async fn paginate_dag(
     state: &AppState,
     room_id: &str,
     room_nid: u64,
+    user_nid: u64,
     from_event_id: &str,
     limit: usize,
 ) -> Result<Json<Value>, ApiError> {
+    // Same per-event history-visibility gate as the timeline path — the DAG
+    // walk would otherwise hand back pre-join history for joined/invited
+    // rooms once the client paginates past the live timeline.
+    let membership = state
+        .db
+        .get_membership(room_nid, user_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let visibility = current_history_visibility(state, room_nid)?;
+    let needs_hv_filter = match visibility.as_str() {
+        "world_readable" => false,
+        "joined" | "invited" => true,
+        _ => !matches!(membership, Some(0) | Some(1)),
+    };
+
     let from_nid = match state
         .db
         .get_event_nid_by_id(from_event_id)
@@ -543,11 +597,26 @@ async fn paginate_dag(
     let mut last_event_id: Option<String> = None;
 
     for nid in &nids {
-        if let Some(client_event) = load_client_event(state, *nid, room_id)? {
-            chunk.push(client_event);
-        }
+        // Advance the cursor over every scanned event (so pagination
+        // progresses even when the gate drops events), but only include
+        // permitted ones in the chunk.
         if let Ok(Some(eid)) = state.db.get_event_id_by_nid(*nid) {
             last_event_id = Some(eid);
+        }
+        if needs_hv_filter
+            && !history_visibility_permits(
+                state,
+                room_nid,
+                user_nid,
+                membership,
+                &visibility,
+                *nid,
+            )?
+        {
+            continue;
+        }
+        if let Some(client_event) = load_client_event(state, *nid, room_id)? {
+            chunk.push(client_event);
         }
     }
 

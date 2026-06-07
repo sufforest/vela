@@ -699,6 +699,23 @@ fn invite_power_level(state: &AppState, room_nid: u64) -> Result<i64, ApiError> 
     Ok(v.unwrap_or(0))
 }
 
+/// The room's `m.room.power_levels` `notifications.room` threshold (the
+/// power required to trigger an `@room` notification). Defaults to 50 per
+/// spec when unset. Shared by push dispatch and /sync highlight counting
+/// (MSC3952 `is_room_mention`).
+pub(crate) fn notifications_room_level(state: &AppState, room_nid: u64) -> i64 {
+    read_state_value_pub(state, room_nid, "m.room.power_levels", "")
+        .ok()
+        .flatten()
+        .and_then(|pl| {
+            pl.get("content")
+                .and_then(|c| c.get("notifications"))
+                .and_then(|n| n.get("room"))
+                .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
+        })
+        .unwrap_or(50)
+}
+
 pub(crate) fn user_power(state: &AppState, room_nid: u64, user_id: &str) -> Result<i64, ApiError> {
     // v12: creator has infinite power. We approximate by inspecting the
     // create event sender + additional_creators.
