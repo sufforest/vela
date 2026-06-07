@@ -10,64 +10,37 @@ minor versions.
 
 ### Added
 
-- **Room summary (MSC3266).** `GET /_matrix/client/v1/rooms/{roomIdOrAlias}/summary`
-  (and the `im.nheko.summary` unstable path) lets clients preview a room
-  before joining. Resolves aliases, gates visibility via the existing
-  peek rules (members/invitees always; otherwise public/knock/
-  world-readable/allow-list), returns the caller's `membership`, and
-  serves unauthenticated requests for world-readable rooms only.
-- **Batch device delete.** `POST /_matrix/client/v3/delete_devices`
-  with the same UIA discipline as single-device delete; ids the caller
-  doesn't own are skipped instead of failing the whole batch.
-- **`/.well-known/matrix/support`.** Serves admin/security contacts and
-  a support page from a new `[support]` config section (MSC1929);
-  returns 404 when unconfigured.
-- **`m.get_login_token` capability** advertised as disabled so clients
-  hide the cross-device-login affordance we don't implement.
-- **`?server=` on `/publicRooms`.** GET/POST `/_matrix/client/v3/publicRooms`
-  now accept the `server` query param. When set to a remote homeserver
-  name, vela forwards the request via
-  `POST /_matrix/federation/v1/publicRooms` and returns the peer's
-  response. Clients can browse other homeservers' directories without
-  having to talk to them directly.
-- **Complement in CI.** The Matrix spec-compliance suite now runs on
-  every PR via `.github/workflows/complement.yml`. Image build is
-  cached through buildkit's GHA backend; the existing
-  `tools/testing/complement/{run.sh,skiplist.txt}` runner is reused
-  unmodified so local and CI behaviour stay aligned.
-
-### Fixed
-
-- **Federated messages didn't trigger push notifications.** The push
-  dispatch path only ran on locally-sent events; when a remote user
-  sent a message to a federated room, every local member's mobile
-  client stayed silent. Inbound federation now calls the same
-  `dispatch_for_event` after persistence, so remote-sender pushes go
-  through identical rule evaluation and gateway POST as local ones.
-- **`m.room.server_acl` was only enforced on inbound /send.** Banned
-  origins could still hit `/make_join`, `/send_join`, `/make_knock`,
-  `/send_knock`, and `/v2/invite` — i.e. join, knock, and invite
-  themselves into rooms whose ACL was supposed to keep them out.
-  All five handlers now run the same ACL check before doing room
-  work. Leave handlers are intentionally exempt per spec: a banned
-  origin must still be able to leave a room it's already in.
-
-- **Own presence not visible in /sync.** `collect_presence_events`
-  filtered the requesting user out of the emitted peer set, so
-  clients that draw their own profile indicator from /sync (Element
-  X among them) fell back to "offline" for the requester. Now
-  always included.
-- **Stored presence never decayed.** A user who set themselves
-  online and closed their browser stayed "online" in every other
-  client indefinitely. Effective presence is now computed at read
-  time from `last_active_ms` with `idle_after` → unavailable and
-  `offline_after` → offline transitions; a background sweeper
-  persists those transitions and broadcasts the federation EDU so
-  remote servers see the new state. Thresholds configurable under
-  `[presence]` (defaults: 5min / 30min / 60s sweep).
-
-### Added
-
+- **Faster remote joins (MSC3706 + MSC3902 partial state).** Joining a
+  large federated room no longer blocks on downloading its full member
+  list. vela requests a join with `omit_members=true`, becomes joinable
+  immediately with a partial-state hint, and a background filler
+  reconciles the rest of the room state and device lists out of band.
+  `/sync` surfaces `partial_state: true` so clients can soft-fail
+  membership-dependent features until the room resolves; endpoints that
+  need complete state (`/members`, `/joined_members`, `/state`,
+  `/state_ids`, inbound `make/send_join` and `make/send_knock`) block or
+  reject while a room is still partial rather than serving incomplete
+  answers. The filler mirrors member transitions and the remote
+  device-key cache on re-verify, replays buffered `m.device_list_update`
+  EDUs once full state lands, and re-evaluates events optimistically
+  accepted or soft-failed during the partial window.
+- **Delegated authentication via OIDC / OAuth2 (MSC3861, phase 2).** vela
+  can defer login to an external identity provider instead of managing
+  passwords itself. Set `[auth.oidc].introspection_endpoint` and vela
+  validates Bearer tokens by introspecting them against the IdP (RFC 7662,
+  `client_secret_basic` / `client_secret_post`), caches results up to two
+  minutes bounded by the token's own expiry, and provisions accounts on
+  first touch from the `sub` / `username` / `device_id` claims. When
+  enabled, the legacy auth surface is refused: `/login` advertises no
+  password flow, `/register` rejects non-AS callers, and
+  `/account/password` / `/account/deactivate` return `M_UNRECOGNIZED`.
+- **Stateful sliding sync (MSC4186).** The `/sync` successor persists
+  per-connection state in a new `sliding_sync_conns` column family.
+  Reconnects no longer re-deliver state the client already has; the
+  server emits room data only for rooms that crossed a list window,
+  visibility, or state version since the last poll (DELTA ops), and
+  explicit room subscriptions stay live across polls until the client
+  drops them (sticky subscriptions).
 - **Matrix Application Service support.** Bridges (mautrix-telegram,
   mautrix-discord, mautrix-signal, etc.) and bots can now register
   with vela. An operator pastes the AS's registration YAML into the
@@ -91,25 +64,143 @@ minor versions.
   ephemeral passthrough (m.presence/m.typing/m.receipt under
   `receive_ephemeral`), device management UIA bypass, third-party
   protocols.
-- **`POST /_matrix/client/v3/rooms/{roomId}/report/{eventId}`** plus
-  the v1.13 `/rooms/{roomId}/report` and v1.14
+- **Delayed events (MSC4140).** Clients can schedule an event to be sent
+  after a delay (self-destructing status, scheduled posts). A
+  `[server] max_delay_ms` knob caps how far out a delay may be set.
+- **Event relationships over federation (MSC2836).**
+  `/event_relationships` walks and backfills threaded and related events
+  across servers, so clients see complete relation chains for rooms whose
+  history spans multiple homeservers.
+- **Owned state events (MSC3757).** State events whose `state_key` is a
+  user's own MXID can be set by that user regardless of power level,
+  enabling per-user state without granting elevated permissions.
+- **Server-side invite filtering (MSC4155).** An invitee's
+  `org.matrix.msc4155.invite_permission_config` account data drives
+  which invites vela accepts on their behalf, so unwanted invites are
+  rejected before they ever reach the client.
+- **Restricted-room joins over federation.** vela can complete the
+  `send_join` happy path for restricted rooms, joining via a third
+  server that vouches for the join authorisation.
+- **Notary server-key proxy.** `/_matrix/key/v2/query` answers questions
+  about *other* servers' keys: vela fetches the target's
+  `/key/v2/server`, countersigns it, and returns the result, acting as a
+  key-notary for peers.
+- **Room summary (MSC3266).** `GET /_matrix/client/v1/rooms/{roomIdOrAlias}/summary`
+  (and the `im.nheko.summary` unstable path) lets clients preview a room
+  before joining. Resolves aliases, gates visibility via the existing
+  peek rules (members/invitees always; otherwise public/knock/
+  world-readable/allow-list), returns the caller's `membership`, and
+  serves unauthenticated requests for world-readable rooms only.
+- **Batch device delete.** `POST /_matrix/client/v3/delete_devices`
+  with the same UIA discipline as single-device delete; ids the caller
+  doesn't own are skipped instead of failing the whole batch.
+- **Content reporting.** `POST /_matrix/client/v3/rooms/{roomId}/report/{eventId}`
+  plus the v1.13 `/rooms/{roomId}/report` and v1.14
   `/users/{userId}/report` siblings. v1.18 semantics: optional
   `reason`, no `score`. Always returns 200 `{}` (privacy mode —
   doesn't leak whether the target exists or the reporter is in the
   room). Reports persist into a new `event_reports` CF.
-- **`!reports [N]` admin bot command** — show the last N abuse
-  reports (default 20). Surfaces what users submit through the
-  `/report` endpoints.
-- **`!reactivate <mxid>` admin bot command.** Undoes `!deactivate`'s
-  flag — operator must follow with `!reset-password` since
-  `!deactivate` blanks the hash.
-- **`!reset-password <mxid> [password]` admin bot command.**
-  Atomic: sets a fresh argon2 hash, clears the `deactivated` flag,
-  and deletes every existing access token. Without a password
-  argument the bot generates a 16-char random one and replies with
-  it. With a password argument that one is used.
+- **`?server=` on `/publicRooms`.** GET/POST `/_matrix/client/v3/publicRooms`
+  now accept the `server` query param. When set to a remote homeserver
+  name, vela forwards the request via
+  `POST /_matrix/federation/v1/publicRooms` and returns the peer's
+  response. Clients can browse other homeservers' directories without
+  having to talk to them directly.
+- **`/.well-known/matrix/support`.** Serves admin/security contacts and
+  a support page from a new `[support]` config section (MSC1929);
+  returns 404 when unconfigured.
+- **`m.get_login_token` capability** advertised as disabled so clients
+  hide the cross-device-login affordance we don't implement.
+- **`vela-admin rooms-top` and `diagnose`.** `rooms-top --limit N` lists
+  rooms by most-recent activity with a relative-age column (clock-skewed
+  future bumps render as `future`); `diagnose` is a one-screen operator
+  health probe covering current stream position, rooms still mid
+  partial-state resync, destinations with pending outbound queues, and
+  24h / 7d room activity. Both read existing schema, no new state.
+- **Admin bot commands** `!reports [N]` (show the last N abuse reports,
+  default 20), `!reactivate <mxid>` (undo `!deactivate`'s flag), and
+  `!reset-password <mxid> [password]` (atomic: fresh argon2 hash, clear
+  the deactivated flag, revoke every access token; generates a random
+  password when none is given).
+- **Complement in CI.** The Matrix spec-compliance suite now runs on
+  every PR via `.github/workflows/complement.yml`. Image build is
+  cached through buildkit's GHA backend; the existing
+  `tools/testing/complement/{run.sh,skiplist.txt}` runner is reused
+  unmodified so local and CI behaviour stay aligned.
 - `[presence]` config block: `idle_after` / `offline_after` /
   `sweep_interval`. See `tools/deploy/vela.toml.example`.
+
+### Changed
+
+- **Federation throughput.** Inbound `/send` transactions process
+  concurrently — one task per room, with each room's PDUs still
+  serialised under a per-room lock spanning the full state-at-event,
+  auth-chain, and persist sequence. The outbound sender is concurrent per
+  `(destination, room)` instead of one serial task per destination, so a
+  busy room no longer stalls delivery to others.
+- **`/members?at=` historical snapshots.** `GET /rooms/{roomId}/members`
+  honors the `at=` sync-token parameter, returning membership as it stood
+  at that point. `/sync`'s `prev_batch` now points past the events the
+  client just received so `at=` resolves to useful state, deleting a
+  canonical alias rewrites `m.room.canonical_alias` to drop the dead
+  reference, and `send_join` responses carry the full `auth_chain`.
+- **Race-free NID allocation.** Replaced the global event-id counter with
+  a HiLo allocator handing out per-namespace counter blocks, eliminating
+  a check-then-write race where two concurrent writers for the same fresh
+  identifier could each consume a slot and leave one writer's state
+  unreachable (seen as spurious 403 "not a member" on federated leaves).
+  The `/sync` device-list watermark was aligned to the same boundary to
+  stop phantom duplicate `device_lists.changed` entries.
+- **Threads and relations** are served from indices maintained on write
+  (`relation_counts`, `thread_index`, `thread_participants`) instead of
+  prefix scans, so `/threads` and relation-count lookups are point reads.
+- **Dependency bumps.** rocksdb to 0.24 and object_store to 0.13; the
+  OpenTelemetry stack to 0.32 with tracing-opentelemetry 0.33.
+- **`vela-api` reorganised into per-domain folders** (`auth`, `room`,
+  `sync`, `federation`, …) instead of one flat module tree.
+
+### Fixed
+
+- **Federated messages didn't trigger push notifications.** The push
+  dispatch path only ran on locally-sent events; when a remote user
+  sent a message to a federated room, every local member's mobile
+  client stayed silent. Inbound federation now calls the same
+  `dispatch_for_event` after persistence, so remote-sender pushes go
+  through identical rule evaluation and gateway POST as local ones.
+- **`m.room.server_acl` was only enforced on inbound /send.** Banned
+  origins could still hit `/make_join`, `/send_join`, `/make_knock`,
+  `/send_knock`, and `/v2/invite` — i.e. join, knock, and invite
+  themselves into rooms whose ACL was supposed to keep them out.
+  All five handlers now run the same ACL check before doing room
+  work. Leave handlers are intentionally exempt per spec: a banned
+  origin must still be able to leave a room it's already in.
+- **Own presence not visible in /sync.** `collect_presence_events`
+  filtered the requesting user out of the emitted peer set, so
+  clients that draw their own profile indicator from /sync (Element
+  X among them) fell back to "offline" for the requester. Now
+  always included.
+- **Stored presence never decayed.** A user who set themselves
+  online and closed their browser stayed "online" in every other
+  client indefinitely. Effective presence is now computed at read
+  time from `last_active_ms` with `idle_after` → unavailable and
+  `offline_after` → offline transitions; a background sweeper
+  persists those transitions and broadcasts the federation EDU so
+  remote servers see the new state. Thresholds configurable under
+  `[presence]` (defaults: 5min / 30min / 60s sweep).
+- **Push-notification retries are bounded.** A failing pusher backs off
+  with a per-pusher exponential schedule and a hard ceiling instead of
+  stalling the push queue behind it.
+- **Federation and sync robustness.** A long tail of correctness fixes to
+  the inbound federation and `/sync` paths: lazy-fetch of unknown
+  prev-events and auth-chain parents during the state-at-event check
+  (transient gaps no longer cascading into permanent rejections), correct
+  v12 auth context (no synthetic invite-stripped create injected), EDU
+  coalescing and `m.room.server_acl` applied to room-scoped EDUs,
+  split-tracked stream watermark so `next_batch` and delta scans agree,
+  redaction markers for not-yet-seen targets parked and applied on
+  arrival, and a localpart fallback for the display-name push rule so
+  `.m.rule.contains_display_name` fires for users without a set profile
+  name.
 
 ## [0.1.1] — 2026-05-17
 
