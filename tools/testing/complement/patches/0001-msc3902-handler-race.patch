@@ -1,0 +1,137 @@
+diff --git a/tests/msc3902/federation_room_join_partial_state_test.go b/tests/msc3902/federation_room_join_partial_state_test.go
+index 9e11b16..220d5b9 100644
+--- a/tests/msc3902/federation_room_join_partial_state_test.go
++++ b/tests/msc3902/federation_room_join_partial_state_test.go
+@@ -15,6 +15,7 @@ import (
+ 	"reflect"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -40,6 +41,12 @@ import (
+ type server struct {
+ 	*federation.Server
+ 
++	// handlersMu guards the handler maps and key counters below. The
++	// federation transaction goroutine reads the maps to dispatch
++	// incoming PDUs/EDUs while test goroutines add and remove handlers
++	// concurrently (e.g. WithWaitForLeave's deferred cleanup), so every
++	// access must hold the lock.
++	handlersMu  sync.Mutex
+ 	pduHandlers map[int]func(gomatrixserverlib.PDU) bool
+ 	eduHandlers map[int]func(gomatrixserverlib.EDU) bool
+ 
+@@ -68,8 +75,15 @@ func createTestServer(t *testing.T, deployment complement.Deployment, opts ...fu
+ 			federation.HandleEventRequests(),
+ 			federation.HandleTransactionRequests(
+ 				func(e gomatrixserverlib.PDU) {
+-					expected := false
++					server.handlersMu.Lock()
++					handlers := make([]func(gomatrixserverlib.PDU) bool, 0, len(server.pduHandlers))
+ 					for _, pduHandler := range server.pduHandlers {
++						handlers = append(handlers, pduHandler)
++					}
++					server.handlersMu.Unlock()
++
++					expected := false
++					for _, pduHandler := range handlers {
+ 						expected = pduHandler(e) || expected
+ 					}
+ 
+@@ -78,8 +92,15 @@ func createTestServer(t *testing.T, deployment complement.Deployment, opts ...fu
+ 					}
+ 				},
+ 				func(edu gomatrixserverlib.EDU) {
+-					expected := false
++					server.handlersMu.Lock()
++					handlers := make([]func(gomatrixserverlib.EDU) bool, 0, len(server.eduHandlers))
+ 					for _, eduHandler := range server.eduHandlers {
++						handlers = append(handlers, eduHandler)
++					}
++					server.handlersMu.Unlock()
++
++					expected := false
++					for _, eduHandler := range handlers {
+ 						expected = eduHandler(edu) || expected
+ 					}
+ 
+@@ -101,12 +122,16 @@ func createTestServer(t *testing.T, deployment complement.Deployment, opts ...fu
+ // When a PDU is received which is not expected by any PDU callback, the ongoing test is failed.
+ // Returns a function to remove the PDU callback.
+ func (s *server) AddPDUHandler(pduHandler func(gomatrixserverlib.PDU) bool) func() {
++	s.handlersMu.Lock()
+ 	pduHandlerKey := s.nextPDUHandlerKey
+ 	s.nextPDUHandlerKey++
+ 	s.pduHandlers[pduHandlerKey] = pduHandler
++	s.handlersMu.Unlock()
+ 
+ 	return func() {
++		s.handlersMu.Lock()
+ 		delete(s.pduHandlers, pduHandlerKey)
++		s.handlersMu.Unlock()
+ 	}
+ }
+ 
+@@ -114,12 +139,16 @@ func (s *server) AddPDUHandler(pduHandler func(gomatrixserverlib.PDU) bool) func
+ // When an EDU is received which is not expected by any EDU callback, the ongoing test is failed.
+ // Returns a function to remove the EDU callback.
+ func (s *server) AddEDUHandler(eduHandler func(gomatrixserverlib.EDU) bool) func() {
++	s.handlersMu.Lock()
+ 	eduHandlerKey := s.nextEDUHandlerKey
+ 	s.nextEDUHandlerKey++
+ 	s.eduHandlers[eduHandlerKey] = eduHandler
++	s.handlersMu.Unlock()
+ 
+ 	return func() {
++		s.handlersMu.Lock()
+ 		delete(s.eduHandlers, eduHandlerKey)
++		s.handlersMu.Unlock()
+ 	}
+ }
+ 
+@@ -143,19 +172,30 @@ func (s *server) WithWaitForLeave(
+ 
+ 	leaveAction()
+ 
+-	memberEvent := room.CurrentState("m.room.member", userID)
+-	membership := ""
+-	if memberEvent != nil {
+-		membership, _ = memberEvent.Membership()
+-	}
+-	if membership == "leave" {
+-		t.Logf("%s has already seen %s leave test room %s.", s.ServerName(), userID, room.RoomID)
+-	} else {
+-		select {
+-		case <-leaveChannel:
+-			t.Logf("%s saw %s leave test room %s.", s.ServerName(), userID, room.RoomID)
+-			break
+-		case <-time.After(1 * time.Second):
++	// Wait for our handler to observe the leave before returning (and thus
++	// removing the handler). The channel is buffered, so a leave delivered
++	// during leaveAction is still queued here — we must drain it rather than
++	// rely on room.CurrentState, because the transaction goroutine updates
++	// room state (via AddEvent) *before* it invokes our handler. Removing the
++	// handler off the back of a CurrentState observation therefore races the
++	// in-flight handler call, which then sees an empty handler set and reports
++	// the leave as an unexpected PDU. Draining the channel first guarantees the
++	// handler call has completed before removal.
++	select {
++	case <-leaveChannel:
++		t.Logf("%s saw %s leave test room %s.", s.ServerName(), userID, room.RoomID)
++	case <-time.After(1 * time.Second):
++		// Nothing arrived in a second: either the leave was applied before our
++		// handler was registered (so the channel will never receive it) or it
++		// genuinely never came. Distinguish via room state.
++		memberEvent := room.CurrentState("m.room.member", userID)
++		membership := ""
++		if memberEvent != nil {
++			membership, _ = memberEvent.Membership()
++		}
++		if membership == "leave" {
++			t.Logf("%s has already seen %s leave test room %s.", s.ServerName(), userID, room.RoomID)
++		} else {
+ 			t.Errorf("%s timed out waiting for %s to leave test room %s.", s.ServerName(), userID, room.RoomID)
+ 		}
+ 	}

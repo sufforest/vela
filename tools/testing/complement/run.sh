@@ -30,6 +30,31 @@ RETRY_FLAKES="${RETRY_FLAKES:-0}"
 [ -d "$COMPLEMENT_DIR" ] || { echo "complement dir not found at $COMPLEMENT_DIR" >&2; exit 1; }
 [ -f "$SKIPLIST" ] || { echo "skiplist not found at $SKIPLIST" >&2; exit 1; }
 
+# Apply local patches to the checked-out Complement tree before compiling
+# the tests. These carry upstream-pending fixes — currently a data race in
+# the msc3902 partial-state-join test harness that surfaces as spurious
+# "unexpected PDU" failures (see patches/README.md). Idempotent: a patch that
+# already reverse-applies is treated as present. Drop a patch once its
+# upstream change lands and the pinned ref in
+# .github/workflows/complement.yml is bumped past it.
+# Absolute path: `git -C "$COMPLEMENT_DIR" apply` resolves its patch argument
+# relative to COMPLEMENT_DIR, so a relative path here would not be found.
+PATCHES_DIR="$(cd "$(dirname "$0")/patches" 2>/dev/null && pwd || true)"
+if [ -n "$PATCHES_DIR" ] && [ -d "$PATCHES_DIR" ]; then
+    for patch in "$PATCHES_DIR"/*.patch; do
+        [ -e "$patch" ] || continue
+        name=$(basename "$patch")
+        if git -C "$COMPLEMENT_DIR" apply --reverse --check "$patch" 2>/dev/null; then
+            echo "[complement] patch already applied: $name"
+        elif git -C "$COMPLEMENT_DIR" apply --check "$patch" 2>/dev/null; then
+            git -C "$COMPLEMENT_DIR" apply "$patch" && echo "[complement] patch applied: $name"
+        else
+            echo "[complement] WARNING: patch does not apply, skipping: $name" >&2
+            echo "[complement]          the pinned Complement ref may have moved past it" >&2
+        fi
+    done
+fi
+
 # Build the -skip regex by joining non-comment lines with '|'.
 # Empty list → don't pass -skip (regex of empty would match everything).
 SKIP_REGEX=$(grep -vE '^\s*(#|$)' "$SKIPLIST" | paste -sd '|' -)
