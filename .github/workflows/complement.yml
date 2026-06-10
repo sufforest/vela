@@ -30,6 +30,9 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: matrix-org/complement
+          # run.sh applies tools/testing/complement/patches/*.patch to this
+          # tree before the tests compile. When bumping this ref, re-check
+          # those patches still apply (and drop any that have landed upstream).
           ref: 6be1478db0be8f39ae5a06e5a148d001ca860db3
           path: complement
 
