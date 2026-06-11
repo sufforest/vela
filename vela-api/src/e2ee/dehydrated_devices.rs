@@ -40,13 +40,12 @@ const MAX_DEVICE_DATA_BYTES: usize = 64 * 1024;
 /// client can't grow the OTK store without bound by looping uploads.
 const MAX_DEHYDRATED_OTKS: usize = 100;
 
-/// Tear down a superseded or deleted dehydrated device: tell remote servers
-/// to drop it from their `/keys/query` view, reclaim its queued to-device
-/// messages (it never runs `/sync` to drain them itself), then remove the
-/// device record + tokens. Best-effort — a failure here leaves an orphan but
-/// must not fail the request that triggered the replacement/deletion.
-fn purge_dehydrated_device(state: &AppState, user_nid: u64, user_id: &str, device_id: &str) {
-    federate_device_list_update_for(state, user_nid, user_id, device_id, json!({}), true);
+/// Tear down a superseded or deleted dehydrated device: reclaim its queued
+/// to-device messages (it never runs `/sync` to drain them itself), then
+/// `purge_device` (which removes the device record + key material and
+/// federates the `deleted` device-list update). Best-effort — a failure
+/// here leaves an orphan but must not fail the triggering request.
+fn purge_dehydrated_device(state: &AppState, user_nid: u64, device_id: &str) {
     match state.db.get_to_device_messages(user_nid, device_id) {
         Ok(msgs) if !msgs.is_empty() => {
             let keys: Vec<Vec<u8>> = msgs.into_iter().map(|(k, _)| k).collect();
@@ -184,7 +183,7 @@ pub async fn put_dehydrated_device(
     if let Some(old) = prior
         && old != device_id
     {
-        purge_dehydrated_device(&state, user.user_nid, &user.user_id, &old);
+        purge_dehydrated_device(&state, user.user_nid, &old);
     }
 
     // The new device's keys are now queryable. Tell local observers to
@@ -234,7 +233,7 @@ pub async fn delete_dehydrated_device(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     match removed {
         Some(device_id) => {
-            purge_dehydrated_device(&state, user.user_nid, &user.user_id, &device_id);
+            purge_dehydrated_device(&state, user.user_nid, &device_id);
             Ok(Json(json!({ "device_id": device_id })))
         }
         None => Err(VelaError::NotFound("no dehydrated device".into()).into()),

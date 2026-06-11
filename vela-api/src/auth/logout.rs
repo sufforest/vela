@@ -29,15 +29,9 @@ pub async fn logout(
     State(state): State<AppState>,
     user: AuthenticatedUser,
 ) -> Result<Json<Value>, ApiError> {
-    state
-        .db
-        .delete_device_tokens(user.user_nid, &user.device_id)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    state
-        .db
-        .delete_device(user.user_nid, &user.device_id)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    purge_msc3890_local_notification_settings(&state, user.user_nid, &user.device_id);
+    // Tokens, device record + key material, MSC3890 settings, and the
+    // federated `deleted` device-list update — all handled by purge_device.
+    crate::auth::devices::purge_device(&state, user.user_nid, &user.device_id)?;
     Ok(Json(json!({})))
 }
 
@@ -81,11 +75,7 @@ pub async fn logout_all(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     for d in devices {
         if let Some(device_id) = d.get("device_id").and_then(|v| v.as_str()) {
-            state
-                .db
-                .delete_device(user.user_nid, device_id)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-            purge_msc3890_local_notification_settings(&state, user.user_nid, device_id);
+            let _ = crate::auth::devices::purge_device(&state, user.user_nid, device_id);
         }
     }
     Ok(Json(json!({})))
