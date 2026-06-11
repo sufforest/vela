@@ -1000,10 +1000,46 @@ impl Database {
         self.db.put_cf(&cf, &key, rec.to_string().as_bytes())
     }
 
+    /// Delete a device and reclaim the key material bound to it: the device
+    /// record, its identity (device) keys, and all of its one-time keys.
+    /// Without the key/OTK cascade, every logout / device delete / dehydrated
+    /// device replace leaked `device_keys` + `one_time_keys` rows that nothing
+    /// ever reclaimed. Cross-signing keys are per-user, not per-device, so
+    /// they are intentionally left alone.
     pub fn delete_device(&self, user_nid: u64, device_id: &str) -> Result<(), rocksdb::Error> {
-        let cf = self.db.cf_handle("devices").unwrap();
-        let key = keys::encode_u64_bytes(user_nid, device_id.as_bytes());
-        self.db.delete_cf(&cf, &key)
+        let mut batch = WriteBatch::default();
+
+        let devices = self.db.cf_handle("devices").unwrap();
+        batch.delete_cf(
+            &devices,
+            keys::encode_u64_bytes(user_nid, device_id.as_bytes()),
+        );
+
+        // Identity keys: a single exact key per (user, device).
+        let device_keys = self.db.cf_handle("device_keys").unwrap();
+        batch.delete_cf(
+            &device_keys,
+            keys::encode_u64_bytes(user_nid, device_id.as_bytes()),
+        );
+
+        // One-time keys: keyed (user_nid || len(device_id) || device_id ||
+        // key_id), so drop the whole (user_nid, device_id) prefix range. The
+        // length prefix means a device id that is a prefix of another (e.g.
+        // "AB" vs "ABC") gets a distinct range — no bleed.
+        let otk = self.db.cf_handle("one_time_keys").unwrap();
+        let mut prefix = keys::encode_u64(user_nid).to_vec();
+        let did = device_id.as_bytes();
+        prefix.extend_from_slice(&(did.len() as u16).to_be_bytes());
+        prefix.extend_from_slice(did);
+        for item in self.db.prefix_iterator_cf(&otk, &prefix) {
+            let (k, _) = item?;
+            if k.len() < prefix.len() || k[..prefix.len()] != prefix[..] {
+                break;
+            }
+            batch.delete_cf(&otk, &k);
+        }
+
+        self.db.write(batch)
     }
 
     /// Delete every token issued for `(user_nid, device_id)`. Symmetric
@@ -7643,6 +7679,43 @@ mod stream_recovery_tests {
             "promotion must reuse the nid so references survive"
         );
         assert_eq!(db.get_prev_events(child).unwrap(), vec![nid]);
+    }
+
+    /// Deleting a device must reclaim its identity keys and one-time keys,
+    /// not just the device record — and must NOT touch another device whose
+    /// id shares a prefix (the length-prefixed OTK key range keeps them
+    /// distinct). Guards the storage-growth / orphaned-key leak.
+    #[test]
+    fn delete_device_reclaims_keys_and_otks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        let user = db.get_or_create_nid("@alice:example.com").unwrap();
+
+        let mut otks = serde_json::Map::new();
+        otks.insert(
+            "signed_curve25519:AAAA".to_string(),
+            serde_json::json!({"key": "k"}),
+        );
+
+        // Two devices whose ids share a prefix: "AB" must not reap "ABC".
+        for d in ["AB", "ABC"] {
+            db.create_device(user, d).unwrap();
+            db.set_device_keys(user, d, &serde_json::json!({"keys": {}}))
+                .unwrap();
+            db.add_one_time_keys(user, d, &otks).unwrap();
+        }
+
+        db.delete_device(user, "AB").unwrap();
+
+        // "AB" fully reclaimed.
+        assert!(db.get_device(user, "AB").unwrap().is_none());
+        assert!(db.get_device_keys(user, "AB").unwrap().is_none());
+        assert!(db.count_one_time_keys(user, "AB").unwrap().is_empty());
+
+        // "ABC" untouched — no prefix bleed.
+        assert!(db.get_device(user, "ABC").unwrap().is_some());
+        assert!(db.get_device_keys(user, "ABC").unwrap().is_some());
+        assert!(!db.count_one_time_keys(user, "ABC").unwrap().is_empty());
     }
 
     /// `set_receipt` MUST bump the room's max-receipt stream position

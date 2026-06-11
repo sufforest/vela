@@ -204,6 +204,11 @@ minor versions.
 
 ### Fixed
 
+- **Device deletion now reclaims its keys.** Removing a device (logout,
+  `/devices/{id}` delete, or a dehydrated-device replace) only dropped the
+  device record, leaving its `device_keys` and `one_time_keys` behind to
+  accumulate forever. `delete_device` now cascades to both, scoped to the
+  one device (a device id that is a prefix of another is unaffected).
 - **Outlier events now promote to live on re-delivery.** An event first
   seen as an outlier — fetched via an `/event` probe for auth/prev context
   and never timelined — was dropped by the already-seen check when it later
