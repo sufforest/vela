@@ -204,6 +204,11 @@ minor versions.
 
 ### Fixed
 
+- **Device deletion is now federated.** Removing a device (logout,
+  `/devices/{id}` delete, or a dehydrated-device replace) didn't tell remote
+  servers, so they kept the dead device in their `/keys/query` view. It now
+  emits an `m.device_list_update` with `deleted: true` to servers sharing a
+  room with the user, paired with the local key reclaim below.
 - **Device deletion now reclaims its keys.** Removing a device (logout,
   `/devices/{id}` delete, or a dehydrated-device replace) only dropped the
   device record, leaving its `device_keys` and `one_time_keys` behind to

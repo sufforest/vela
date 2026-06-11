@@ -179,6 +179,19 @@ pub(crate) fn purge_device(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     let _ = state.db.delete_device(user_nid, device_id);
     crate::auth::logout::purge_msc3890_local_notification_settings_pub(state, user_nid, device_id);
+    // Federate the removal so remote servers drop this device from their
+    // `/keys/query` view — an `m.device_list_update` with `deleted: true`.
+    // Matches the local key reclaim in `Database::delete_device`.
+    if let Ok(Some(user_id)) = state.db.resolve_nid(user_nid) {
+        crate::e2ee::keys::federate_device_list_update_for(
+            state,
+            user_nid,
+            &user_id,
+            device_id,
+            json!({}),
+            /* deleted = */ true,
+        );
+    }
     Ok(())
 }
 
