@@ -18,7 +18,7 @@ use vela_store::media::MediaStore;
 
 use crate::auth::{account, account_data, devices, login, logout, refresh, register, whoami};
 use crate::directory::{self, discovery, search};
-use crate::e2ee::{key_backup, keys, to_device};
+use crate::e2ee::{dehydrated_devices, key_backup, keys, to_device};
 use crate::federation;
 use crate::federation::federation_client::{FederationClient, RemoteKeyCache};
 use crate::federation::federation_sender::FederationSender;
@@ -847,6 +847,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/_matrix/client/v3/keys/query", post(keys::query_keys))
         .route("/_matrix/client/v3/keys/claim", post(keys::claim_keys))
         .route("/_matrix/client/v3/keys/changes", get(keys::key_changes))
+        // MSC3814 dehydrated devices (unstable prefix clients use).
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device",
+            put(dehydrated_devices::put_dehydrated_device)
+                .get(dehydrated_devices::get_dehydrated_device)
+                .delete(dehydrated_devices::delete_dehydrated_device),
+        )
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device/{deviceId}/events",
+            post(dehydrated_devices::dehydrated_device_events),
+        )
         .route(
             "/_matrix/client/v3/keys/device_signing/upload",
             post(keys::upload_signing_keys),

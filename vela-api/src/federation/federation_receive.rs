@@ -149,8 +149,34 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
     // peer's transaction can come back at us under a different
     // round-trip. Re-persisting would clobber event_ids → nid and
     // re-fire device-list/membership side effects.
-    if let Ok(Some(_)) = state.db.get_event_nid_by_id(&pdu.event_id) {
-        return (pdu.event_id, PduOutcome::Accepted);
+    if let Ok(Some(existing_nid)) = state.db.get_event_nid_by_id(&pdu.event_id) {
+        // Already in our live timeline → idempotent skip (the /send fan-out
+        // re-echoes accepted events). EXCEPTION: an event we only hold as an
+        // OUTLIER — fetched via an /event probe for auth/prev context and
+        // never timelined — must be PROMOTED when it's later delivered live.
+        // Fall through so the normal path re-auths it and re-persists it as
+        // Live, reusing its nid (see persist_received_pdu). Side effects
+        // (membership, device lists) skipped for the outlier fire on this
+        // pass, which is exactly what promotion needs.
+        //
+        // Outlier check: O(1) via the forward index, but fall back to the
+        // authoritative room_timeline scan when the index has no entry, so a
+        // live event that predates the index (an existing deployment's
+        // backlog) is never mistaken for an outlier and re-timelined.
+        let is_outlier = match state.db.event_timeline_pos_of(existing_nid) {
+            Ok(Some(_)) => false,
+            _ => match state.db.get_nid(&pdu.room_id) {
+                Ok(Some(rn)) => state
+                    .db
+                    .event_stream_pos(rn, &pdu.event_id)
+                    .map(|p| p.is_none())
+                    .unwrap_or(false),
+                _ => false,
+            },
+        };
+        if !is_outlier {
+            return (pdu.event_id, PduOutcome::Accepted);
+        }
     }
 
     // Spec limits on array sizes.
@@ -1294,7 +1320,17 @@ async fn persist_received_pdu(
         }
     }
 
-    let event_nid = state.db.next_nid().map_err(|e| format!("db: {e}"))?;
+    // Reuse the nid when we already hold this event as an outlier (probed via
+    // /event for auth/prev context, never timelined): re-persisting as Live on
+    // the SAME nid promotes it in place — timeline position, state tiebreak,
+    // extremity — without orphaning the outlier row or dangling the references
+    // other events hold to it as a prev/auth nid. A genuinely new event keeps
+    // allocating a fresh nid. (process_pdu only falls through to here for
+    // outliers; live events are skipped upstream.)
+    let event_nid = match state.db.get_event_nid_by_id(&pdu.event_id) {
+        Ok(Some(existing)) => existing,
+        _ => state.db.next_nid().map_err(|e| format!("db: {e}"))?,
+    };
     let json_bytes = canonical_json_object(event_json);
     let is_state = pdu.state_key.is_some();
 
