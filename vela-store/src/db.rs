@@ -971,7 +971,7 @@ impl Database {
     ) -> Result<Option<Value>, rocksdb::Error> {
         let cf = self.db.cf_handle("devices").unwrap();
         let key = keys::encode_u64_bytes(user_nid, device_id.as_bytes());
-        match self.db.get_cf(&cf, &key)? {
+        match self.db.get_cf(&cf, key.as_slice())? {
             Some(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
             None => Ok(None),
         }
@@ -987,7 +987,7 @@ impl Database {
     ) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("devices").unwrap();
         let key = keys::encode_u64_bytes(user_nid, device_id.as_bytes());
-        let mut rec = match self.db.get_cf(&cf, &key)? {
+        let mut rec = match self.db.get_cf(&cf, key.as_slice())? {
             Some(b) => serde_json::from_slice::<Value>(&b).unwrap_or(Value::Null),
             None => serde_json::json!({"device_id": device_id}),
         };
@@ -1829,7 +1829,7 @@ impl Database {
         key.extend_from_slice(origin.as_bytes());
         key.push(0xff);
         key.extend_from_slice(message_id.as_bytes());
-        if self.db.get_cf(&cf, &key)?.is_some() {
+        if self.db.get_cf(&cf, key.as_slice())?.is_some() {
             return Ok(true);
         }
         self.db.put_cf(&cf, &key, [1u8])?;
@@ -2356,6 +2356,15 @@ impl Database {
                 &cf_timeline,
                 keys::encode_u64_pair(room_nid, stream_pos),
                 keys::encode_u64(event_nid),
+            );
+            // Forward index for O(1) "is this in the timeline / at what pos".
+            // Promoting an outlier (re-persist as Live on the same nid) writes
+            // its real position here, flipping it out of outlier status.
+            let cf_tlpos = self.db.cf_handle("event_timeline_pos").unwrap();
+            batch.put_cf(
+                &cf_tlpos,
+                keys::encode_u64(event_nid),
+                keys::encode_u64(stream_pos),
             );
         }
 
@@ -3157,7 +3166,7 @@ impl Database {
         let key = keys::encode_u64_bytes(user_nid, device_id.as_bytes());
         let prev = self
             .db
-            .get_cf(&cf, &key)?
+            .get_cf(&cf, key.as_slice())?
             .map(|b| keys::decode_u64(&b))
             .unwrap_or(0);
         if stream_id <= prev {
@@ -3741,7 +3750,7 @@ impl Database {
     ) -> Result<Option<u64>, rocksdb::Error> {
         let cf = self.db.cf_handle("sync_tokens").unwrap();
         let key = keys::encode_u64_bytes(user_nid, device_id.as_bytes());
-        match self.db.get_cf(&cf, &key)? {
+        match self.db.get_cf(&cf, key.as_slice())? {
             Some(bytes) => Ok(Some(keys::decode_u64(&bytes))),
             None => Ok(None),
         }
@@ -3776,7 +3785,7 @@ impl Database {
     ) -> Result<Option<String>, rocksdb::Error> {
         let cf = self.db.cf_handle("transactions").unwrap();
         let key = transaction_key(user_nid, device_id, scope, txn_id);
-        match self.db.get_cf(&cf, &key)? {
+        match self.db.get_cf(&cf, key.as_slice())? {
             Some(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).to_string())),
             None => Ok(None),
         }
@@ -4032,6 +4041,26 @@ impl Database {
         Ok(None)
     }
 
+    /// O(1) timeline position for an event by nid via the `event_timeline_pos`
+    /// forward index. `None` means the event isn't in the live timeline —
+    /// i.e. it's an outlier (or predates the index). Prefer this over
+    /// `event_stream_pos`'s backward scan when you already hold the nid.
+    pub fn event_timeline_pos_of(&self, event_nid: u64) -> Result<Option<u64>, rocksdb::Error> {
+        let cf = self.db.cf_handle("event_timeline_pos").unwrap();
+        Ok(self
+            .db
+            .get_cf(&cf, keys::encode_u64(event_nid))?
+            .map(|b| keys::decode_u64(&b)))
+    }
+
+    /// True when the event exists but is an outlier — present in the `events`
+    /// CF yet absent from the live timeline (no `event_timeline_pos` entry).
+    /// Used by the federation receive path to decide whether a re-delivered
+    /// event should be promoted to live rather than skipped as already-seen.
+    pub fn event_is_outlier(&self, event_nid: u64) -> Result<bool, rocksdb::Error> {
+        Ok(self.event_timeline_pos_of(event_nid)?.is_none())
+    }
+
     // --- Account data operations ---
 
     pub fn get_account_data(
@@ -4041,7 +4070,7 @@ impl Database {
     ) -> Result<Option<Value>, rocksdb::Error> {
         let cf = self.db.cf_handle("account_data").unwrap();
         let key = keys::encode_u64_bytes(user_nid, data_type.as_bytes());
-        match self.db.get_cf(&cf, &key)? {
+        match self.db.get_cf(&cf, key.as_slice())? {
             Some(bytes) => Ok(Some(serde_json::from_slice(&bytes).unwrap_or(Value::Null))),
             None => Ok(None),
         }
@@ -4083,7 +4112,7 @@ impl Database {
     pub fn key_backup_versions_get(&self, user_nid: u64) -> Result<Option<Value>, rocksdb::Error> {
         let cf = self.db.cf_handle("key_backup").unwrap();
         let key = key_backup_versions_key(user_nid);
-        match self.db.get_cf(&cf, &key)? {
+        match self.db.get_cf(&cf, key.as_slice())? {
             Some(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
             None => Ok(None),
         }
@@ -4132,7 +4161,7 @@ impl Database {
     ) -> Result<Option<Value>, rocksdb::Error> {
         let cf = self.db.cf_handle("key_backup").unwrap();
         let key = key_backup_session_key(user_nid, version, room_id, session_id);
-        match self.db.get_cf(&cf, &key)? {
+        match self.db.get_cf(&cf, key.as_slice())? {
             Some(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
             None => Ok(None),
         }
@@ -4149,9 +4178,9 @@ impl Database {
     ) -> Result<bool, rocksdb::Error> {
         let cf = self.db.cf_handle("key_backup").unwrap();
         let key = key_backup_session_key(user_nid, version, room_id, session_id);
-        let existed = self.db.get_cf(&cf, &key)?.is_some();
+        let existed = self.db.get_cf(&cf, key.as_slice())?.is_some();
         if existed {
-            self.db.delete_cf(&cf, &key)?;
+            self.db.delete_cf(&cf, key.as_slice())?;
         }
         Ok(existed)
     }
@@ -4273,7 +4302,7 @@ impl Database {
     ) -> Result<(u64, u64), rocksdb::Error> {
         let cf = self.db.cf_handle("key_backup").unwrap();
         let key = key_backup_stats_key(user_nid, version);
-        match self.db.get_cf(&cf, &key)? {
+        match self.db.get_cf(&cf, key.as_slice())? {
             Some(bytes) if bytes.len() == 16 => {
                 let mut count_buf = [0u8; 8];
                 let mut etag_buf = [0u8; 8];
@@ -4315,7 +4344,7 @@ impl Database {
     ) -> Result<Option<(u8, u64)>, rocksdb::Error> {
         let cf = self.db.cf_handle("thread_subscriptions").unwrap();
         let key = keys::encode_u64_pair_bytes(user_nid, room_nid, thread_root.as_bytes());
-        match self.db.get_cf(&cf, &key)? {
+        match self.db.get_cf(&cf, key.as_slice())? {
             Some(bytes) if bytes.len() == 9 => {
                 let state = bytes[0];
                 let pos = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
@@ -4457,7 +4486,7 @@ impl Database {
         key.extend_from_slice(&keys::encode_u64(user_nid));
         key.extend_from_slice(&keys::encode_u64(room_nid));
         key.extend_from_slice(data_type.as_bytes());
-        match self.db.get_cf(&cf, &key)? {
+        match self.db.get_cf(&cf, key.as_slice())? {
             Some(bytes) => Ok(Some(serde_json::from_slice(&bytes).unwrap_or(Value::Null))),
             None => Ok(None),
         }
@@ -4703,7 +4732,7 @@ impl Database {
     ) -> Result<Option<String>, rocksdb::Error> {
         let cf = self.db.cf_handle("receipts").unwrap();
         let key = receipt_key(room_nid, receipt_type, user_nid, thread_id);
-        match self.db.get_cf(&cf, &key)? {
+        match self.db.get_cf(&cf, key.as_slice())? {
             Some(bytes) => {
                 let v: Value = match serde_json::from_slice(&bytes) {
                     Ok(v) => v,
@@ -4824,7 +4853,7 @@ impl Database {
     ) -> Result<Option<Value>, rocksdb::Error> {
         let cf = self.db.cf_handle("device_keys").unwrap();
         let key = keys::encode_u64_bytes(user_nid, device_id.as_bytes());
-        match self.db.get_cf(&cf, &key)? {
+        match self.db.get_cf(&cf, key.as_slice())? {
             Some(bytes) => Ok(Some(serde_json::from_slice(&bytes).unwrap_or(Value::Null))),
             None => Ok(None),
         }
@@ -5059,6 +5088,126 @@ impl Database {
             batch.delete_cf(&cf, key);
         }
         self.db.write(batch)
+    }
+
+    /// Page through to-device messages queued for `device_id`, returning
+    /// those with a stream id strictly greater than `since` (0 = from the
+    /// start), up to `limit`. Returns the messages plus the highest stream
+    /// id seen (the next cursor), or `since` unchanged when nothing newer
+    /// is queued. Messages are NOT deleted — MSC3814's rehydration drain is
+    /// a read-ahead cursor, so a client can re-call or resume mid-page.
+    pub fn get_to_device_messages_since(
+        &self,
+        user_nid: u64,
+        device_id: &str,
+        since: u64,
+        limit: usize,
+    ) -> Result<(Vec<Value>, u64), rocksdb::Error> {
+        let cf = self.db.cf_handle("to_device_messages").unwrap();
+        let device_bytes = device_id.as_bytes();
+        let len = device_bytes.len() as u16;
+        let mut prefix = Vec::with_capacity(8 + 2 + device_bytes.len());
+        prefix.extend_from_slice(&keys::encode_u64(user_nid));
+        prefix.extend_from_slice(&len.to_be_bytes());
+        prefix.extend_from_slice(device_bytes);
+
+        let mut messages = Vec::new();
+        let mut cursor = since;
+        for item in self.db.prefix_iterator_cf(&cf, &prefix) {
+            let (key, val) = item?;
+            if key.len() != prefix.len() + 8 || key[..prefix.len()] != prefix[..] {
+                if key.len() <= prefix.len() || key[..prefix.len()] != prefix[..] {
+                    break;
+                }
+                continue;
+            }
+            let msg_id = u64::from_be_bytes(key[prefix.len()..].try_into().unwrap());
+            if msg_id <= since {
+                continue;
+            }
+            if messages.len() >= limit {
+                break;
+            }
+            let msg: Value = serde_json::from_slice(&val).unwrap_or(Value::Null);
+            messages.push(msg);
+            cursor = cursor.max(msg_id);
+        }
+        Ok((messages, cursor))
+    }
+
+    // --- MSC3814: Dehydrated devices ---
+
+    /// Fetch the user's current dehydrated device, if any, as
+    /// `(device_id, device_data)`.
+    pub fn get_dehydrated_device(
+        &self,
+        user_nid: u64,
+    ) -> Result<Option<(String, Value)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("dehydrated_devices").unwrap();
+        let Some(bytes) = self.db.get_cf(&cf, keys::encode_u64(user_nid))? else {
+            return Ok(None);
+        };
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let device_id = v.get("device_id").and_then(|d| d.as_str());
+        let device_data = v.get("device_data").cloned();
+        match (device_id, device_data) {
+            (Some(id), Some(data)) => Ok(Some((id.to_string(), data))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Upsert the user's dehydrated device record (one per user). Returns
+    /// the previous `device_id` when it differs from `device_id`, so the
+    /// caller can purge the stale device. Does not touch the `devices`,
+    /// key, or to-device CFs — the handler owns that lifecycle.
+    pub fn store_dehydrated_device(
+        &self,
+        user_nid: u64,
+        device_id: &str,
+        device_data: &Value,
+    ) -> Result<Option<String>, rocksdb::Error> {
+        let cf = self.db.cf_handle("dehydrated_devices").unwrap();
+        let key = keys::encode_u64(user_nid);
+        let prior = self
+            .db
+            .get_cf(&cf, key.as_slice())?
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| {
+                v.get("device_id")
+                    .and_then(|d| d.as_str())
+                    .map(String::from)
+            })
+            .filter(|old| old != device_id);
+        let record = serde_json::json!({
+            "device_id": device_id,
+            "device_data": device_data,
+        });
+        self.db
+            .put_cf(&cf, key.as_slice(), record.to_string().as_bytes())?;
+        Ok(prior)
+    }
+
+    /// Remove the user's dehydrated device record, returning its
+    /// `device_id` when one existed. The handler purges the device itself.
+    pub fn remove_dehydrated_device(
+        &self,
+        user_nid: u64,
+    ) -> Result<Option<String>, rocksdb::Error> {
+        let cf = self.db.cf_handle("dehydrated_devices").unwrap();
+        let key = keys::encode_u64(user_nid);
+        let prior = self
+            .db
+            .get_cf(&cf, key.as_slice())?
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| {
+                v.get("device_id")
+                    .and_then(|d| d.as_str())
+                    .map(String::from)
+            });
+        if prior.is_some() {
+            self.db.delete_cf(&cf, key.as_slice())?;
+        }
+        Ok(prior)
     }
 
     // --- E2EE: Cross-signing keys ---
@@ -6463,7 +6612,7 @@ impl Database {
     ) -> Result<u64, rocksdb::Error> {
         let cf = self.db.cf_handle("federation_edu_cursor").unwrap();
         let key = edu_cursor_key(destination, stream_name);
-        match self.db.get_cf(&cf, &key)? {
+        match self.db.get_cf(&cf, key.as_slice())? {
             Some(bytes) if bytes.len() == 8 => Ok(keys::decode_u64(&bytes)),
             _ => Ok(0),
         }
@@ -6494,7 +6643,7 @@ impl Database {
     ) -> Result<Option<u64>, rocksdb::Error> {
         let cf = self.db.cf_handle("external_ids").unwrap();
         let key = external_id_key(provider, sub);
-        match self.db.get_cf(&cf, &key)? {
+        match self.db.get_cf(&cf, key.as_slice())? {
             Some(bytes) if bytes.len() == 8 => Ok(Some(keys::decode_u64(&bytes))),
             _ => Ok(None),
         }
@@ -7397,6 +7546,103 @@ mod stream_recovery_tests {
                 1_750_000_000_000u64
             )
         );
+    }
+
+    /// Outlier→live promotion (the federation "probed an event via /event,
+    /// then got it live via /send" path): re-persisting an event we hold
+    /// only as an outlier as Live on the SAME nid must move it into the
+    /// timeline (gain an `event_timeline_pos`, leave outlier status) WITHOUT
+    /// changing its nid — so any event referencing it as a prev/auth nid
+    /// stays valid rather than dangling or duplicating.
+    #[test]
+    fn outlier_promotes_to_live_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+
+        let room_nid = db.get_or_create_nid("!r:example.com").unwrap();
+        let msg_type = db.get_or_create_nid("m.room.message").unwrap();
+        let alice = db.get_or_create_nid("@alice:example.com").unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "m.room.message", "sender": "@alice:example.com", "content": {"body": "hi"}
+        }))
+        .unwrap();
+
+        // Probed via /event for context → stored as an outlier (suppress=true).
+        let nid = db.next_nid().unwrap();
+        db.persist_event(
+            nid,
+            "$probed:example.com",
+            room_nid,
+            msg_type,
+            alice,
+            0,
+            1000,
+            5,
+            body.as_slice(),
+            &[],
+            &[],
+            false,
+            /* suppress = */ true,
+        )
+        .unwrap();
+        assert!(
+            db.event_is_outlier(nid).unwrap(),
+            "freshly probed event is an outlier"
+        );
+        assert_eq!(db.event_timeline_pos_of(nid).unwrap(), None);
+
+        // A later event references the outlier as a prev_event (by nid).
+        let child = db.next_nid().unwrap();
+        db.persist_event(
+            child,
+            "$child:example.com",
+            room_nid,
+            msg_type,
+            alice,
+            0,
+            1001,
+            6,
+            body.as_slice(),
+            &[nid],
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+
+        // The same event is re-delivered live → promote in place (same nid).
+        db.persist_event(
+            nid,
+            "$probed:example.com",
+            room_nid,
+            msg_type,
+            alice,
+            0,
+            1000,
+            5,
+            body.as_slice(),
+            &[],
+            &[],
+            false,
+            /* suppress = */ false,
+        )
+        .unwrap();
+
+        assert!(
+            !db.event_is_outlier(nid).unwrap(),
+            "promoted event must leave outlier status"
+        );
+        assert!(
+            db.event_timeline_pos_of(nid).unwrap().is_some(),
+            "promoted event must gain a timeline position"
+        );
+        // nid unchanged → the child's prev reference still resolves to it.
+        assert_eq!(
+            db.get_event_nid_by_id("$probed:example.com").unwrap(),
+            Some(nid),
+            "promotion must reuse the nid so references survive"
+        );
+        assert_eq!(db.get_prev_events(child).unwrap(), vec![nid]);
     }
 
     /// `set_receipt` MUST bump the room's max-receipt stream position

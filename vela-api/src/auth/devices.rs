@@ -168,7 +168,11 @@ pub async fn delete_device(
 /// MSC3890: device-local notification settings live in account_data
 /// keyed by the device_id and stop being useful once the device is
 /// gone, so tombstone the entry as part of the device deletion.
-fn purge_device(state: &AppState, user_nid: u64, device_id: &str) -> Result<(), ApiError> {
+pub(crate) fn purge_device(
+    state: &AppState,
+    user_nid: u64,
+    device_id: &str,
+) -> Result<(), ApiError> {
     state
         .db
         .delete_device_tokens(user_nid, device_id)

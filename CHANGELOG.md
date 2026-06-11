@@ -10,6 +10,17 @@ minor versions.
 
 ### Added
 
+- **Dehydrated devices (MSC3814).** `PUT`/`GET`/`DELETE
+  /_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device` plus
+  `POST .../{device_id}/events` let a client park an encrypted, offline
+  device on the server and rehydrate it later to decrypt to-device room keys
+  that arrived while it was away. The dehydrated device is registered like
+  any other device, so `/keys/query`, `/keys/claim`, to-device routing, and
+  cross-server `m.device_list_update` all work for it; the events endpoint
+  drains its to-device queue with a read-ahead cursor. One per user — a new
+  upload replaces and purges the previous one; `device_data` and one-time-key
+  counts are bounded, and a dehydrated id may not alias an existing device.
+
 - **Notification history.** `GET /_matrix/client/v3/notifications` returns a
   paginated list of past notifications (with `from` / `limit` / `only=highlight`).
   Rows are persisted whenever a push rule matches for a local recipient — even
@@ -193,6 +204,15 @@ minor versions.
 
 ### Fixed
 
+- **Outlier events now promote to live on re-delivery.** An event first
+  seen as an outlier — fetched via an `/event` probe for auth/prev context
+  and never timelined — was dropped by the already-seen check when it later
+  arrived through `/send`, so it stayed invisible to `/sync` and never fired
+  its membership/device-list side effects. It's now promoted to a live
+  timeline event: the receive path re-auths it and re-persists it as live
+  reusing its nid (references stay intact). Backed by a new
+  `event_timeline_pos` forward index, which also retires the O(timeline)
+  backward scan in `event_stream_pos`.
 - **Push-rule keys with escaped dots weren't resolved.** The condition
   key parser split on every `.`, so a key like `content.m\.mentions.room`
   (whose `m.mentions` segment contains a literal dot) never matched.

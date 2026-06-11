@@ -13,6 +13,13 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     "event_state",
     "state_snapshots",
     "room_timeline",
+    // Forward index `event_nid (8 BE) -> stream_pos (8 BE)` for events in
+    // the live timeline. Lets us answer "is this event in the timeline?"
+    // (and its position) in O(1) instead of a backward `room_timeline`
+    // scan. Absence = the event is an outlier (events-CF-only), which the
+    // federation receive path uses to promote a probed outlier to live
+    // when it's later re-delivered via /send.
+    "event_timeline_pos",
     "room_state",
     "room_meta",
     "room_extremities",
@@ -31,6 +38,11 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     "device_keys",
     "one_time_keys",
     "cross_signing_keys",
+    // MSC3814 dehydrated devices: `user_nid (8 BE) -> { device_id,
+    // device_data }`. One row per user; the PUT replaces any prior
+    // dehydrated device. The device itself lives in `devices` like any
+    // other so to-device routing and OTK claims work unchanged.
+    "dehydrated_devices",
     "to_device_messages",
     "key_backup",
     "device_key_changes",
