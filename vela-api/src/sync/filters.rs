@@ -209,8 +209,10 @@ pub async fn get_filter(
 /// - `room.timeline.not_senders`: deny-list senders.
 /// - `room.timeline.rooms`/`not_rooms`: applied at the per-room loop, not here.
 ///
-/// Other filter fields (state filter, ephemeral, presence, event_format,
-/// event_fields) are accepted-but-ignored for now.
+/// The `state`, `ephemeral`, `presence`, and `account_data` sub-filters are
+/// applied by their own helpers (`apply_state_filter` / `apply_event_filter`)
+/// at the call sites. `event_format` / `event_fields` remain accepted-but-
+/// ignored.
 pub fn apply_timeline_filter(room: &mut Value, timeline_filter: &Value) {
     let Some(events) = room
         .pointer_mut("/timeline/events")
@@ -342,6 +344,64 @@ pub fn apply_state_filter(room: &mut Value, state_filter: &Value) {
         }
         true
     });
+}
+
+/// Apply an `EventFilter`'s `types` / `not_types` / `senders` / `not_senders`
+/// / `limit` to a flat event array in place — used for the `presence`,
+/// per-room `ephemeral`, and global/room `account_data` sync sections, which
+/// carry a plain `EventFilter` (no room dimension). Same type-wildcard
+/// (`m.x.*`) and limit semantics as the timeline filter. `senders` is a no-op
+/// for sender-less events (account_data, typing), which is the spec intent.
+pub fn apply_event_filter(events: &mut Vec<Value>, filter: &Value) {
+    let str_list = |k: &str| {
+        filter.get(k).and_then(|v| v.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+    };
+    let allow_types = str_list("types");
+    let deny_types = str_list("not_types");
+    let allow_senders = str_list("senders");
+    let deny_senders = str_list("not_senders");
+
+    events.retain(|e| {
+        let etype = e.event_type().unwrap_or("");
+        if let Some(allow) = &allow_types
+            && !allow.iter().any(|p| type_matches(etype, p))
+        {
+            return false;
+        }
+        if let Some(deny) = &deny_types
+            && deny.iter().any(|p| type_matches(etype, p))
+        {
+            return false;
+        }
+        // Only constrain by sender when the events actually carry one.
+        if allow_senders.is_some() || deny_senders.is_some() {
+            let sender = e.sender().unwrap_or("");
+            if let Some(allow) = &allow_senders
+                && !allow.iter().any(|s| s == sender)
+            {
+                return false;
+            }
+            if let Some(deny) = &deny_senders
+                && deny.iter().any(|s| s == sender)
+            {
+                return false;
+            }
+        }
+        true
+    });
+
+    if let Some(limit) = filter
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        && events.len() > limit
+    {
+        events.truncate(limit);
+    }
 }
 
 /// True if either the `state` or `timeline` sub-filter requests
@@ -489,6 +549,40 @@ mod tests {
         assert!(kinds.contains(&("m.room.member", "@charlie:s")));
         assert!(kinds.contains(&("m.room.member", "@alice:s")));
         assert!(!kinds.contains(&("m.room.member", "@bob:s")));
+    }
+
+    #[test]
+    fn event_filter_applies_types_senders_and_limit() {
+        let ev = |t: &str, s: &str| json!({"type": t, "sender": s, "content": {}});
+
+        // not_types denies; the rest pass.
+        let mut events = vec![ev("m.presence", "@a:s"), ev("m.receipt", "@a:s")];
+        apply_event_filter(&mut events, &json!({"not_types": ["m.receipt"]}));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "m.presence");
+
+        // types allow-list with a wildcard.
+        let mut events = vec![ev("m.room.foo", "@a:s"), ev("m.tag", "@a:s")];
+        apply_event_filter(&mut events, &json!({"types": ["m.room.*"]}));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "m.room.foo");
+
+        // senders allow-list (relevant for presence).
+        let mut events = vec![ev("m.presence", "@a:s"), ev("m.presence", "@b:s")];
+        apply_event_filter(&mut events, &json!({"senders": ["@a:s"]}));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["sender"], "@a:s");
+
+        // limit caps the count.
+        let mut events = vec![ev("x", "@a:s"), ev("x", "@a:s"), ev("x", "@a:s")];
+        apply_event_filter(&mut events, &json!({"limit": 2}));
+        assert_eq!(events.len(), 2);
+
+        // sender-less events (account_data / typing) survive when only a type
+        // filter is set — the senders constraint must not strip them.
+        let mut events = vec![json!({"type": "m.tag", "content": {}})];
+        apply_event_filter(&mut events, &json!({"not_types": ["m.fully_read"]}));
+        assert_eq!(events.len(), 1);
     }
 
     /// Mirrors Complement TestFilter's getFilters() — every invalid filter

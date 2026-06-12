@@ -204,6 +204,11 @@ minor versions.
 
 ### Fixed
 
+- **`/sync` now honours the state, ephemeral, presence, and account_data
+  sub-filters.** Only the timeline filter was applied before (and the state
+  filter only on left rooms); the rest were accepted but silently ignored.
+  Their `types` / `not_types` / `senders` / `limit` constraints now apply to
+  each section, including the room state filter on joined rooms.
 - **Device deletion is now federated.** Removing a device (logout,
   `/devices/{id}` delete, or a dehydrated-device replace) didn't tell remote
   servers, so they kept the dead device in their `/keys/query` view. It now
