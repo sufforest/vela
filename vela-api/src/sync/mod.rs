@@ -409,6 +409,26 @@ pub(crate) fn build_sync_response_inner(
         if let Some(tf) = timeline_filter {
             crate::sync::filters::apply_timeline_filter(&mut room_data, tf);
         }
+        // Apply the state filter before lazy-loading so lazy-loaded member
+        // events (added next) are never stripped by a `not_types` / `types`
+        // that omits `m.room.member` — lazy loading is its own opt-in.
+        if let Some(sf) = state_filter {
+            crate::sync::filters::apply_state_filter(&mut room_data, sf);
+        }
+        // Per-room `ephemeral` (typing / receipts) and `account_data`
+        // sub-filters — accepted-but-ignored until now.
+        if let Some(rf) = room_filter {
+            for (sub, ptr) in [
+                ("ephemeral", "/ephemeral/events"),
+                ("account_data", "/account_data/events"),
+            ] {
+                if let Some(sub_filter) = rf.get(sub)
+                    && let Some(arr) = room_data.pointer_mut(ptr).and_then(|v| v.as_array_mut())
+                {
+                    crate::sync::filters::apply_event_filter(arr, sub_filter);
+                }
+            }
+        }
         if lazy_load {
             ensure_lazy_load_member_state(
                 state,
@@ -603,7 +623,15 @@ pub(crate) fn build_sync_response_inner(
         .set_sync_position(user.user_nid, &user.device_id, safe_pos)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
-    let presence_events = collect_presence_events(state, user.user_nid, joined_room_nids)?;
+    let mut presence_events = collect_presence_events(state, user.user_nid, joined_room_nids)?;
+    // Top-level `presence` and `account_data` sub-filters (types / not_types /
+    // senders / limit). Accepted-but-ignored until now.
+    if let Some(pf) = filter.and_then(|f| f.get("presence")) {
+        crate::sync::filters::apply_event_filter(&mut presence_events, pf);
+    }
+    if let Some(af) = filter.and_then(|f| f.get("account_data")) {
+        crate::sync::filters::apply_event_filter(&mut global_account_data, af);
+    }
 
     // device_lists.changed: users whose device/cross-signing keys changed
     // since `since` (or since 0 on initial sync). Element uses this to
