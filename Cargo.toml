@@ -10,7 +10,7 @@ exclude = ["tools/testing/smoketest-rs"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.1"
+version = "0.2.0"
 license = "Apache-2.0"
 description = "A Matrix homeserver written in Rust."
 readme = "README.md"
@@ -104,9 +104,9 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] 
 
 # Internal crates. Path-and-version: path wins for local builds, the
 # version anchor satisfies cargo-deny + works the day we ever publish.
-vela-core = { path = "vela-core", version = "0.1.1" }
-vela-store = { path = "vela-store", version = "0.1.1" }
-vela-api = { path = "vela-api", version = "0.1.1" }
+vela-core = { path = "vela-core", version = "0.2.0" }
+vela-store = { path = "vela-store", version = "0.2.0" }
+vela-api = { path = "vela-api", version = "0.2.0" }
 
 # Dev-profile override: line-table-only debuginfo. Backtraces still
 # show file:line (good enough for nearly all triage); variable
