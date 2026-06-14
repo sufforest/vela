@@ -8,6 +8,12 @@ minor versions.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-13
+
+Spec-maturity milestone: faster joins (MSC3706/MSC3902), delegated auth
+(MSC3861), extended profiles (MSC4133), notifications history, dehydrated
+devices (MSC3814), and a long tail of CS-API / federation correctness work.
+
 ### Added
 
 - **Dehydrated devices (MSC3814).** `PUT`/`GET`/`DELETE
