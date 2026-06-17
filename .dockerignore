@@ -1,4 +1,5 @@
 target/
+**/target/
 data/
 **/*.rs.bk
 *.profraw
