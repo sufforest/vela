@@ -1,0 +1,29 @@
+[package]
+name = "vela-extensions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["wasmtime-runtime"]
+# The sandboxed WASM runtime. With it OFF, the crate still exposes its types
+# (Verdict, EventContext, PluginConfig) and a no-op Runtime that returns Allow,
+# but pulls ZERO wasmtime/Cranelift crates — so vela can build without WASM
+# support (`--no-default-features`). Plumbed up via vela-api/vela-server.
+wasmtime-runtime = ["dep:wasmtime"]
+
+[dependencies]
+# Host runtime. Optional + trimmed default features: we need the Cranelift
+# compiler, the Component Model, and runtime support — not the CLI/debug extras.
+wasmtime = { version = "45", optional = true, default-features = false, features = [
+    "std",
+    "runtime",
+    "cranelift",
+    "component-model",
+] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+wat = "1"
