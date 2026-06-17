@@ -71,13 +71,13 @@ jobs:
     # supported Rust version (rust-version in Cargo.toml). Drift here is
     # silent without this job. Uses `cargo build` (not `check`) so codegen
     # errors surface, not just type errors.
-    name: cargo build (MSRV 1.88)
+    name: cargo build (MSRV 1.93)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88
+      - name: Install Rust 1.93
+        uses: dtolnay/rust-toolchain@1.93
 
       - name: Install libclang
         run: sudo apt-get update && sudo apt-get install -y libclang-dev

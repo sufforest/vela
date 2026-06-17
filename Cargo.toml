@@ -14,7 +14,7 @@ version = "0.2.0"
 license = "Apache-2.0"
 description = "A Matrix homeserver written in Rust."
 readme = "README.md"
-rust-version = "1.88"
+rust-version = "1.93"
 
 # Workspace-level lint config — every member crate inherits via
 # `[lints] workspace = true`. The CI lint job runs with `-D warnings`,
