@@ -403,18 +403,21 @@ pub struct AppState {
     /// can detect process restarts (the value changes) without relying
     /// on a monotonic clock alone.
     pub started_at_ms: u64,
-    /// Sandboxed WASM extension runtime. Always present; when the
-    /// `extensions` feature is off it's the no-op runtime that allows
-    /// everything (so the send path needs no `#[cfg]`). Shared `Arc` so
-    /// every `AppState` clone reuses the one loaded plugin set.
-    pub extensions: Arc<vela_extensions::Runtime>,
+    /// Sandboxed WASM extension runtime. Always present; when the `extensions`
+    /// feature is off it's the no-op runtime that allows everything (so the send
+    /// path needs no `#[cfg]`). Wrapped in `ArcSwap` so a SIGHUP reload can swap
+    /// the plugin set atomically without locking the send hot path — readers
+    /// `.load()` a snapshot, the reloader `.store()`s a freshly-built runtime.
+    pub extensions: Arc<arc_swap::ArcSwap<vela_extensions::Runtime>>,
 }
 
 /// An empty extension runtime (no plugins) — allows everything. Lets external
 /// `AppState` constructors (test harnesses, embedders) fill the `extensions`
 /// field without naming `vela_extensions` themselves.
-pub fn empty_extension_runtime() -> Arc<vela_extensions::Runtime> {
-    Arc::new(vela_extensions::Runtime::new(Vec::new()).expect("empty extension runtime"))
+pub fn empty_extension_runtime() -> Arc<arc_swap::ArcSwap<vela_extensions::Runtime>> {
+    Arc::new(arc_swap::ArcSwap::from_pointee(
+        vela_extensions::Runtime::new(Vec::new()).expect("empty extension runtime"),
+    ))
 }
 
 pub fn build_router(state: AppState) -> Router {

@@ -281,7 +281,8 @@ pub(crate) async fn send_message_inner(
 
     // Gate: sandboxed extension policy hook (no-op when no plugins configured).
     local_extension_gate(
-        &state.extensions,
+        // Lock-free snapshot; a concurrent SIGHUP reload can't tear an in-flight call.
+        &state.extensions.load(),
         &event,
         room_id.as_str(),
         &user.user_id,
@@ -667,7 +668,8 @@ pub(crate) async fn send_state_inner(
 
     // Gate: sandboxed extension policy hook (no-op when no plugins configured).
     local_extension_gate(
-        &state.extensions,
+        // Lock-free snapshot; a concurrent SIGHUP reload can't tear an in-flight call.
+        &state.extensions.load(),
         &event,
         room_id.as_str(),
         &user.user_id,

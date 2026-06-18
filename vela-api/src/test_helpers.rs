@@ -124,9 +124,7 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
             .unwrap_or(0),
         // No plugins in tests; an empty runtime allows everything (and pulls no
         // wasmtime when the feature is off).
-        extensions: Arc::new(
-            vela_extensions::Runtime::new(vec![]).expect("empty extension runtime"),
-        ),
+        extensions: crate::router::empty_extension_runtime(),
     };
     (state, tmp)
 }
