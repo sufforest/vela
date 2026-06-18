@@ -65,9 +65,10 @@ moderation. (Unix only; on other platforms, restart to reload.)
 
 ## What plugins can do
 
-Today: one decision point — **`check_event` on local sends** (message and state
-events, after auth, before the event is persisted). A plugin returns *allow* or
-*block*; a block rejects the send with the plugin's errcode/reason (HTTP 403).
+Today: one decision point — **`check_event`**, on both **local sends** (message
+and state events, after auth, before persist — a block rejects the send with the
+plugin's errcode/reason, HTTP 403) and **inbound federated events** (a block
+soft-fails — see below). A plugin returns *allow* or *block*.
 
 Plugins are **stateless** and get **no host capabilities** — no network, disk, or
 syscalls. They only see the event and their own config.
@@ -81,10 +82,12 @@ syscalls. They only see the event and their own config.
 - **Fail policy:** a trapping/erroring plugin is resolved per its `fail_policy` —
   `open` favors availability, `closed` favors safety.
 - **Multiple plugins** at a point are **block-if-any** (any block wins).
-- **Federation:** a block on an inbound federated event is **soft-failed**, never
-  hard-rejected — rejecting an event peers accepted would diverge room state.
-  (Today only local sends are gated; this invariant guards the federation path
-  as it's wired up.)
+- **Federation:** the decision hook also runs on **inbound federated events**. A
+  block there is **soft-failed**, never hard-rejected: the event is still stored
+  and still served to peer servers (so the room DAG stays consistent across the
+  federation), but it's hidden from your local clients (`/sync` and `/event`).
+  That's the only spec-safe moderation across federation — you can't make a
+  remote server un-send an event, but you can keep it from your users.
 
 ## Writing a plugin
 

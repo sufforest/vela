@@ -66,6 +66,42 @@ impl PduOutcome {
 /// don't echo the event back to them; safe to pass an empty string if
 /// the caller doesn't have an origin (e.g. internal callers / tests).
 ///
+/// True if a configured extension plugin blocks this inbound federated event,
+/// meaning the caller must SOFT-fail it. No-op (false) when no plugins are
+/// configured. Origin is always `Federation` here — a block is a soft-fail, the
+/// runtime returns a pure verdict and this call site applies the origin policy.
+fn extension_soft_fails_inbound(
+    extensions: &vela_extensions::Runtime,
+    event_id: &str,
+    event_json: &Map<String, Value>,
+    room_id: &str,
+    sender: &str,
+    event_type: &str,
+) -> bool {
+    if extensions.is_empty() {
+        return false;
+    }
+    let event_value = Value::Object(event_json.clone());
+    let decision = extensions.check_event(&vela_extensions::EventContext {
+        event: &event_value,
+        room_id,
+        sender,
+        event_type,
+        origin: vela_extensions::Origin::Federation,
+    });
+    match decision {
+        vela_extensions::Decision::Block { errcode, reason } => {
+            metrics::counter!("vela_extension_decisions_total", "verdict" => "block").increment(1);
+            warn!(%event_id, %sender, %errcode, %reason, "extension soft-failed an inbound federated event");
+            true
+        }
+        vela_extensions::Decision::Allow => {
+            metrics::counter!("vela_extension_decisions_total", "verdict" => "allow").increment(1);
+            false
+        }
+    }
+}
+
 /// On Accepted / SoftFailed the event has been persisted. On Rejected it has not.
 pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (String, PduOutcome) {
     // --- Check 1: format ---
@@ -741,7 +777,7 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
     // never reaches /sync). Treat partial-state Check 6 failures as
     // accepts; full state reconciliation happens at filler completion.
     let cs_failed = cs_outcome.is_err();
-    let soft_failed = soft_failed_at_send || (cs_failed && !is_partial_state_room);
+    let mut soft_failed = soft_failed_at_send || (cs_failed && !is_partial_state_room);
     if soft_failed {
         let reason = match &cs_outcome {
             Err(AuthError::Rejected(r)) => r.clone(),
@@ -759,6 +795,29 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
             %reason,
             "event soft-failed"
         );
+    }
+
+    // Extension policy on inbound federated events. A plugin Block SOFT-fails the
+    // event (stored, hidden from local /sync + /event, still served to peers) —
+    // NEVER a hard reject, which would hole our DAG vs. the federation. Skipped
+    // when already soft-failed or no plugins are configured.
+    //
+    // Also skipped during partial state: those events are re-verified on join
+    // completion (`reverify_pending_events`), which re-derives soft-fail from
+    // *auth* and would `unmark_soft_failed` a plugin's decision. Moderating
+    // partial-state-window events is a deliberate follow-up, not done here.
+    if !soft_failed
+        && !is_partial_state_room
+        && extension_soft_fails_inbound(
+            &state.extensions.load(),
+            &effective_pdu.event_id,
+            &effective_event_json,
+            &effective_pdu.room_id,
+            &effective_pdu.sender,
+            &effective_pdu.event_type,
+        )
+    {
+        soft_failed = true;
     }
 
     // --- Persist ---
@@ -1455,11 +1514,12 @@ async fn persist_received_pdu(
             .map_err(|e| format!("db: {e}"))?;
     }
 
-    // Notify local sync listeners. /sync surfaces soft-failed events
-    // (no filter), and during MSC3902 partial state an optimistically
-    // soft-failed event may flip to accepted on re-verify, so the
-    // wake-up needs to fire either way. Without it, alice's
-    // long-poll never sees a partial-state ban/leave landing.
+    // Wake local /sync listeners. We notify even for soft-failed events: a
+    // soft-failed event is itself absent from the timeline (Outlier — see
+    // PersistKind), but during MSC3902 partial state an optimistically
+    // soft-failed event may flip to accepted on re-verify, and that flip needs
+    // the wake to fire. Without it, alice's long-poll never sees a partial-state
+    // ban/leave landing.
     if let Some(sender_ch) = state.room_senders.get(&Nid(room_nid)) {
         let _ = sender_ch.send(stream_pos);
     }
@@ -3138,5 +3198,78 @@ mod tests {
 
         let joined = db.get_user_joined_rooms(alice_nid).unwrap();
         assert_eq!(joined, vec![room_joined]);
+    }
+}
+
+#[cfg(all(test, feature = "extensions"))]
+mod extension_soft_fail_tests {
+    use super::*;
+    use serde_json::json;
+
+    // Reuse the config-driven sandbox fixture: `mode:block` always blocks,
+    // `mode:allow` checks the event for "SPAM".
+    const FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../vela-extensions/tests/fixtures/spam_guest.wasm"
+    ));
+
+    fn runtime(mode: &str) -> vela_extensions::Runtime {
+        vela_extensions::Runtime::new(vec![vela_extensions::PluginConfig {
+            name: "fed-filter".into(),
+            wasm: FIXTURE.to_vec(),
+            fail_policy: vela_extensions::FailPolicy::Closed,
+            fuel: 50_000_000,
+            wall_ms: 0,
+            memory_pages: 256,
+            event_types: None,
+            config: serde_json::json!({ "mode": mode }),
+        }])
+        .expect("runtime loads")
+    }
+
+    fn event() -> Map<String, Value> {
+        json!({ "type": "m.room.message", "content": { "body": "hi" } })
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn a_blocking_plugin_soft_fails_an_inbound_event() {
+        let rt = runtime("block");
+        assert!(extension_soft_fails_inbound(
+            &rt,
+            "$e:remote.example",
+            &event(),
+            "!r:remote.example",
+            "@u:remote.example",
+            "m.room.message",
+        ));
+    }
+
+    #[test]
+    fn an_allowing_plugin_does_not_soft_fail() {
+        let rt = runtime("allow");
+        assert!(!extension_soft_fails_inbound(
+            &rt,
+            "$e:remote.example",
+            &event(),
+            "!r:remote.example",
+            "@u:remote.example",
+            "m.room.message",
+        ));
+    }
+
+    #[test]
+    fn no_plugins_never_soft_fails() {
+        let rt = vela_extensions::Runtime::new(vec![]).expect("empty runtime");
+        assert!(!extension_soft_fails_inbound(
+            &rt,
+            "$e:remote.example",
+            &event(),
+            "!r:remote.example",
+            "@u:remote.example",
+            "m.room.message",
+        ));
     }
 }
