@@ -1,0 +1,103 @@
+# vela-extension-sdk
+
+Write sandboxed WASM extensions for the [vela](https://github.com/sufforest/vela)
+Matrix homeserver in Rust.
+
+A vela extension is a WASM component that vela loads at runtime and runs at a
+server decision point — today, on locally-sent events. It runs **sandboxed**
+(memory-isolated, with per-call CPU/memory/wall-clock budgets) and gets no host
+access it isn't granted, so an operator can run one without trusting its author.
+
+## Write one
+
+```rust
+use serde::Deserialize;
+use vela_extension_sdk::{export_plugin, Decision, Event, Plugin};
+
+#[derive(Deserialize, Default)]
+struct Config {
+    banned: Vec<String>,
+}
+
+struct KeywordFilter;
+
+impl Plugin for KeywordFilter {
+    fn check_event(ev: &Event) -> Decision {
+        let cfg: Config = ev.config();
+        match ev.message_body() {
+            Some(body) if cfg.banned.iter().any(|w| body.contains(w)) => {
+                Decision::block("message contains a blocked term")
+            }
+            _ => Decision::allow(),
+        }
+    }
+}
+
+export_plugin!(KeywordFilter);
+```
+
+`Cargo.toml`:
+
+```toml
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Not yet published to crates.io — use a git or path dependency for now:
+vela-extension-sdk = { git = "https://github.com/sufforest/vela" }
+serde = { version = "1", features = ["derive"] }
+```
+
+See [`examples/keyword-filter`](../examples/keyword-filter) for the full version.
+
+## The API
+
+- **`Plugin::check_event(&Event) -> Decision`** — your logic. Pure: no host
+  capabilities are granted (yet).
+- **`Event`** — `room_id()`, `sender()`, `event_type()`, `origin()`,
+  `event()` (the full event as parsed JSON), `message_body()` (`content.body`
+  if present), and `config::<T>()` / `try_config::<T>()` to read your
+  operator-supplied config block as a typed struct.
+- **`Decision`** — `allow()`, `block(reason)`, or `block_with(errcode, reason)`
+  for a custom Matrix errcode.
+
+## Build
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-tools                       # once
+
+cargo build --release --target wasm32-unknown-unknown
+wasm-tools component new \
+    target/wasm32-unknown-unknown/release/my_plugin.wasm \
+    -o my-plugin.wasm
+```
+
+`my-plugin.wasm` is a Component-Model component — hand it to an operator.
+
+## Install into vela
+
+The operator points vela at the file in `vela.toml`:
+
+```toml
+[[extensions.plugin]]
+name = "keyword-filter"
+wasm_path = "/etc/vela/plugins/keyword-filter.wasm"
+event_types = ["m.room.message"]      # optional scope; omit for all events
+fail_policy = "open"                   # "open" (allow on error) | "closed" (block)
+config = { banned = ["spam"] }         # handed to your plugin verbatim
+```
+
+vela must be built with `--features extensions` (the release Docker image is).
+See the [extensions guide](../../vela-extensions/README.md) for the full config
+reference and the security model.
+
+## Limits & semantics
+
+- Your plugin is **stateless** — a fresh instance per call; nothing persists in
+  memory between events.
+- Per call it gets a **fuel** (≈ instruction) budget, a **memory** cap, and an
+  optional **wall-clock** deadline. Exceeding any traps the call, which the host
+  resolves via your `fail_policy`.
+- A `block` on a **federated** event is soft-failed by the host (never a
+  hard-reject) — you just return a verdict; vela applies origin policy.

@@ -1,0 +1,14 @@
+# Detached workspace for the guest-side extension SDK and example plugins.
+# Separate from the main vela workspace (its own Cargo.lock) because these crates
+# compile to wasm32 components, not the host target — `cargo build --workspace`
+# at the repo root must never try to build them. Build with build-examples.sh.
+[workspace]
+resolver = "2"
+members = ["sdk", "examples/keyword-filter"]
+
+# Small, trap-on-panic wasm artifacts. Applies to every example.
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+panic = "abort"
