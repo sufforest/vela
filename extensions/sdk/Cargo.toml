@@ -1,0 +1,13 @@
+[package]
+name = "vela-extension-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "SDK for writing sandboxed WASM extensions for the vela Matrix homeserver."
+# Ship the vendored WIT so `generate!` works for a crates.io consumer.
+include = ["src/**/*", "wit/**/*", "README.md", "Cargo.toml"]
+
+[dependencies]
+wit-bindgen = "0.58"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
