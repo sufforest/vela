@@ -312,13 +312,12 @@ fn federation_origin_allows_normally() {
     assert_eq!(rt.check_event(&ctx), Decision::Allow);
 }
 
-#[cfg(debug_assertions)]
 #[test]
-#[should_panic(expected = "soft-failed by the caller")]
-fn federation_block_trips_the_dev_tripwire() {
-    // In debug builds the invariant tripwire must fire if a Block escapes for a
-    // federated event (it's compiled out in release — enforcement is PR2's call
-    // site). This documents and guards the tripwire itself.
+fn federation_block_returns_block_for_the_caller_to_soft_fail() {
+    // The runtime returns a pure Block for a federated event too — no panic. The
+    // origin-aware caller (federation receive) maps that Block to a soft-fail
+    // (store + hide), never a hard reject. This pins that the runtime itself is
+    // origin-agnostic and leaves the local-vs-federation policy to the caller.
     let rt = Runtime::new(vec![plugin("b", "block")]).expect("loads");
     let ev = message("hi");
     let ctx = EventContext {
@@ -328,7 +327,7 @@ fn federation_block_trips_the_dev_tripwire() {
         event_type: "m.room.message",
         origin: Origin::Federation,
     };
-    let _ = rt.check_event(&ctx);
+    assert!(matches!(rt.check_event(&ctx), Decision::Block { .. }));
 }
 
 // --- adversarial under concurrency -----------------------------------------

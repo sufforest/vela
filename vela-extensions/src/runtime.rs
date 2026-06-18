@@ -32,7 +32,7 @@ impl std::error::Error for RuntimeError {}
 #[cfg(feature = "wasmtime-runtime")]
 mod imp {
     use super::*;
-    use crate::abi::{Origin, Verdict};
+    use crate::abi::Verdict;
     use crate::config::FailPolicy;
     use crate::plugin::{EpochTicker, Plugin};
 
@@ -117,19 +117,12 @@ mod imp {
                 };
 
                 if let Verdict::Block { errcode, reason } = verdict {
-                    // INVARIANT (carried by the caller, not enforced here): a
-                    // Block on a federated event must be SOFT-failed, never
-                    // hard-rejected — hard-rejecting an event peers accepted
-                    // would hole our DAG. This crate returns a pure verdict; the
-                    // origin-aware translation lives at the call site.
-                    // TODO(PR2): the federation call site must map Block→soft-fail
-                    // for Origin::Federation. The debug_assert below is only a
-                    // dev tripwire (compiled out in release) — it is NOT the
-                    // enforcement. PR1 constructs Origin::Local exclusively.
-                    debug_assert!(
-                        ctx.origin == Origin::Local,
-                        "block on a federation event must be soft-failed by the caller"
-                    );
+                    // This crate returns a pure verdict; the origin-aware
+                    // translation lives at the call site. INVARIANT (enforced
+                    // there): a Block on a `local` event is a hard reject (we
+                    // refuse to originate it); a Block on a `federation` event is
+                    // a SOFT-fail (store it, hide it from local clients) — never
+                    // a hard reject, which would hole our DAG vs. peers.
                     return Decision::Block { errcode, reason };
                 }
             }
