@@ -272,3 +272,34 @@ jobs:
           VELA_TEST_S3_SECRET_KEY: vela-test-secret
           VELA_TEST_S3_BUCKET: vela-test
         run: cargo test -p vela-store --features s3-integration --locked
+
+  extensions:
+    # Build + lint the guest-side extension SDK and example plugins. They live in
+    # a detached `extensions/` workspace (own lockfile, wasm32 target) so the
+    # main workspace never compiles them — this job is what keeps them honest.
+    # The host integration test that runs the built example lives in the regular
+    # `cargo test` job (it loads the committed `.wasm`).
+    name: build extensions (wasm32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: extensions
+
+      - name: rustfmt
+        run: cargo fmt --all --manifest-path extensions/Cargo.toml -- --check
+
+      - name: clippy
+        run: cargo clippy --manifest-path extensions/Cargo.toml --target wasm32-unknown-unknown --all-targets --locked -- -D warnings
+
+      - name: build
+        run: cargo build --release --manifest-path extensions/Cargo.toml --target wasm32-unknown-unknown --locked

@@ -159,7 +159,18 @@ mod imp {
     pub struct Runtime;
 
     impl Runtime {
-        pub fn new(_configs: Vec<PluginConfig>) -> Result<Self, RuntimeError> {
+        pub fn new(configs: Vec<PluginConfig>) -> Result<Self, RuntimeError> {
+            // Loud warning rather than silent no-op: an operator who configured
+            // plugins but built without the `extensions` feature would otherwise
+            // see their policy silently ignored (everything allowed).
+            if !configs.is_empty() {
+                tracing::warn!(
+                    count = configs.len(),
+                    "extension plugins are configured but this build lacks the \
+                     `extensions` feature — they will NOT run and all events are \
+                     allowed; rebuild with `--features extensions` to enable them"
+                );
+            }
             Ok(Runtime)
         }
 
