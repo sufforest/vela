@@ -908,6 +908,71 @@ fn build_extension_runtime(
     vela_extensions::Runtime::new(configs).map_err(|e| anyhow::anyhow!("extensions: {e}"))
 }
 
+/// Re-read `[extensions]` from the config file and build a fresh runtime, for
+/// SIGHUP hot-reload. Unlike [`load_config`], a parse/build error is *returned*
+/// (not fatal) so the caller keeps the current plugin set. Returns the runtime
+/// and the plugin count.
+#[cfg(unix)]
+fn reload_extension_runtime(
+    path: &std::path::Path,
+) -> Result<(vela_extensions::Runtime, usize), String> {
+    let config: Config = Figment::new()
+        .merge(Toml::file(path))
+        .merge(Env::prefixed("VELA_").split("_"))
+        .extract()
+        .map_err(|e| format!("parsing {}: {e}", path.display()))?;
+    let count = config.extensions.plugin.len();
+    let runtime = build_extension_runtime(&config.extensions).map_err(|e| e.to_string())?;
+    Ok((runtime, count))
+}
+
+#[cfg(all(test, unix))]
+mod reload_tests {
+    fn write_config(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vela.toml");
+        std::fs::write(&path, body).expect("write config");
+        (dir, path)
+    }
+
+    fn example_wasm() -> String {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../extensions/examples/keyword-filter/keyword-filter.wasm"
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn reloads_a_valid_config() {
+        let (_dir, path) = write_config(&format!(
+            "[[extensions.plugin]]\nname = \"kf\"\nwasm_path = \"{}\"\n\
+             config = {{ banned = [\"spam\"] }}\n",
+            example_wasm()
+        ));
+        let (_rt, count) = super::reload_extension_runtime(&path).expect("valid config reloads");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn empty_config_reloads_to_zero_plugins() {
+        let (_dir, path) = write_config("# nothing here\n");
+        let (_rt, count) = super::reload_extension_runtime(&path).expect("empty config reloads");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn a_missing_wasm_errors_so_the_caller_keeps_the_old_set() {
+        let (_dir, path) = write_config(
+            "[[extensions.plugin]]\nname = \"kf\"\nwasm_path = \"/no/such/plugin.wasm\"\n",
+        );
+        assert!(
+            super::reload_extension_runtime(&path).is_err(),
+            "a bad reload must error, not panic or silently succeed"
+        );
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -959,6 +1024,9 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
+    // Captured into the async block for the SIGHUP extension-reload task (unix).
+    #[cfg(unix)]
+    let config_path = cli.config.clone();
     runtime.block_on(async move {
         // Open database
         let db_path = PathBuf::from(&config.database.path);
@@ -1139,7 +1207,41 @@ fn main() -> anyhow::Result<()> {
                     Arc::new(vela_api::auth::oidc::IntrospectionState { client, cache })
                 });
 
-        let extensions = Arc::new(build_extension_runtime(&config.extensions)?);
+        let extensions = Arc::new(arc_swap::ArcSwap::from_pointee(build_extension_runtime(
+            &config.extensions,
+        )?));
+
+        // SIGHUP → re-read [extensions] from the config file and atomically swap
+        // the plugin set in. A bad new config (missing file, invalid component)
+        // is logged and the current set is kept — a reload must never disarm
+        // moderation. Unix only; other platforms restart to reload.
+        #[cfg(unix)]
+        {
+            let extensions = extensions.clone();
+            let config_path = config_path.clone();
+            tokio::spawn(async move {
+                let mut hup = match tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::hangup(),
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to install SIGHUP handler; extension hot-reload disabled");
+                        return;
+                    }
+                };
+                while hup.recv().await.is_some() {
+                    match reload_extension_runtime(&config_path) {
+                        Ok((runtime, count)) => {
+                            extensions.store(Arc::new(runtime));
+                            info!(plugins = count, "reloaded extensions on SIGHUP");
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "extension reload failed; keeping the current plugin set");
+                        }
+                    }
+                }
+            });
+        }
 
         let state = AppState {
             db: db.clone(),

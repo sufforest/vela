@@ -45,6 +45,7 @@ vela-core = { workspace = true }
 # (→ vela-api/extensions → vela-extensions/wasmtime-runtime), unified across
 # the graph; default-features stay off here.
 vela-extensions = { workspace = true }
+arc-swap = { workspace = true }
 vela-store = { workspace = true }
 vela-api = { workspace = true }
 tokio = { workspace = true }

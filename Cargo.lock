@@ -3761,6 +3761,7 @@ dependencies = [
 name = "vela-api"
 version = "0.2.0"
 dependencies = [
+ "arc-swap",
  "argon2",
  "axum",
  "base64",
@@ -3834,6 +3835,7 @@ name = "vela-server"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "axum",
  "axum-server",
  "bytes",

@@ -51,6 +51,18 @@ config = { banned = ["spam"] }         # opaque JSON, handed to the plugin
 A missing file, an unknown `fail_policy`, or an invalid component **aborts
 startup** — a misconfigured policy never silently no-ops.
 
+## Reloading (SIGHUP)
+
+Send the server **`SIGHUP`** (`kill -HUP <pid>`, or `systemctl reload` with an
+`ExecReload`) to re-read `[extensions]` and swap the plugin set in **without a
+restart** — picking up added/removed plugins, changed knobs, and updated `.wasm`
+files. The swap is atomic and lock-free; in-flight sends finish on the plugin
+set they started with.
+
+If the new config is bad (missing file, invalid component, malformed TOML) the
+error is logged and the **current plugin set is kept** — a reload never disarms
+moderation. (Unix only; on other platforms, restart to reload.)
+
 ## What plugins can do
 
 Today: one decision point — **`check_event` on local sends** (message and state
