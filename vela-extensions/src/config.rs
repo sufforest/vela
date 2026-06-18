@@ -23,9 +23,13 @@ pub struct PluginConfig {
     pub wasm: Vec<u8>,
     pub fail_policy: FailPolicy,
     /// Per-call CPU budget. wasmtime meters *fuel* (≈ executed instructions),
-    /// not wall-clock time — see `DESIGN.md`. An epoch (wall-clock) deadline is
-    /// a planned PR2 backstop for the live hot path.
+    /// not wall-clock time — see `DESIGN.md`.
     pub fuel: u64,
+    /// Per-call wall-clock budget in milliseconds, enforced via wasmtime epoch
+    /// interruption as a backstop to `fuel` (fuel bounds work, not time — a
+    /// fuel-cheap-but-slow call could still stall the send path). `0` disables
+    /// the wall-clock deadline. Resolution is the epoch tick (~10ms).
+    pub wall_ms: u64,
     /// Max linear-memory size in 64 KiB WASM pages.
     pub memory_pages: u32,
     /// Scoped activation: only invoke for these event types. `None` = all.

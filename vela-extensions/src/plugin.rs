@@ -3,12 +3,21 @@
 //! the `wasmtime-runtime` feature — nothing here compiles in a wasmtime-free
 //! build.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
+
 use serde_json::Value;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use crate::abi::{EventContext, Origin, Verdict};
 use crate::config::PluginConfig;
+
+/// How often the epoch ticker advances the engine's epoch. This is the
+/// resolution of the per-plugin `wall_ms` deadline.
+const EPOCH_TICK_MS: u64 = 10;
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -28,7 +37,7 @@ struct HostState {
 /// A loaded, ready-to-instantiate plugin. The component is compiled once at
 /// load (via `PluginPre`), so per-call work is instantiation only — not
 /// recompilation. Each call still builds a fresh store + instance, keeping
-/// plugins stateless; a warm instance pool is a planned PR2 optimization.
+/// plugins stateless; a warm instance pool is a possible future optimization.
 pub(crate) struct Plugin {
     engine: Engine,
     pre: bindings::PluginPre<HostState>,
@@ -62,6 +71,9 @@ impl Plugin {
         let mut config = Config::new();
         config.wasm_component_model(true);
         config.consume_fuel(true);
+        // Wall-clock backstop: the epoch is advanced by a ticker thread (see
+        // `EpochTicker`); a store sets a deadline in ticks.
+        config.epoch_interruption(true);
         Engine::new(&config).map_err(|e| PluginError::Load(e.to_string()))
     }
 
@@ -87,8 +99,14 @@ impl Plugin {
     }
 
     /// Run the decision hook for one event. A fresh instance per call keeps
-    /// plugins stateless; fuel and memory are bounded per the plugin's config.
-    pub(crate) fn check_event(&self, ctx: &EventContext<'_>) -> Result<Verdict, PluginError> {
+    /// plugins stateless; fuel, memory, and wall-clock are bounded per config.
+    /// `event_json` is the event serialized once by the runtime and shared
+    /// across all plugins at this decision point (not re-serialized per plugin).
+    pub(crate) fn check_event(
+        &self,
+        event_json: &str,
+        ctx: &EventContext<'_>,
+    ) -> Result<Verdict, PluginError> {
         let limits = StoreLimitsBuilder::new()
             .memory_size(self.cfg.memory_pages as usize * 64 * 1024)
             .build();
@@ -97,6 +115,16 @@ impl Plugin {
         store
             .set_fuel(self.cfg.fuel)
             .map_err(|e| PluginError::Trap(e.to_string()))?;
+        // With epoch_interruption enabled, a store's default deadline traps
+        // immediately — so we must always set one. `wall_ms == 0` → an
+        // effectively-infinite deadline (no wall limit); otherwise trap (the
+        // default deadline behavior) after this many epoch ticks.
+        let deadline = if self.cfg.wall_ms > 0 {
+            self.cfg.wall_ms.div_ceil(EPOCH_TICK_MS).max(1)
+        } else {
+            u64::MAX
+        };
+        store.set_epoch_deadline(deadline);
 
         let instance = self
             .pre
@@ -104,7 +132,7 @@ impl Plugin {
             .map_err(|e| PluginError::Trap(e.to_string()))?;
 
         let wire = wit::EventContext {
-            event: ctx.event.to_string(),
+            event: event_json.to_string(),
             room_id: ctx.room_id.to_string(),
             sender: ctx.sender.to_string(),
             event_type: ctx.event_type.to_string(),
@@ -136,5 +164,43 @@ fn config_json(v: &Value) -> String {
         String::new()
     } else {
         v.to_string()
+    }
+}
+
+/// Background timer that advances the shared engine's epoch every
+/// `EPOCH_TICK_MS`, so per-call wall-clock deadlines (`set_epoch_deadline`)
+/// fire. One ticker per runtime; it stops and joins on drop.
+pub(crate) struct EpochTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    pub(crate) fn spawn(engine: &Engine) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let engine = engine.clone();
+        let handle = thread::Builder::new()
+            .name("vela-ext-epoch".into())
+            .spawn(move || {
+                while !stop_thread.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(EPOCH_TICK_MS));
+                    engine.increment_epoch();
+                }
+            })
+            .expect("spawn epoch ticker");
+        EpochTicker {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
     }
 }

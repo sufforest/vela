@@ -221,9 +221,17 @@ version — interface evolution is a WIT change, not a wire-format hack.
    → cap; trap/garbage → fail policy) + happy path. Self-contained — no vela-api
    wiring. Test fixtures are real components (a tiny Rust guest compiled to a
    component, or hand-authored component WAT).
-2. **PR2 — wire the sync decision path:** `ServerConfig.extensions`,
-   vela-server config loading, the `check_event` call site on **local send**;
-   per-plugin metrics. Harness integration test.
+2. **PR2 — wire the sync decision path (done):** `[extensions]` config +
+   loading, `AppState.extensions`, the `check_event` gate on **local send**
+   (both message + state paths, after auth / before persist), block →
+   `M_FORBIDDEN`-style 403 carrying the plugin's errcode/reason, decision +
+   latency metrics, serialize-once across plugins, and the **epoch wall-clock
+   deadline** backstop. Integration test against the real fixture component.
+   The runtime is **opt-in at the binary level** (`--features extensions`; the
+   release Docker image builds with it) so the default `cargo build` and the
+   `cargo test --workspace` CI job stay wasmtime-free — otherwise every vela-api
+   test binary would statically link wasmtime. A dedicated CI job runs the gate
+   tests with the feature on.
 3. **PR3 — SDK + example:** `vela-extension-sdk` + an example plugin compiled
    to real `.wasm`; operator docs.
 4. **PR4+ — async path + capabilities:** worker pool, `kv-state`,

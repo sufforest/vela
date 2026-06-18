@@ -34,11 +34,14 @@ mod imp {
     use super::*;
     use crate::abi::{Origin, Verdict};
     use crate::config::FailPolicy;
-    use crate::plugin::Plugin;
+    use crate::plugin::{EpochTicker, Plugin};
 
     /// Loads and dispatches across sandboxed plugins.
     pub struct Runtime {
         plugins: Vec<Plugin>,
+        /// Drives wall-clock deadlines; `None` if no plugin sets `wall_ms`.
+        /// Held only for its `Drop` (stops the ticker thread).
+        _ticker: Option<EpochTicker>,
     }
 
     impl Runtime {
@@ -47,6 +50,9 @@ mod imp {
         /// a missing policy.
         pub fn new(configs: Vec<PluginConfig>) -> Result<Self, RuntimeError> {
             let engine = Plugin::new_engine().map_err(|e| RuntimeError(e.to_string()))?;
+            // Only run the epoch ticker if some plugin actually uses a
+            // wall-clock budget — no idle thread otherwise.
+            let needs_ticker = configs.iter().any(|c| c.wall_ms > 0);
             let mut plugins = Vec::with_capacity(configs.len());
             for cfg in configs {
                 let name = cfg.name.clone();
@@ -54,7 +60,11 @@ mod imp {
                     .map_err(|e| RuntimeError(format!("plugin '{name}': {e}")))?;
                 plugins.push(plugin);
             }
-            Ok(Runtime { plugins })
+            let ticker = needs_ticker.then(|| EpochTicker::spawn(&engine));
+            Ok(Runtime {
+                plugins,
+                _ticker: ticker,
+            })
         }
 
         /// True if no plugins are loaded at all — lets the hot path skip
@@ -72,11 +82,16 @@ mod imp {
         /// - **fail policy**: on trap/fuel-out/error, fail-open → treat as allow,
         ///   fail-closed → treat as block.
         pub fn check_event(&self, ctx: &EventContext<'_>) -> Decision {
+            // Serialize the event once, shared across every interested plugin
+            // (the JSON marshaling — not wasm execution — is the real cost).
+            // Computed lazily so a fully-scoped-out event pays nothing.
+            let mut event_json: Option<String> = None;
             for plugin in &self.plugins {
                 if !scoped_in(&plugin.cfg, ctx.event_type) {
                     continue;
                 }
-                let verdict = match plugin.check_event(ctx) {
+                let event_json = event_json.get_or_insert_with(|| ctx.event.to_string());
+                let verdict = match plugin.check_event(event_json, ctx) {
                     Ok(v) => v,
                     Err(e) => match plugin.cfg.fail_policy {
                         FailPolicy::Open => {

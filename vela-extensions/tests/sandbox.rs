@@ -21,6 +21,7 @@ fn plugin(name: &str, mode: &str) -> PluginConfig {
         fail_policy: FailPolicy::Open,
         fuel: 100_000_000,
         memory_pages: 256, // 16 MiB cap; comfortably above the guest's baseline
+        wall_ms: 0,        // wall-clock deadline off unless a test sets it
         event_types: None,
         config: json!({ "mode": mode }),
     }
@@ -238,6 +239,27 @@ fn unbounded_recursion_is_trapped_by_the_stack_limit() {
     p.fail_policy = FailPolicy::Open;
     let d = run(vec![p], &message("hi"), "m.room.message");
     assert_eq!(d, Decision::Allow, "stack-trapped plugin should fail open");
+}
+
+#[test]
+fn wall_clock_deadline_traps_independently_of_fuel() {
+    // Effectively unlimited fuel, so only the wall-clock budget can stop the
+    // spin loop. Proves the epoch backstop, not fuel, is doing the work.
+    let mut p = plugin("slowloop", "loop");
+    p.fuel = u64::MAX / 2;
+    p.wall_ms = 50;
+    p.fail_policy = FailPolicy::Open;
+    let start = std::time::Instant::now();
+    let d = run(vec![p], &message("hi"), "m.room.message");
+    assert_eq!(
+        d,
+        Decision::Allow,
+        "wall-clock-trapped plugin should fail open"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "must trap on the wall deadline, not run toward fuel exhaustion"
+    );
 }
 
 #[test]
