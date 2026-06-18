@@ -77,6 +77,8 @@ struct Config {
     appservice: AppServiceSection,
     #[serde(default)]
     support: SupportSection,
+    #[serde(default)]
+    extensions: ExtensionsSection,
 }
 
 /// `[support]` section — drives `.well-known/matrix/support` (MSC1929 /
@@ -110,6 +112,54 @@ struct SupportContactSection {
 #[serde(default)]
 struct AppServiceSection {
     registration_dir: Option<String>,
+}
+
+/// `[extensions]` section. Sandboxed WASM plugins run at server-discretion
+/// points (currently the local send path). Empty by default — no plugins, the
+/// runtime is inert. Each `[[extensions.plugin]]` declares one component.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+struct ExtensionsSection {
+    plugin: Vec<ExtensionPluginSection>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ExtensionPluginSection {
+    /// Operator-facing name, used in errors, logs, and metrics labels.
+    name: String,
+    /// Path to the compiled `.wasm` component.
+    wasm_path: String,
+    /// "open" (default) → a failing/trapping plugin allows the event;
+    /// "closed" → it blocks. Availability vs. safety.
+    #[serde(default = "default_fail_policy")]
+    fail_policy: String,
+    /// Per-call fuel (≈ instruction) budget.
+    #[serde(default = "default_plugin_fuel")]
+    fuel: u64,
+    /// Per-call wall-clock budget (ms); 0 disables the wall deadline.
+    #[serde(default = "default_plugin_wall_ms")]
+    wall_ms: u64,
+    /// Max linear memory in 64 KiB pages.
+    #[serde(default = "default_plugin_memory_pages")]
+    memory_pages: u32,
+    /// Only invoke for these event types; omitted → all events.
+    event_types: Option<Vec<String>>,
+    /// Opaque JSON handed to the guest verbatim as `plugin_config`.
+    #[serde(default)]
+    config: serde_json::Value,
+}
+
+fn default_fail_policy() -> String {
+    "open".to_string()
+}
+fn default_plugin_fuel() -> u64 {
+    50_000_000
+}
+fn default_plugin_wall_ms() -> u64 {
+    100
+}
+fn default_plugin_memory_pages() -> u32 {
+    256
 }
 
 /// `[push]` section. Outbound push gateway posture knobs.
@@ -816,6 +866,48 @@ fn load_extra_ca_certs(paths: &[PathBuf]) -> anyhow::Result<Vec<reqwest::Certifi
     Ok(out)
 }
 
+/// Build the sandboxed extension runtime from `[extensions]`. An empty section
+/// yields an inert runtime (no plugins). A missing wasm file, an unknown
+/// fail_policy, or an invalid component aborts startup — a misconfigured policy
+/// must not silently no-op. With the `extensions` feature off this still
+/// compiles and returns the no-op runtime.
+fn build_extension_runtime(
+    section: &ExtensionsSection,
+) -> anyhow::Result<vela_extensions::Runtime> {
+    let mut configs = Vec::with_capacity(section.plugin.len());
+    for p in &section.plugin {
+        let wasm = std::fs::read(&p.wasm_path).map_err(|e| {
+            anyhow::anyhow!(
+                "extension '{}': reading wasm at {}: {e}",
+                p.name,
+                p.wasm_path
+            )
+        })?;
+        let fail_policy = match p.fail_policy.as_str() {
+            "open" => vela_extensions::FailPolicy::Open,
+            "closed" => vela_extensions::FailPolicy::Closed,
+            other => anyhow::bail!(
+                "extension '{}': unknown fail_policy {other:?} (expected \"open\" or \"closed\")",
+                p.name
+            ),
+        };
+        configs.push(vela_extensions::PluginConfig {
+            name: p.name.clone(),
+            wasm,
+            fail_policy,
+            fuel: p.fuel,
+            wall_ms: p.wall_ms,
+            memory_pages: p.memory_pages,
+            event_types: p.event_types.clone(),
+            config: p.config.clone(),
+        });
+    }
+    if !configs.is_empty() {
+        info!(count = configs.len(), "extensions: loading plugin(s)");
+    }
+    vela_extensions::Runtime::new(configs).map_err(|e| anyhow::anyhow!("extensions: {e}"))
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -1047,6 +1139,8 @@ fn main() -> anyhow::Result<()> {
                     Arc::new(vela_api::auth::oidc::IntrospectionState { client, cache })
                 });
 
+        let extensions = Arc::new(build_extension_runtime(&config.extensions)?);
+
         let state = AppState {
             db: db.clone(),
             config: Arc::new(ServerConfig {
@@ -1170,6 +1264,7 @@ fn main() -> anyhow::Result<()> {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
+            extensions,
         };
 
         // Admin bot + admin room bootstrap. Idempotent: creates the

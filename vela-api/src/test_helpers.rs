@@ -122,6 +122,11 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0),
+        // No plugins in tests; an empty runtime allows everything (and pulls no
+        // wasmtime when the feature is off).
+        extensions: Arc::new(
+            vela_extensions::Runtime::new(vec![]).expect("empty extension runtime"),
+        ),
     };
     (state, tmp)
 }

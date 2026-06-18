@@ -1,0 +1,55 @@
+// The host↔guest contract for vela extensions, as a WIT interface. The host
+// generates bindings with `wasmtime::component::bindgen!`; a guest SDK (PR3)
+// generates its side with `wit-bindgen`. The Component Model lifts these typed
+// records across the sandbox boundary — no hand-rolled linear-memory marshaling.
+//
+// Versioned by the package version. An incompatible change bumps it; the host
+// refuses to instantiate a component whose interface version it doesn't know.
+package vela:extension@0.1.0;
+
+interface decision {
+    // Where an event originated. A `block` verdict is a hard reject for `local`
+    // (we refuse to originate the event) but MUST be treated as a soft-fail for
+    // `federation` by the host — rejecting an event peers accepted would hole
+    // our DAG. The guest just reports a verdict; the host applies origin policy.
+    enum origin {
+        local,
+        federation,
+    }
+
+    // The per-event data handed to a plugin at a decision point. `event` and
+    // `plugin-config` carry canonical JSON as strings (PDUs are schemaless);
+    // everything else is a typed field.
+    record event-context {
+        // Canonical JSON of the event/PDU.
+        event: string,
+        room-id: string,
+        sender: string,
+        // The `type` field of the event, e.g. "m.room.message".
+        event-type: string,
+        origin: origin,
+        // This plugin's opaque config, verbatim JSON. Empty string if none.
+        plugin-config: string,
+    }
+
+    record block-reason {
+        // Matrix error code, e.g. "M_FORBIDDEN".
+        errcode: string,
+        reason: string,
+    }
+
+    // What a plugin returns from a decision point.
+    variant verdict {
+        allow,
+        block(block-reason),
+    }
+
+    // The decision hook. Pure: no host capabilities are granted in PR1.
+    check-event: func(ctx: event-context) -> verdict;
+}
+
+// A plugin component exports the decision interface. Later worlds add
+// observation/action exports and host-capability imports (kv, emit-event…).
+world plugin {
+    export decision;
+}

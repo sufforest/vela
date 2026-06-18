@@ -200,6 +200,7 @@ impl Harness {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
+            extensions: vela_api::router::empty_extension_runtime(),
         };
         let router = build_router(state.clone());
         Harness {

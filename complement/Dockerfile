@@ -9,7 +9,7 @@
 
 # --- Build stage ---------------------------------------------------------
 
-FROM rust:1.90-slim-bookworm AS builder
+FROM rust:1.93-slim-bookworm AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -28,12 +28,16 @@ COPY vela-store/Cargo.toml vela-store/
 COPY vela-api/Cargo.toml vela-api/
 COPY vela-server/Cargo.toml vela-server/
 COPY tools/vela-admin/Cargo.toml tools/vela-admin/
+COPY vela-extensions/Cargo.toml vela-extensions/
 
 # Create stub sources so the workspace resolves for the dep-build step.
-RUN mkdir -p vela-core/src vela-store/src vela-api/src vela-server/src tools/vela-admin/src \
+# vela-extensions is a workspace member but not a dependency of the vela binary,
+# so it isn't compiled here (no wasmtime in the image build).
+RUN mkdir -p vela-core/src vela-store/src vela-api/src vela-server/src tools/vela-admin/src vela-extensions/src \
     && echo "" > vela-core/src/lib.rs \
     && echo "" > vela-store/src/lib.rs \
     && echo "" > vela-api/src/lib.rs \
+    && echo "" > vela-extensions/src/lib.rs \
     && echo "fn main() {}" > vela-server/src/main.rs \
     && echo "fn main() {}" > tools/vela-admin/src/main.rs \
     && cargo build --release --bin vela || true
@@ -44,8 +48,10 @@ COPY vela-store/ vela-store/
 COPY vela-api/ vela-api/
 COPY vela-server/ vela-server/
 COPY tools/vela-admin/ tools/vela-admin/
+COPY vela-extensions/ vela-extensions/
 
 RUN touch vela-core/src/lib.rs vela-store/src/lib.rs vela-api/src/lib.rs vela-server/src/main.rs \
+              vela-extensions/src/lib.rs \
     && cargo build --release --bin vela
 
 # --- Runtime stage -------------------------------------------------------

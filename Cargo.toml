@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["vela-server", "vela-core", "vela-store", "vela-api", "tools/vela-admin"]
+members = ["vela-server", "vela-core", "vela-store", "vela-api", "vela-extensions", "tools/vela-admin"]
 # `tools/testing/smoketest-rs` is deliberately NOT a workspace member.
 # Its ruma-client dep tree (proc-macros, additional rustls plumbing) is
 # heavy enough that gating every `cargo check` of the homeserver on it
@@ -14,7 +14,7 @@ version = "0.2.0"
 license = "Apache-2.0"
 description = "A Matrix homeserver written in Rust."
 readme = "README.md"
-rust-version = "1.88"
+rust-version = "1.93"
 
 # Workspace-level lint config — every member crate inherits via
 # `[lints] workspace = true`. The CI lint job runs with `-D warnings`,
@@ -107,6 +107,9 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] 
 vela-core = { path = "vela-core", version = "0.2.0" }
 vela-store = { path = "vela-store", version = "0.2.0" }
 vela-api = { path = "vela-api", version = "0.2.0" }
+# default-features off → consumers get the no-op, wasmtime-free Runtime
+# unless they opt in via their own `extensions` feature.
+vela-extensions = { path = "vela-extensions", version = "0.2.0", default-features = false }
 
 # Dev-profile override: line-table-only debuginfo. Backtraces still
 # show file:line (good enough for nearly all triage); variable

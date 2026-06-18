@@ -71,13 +71,13 @@ jobs:
     # supported Rust version (rust-version in Cargo.toml). Drift here is
     # silent without this job. Uses `cargo build` (not `check`) so codegen
     # errors surface, not just type errors.
-    name: cargo build (MSRV 1.88)
+    name: cargo build (MSRV 1.93)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88
+      - name: Install Rust 1.93
+        uses: dtolnay/rust-toolchain@1.93
 
       - name: Install libclang
         run: sudo apt-get update && sudo apt-get install -y libclang-dev
@@ -170,6 +170,11 @@ jobs:
         run: cargo test -p vela-server --features otel --locked
       - name: cargo test --features otel (vela-api OTLP export)
         run: cargo test -p vela-api --features otel --test otlp_export --locked
+      # Extensions are opt-in (off in the default `cargo test --workspace` to
+      # keep wasmtime out of every test binary), so exercise the WASM extension
+      # gate explicitly here. `--lib` keeps it to the one lib-test binary.
+      - name: cargo test --features extensions (WASM extension gate)
+        run: cargo test -p vela-api --features extensions --lib --locked
 
   smoketest:
     # Real-client smoke test (ruma-client) against vela on an ephemeral

@@ -1,0 +1,26 @@
+# Test-only guest plugin. Compiled to a WASI-free WASM component via
+# `tests/fixtures/build.sh`; the built artifact is committed as
+# `tests/fixtures/spam_guest.wasm` so the host tests run without a wasm
+# toolchain. Detached from the parent workspace (empty [workspace]) so the host
+# build never tries to compile it for the host target.
+[package]
+name = "spam-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+# Make `panic!` a hard wasm trap (for the "trap" test mode) rather than an
+# unwind, and keep the artifact small.
+panic = "abort"
+
+[workspace]

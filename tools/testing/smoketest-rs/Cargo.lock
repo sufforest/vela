@@ -3042,6 +3042,7 @@ dependencies = [
  "tracing",
  "uuid",
  "vela-core",
+ "vela-extensions",
  "vela-store",
 ]
 
@@ -3056,6 +3057,15 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "vela-extensions"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "tracing",
 ]
 
