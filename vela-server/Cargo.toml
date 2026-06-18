@@ -20,6 +20,12 @@ path = "src/bin/backup.rs"
 # endpoint stays wired but returns 503 until a renderer is plumbed.
 default = ["prometheus"]
 prometheus = ["dep:metrics-exporter-prometheus"]
+# Sandboxed WASM extension runtime. Opt-in (the release Docker images build with
+# `--features extensions`) so a plain `cargo build` and the `cargo test
+# --workspace` CI job stay wasmtime-free — otherwise every vela-api test binary
+# would statically link wasmtime. With it off, vela-api's no-op Runtime takes
+# over and allows everything.
+extensions = ["vela-api/extensions"]
 # OpenTelemetry distributed tracing exporter. Off by default — only
 # install the OTLP/tonic dependency tree when an operator opts in.
 # When enabled, set [tracing.otlp_endpoint] in vela.toml to point at a
@@ -34,6 +40,11 @@ otel = [
 
 [dependencies]
 vela-core = { workspace = true }
+# Direct dep so main.rs can build PluginConfig/Runtime from the [extensions]
+# config. The wasmtime backend is pulled in via the `extensions` feature
+# (→ vela-api/extensions → vela-extensions/wasmtime-runtime), unified across
+# the graph; default-features stay off here.
+vela-extensions = { workspace = true }
 vela-store = { workspace = true }
 vela-api = { workspace = true }
 tokio = { workspace = true }

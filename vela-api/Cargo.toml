@@ -26,9 +26,15 @@ otel = [
 # the caller owns. Off by default — no production binary enables this.
 test-harness = ["dep:tempfile"]
 
+# Sandboxed WASM extension runtime. Off by default: vela-extensions is always
+# linked (for its types + the no-op Runtime), but the heavy wasmtime backend is
+# only pulled in when this feature is on. vela-server enables it by default.
+extensions = ["vela-extensions/wasmtime-runtime"]
+
 [dependencies]
 vela-core = { workspace = true }
 vela-store = { workspace = true }
+vela-extensions = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }

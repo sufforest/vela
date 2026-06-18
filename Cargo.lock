@@ -3799,6 +3799,7 @@ dependencies = [
  "tracing-opentelemetry",
  "uuid",
  "vela-core",
+ "vela-extensions",
  "vela-store",
  "wiremock",
 ]
@@ -3855,6 +3856,7 @@ dependencies = [
  "tracing-subscriber",
  "vela-api",
  "vela-core",
+ "vela-extensions",
  "vela-store",
 ]
 

@@ -44,7 +44,7 @@ RUN mkdir -p vela-core/src vela-store/src vela-api/src vela-server/src tools/vel
     && echo "" > vela-extensions/src/lib.rs \
     && echo "fn main() {}" > vela-server/src/main.rs \
     && echo "fn main() {}" > tools/vela-admin/src/main.rs \
-    && cargo build --release --bin vela --bin vela-backup || true
+    && cargo build --release --features extensions --bin vela --bin vela-backup || true
 
 # Now copy real sources and build for real.
 COPY vela-core/ vela-core/
@@ -56,7 +56,8 @@ COPY vela-extensions/ vela-extensions/
 
 RUN touch vela-core/src/lib.rs vela-store/src/lib.rs vela-api/src/lib.rs vela-server/src/main.rs \
               tools/vela-admin/src/main.rs vela-extensions/src/lib.rs \
-    && cargo build --release --bin vela --bin vela-backup --bin vela-admin
+    && cargo build --release --features extensions \
+        --bin vela --bin vela-backup --bin vela-admin
 
 # --- Runtime stage -------------------------------------------------------
 

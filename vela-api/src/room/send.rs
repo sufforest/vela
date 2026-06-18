@@ -97,6 +97,49 @@ pub async fn send_message(
     .await
 }
 
+/// Run the sandboxed extension decision hook for a locally-originated event,
+/// just before it is persisted. Returns `Err` (the plugin's errcode/reason,
+/// 403) if any plugin blocks. No-op — and no serialization — when no plugins
+/// are configured, so the common path is free. Origin is always `Local` here,
+/// so a block is a safe hard-reject (we simply refuse to originate the event).
+fn local_extension_gate(
+    extensions: &vela_extensions::Runtime,
+    event: &serde_json::Map<String, Value>,
+    room_id: &str,
+    sender: &str,
+    event_type: &str,
+) -> Result<(), ApiError> {
+    if extensions.is_empty() {
+        return Ok(());
+    }
+    let event_value = Value::Object(event.clone());
+    let ctx = vela_extensions::EventContext {
+        event: &event_value,
+        room_id,
+        sender,
+        event_type,
+        origin: vela_extensions::Origin::Local,
+    };
+    let start = std::time::Instant::now();
+    let decision = extensions.check_event(&ctx);
+    metrics::histogram!("vela_extension_check_duration_seconds")
+        .record(start.elapsed().as_secs_f64());
+    match decision {
+        vela_extensions::Decision::Allow => {
+            metrics::counter!("vela_extension_decisions_total", "verdict" => "allow").increment(1);
+            Ok(())
+        }
+        vela_extensions::Decision::Block { errcode, reason } => {
+            metrics::counter!("vela_extension_decisions_total", "verdict" => "block").increment(1);
+            tracing::info!(
+                room_id, sender, event_type, %errcode, %reason,
+                "extension blocked local event"
+            );
+            Err(ApiError(VelaError::ExtensionBlocked { errcode, reason }))
+        }
+    }
+}
+
 pub(crate) async fn send_message_inner(
     state: AppState,
     user: AuthenticatedUser,
@@ -235,6 +278,15 @@ pub(crate) async fn send_message_inner(
 
     // Gate: authorise against current room state before persisting.
     authorise_event(&state, room_nid, &event_id, &event, None)?;
+
+    // Gate: sandboxed extension policy hook (no-op when no plugins configured).
+    local_extension_gate(
+        &state.extensions,
+        &event,
+        room_id.as_str(),
+        &user.user_id,
+        &event_type,
+    )?;
 
     // Persist
     let event_nid = state.db.next_nid()?;
@@ -612,6 +664,15 @@ pub(crate) async fn send_state_inner(
     );
 
     authorise_event(&state, room_nid, &event_id, &event, None)?;
+
+    // Gate: sandboxed extension policy hook (no-op when no plugins configured).
+    local_extension_gate(
+        &state.extensions,
+        &event,
+        room_id.as_str(),
+        &user.user_id,
+        &event_type,
+    )?;
 
     let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&event);
@@ -1153,5 +1214,90 @@ mod tests {
         let changed =
             existing_state_event_if_unchanged(&state, room_nid, etype, skey, alice_id, &updated);
         assert!(changed.is_none());
+    }
+}
+
+// End-to-end test of the extension gate against a real WASM component. Only
+// built when the `extensions` feature is on (otherwise the runtime is the no-op
+// stub). The fixture is the same config-driven guest vela-extensions tests use.
+#[cfg(all(test, feature = "extensions"))]
+mod extension_gate_tests {
+    use super::*;
+
+    const SPAM_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../vela-extensions/tests/fixtures/spam_guest.wasm"
+    ));
+
+    fn spam_runtime() -> vela_extensions::Runtime {
+        vela_extensions::Runtime::new(vec![vela_extensions::PluginConfig {
+            name: "spam".into(),
+            wasm: SPAM_FIXTURE.to_vec(),
+            fail_policy: vela_extensions::FailPolicy::Open,
+            fuel: 50_000_000,
+            wall_ms: 0,
+            memory_pages: 256,
+            event_types: None,
+            config: serde_json::json!({ "mode": "allow" }),
+        }])
+        .expect("runtime loads")
+    }
+
+    fn message(body: &str) -> serde_json::Map<String, Value> {
+        serde_json::json!({
+            "type": "m.room.message",
+            "content": { "msgtype": "m.text", "body": body },
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    #[test]
+    fn gate_blocks_a_spam_message_with_forbidden() {
+        let rt = spam_runtime();
+        match local_extension_gate(
+            &rt,
+            &message("buy SPAM now"),
+            "!r:example.org",
+            "@a:example.org",
+            "m.room.message",
+        ) {
+            Err(ApiError(VelaError::ExtensionBlocked { errcode, reason })) => {
+                assert_eq!(errcode, "M_FORBIDDEN");
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected ExtensionBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_allows_a_clean_message() {
+        let rt = spam_runtime();
+        assert!(
+            local_extension_gate(
+                &rt,
+                &message("hello there"),
+                "!r:example.org",
+                "@a:example.org",
+                "m.room.message",
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn empty_runtime_is_a_no_op_even_for_spam() {
+        let rt = vela_extensions::Runtime::new(vec![]).expect("empty runtime");
+        assert!(
+            local_extension_gate(
+                &rt,
+                &message("SPAM SPAM SPAM"),
+                "!r:example.org",
+                "@a:example.org",
+                "m.room.message",
+            )
+            .is_ok()
+        );
     }
 }

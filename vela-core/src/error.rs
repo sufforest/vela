@@ -54,10 +54,15 @@ pub enum VelaError {
         errcode: &'static str,
         msg: String,
     },
+    /// A sandboxed extension plugin blocked a local event. Carries the plugin's
+    /// own errcode + reason (the extension contract lets a plugin choose them;
+    /// it defaults to `M_FORBIDDEN`). Maps to 403.
+    #[error("{reason}")]
+    ExtensionBlocked { errcode: String, reason: String },
 }
 
 impl VelaError {
-    pub fn errcode(&self) -> &'static str {
+    pub fn errcode(&self) -> &str {
         match self {
             Self::Forbidden(_) => "M_FORBIDDEN",
             Self::NotFound(_) => "M_NOT_FOUND",
@@ -76,6 +81,7 @@ impl VelaError {
             Self::Store(_) => "M_UNKNOWN",
             Self::Uia { .. } => "M_FORBIDDEN",
             Self::Custom { errcode, .. } => errcode,
+            Self::ExtensionBlocked { errcode, .. } => errcode,
         }
     }
 
@@ -96,6 +102,7 @@ impl VelaError {
             Self::UserDeactivated => 403,
             Self::Uia { status, .. } => *status,
             Self::Custom { status, .. } => *status,
+            Self::ExtensionBlocked { .. } => 403,
             Self::Unknown(_) | Self::Store(_) => 500,
         }
     }

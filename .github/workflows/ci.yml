@@ -170,6 +170,11 @@ jobs:
         run: cargo test -p vela-server --features otel --locked
       - name: cargo test --features otel (vela-api OTLP export)
         run: cargo test -p vela-api --features otel --test otlp_export --locked
+      # Extensions are opt-in (off in the default `cargo test --workspace` to
+      # keep wasmtime out of every test binary), so exercise the WASM extension
+      # gate explicitly here. `--lib` keeps it to the one lib-test binary.
+      - name: cargo test --features extensions (WASM extension gate)
+        run: cargo test -p vela-api --features extensions --lib --locked
 
   smoketest:
     # Real-client smoke test (ruma-client) against vela on an ephemeral

@@ -107,6 +107,9 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] 
 vela-core = { path = "vela-core", version = "0.2.0" }
 vela-store = { path = "vela-store", version = "0.2.0" }
 vela-api = { path = "vela-api", version = "0.2.0" }
+# default-features off → consumers get the no-op, wasmtime-free Runtime
+# unless they opt in via their own `extensions` feature.
+vela-extensions = { path = "vela-extensions", version = "0.2.0", default-features = false }
 
 # Dev-profile override: line-table-only debuginfo. Backtraces still
 # show file:line (good enough for nearly all triage); variable
