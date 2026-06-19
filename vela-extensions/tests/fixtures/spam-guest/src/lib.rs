@@ -102,4 +102,35 @@ fn blocked(reason: &str) -> Verdict {
     })
 }
 
+// Observation hook. Exercises the same sandbox-bound trap modes so on_event's
+// fuel/memory/wall bounds are testable; otherwise a no-op (there's nothing for
+// an observer to do without host capabilities yet).
+impl exports::vela::extension::observation::Guest for Component {
+    fn on_event(ctx: exports::vela::extension::observation::EventContext) {
+        run_trap_modes(&ctx.plugin_config);
+    }
+}
+
+fn run_trap_modes(cfg: &str) {
+    if cfg.contains("loop") {
+        #[allow(clippy::empty_loop)]
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    if cfg.contains("membomb") {
+        let mut sink: Vec<u8> = Vec::new();
+        loop {
+            sink.extend(core::iter::repeat(0u8).take(64 * 1024));
+            core::hint::black_box(sink.last());
+        }
+    }
+    if cfg.contains("recurse") {
+        let _ = recurse(core::hint::black_box(u64::MAX));
+    }
+    if cfg.contains("trap") {
+        panic!("test plugin trapping on purpose");
+    }
+}
+
 export!(Component);

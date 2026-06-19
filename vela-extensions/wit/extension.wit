@@ -5,7 +5,7 @@
 //
 // Versioned by the package version. An incompatible change bumps it; the host
 // refuses to instantiate a component whose interface version it doesn't know.
-package vela:extension@0.1.0;
+package vela:extension@0.2.0;
 
 interface decision {
     // Where an event originated. A `block` verdict is a hard reject for `local`
@@ -44,12 +44,26 @@ interface decision {
         block(block-reason),
     }
 
-    // The decision hook. Pure: no host capabilities are granted in PR1.
+    // The decision hook (sync, on the critical path). Pure: no host
+    // capabilities are granted here.
     check-event: func(ctx: event-context) -> verdict;
 }
 
-// A plugin component exports the decision interface. Later worlds add
-// observation/action exports and host-capability imports (kv, emit-event…).
+// Async observation: the host calls this off the request hot path (a worker
+// pool), after an event is persisted. No verdict — an observer cannot block.
+// `on-event` is where audit, metrics, and (once capabilities are granted) bots
+// live. Sandbox limits still apply.
+interface observation {
+    use decision.{event-context};
+
+    on-event: func(ctx: event-context);
+}
+
+// A plugin component exports both interfaces. A plugin that only cares about one
+// no-ops the other (the SDK provides no-op defaults); the operator's `points`
+// config decides which the host actually invokes. Later versions add
+// host-capability imports (log, kv, emit-event…) for the action/bot shape.
 world plugin {
     export decision;
+    export observation;
 }

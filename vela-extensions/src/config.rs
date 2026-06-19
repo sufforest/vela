@@ -4,6 +4,27 @@
 
 use serde_json::Value;
 
+/// Which extension points a plugin binds. The runtime only invokes a plugin at
+/// the points it binds — a decision-only plugin is never called on the async
+/// observation path, and vice versa. Defaults to `check_event` only (the
+/// original decision behavior), so existing configs are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Points {
+    /// Sync decision hook on local send / federation receive.
+    pub check_event: bool,
+    /// Async observation hook, off the hot path.
+    pub on_event: bool,
+}
+
+impl Default for Points {
+    fn default() -> Self {
+        Points {
+            check_event: true,
+            on_event: false,
+        }
+    }
+}
+
 /// What to do when a plugin traps, runs out of fuel, or errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailPolicy {
@@ -34,6 +55,8 @@ pub struct PluginConfig {
     pub memory_pages: u32,
     /// Scoped activation: only invoke for these event types. `None` = all.
     pub event_types: Option<Vec<String>>,
+    /// Which extension points this plugin binds (decision / observation).
+    pub points: Points,
     /// Opaque config handed verbatim to the guest as `plugin_config`.
     pub config: Value,
 }

@@ -3222,6 +3222,7 @@ mod extension_soft_fail_tests {
             wall_ms: 0,
             memory_pages: 256,
             event_types: None,
+            points: vela_extensions::Points::default(),
             config: serde_json::json!({ "mode": mode }),
         }])
         .expect("runtime loads")

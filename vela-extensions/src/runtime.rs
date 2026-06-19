@@ -87,7 +87,7 @@ mod imp {
             // Computed lazily so a fully-scoped-out event pays nothing.
             let mut event_json: Option<String> = None;
             for plugin in &self.plugins {
-                if !scoped_in(&plugin.cfg, ctx.event_type) {
+                if !plugin.cfg.points.check_event || !scoped_in(&plugin.cfg, ctx.event_type) {
                     continue;
                 }
                 let event_json = event_json.get_or_insert_with(|| ctx.event.to_string());
@@ -127,6 +127,33 @@ mod imp {
                 }
             }
             Decision::Allow
+        }
+
+        /// True if any plugin binds the async observation point — lets the host
+        /// skip enqueuing for observation when there are no observers.
+        pub fn binds_on_event(&self) -> bool {
+            self.plugins.iter().any(|p| p.cfg.points.on_event)
+        }
+
+        /// Run the async observation point: every `on_event`-bound, scoped plugin
+        /// sees the event. No verdict (an observer cannot block); a failing
+        /// observer is logged and skipped — `fail_policy` does not apply (there
+        /// is nothing to fail open/closed). Called off the hot path.
+        pub fn on_event(&self, ctx: &EventContext<'_>) {
+            let mut event_json: Option<String> = None;
+            for plugin in &self.plugins {
+                if !plugin.cfg.points.on_event || !scoped_in(&plugin.cfg, ctx.event_type) {
+                    continue;
+                }
+                let event_json = event_json.get_or_insert_with(|| ctx.event.to_string());
+                if let Err(e) = plugin.on_event(event_json, ctx) {
+                    tracing::warn!(
+                        plugin = %plugin.cfg.name,
+                        error = %e,
+                        "extension on_event failed"
+                    );
+                }
+            }
         }
     }
 
@@ -174,6 +201,12 @@ mod imp {
         pub fn check_event(&self, _ctx: &EventContext<'_>) -> Decision {
             Decision::Allow
         }
+
+        pub fn binds_on_event(&self) -> bool {
+            false
+        }
+
+        pub fn on_event(&self, _ctx: &EventContext<'_>) {}
     }
 }
 

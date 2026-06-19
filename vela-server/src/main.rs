@@ -144,6 +144,10 @@ struct ExtensionPluginSection {
     memory_pages: u32,
     /// Only invoke for these event types; omitted → all events.
     event_types: Option<Vec<String>>,
+    /// Which extension points this plugin binds: "check_event" (sync decision)
+    /// and/or "on_event" (async observation). Defaults to ["check_event"].
+    #[serde(default = "default_points")]
+    points: Vec<String>,
     /// Opaque JSON handed to the guest verbatim as `plugin_config`.
     #[serde(default)]
     config: serde_json::Value,
@@ -151,6 +155,9 @@ struct ExtensionPluginSection {
 
 fn default_fail_policy() -> String {
     "open".to_string()
+}
+fn default_points() -> Vec<String> {
+    vec!["check_event".to_string()]
 }
 fn default_plugin_fuel() -> u64 {
     50_000_000
@@ -891,6 +898,34 @@ fn build_extension_runtime(
                 p.name
             ),
         };
+        let mut points = vela_extensions::Points {
+            check_event: false,
+            on_event: false,
+        };
+        for point in &p.points {
+            match point.as_str() {
+                "check_event" => points.check_event = true,
+                "on_event" => points.on_event = true,
+                other => anyhow::bail!(
+                    "extension '{}': unknown point {other:?} (expected \"check_event\" or \"on_event\")",
+                    p.name
+                ),
+            }
+        }
+        if !points.check_event && !points.on_event {
+            anyhow::bail!(
+                "extension '{}': points is empty — a plugin bound to no point can never run",
+                p.name
+            );
+        }
+        if points.on_event {
+            // Host-side observation dispatch isn't wired yet; an on_event plugin
+            // loads and validates but isn't invoked. Make that loud, not silent.
+            tracing::warn!(
+                plugin = %p.name,
+                "extensions: on_event is bound but observation dispatch is not wired yet — this plugin will not be invoked"
+            );
+        }
         configs.push(vela_extensions::PluginConfig {
             name: p.name.clone(),
             wasm,
@@ -899,6 +934,7 @@ fn build_extension_runtime(
             wall_ms: p.wall_ms,
             memory_pages: p.memory_pages,
             event_types: p.event_types.clone(),
+            points,
             config: p.config.clone(),
         });
     }

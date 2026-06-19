@@ -8,7 +8,7 @@
 #![cfg(feature = "wasmtime-runtime")]
 
 use serde_json::{Value, json};
-use vela_extensions::{Decision, EventContext, FailPolicy, Origin, PluginConfig, Runtime};
+use vela_extensions::{Decision, EventContext, FailPolicy, Origin, PluginConfig, Points, Runtime};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/spam_guest.wasm");
 
@@ -23,6 +23,7 @@ fn plugin(name: &str, mode: &str) -> PluginConfig {
         memory_pages: 256, // 16 MiB cap; comfortably above the guest's baseline
         wall_ms: 0,        // wall-clock deadline off unless a test sets it
         event_types: None,
+        points: Points::default(), // decision-only unless a test overrides
         config: json!({ "mode": mode }),
     }
 }
@@ -380,4 +381,93 @@ fn traps_stay_isolated_under_concurrency() {
     for h in handles {
         h.join().expect("thread panicked");
     }
+}
+
+// --- observation point (on_event) + points routing -------------------------
+
+/// An observer-only plugin: binds `on_event`, not `check_event`.
+fn observer(name: &str, mode: &str) -> PluginConfig {
+    let mut p = plugin(name, mode);
+    p.points = Points {
+        check_event: false,
+        on_event: true,
+    };
+    p
+}
+
+fn ctx_for<'a>(event: &'a Value, event_type: &'a str) -> EventContext<'a> {
+    EventContext {
+        event,
+        room_id: "!room:example.org",
+        sender: "@alice:example.org",
+        event_type,
+        origin: Origin::Local,
+    }
+}
+
+#[test]
+fn observer_only_plugin_is_skipped_by_check_event() {
+    // Binds on_event, not check_event. Even in block mode it must NOT affect a
+    // decision — check_event skips it → Allow.
+    let rt = Runtime::new(vec![observer("obs", "block")]).expect("loads");
+    assert_eq!(
+        rt.check_event(&ctx_for(&message("hi"), "m.room.message")),
+        Decision::Allow
+    );
+    assert!(rt.binds_on_event());
+}
+
+#[test]
+fn decision_only_plugin_is_skipped_by_on_event() {
+    // Default points = decision-only. A loop-mode decision plugin would hang
+    // on_event if it were invoked there — it isn't, so on_event returns fast.
+    let mut p = plugin("dec", "loop");
+    p.fuel = 1_000_000;
+    let rt = Runtime::new(vec![p]).expect("loads");
+    assert!(!rt.binds_on_event());
+    let start = std::time::Instant::now();
+    rt.on_event(&ctx_for(&message("hi"), "m.room.message"));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "on_event must not invoke a decision-only plugin"
+    );
+}
+
+#[test]
+fn on_event_is_fuel_bounded() {
+    // An observer that spins must be fuel-bounded: on_event returns promptly
+    // rather than hanging the worker. (No verdict — observation can't block.)
+    let mut p = observer("looper", "loop");
+    p.fuel = 1_000_000;
+    let rt = Runtime::new(vec![p]).expect("loads");
+    let start = std::time::Instant::now();
+    rt.on_event(&ctx_for(&message("hi"), "m.room.message"));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "on_event must be fuel-bounded, not hang"
+    );
+}
+
+#[test]
+fn on_event_completes_for_a_normal_event() {
+    // Smoke: a well-behaved observer returns cleanly.
+    let rt = Runtime::new(vec![observer("obs", "allow")]).expect("loads");
+    rt.on_event(&ctx_for(&message("hello"), "m.room.message"));
+}
+
+#[test]
+fn a_plugin_can_bind_both_points() {
+    // points = both → check_event decides AND on_event observes.
+    let mut p = plugin("both", "block");
+    p.points = Points {
+        check_event: true,
+        on_event: true,
+    };
+    let rt = Runtime::new(vec![p]).expect("loads");
+    assert!(matches!(
+        rt.check_event(&ctx_for(&message("hi"), "m.room.message")),
+        Decision::Block { .. }
+    ));
+    assert!(rt.binds_on_event());
+    rt.on_event(&ctx_for(&message("hi"), "m.room.message")); // no-op observe, returns
 }

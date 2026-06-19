@@ -98,15 +98,16 @@ impl Plugin {
         })
     }
 
-    /// Run the decision hook for one event. A fresh instance per call keeps
-    /// plugins stateless; fuel, memory, and wall-clock are bounded per config.
-    /// `event_json` is the event serialized once by the runtime and shared
-    /// across all plugins at this decision point (not re-serialized per plugin).
-    pub(crate) fn check_event(
+    /// Build a fresh, bounded store, instantiate the component, and marshal the
+    /// wire event context — shared by `check_event` and `on_event`. A fresh
+    /// instance per call keeps plugins stateless; fuel/memory/wall are bounded
+    /// per config. `event_json` is serialized once by the runtime and shared
+    /// across plugins (not re-serialized per plugin).
+    fn prepare(
         &self,
         event_json: &str,
         ctx: &EventContext<'_>,
-    ) -> Result<Verdict, PluginError> {
+    ) -> Result<(Store<HostState>, bindings::Plugin, wit::EventContext), PluginError> {
         let limits = StoreLimitsBuilder::new()
             .memory_size(self.cfg.memory_pages as usize * 64 * 1024)
             .build();
@@ -142,12 +143,20 @@ impl Plugin {
             },
             plugin_config: config_json(&self.cfg.config),
         };
+        Ok((store, instance, wire))
+    }
 
+    /// Run the decision hook (sync, critical path) for one event → a verdict.
+    pub(crate) fn check_event(
+        &self,
+        event_json: &str,
+        ctx: &EventContext<'_>,
+    ) -> Result<Verdict, PluginError> {
+        let (mut store, instance, wire) = self.prepare(event_json, ctx)?;
         let verdict = instance
             .vela_extension_decision()
             .call_check_event(&mut store, &wire)
             .map_err(|e| PluginError::Trap(e.to_string()))?;
-
         Ok(match verdict {
             wit::Verdict::Allow => Verdict::Allow,
             wit::Verdict::Block(r) => Verdict::Block {
@@ -155,6 +164,21 @@ impl Plugin {
                 reason: r.reason,
             },
         })
+    }
+
+    /// Run the observation hook (async, off the hot path) for one event. No
+    /// verdict — an observer cannot block. Same per-call bounds as check_event.
+    pub(crate) fn on_event(
+        &self,
+        event_json: &str,
+        ctx: &EventContext<'_>,
+    ) -> Result<(), PluginError> {
+        let (mut store, instance, wire) = self.prepare(event_json, ctx)?;
+        instance
+            .vela_extension_observation()
+            .call_on_event(&mut store, &wire)
+            .map_err(|e| PluginError::Trap(e.to_string()))?;
+        Ok(())
     }
 }
 
