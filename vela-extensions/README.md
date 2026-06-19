@@ -7,8 +7,7 @@ targets the Component Model (Rust today, via
 operator can run one without trusting its author. No other major homeserver
 offers this; Synapse's modules run with full server privileges.
 
-This README is the operator reference. The architecture and rationale are in
-[`DESIGN.md`](DESIGN.md); the plugin-author guide is the
+This README is the operator reference; the plugin-author guide is the
 [SDK README](../extensions/sdk/README.md).
 
 ## Enabling it
@@ -30,6 +29,7 @@ Each `[[extensions.plugin]]` block loads one component:
 name = "keyword-filter"                # for logs, errors, metrics
 wasm_path = "/etc/vela/plugins/keyword-filter.wasm"
 event_types = ["m.room.message"]       # optional; omit to run for all events
+points = ["check_event"]               # which hooks: check_event and/or on_event
 fail_policy = "open"                   # "open" (default) | "closed"
 fuel = 50000000                        # per-call CPU budget (≈ instructions)
 wall_ms = 100                          # per-call wall-clock budget; 0 disables
@@ -42,6 +42,7 @@ config = { banned = ["spam"] }         # opaque JSON, handed to the plugin
 | `name` | — (required) | identifier in logs/errors/metrics |
 | `wasm_path` | — (required) | path to the `.wasm` component |
 | `event_types` | all | only invoke for these event types |
+| `points` | `["check_event"]` | hooks the plugin binds: `check_event` (sync decision) and/or `on_event` (async observation) |
 | `fail_policy` | `open` | on trap/timeout: `open` allows, `closed` blocks |
 | `fuel` | 50,000,000 | per-call instruction budget |
 | `wall_ms` | 100 | per-call wall-clock budget (ms); `0` = off |
@@ -65,13 +66,21 @@ moderation. (Unix only; on other platforms, restart to reload.)
 
 ## What plugins can do
 
-Today: one decision point — **`check_event`**, on both **local sends** (message
-and state events, after auth, before persist — a block rejects the send with the
-plugin's errcode/reason, HTTP 403) and **inbound federated events** (a block
-soft-fails — see below). A plugin returns *allow* or *block*.
+Two extension points (a plugin binds either or both via `points`):
 
-Plugins are **stateless** and get **no host capabilities** — no network, disk, or
-syscalls. They only see the event and their own config.
+- **`check_event`** — the sync decision hook, on **local sends** (message and
+  state events, after auth, before persist — a block rejects the send with the
+  plugin's errcode/reason, HTTP 403) and **inbound federated events** (a block
+  soft-fails — see below). Returns *allow* or *block*.
+- **`on_event`** — the async observation hook: off the request path, after an
+  event is persisted, with no verdict (an observer can't block) — for audit,
+  metrics, and (as host capabilities land) automation. The runtime and SDK
+  support it now; the host begins dispatching `on_event` plugins in a following
+  change, so an `on_event` plugin loads and validates but isn't invoked until
+  then.
+
+Plugins are **stateless** and get **no host capabilities** yet — no network,
+disk, or syscalls. They see the event and their own config.
 
 ## Security model
 

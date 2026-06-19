@@ -152,13 +152,31 @@ impl Event {
     }
 }
 
-/// Implement this for your plugin type, then `export_plugin!(YourType)`.
+/// Host capabilities granted to a plugin. **Empty in v1** — a forward-compatible
+/// seam: `log`, `emit-event`, and `kv` are *added here* in later stages, so a
+/// plugin's [`Plugin::on_event`] signature never has to change as capabilities
+/// grow. `#[non_exhaustive]` so adding methods isn't a breaking change.
+#[non_exhaustive]
+pub struct Caps {}
+
+/// Implement this for your plugin type, then `export_plugin!(YourType)`. A plugin
+/// can implement the **decision** hook ([`Plugin::check_event`]), the async
+/// **observation** hook ([`Plugin::on_event`]), or both — the unused one defaults
+/// to a no-op, and the operator's `points` config decides which the host invokes.
 pub trait Plugin {
-    /// Decide whether to allow or block one event.
-    fn check_event(event: &Event) -> Decision;
+    /// Decide whether to allow or block one event (sync, on the hot path).
+    /// Default: allow.
+    fn check_event(_event: &Event) -> Decision {
+        Decision::allow()
+    }
+
+    /// Observe an event asynchronously (off the hot path). No return — an
+    /// observer cannot block. Default: no-op. Override to audit, emit metrics,
+    /// or (with future capabilities via `caps`) act.
+    fn on_event(_event: &Event, _caps: &Caps) {}
 }
 
-/// Bridge from the raw Component-Model entry point to a typed [`Plugin`].
+/// Bridge from the raw decision entry point to [`Plugin::check_event`].
 /// Called by [`export_plugin!`]; not for direct use.
 #[doc(hidden)]
 pub fn dispatch<P: Plugin>(
@@ -174,6 +192,16 @@ pub fn dispatch<P: Plugin>(
     }
 }
 
+/// Bridge from the raw observation entry point to [`Plugin::on_event`].
+/// Called by [`export_plugin!`]; not for direct use.
+#[doc(hidden)]
+pub fn dispatch_on_event<P: Plugin>(
+    ctx: bindings::exports::vela::extension::decision::EventContext,
+) {
+    let event = Event::new(ctx);
+    P::on_event(&event, &Caps {});
+}
+
 /// Export your [`Plugin`] implementation as the component's entry point. Call
 /// this exactly once at the crate root.
 #[macro_export]
@@ -185,6 +213,13 @@ macro_rules! export_plugin {
                 ctx: $crate::bindings::exports::vela::extension::decision::EventContext,
             ) -> $crate::bindings::exports::vela::extension::decision::Verdict {
                 $crate::dispatch::<$plugin>(ctx)
+            }
+        }
+        impl $crate::bindings::exports::vela::extension::observation::Guest for __VelaPluginGlue {
+            fn on_event(
+                ctx: $crate::bindings::exports::vela::extension::observation::EventContext,
+            ) {
+                $crate::dispatch_on_event::<$plugin>(ctx)
             }
         }
         $crate::bindings::export!(__VelaPluginGlue with_types_in $crate::bindings);

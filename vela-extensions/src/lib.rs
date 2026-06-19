@@ -17,5 +17,5 @@ mod runtime;
 mod plugin;
 
 pub use abi::{EventContext, Origin, Verdict};
-pub use config::{FailPolicy, PluginConfig};
+pub use config::{FailPolicy, PluginConfig, Points};
 pub use runtime::{Decision, Runtime, RuntimeError};
