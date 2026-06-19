@@ -140,6 +140,32 @@ fn local_extension_gate(
     }
 }
 
+/// Whether a sender is a plugin's `@_ext_<name>` bot — the reserved localpart
+/// prefix that marks extension-emitted events. The loop-protection guard: such
+/// events are never queued for observation, so an emitting plugin can't observe
+/// (and re-react to) its own — or another plugin's — output.
+fn sender_is_plugin_bot(sender: &str) -> bool {
+    sender.starts_with("@_ext_")
+}
+
+#[cfg(test)]
+mod loop_protection_tests {
+    use super::sender_is_plugin_bot;
+
+    #[test]
+    fn only_ext_prefixed_senders_are_plugin_bots() {
+        // Plugin bots are skipped for observation (loop protection)...
+        assert!(sender_is_plugin_bot("@_ext_keyword-filter:example.org"));
+        assert!(sender_is_plugin_bot("@_ext_judge:server"));
+        // ...and humans, the admin bot, and appservice ghosts are NOT, so their
+        // events are still observed.
+        assert!(!sender_is_plugin_bot("@alice:example.org"));
+        assert!(!sender_is_plugin_bot("@admin:example.org"));
+        assert!(!sender_is_plugin_bot("@_telegram_bob:example.org"));
+        assert!(!sender_is_plugin_bot("@ext_not_reserved:example.org"));
+    }
+}
+
 /// Queue a just-persisted local event for the async observation point
 /// (`on_event`). No-op — and no serialization — unless some plugin binds
 /// `on_event`. Best-effort: the event is already persisted and federated, so a
@@ -151,6 +177,13 @@ fn observe_local_event(
     sender: &str,
     event_type: &str,
 ) {
+    // Loop protection: never feed a plugin bot's own emitted events back into
+    // observation, or an emitting plugin would observe its own output and emit
+    // again. Plugin bots use the reserved `@_ext_` localpart prefix, so this is
+    // an O(1) check with no lookup (and covers cross-plugin loops too).
+    if sender_is_plugin_bot(sender) {
+        return;
+    }
     // Lock-free snapshot, like the decision gate: a concurrent SIGHUP reload
     // can't tear this check.
     if state.extensions.load().binds_on_event() {
@@ -804,7 +837,7 @@ fn dispatch_appservice_interest(
 /// be rejected with HTTP 413.
 const MAX_EVENT_BYTES: usize = 65_536;
 
-fn enforce_event_size(canonical: &[u8]) -> Result<(), ApiError> {
+pub(crate) fn enforce_event_size(canonical: &[u8]) -> Result<(), ApiError> {
     if canonical.len() > MAX_EVENT_BYTES {
         return Err(VelaError::EventTooLarge(format!(
             "canonical event JSON is {} bytes, exceeds {} limit",
@@ -1267,6 +1300,7 @@ mod extension_gate_tests {
             memory_pages: 256,
             event_types: None,
             points: vela_extensions::Points::default(),
+            capabilities: vela_extensions::Capabilities::default(),
             config: serde_json::json!({ "mode": "allow" }),
         }])
         .expect("runtime loads")

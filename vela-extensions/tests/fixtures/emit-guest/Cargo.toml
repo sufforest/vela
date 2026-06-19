@@ -1,0 +1,24 @@
+# Test-only guest plugin that exercises the `emit-event` capability (a host
+# import). Kept separate from `spam-guest` because importing `emit` means the
+# component only instantiates when the host grants it — `spam-guest` is loaded
+# ungranted in most tests, so it must stay emit-free. Built via
+# `tests/fixtures/build.sh`; the artifact is committed as `emit_guest.wasm`.
+[package]
+name = "emit-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+panic = "abort"
+
+[workspace]

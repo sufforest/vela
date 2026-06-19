@@ -61,11 +61,18 @@ no-op, and the operator's `points` config decides which the host invokes.
 - **`Plugin::on_event(&Event, &Caps)`** — the async observation hook (default:
   no-op). Runs off the request path after persist; no return (an observer can't
   block). Delivery is at-least-once, so make it idempotent.
-- **`Caps`** — the host-capabilities handle. Today: `caps.log(msg)` (and
-  `.debug` / `.warn` / `.error` / `.trace`) writes a line to vela's log, tagged
-  with your plugin name; the host truncates long messages and rate-limits a tight
-  loop, so it's safe to call freely. `emit-event` and `kv` are added here later —
-  your `on_event` signature won't change.
+- **`Caps`** — the host-capabilities handle:
+  - `caps.log(msg)` (and `.debug` / `.warn` / `.error` / `.trace`) — write a line
+    to vela's log, tagged with your plugin name; truncated and rate-limited by the
+    host, so it's safe to call freely. Always available.
+  - `caps.emit(room_id, event_type, &content)` / `caps.send_text(room_id, body)` —
+    post an event into a room as your `@_ext_<name>` bot, returning the new
+    event's id. Needs the operator-granted `emit-event` capability and only works
+    from `on_event`; the bot must be invited to the room with power level, or you
+    get `EmitError::Unauthorized`. Allowed types: message, reaction, redaction;
+    rate-capped per plugin.
+
+  `kv` is added here later — your `on_event` signature won't change.
 - **`Event`** — `room_id()`, `sender()`, `event_type()`, `origin()`,
   `event()` (the full event as parsed JSON), `message_body()` (`content.body`
   if present), and `config::<T>()` / `try_config::<T>()` to read your

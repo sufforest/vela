@@ -31,9 +31,12 @@ impl std::error::Error for RuntimeError {}
 
 #[cfg(feature = "wasmtime-runtime")]
 mod imp {
+    use std::sync::Arc;
+
     use super::*;
     use crate::abi::Verdict;
     use crate::config::FailPolicy;
+    use crate::emit::EventEmitter;
     use crate::plugin::{EpochTicker, Plugin};
 
     /// Loads and dispatches across sandboxed plugins.
@@ -45,10 +48,20 @@ mod imp {
     }
 
     impl Runtime {
-        /// Compile every configured plugin. Fails if any component is invalid —
-        /// a misconfigured server should refuse to start, not silently run with
-        /// a missing policy.
+        /// Compile every configured plugin with no host emit service — every
+        /// `emit-event`-granted plugin's emits will fail `not-permitted`. Used by
+        /// tests and wasmtime-free embedders; vela-server uses [`with_emitter`].
         pub fn new(configs: Vec<PluginConfig>) -> Result<Self, RuntimeError> {
+            Self::with_emitter(configs, None)
+        }
+
+        /// Compile every configured plugin, injecting the host `emit-event`
+        /// service. Fails if any component is invalid — a misconfigured server
+        /// should refuse to start, not silently run with a missing policy.
+        pub fn with_emitter(
+            configs: Vec<PluginConfig>,
+            emitter: Option<Arc<dyn EventEmitter>>,
+        ) -> Result<Self, RuntimeError> {
             let engine = Plugin::new_engine().map_err(|e| RuntimeError(e.to_string()))?;
             // Only run the epoch ticker if some plugin actually uses a
             // wall-clock budget — no idle thread otherwise.
@@ -56,7 +69,7 @@ mod imp {
             let mut plugins = Vec::with_capacity(configs.len());
             for cfg in configs {
                 let name = cfg.name.clone();
-                let plugin = Plugin::load(&engine, cfg)
+                let plugin = Plugin::load(&engine, cfg, emitter.clone())
                     .map_err(|e| RuntimeError(format!("plugin '{name}': {e}")))?;
                 plugins.push(plugin);
             }
@@ -179,6 +192,15 @@ mod imp {
     pub struct Runtime;
 
     impl Runtime {
+        /// Mirrors the real runtime's signature; the injected emitter is ignored
+        /// (no plugins run without wasmtime).
+        pub fn with_emitter(
+            configs: Vec<PluginConfig>,
+            _emitter: Option<std::sync::Arc<dyn crate::emit::EventEmitter>>,
+        ) -> Result<Self, RuntimeError> {
+            Self::new(configs)
+        }
+
         pub fn new(configs: Vec<PluginConfig>) -> Result<Self, RuntimeError> {
             // Loud warning rather than silent no-op: an operator who configured
             // plugins but built without the `extensions` feature would otherwise

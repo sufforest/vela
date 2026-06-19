@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# Rebuild the committed test-fixture component. Run from anywhere; needs:
+# Rebuild the committed test-fixture components. Run from anywhere; needs:
 #   rustup target add wasm32-unknown-unknown
 #   cargo install wasm-tools
-# The output `spam_guest.wasm` is committed so host tests need no wasm toolchain.
+# The outputs are committed so host tests need no wasm toolchain.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-cargo build --release --target wasm32-unknown-unknown \
-    --manifest-path "$here/spam-guest/Cargo.toml"
+build_one() {
+    local crate="$1" out="$2"
+    cargo build --release --target wasm32-unknown-unknown \
+        --manifest-path "$here/$crate/Cargo.toml"
+    local core="$here/$crate/target/wasm32-unknown-unknown/release/${crate//-/_}.wasm"
+    # No WASI imports → no adapter needed to turn the core module into a component.
+    wasm-tools component new "$core" -o "$here/$out"
+    echo "wrote $here/$out"
+}
 
-core="$here/spam-guest/target/wasm32-unknown-unknown/release/spam_guest.wasm"
-
-# No WASI imports → no adapter needed to turn the core module into a component.
-wasm-tools component new "$core" -o "$here/spam_guest.wasm"
-echo "wrote $here/spam_guest.wasm"
+build_one spam-guest spam_guest.wasm
+build_one emit-guest emit_guest.wasm

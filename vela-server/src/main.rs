@@ -148,6 +148,11 @@ struct ExtensionPluginSection {
     /// and/or "on_event" (async observation). Defaults to ["check_event"].
     #[serde(default = "default_points")]
     points: Vec<String>,
+    /// Host capabilities granted to this plugin (least-privilege; default none).
+    /// "emit-event" lets it post events as its `@_ext_<name>` bot. `logging` is
+    /// always granted and not listed here.
+    #[serde(default)]
+    capabilities: Vec<String>,
     /// Opaque JSON handed to the guest verbatim as `plugin_config`.
     #[serde(default)]
     config: serde_json::Value,
@@ -880,6 +885,7 @@ fn load_extra_ca_certs(paths: &[PathBuf]) -> anyhow::Result<Vec<reqwest::Certifi
 /// compiles and returns the no-op runtime.
 fn build_extension_runtime(
     section: &ExtensionsSection,
+    emitter: Option<std::sync::Arc<dyn vela_extensions::EventEmitter>>,
 ) -> anyhow::Result<vela_extensions::Runtime> {
     let mut configs = Vec::with_capacity(section.plugin.len());
     for p in &section.plugin {
@@ -918,6 +924,24 @@ fn build_extension_runtime(
                 p.name
             );
         }
+        let mut capabilities = vela_extensions::Capabilities::default();
+        for cap in &p.capabilities {
+            match cap.as_str() {
+                "emit-event" => capabilities.emit_event = true,
+                other => anyhow::bail!(
+                    "extension '{}': unknown capability {other:?} (expected \"emit-event\")",
+                    p.name
+                ),
+            }
+        }
+        // emit-event is only meaningful from on_event (it can't run on the
+        // decision hot path); reject a config that grants it without binding it.
+        if capabilities.emit_event && !points.on_event {
+            anyhow::bail!(
+                "extension '{}': capability \"emit-event\" requires the \"on_event\" point",
+                p.name
+            );
+        }
         configs.push(vela_extensions::PluginConfig {
             name: p.name.clone(),
             wasm,
@@ -927,13 +951,15 @@ fn build_extension_runtime(
             memory_pages: p.memory_pages,
             event_types: p.event_types.clone(),
             points,
+            capabilities,
             config: p.config.clone(),
         });
     }
     if !configs.is_empty() {
         info!(count = configs.len(), "extensions: loading plugin(s)");
     }
-    vela_extensions::Runtime::new(configs).map_err(|e| anyhow::anyhow!("extensions: {e}"))
+    vela_extensions::Runtime::with_emitter(configs, emitter)
+        .map_err(|e| anyhow::anyhow!("extensions: {e}"))
 }
 
 /// Re-read `[extensions]` from the config file and build a fresh runtime, for
@@ -943,6 +969,7 @@ fn build_extension_runtime(
 #[cfg(unix)]
 fn reload_extension_runtime(
     path: &std::path::Path,
+    emitter: Option<std::sync::Arc<dyn vela_extensions::EventEmitter>>,
 ) -> Result<(vela_extensions::Runtime, usize), String> {
     let config: Config = Figment::new()
         .merge(Toml::file(path))
@@ -950,7 +977,8 @@ fn reload_extension_runtime(
         .extract()
         .map_err(|e| format!("parsing {}: {e}", path.display()))?;
     let count = config.extensions.plugin.len();
-    let runtime = build_extension_runtime(&config.extensions).map_err(|e| e.to_string())?;
+    let runtime =
+        build_extension_runtime(&config.extensions, emitter).map_err(|e| e.to_string())?;
     Ok((runtime, count))
 }
 
@@ -978,14 +1006,16 @@ mod reload_tests {
              config = {{ banned = [\"spam\"] }}\n",
             example_wasm()
         ));
-        let (_rt, count) = super::reload_extension_runtime(&path).expect("valid config reloads");
+        let (_rt, count) =
+            super::reload_extension_runtime(&path, None).expect("valid config reloads");
         assert_eq!(count, 1);
     }
 
     #[test]
     fn empty_config_reloads_to_zero_plugins() {
         let (_dir, path) = write_config("# nothing here\n");
-        let (_rt, count) = super::reload_extension_runtime(&path).expect("empty config reloads");
+        let (_rt, count) =
+            super::reload_extension_runtime(&path, None).expect("empty config reloads");
         assert_eq!(count, 0);
     }
 
@@ -995,7 +1025,7 @@ mod reload_tests {
             "[[extensions.plugin]]\nname = \"kf\"\nwasm_path = \"/no/such/plugin.wasm\"\n",
         );
         assert!(
-            super::reload_extension_runtime(&path).is_err(),
+            super::reload_extension_runtime(&path, None).is_err(),
             "a bad reload must error, not panic or silently succeed"
         );
     }
@@ -1235,8 +1265,14 @@ fn main() -> anyhow::Result<()> {
                     Arc::new(vela_api::auth::oidc::IntrospectionState { client, cache })
                 });
 
+        // The host service backing the `emit-event` capability. Built first
+        // (its AppState is wired in after the struct exists, below), injected
+        // into the runtime so granted plugins can emit. `as _` widens the
+        // concrete Arc to the trait object the runtime expects.
+        let event_emitter = vela_api::extensions::ApiEventEmitter::new();
         let extensions = Arc::new(arc_swap::ArcSwap::from_pointee(build_extension_runtime(
             &config.extensions,
+            Some(event_emitter.clone() as std::sync::Arc<dyn vela_extensions::EventEmitter>),
         )?));
         let observe_queue = vela_api::extensions::ObserveQueue::new(&db);
 
@@ -1248,6 +1284,8 @@ fn main() -> anyhow::Result<()> {
         {
             let extensions = extensions.clone();
             let config_path = config_path.clone();
+            let reload_emitter =
+                event_emitter.clone() as std::sync::Arc<dyn vela_extensions::EventEmitter>;
             tokio::spawn(async move {
                 let mut hup = match tokio::signal::unix::signal(
                     tokio::signal::unix::SignalKind::hangup(),
@@ -1259,7 +1297,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 };
                 while hup.recv().await.is_some() {
-                    match reload_extension_runtime(&config_path) {
+                    match reload_extension_runtime(&config_path, Some(reload_emitter.clone())) {
                         Ok((runtime, count)) => {
                             extensions.store(Arc::new(runtime));
                             info!(plugins = count, "reloaded extensions on SIGHUP");
@@ -1398,6 +1436,14 @@ fn main() -> anyhow::Result<()> {
             extensions,
             observe_queue,
         };
+
+        // Wire AppState into the emit service now that it exists (the runtime
+        // already holds the emitter; this completes the loop so emit-granted
+        // plugins can drive the send path). This forms an intentional Arc cycle
+        // (emitter → AppState → runtime → emitter) that lives for the process —
+        // AppState never tears down — so it's a one-time allocation, not a leak;
+        // don't "fix" it with a Weak.
+        event_emitter.set_state(state.clone());
 
         // Admin bot + admin room bootstrap. Idempotent: creates the
         // bot user + private "Admins" room on first boot, no-ops on

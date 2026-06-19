@@ -166,31 +166,92 @@ impl Caps {
     /// The host truncates very long messages and rate-limits a tight log loop,
     /// so this is safe to call freely. Pure output — no events, no I/O.
     pub fn log(&self, message: impl AsRef<str>) {
-        self.emit(bindings::vela::extension::logging::LogLevel::Info, message);
+        self.log_at(bindings::vela::extension::logging::LogLevel::Info, message);
     }
 
     /// Log at trace level.
     pub fn trace(&self, message: impl AsRef<str>) {
-        self.emit(bindings::vela::extension::logging::LogLevel::Trace, message);
+        self.log_at(bindings::vela::extension::logging::LogLevel::Trace, message);
     }
 
     /// Log at debug level.
     pub fn debug(&self, message: impl AsRef<str>) {
-        self.emit(bindings::vela::extension::logging::LogLevel::Debug, message);
+        self.log_at(bindings::vela::extension::logging::LogLevel::Debug, message);
     }
 
     /// Log at warn level.
     pub fn warn(&self, message: impl AsRef<str>) {
-        self.emit(bindings::vela::extension::logging::LogLevel::Warn, message);
+        self.log_at(bindings::vela::extension::logging::LogLevel::Warn, message);
     }
 
     /// Log at error level.
     pub fn error(&self, message: impl AsRef<str>) {
-        self.emit(bindings::vela::extension::logging::LogLevel::Error, message);
+        self.log_at(bindings::vela::extension::logging::LogLevel::Error, message);
     }
 
-    fn emit(&self, level: bindings::vela::extension::logging::LogLevel, message: impl AsRef<str>) {
+    fn log_at(
+        &self,
+        level: bindings::vela::extension::logging::LogLevel,
+        message: impl AsRef<str>,
+    ) {
         bindings::vela::extension::logging::log(level, message.as_ref());
+    }
+
+    /// Post an event into a room as this plugin's `@_ext_<name>` bot user, and
+    /// return the new event's id. Requires the operator-granted `emit-event`
+    /// capability and is only available from [`Plugin::on_event`] — otherwise
+    /// you get [`EmitError::NotPermitted`].
+    ///
+    /// The event goes through normal room authorization: the bot must be a
+    /// member of the room with sufficient power level (the operator invites it),
+    /// or this returns [`EmitError::Unauthorized`]. v1 allows `m.room.message`,
+    /// `m.reaction`, and `m.room.redaction`; emits are rate-limited per plugin.
+    pub fn emit(
+        &self,
+        room_id: &str,
+        event_type: &str,
+        content: &Value,
+    ) -> Result<String, EmitError> {
+        let ev = bindings::vela::extension::emit::NewEvent {
+            room_id: room_id.to_string(),
+            event_type: event_type.to_string(),
+            content: content.to_string(),
+            state_key: None,
+        };
+        bindings::vela::extension::emit::emit_event(&ev).map_err(EmitError::from)
+    }
+
+    /// Convenience over [`emit`](Self::emit): send a plain-text `m.room.message`.
+    pub fn send_text(&self, room_id: &str, body: &str) -> Result<String, EmitError> {
+        let content = serde_json::json!({ "msgtype": "m.text", "body": body });
+        self.emit(room_id, "m.room.message", &content)
+    }
+}
+
+/// Why an [`Caps::emit`] failed. `#[non_exhaustive]` — match with a `_` arm.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmitError {
+    /// The bot isn't joined / lacks power level in that room (invite it).
+    Unauthorized,
+    /// Not granted, called outside `on_event`, a disallowed event type, or
+    /// malformed content.
+    NotPermitted(String),
+    /// This plugin's emit rate cap tripped — back off and retry later.
+    RateLimited,
+    /// Internal host failure (logged server-side).
+    Internal,
+}
+
+impl From<bindings::vela::extension::emit::EmitError> for EmitError {
+    fn from(e: bindings::vela::extension::emit::EmitError) -> Self {
+        use bindings::vela::extension::emit::EmitError as W;
+        match e {
+            W::Unauthorized => EmitError::Unauthorized,
+            W::NotPermitted(m) => EmitError::NotPermitted(m),
+            W::RateLimited => EmitError::RateLimited,
+            W::Internal => EmitError::Internal,
+        }
     }
 }
 

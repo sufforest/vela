@@ -3,12 +3,15 @@
 // generates its side with `wit-bindgen`. The Component Model lifts these typed
 // records across the sandbox boundary — no hand-rolled linear-memory marshaling.
 //
-// Versioned by the package version. Adding an export is breaking (a guest must
-// provide it); adding an import — a host capability the guest may ignore — is
-// compatible, so it's a minor bump. Components match structurally: a guest
-// instantiates as long as it exports what the world requires and imports only
-// capabilities the host granted it.
-package vela:extension@0.3.0;
+// Versioned by the package version. The version is baked into every interface's
+// identity (e.g. a guest imports `vela:extension/logging@0.4.0`), so ANY bump —
+// even a purely additive one like a new capability interface — requires
+// rebuilding every component against the new version; an older component won't
+// match the host's linker. So a bump is effectively breaking for already-built
+// components regardless of what changed; the committed fixtures/examples are
+// rebuilt with each bump. (Within a fixed version, a guest still instantiates as
+// long as it exports what the world requires and imports only granted caps.)
+package vela:extension@0.4.0;
 
 interface decision {
     // Where an event originated. A `block` verdict is a hard reject for `local`
@@ -83,12 +86,42 @@ interface logging {
     log: func(level: log-level, message: string);
 }
 
+// The `emit-event` capability — post an event into a room as the plugin's own
+// bot user (`@_ext_<name>`). Granted per-plugin by the operator (the host links
+// this interface only when granted) and usable only from `on_event`. The event
+// goes through normal room authorization: the bot must be joined with power
+// level, or `emit` is `unauthorized` — there is no auth bypass.
+interface emit {
+    // The event to post. `content` is canonical JSON of the event content; a
+    // present `state-key` makes it a state event (rejected in v1 — message,
+    // reaction, and redaction only).
+    record new-event {
+        room-id: string,
+        event-type: string,
+        content: string,
+        state-key: option<string>,
+    }
+    variant emit-error {
+        // the bot isn't joined / lacks power level in that room
+        unauthorized,
+        // not granted, called off on_event, disallowed type, or malformed content
+        not-permitted(string),
+        // this plugin's emit rate cap tripped
+        rate-limited,
+        // internal failure (persist/lock) — logged host-side
+        internal,
+    }
+    // Returns the new event's id on success.
+    emit-event: func(event: new-event) -> result<string, emit-error>;
+}
+
 // A plugin component exports both interfaces. A plugin that only cares about one
 // no-ops the other (the SDK provides no-op defaults); the operator's `points`
 // config decides which the host actually invokes. It may also import host
 // capabilities (`logging` today) — the host provides those it grants.
 world plugin {
     import logging;
+    import emit;
     export decision;
     export observation;
 }

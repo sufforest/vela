@@ -4,7 +4,9 @@
 #![cfg(feature = "wasmtime-runtime")]
 
 use serde_json::{Value, json};
-use vela_extensions::{Decision, EventContext, FailPolicy, Origin, PluginConfig, Points, Runtime};
+use vela_extensions::{
+    Capabilities, Decision, EventContext, FailPolicy, Origin, PluginConfig, Points, Runtime,
+};
 
 const KEYWORD_FILTER: &[u8] =
     include_bytes!("../../extensions/examples/keyword-filter/keyword-filter.wasm");
@@ -21,6 +23,7 @@ fn runtime(config: Value) -> Runtime {
         memory_pages: 256,
         event_types: None,
         points: Points::default(),
+        capabilities: Capabilities::default(),
         config,
     }])
     .expect("example plugin loads in the host runtime")
@@ -114,6 +117,7 @@ fn malformed_config_traps_and_is_resolved_by_fail_policy() {
         memory_pages: 256,
         event_types: None,
         points: Points::default(),
+        capabilities: Capabilities::default(),
         config: bad,
     }])
     .expect("loads");

@@ -14,10 +14,17 @@ use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use crate::abi::{EventContext, Origin, Verdict};
 use crate::config::PluginConfig;
+use crate::emit::{EmitLimiter, EmitRequest, EventEmitter, emit_type_allowed};
 
 /// How often the epoch ticker advances the engine's epoch. This is the
 /// resolution of the per-plugin `wall_ms` deadline.
 const EPOCH_TICK_MS: u64 = 10;
+
+/// Per-plugin emit rate cap (token bucket): sustained rate and burst. A
+/// legitimate bot emits in occasional bursts; this bounds a runaway/loop far
+/// below what would flood a room, surfaced to the guest as `rate-limited`.
+const EMIT_RATE_PER_SEC: f64 = 1.0;
+const EMIT_BURST: f64 = 20.0;
 
 /// Longest plugin log message the host will emit; longer is truncated. Bounds
 /// the log *volume* a `log` call produces — not the transient host allocation of
@@ -39,15 +46,86 @@ mod bindings {
 }
 
 use bindings::exports::vela::extension::decision as wit;
+use bindings::vela::extension::emit::{
+    EmitError as WitEmitError, Host as EmitHost, NewEvent as WitNewEvent,
+};
 use bindings::vela::extension::logging::{Host as LoggingHost, LogLevel};
 
 /// Per-store host state. Holds the resource limiter so memory growth is capped
 /// per instantiation; fuel lives on the store itself. Also carries the plugin
-/// name (to attribute its log lines) and a per-invocation log-call counter.
+/// name (to attribute its log lines), a per-invocation log-call counter, and —
+/// only for an `on_event` invocation of an emit-granted plugin — the emit
+/// context backing the `emit-event` capability.
 struct HostState {
     limits: StoreLimits,
     name: String,
     log_calls: u32,
+    emit: Option<EmitCtx>,
+}
+
+/// Backs the `emit-event` capability for one invocation. Present only when the
+/// plugin is emit-granted *and* this is an `on_event` call (emit drives async
+/// host work via `block_on`, which is illegal on the `check_event` request
+/// path). The emitter + limiter are shared (`Arc`) across the plugin's calls.
+struct EmitCtx {
+    emitter: Arc<dyn EventEmitter>,
+    limiter: Arc<EmitLimiter>,
+    plugin: String,
+}
+
+impl EmitHost for HostState {
+    /// A plugin calling `emit-event`. Enforces, in order: capability present
+    /// (else not-permitted), allowlisted non-state event type, content is a JSON
+    /// object, per-plugin rate cap — then hands off to the injected emitter,
+    /// which resolves the plugin's bot and emits through normal room
+    /// authorization. The bot, not this code, is what room auth gates.
+    fn emit_event(&mut self, event: WitNewEvent) -> Result<String, WitEmitError> {
+        let Some(ctx) = self.emit.as_ref() else {
+            return Err(WitEmitError::NotPermitted(
+                "emit-event is only available from on_event with the emit-event capability".into(),
+            ));
+        };
+        if event.state_key.is_some() {
+            return Err(WitEmitError::NotPermitted(
+                "state events cannot be emitted in this version".into(),
+            ));
+        }
+        if !emit_type_allowed(&event.event_type) {
+            return Err(WitEmitError::NotPermitted(format!(
+                "event type {:?} is not permitted to emit",
+                event.event_type
+            )));
+        }
+        let content = match serde_json::from_str(&event.content) {
+            Ok(Value::Object(map)) => Value::Object(map),
+            _ => {
+                return Err(WitEmitError::NotPermitted(
+                    "content must be a JSON object".into(),
+                ));
+            }
+        };
+        if !ctx.limiter.try_acquire() {
+            return Err(WitEmitError::RateLimited);
+        }
+        let req = EmitRequest {
+            room_id: event.room_id,
+            event_type: event.event_type,
+            content,
+            state_key: None,
+        };
+        ctx.emitter.emit(&ctx.plugin, req).map_err(Into::into)
+    }
+}
+
+impl From<crate::emit::EmitError> for WitEmitError {
+    fn from(e: crate::emit::EmitError) -> Self {
+        match e {
+            crate::emit::EmitError::Unauthorized => WitEmitError::Unauthorized,
+            crate::emit::EmitError::NotPermitted(m) => WitEmitError::NotPermitted(m),
+            crate::emit::EmitError::RateLimited => WitEmitError::RateLimited,
+            crate::emit::EmitError::Internal => WitEmitError::Internal,
+        }
+    }
 }
 
 /// Truncate `s` to at most `max` bytes without splitting a UTF-8 char.
@@ -99,6 +177,11 @@ pub(crate) struct Plugin {
     engine: Engine,
     pre: bindings::PluginPre<HostState>,
     pub(crate) cfg: PluginConfig,
+    /// The host emit service, present only when this plugin was granted
+    /// `emit-event` *and* an emitter was injected into the runtime.
+    emitter: Option<Arc<dyn EventEmitter>>,
+    /// Per-plugin emit rate cap, shared across invocations.
+    emit_limiter: Arc<EmitLimiter>,
 }
 
 /// Why a plugin invocation failed. The runtime maps these onto the plugin's
@@ -136,28 +219,52 @@ impl Plugin {
 
     /// Compile a plugin component against the shared engine and resolve its
     /// imports once. Returns an error if the bytes aren't a valid component or
-    /// its world doesn't match.
-    pub(crate) fn load(engine: &Engine, cfg: PluginConfig) -> Result<Self, PluginError> {
+    /// its world doesn't match. `emitter` is the host's emit service (injected
+    /// at runtime construction); a plugin only gets it if it's also granted.
+    pub(crate) fn load(
+        engine: &Engine,
+        cfg: PluginConfig,
+        emitter: Option<Arc<dyn EventEmitter>>,
+    ) -> Result<Self, PluginError> {
         let component =
             Component::new(engine, &cfg.wasm).map_err(|e| PluginError::Load(e.to_string()))?;
 
-        // Grant host capabilities by adding them to the linker. A plugin that
-        // doesn't import `logging` simply ignores it; one that does gets it.
+        // Grant host capabilities by adding them to the linker. `logging` is
+        // always linked (harmless). `emit` is linked ONLY when the operator
+        // granted it — so an ungranted plugin that imports `emit` fails to
+        // instantiate (the enforcement), and one that doesn't import it is
+        // unaffected.
         let mut linker: Linker<HostState> = Linker::new(engine);
         bindings::vela::extension::logging::add_to_linker::<_, HasSelf<HostState>>(
             &mut linker,
             |s| s,
         )
         .map_err(|e| PluginError::Load(e.to_string()))?;
+        if cfg.capabilities.emit_event {
+            bindings::vela::extension::emit::add_to_linker::<_, HasSelf<HostState>>(
+                &mut linker,
+                |s| s,
+            )
+            .map_err(|e| PluginError::Load(e.to_string()))?;
+        }
         let pre = linker
             .instantiate_pre(&component)
             .and_then(bindings::PluginPre::new)
             .map_err(|e| PluginError::Load(e.to_string()))?;
 
+        // Only hold the emitter when the plugin is actually granted emit — a
+        // belt to the linker's suspenders (the host fn also checks the ctx).
+        let emitter = if cfg.capabilities.emit_event {
+            emitter
+        } else {
+            None
+        };
         Ok(Plugin {
             engine: engine.clone(),
             pre,
             cfg,
+            emitter,
+            emit_limiter: Arc::new(EmitLimiter::new(EMIT_RATE_PER_SEC, EMIT_BURST)),
         })
     }
 
@@ -170,16 +277,29 @@ impl Plugin {
         &self,
         event_json: &str,
         ctx: &EventContext<'_>,
+        allow_emit: bool,
     ) -> Result<(Store<HostState>, bindings::Plugin, wit::EventContext), PluginError> {
         let limits = StoreLimitsBuilder::new()
             .memory_size(self.cfg.memory_pages as usize * 64 * 1024)
             .build();
+        // Wire the emit capability only for an on_event call of a granted plugin
+        // (`allow_emit`) with an injected emitter. check_event runs on the async
+        // request path where emit's `block_on` would panic, so emit is None there.
+        let emit = match (allow_emit, &self.emitter) {
+            (true, Some(emitter)) => Some(EmitCtx {
+                emitter: emitter.clone(),
+                limiter: self.emit_limiter.clone(),
+                plugin: self.cfg.name.clone(),
+            }),
+            _ => None,
+        };
         let mut store = Store::new(
             &self.engine,
             HostState {
                 limits,
                 name: self.cfg.name.clone(),
                 log_calls: 0,
+                emit,
             },
         );
         store.limiter(|s| &mut s.limits);
@@ -222,7 +342,9 @@ impl Plugin {
         event_json: &str,
         ctx: &EventContext<'_>,
     ) -> Result<Verdict, PluginError> {
-        let (mut store, instance, wire) = self.prepare(event_json, ctx)?;
+        // No emit on the decision path — it runs inline on the async request
+        // thread, where the capability's `block_on` would panic.
+        let (mut store, instance, wire) = self.prepare(event_json, ctx, false)?;
         let verdict = instance
             .vela_extension_decision()
             .call_check_event(&mut store, &wire)
@@ -243,7 +365,9 @@ impl Plugin {
         event_json: &str,
         ctx: &EventContext<'_>,
     ) -> Result<(), PluginError> {
-        let (mut store, instance, wire) = self.prepare(event_json, ctx)?;
+        // on_event runs on a blocking worker thread, so emit's `block_on` is
+        // legal here — wire the capability (granted plugins only).
+        let (mut store, instance, wire) = self.prepare(event_json, ctx, true)?;
         instance
             .vela_extension_observation()
             .call_on_event(&mut store, &wire)
