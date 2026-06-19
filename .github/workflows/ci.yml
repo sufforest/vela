@@ -170,10 +170,16 @@ jobs:
         run: cargo test -p vela-server --features otel --locked
       - name: cargo test --features otel (vela-api OTLP export)
         run: cargo test -p vela-api --features otel --test otlp_export --locked
-      # Extensions are opt-in (off in the default `cargo test --workspace` to
-      # keep wasmtime out of every test binary), so exercise the WASM extension
-      # gate explicitly here. `--lib` keeps it to the one lib-test binary.
-      - name: cargo test --features extensions (WASM extension gate)
+      # Extensions are opt-in: vela-extensions has NO default features, so the
+      # default `cargo test --workspace` builds it (and every vela-api test
+      # binary) without wasmtime. Exercise the WASM runtime explicitly here.
+      # The vela-extensions suite (sandbox + example + WIT-drift) needs its
+      # `wasmtime-runtime` feature; the vela-api gate/soft-fail tests need
+      # `extensions` (which enables it transitively). `--lib` keeps the latter
+      # to the one lib-test binary.
+      - name: cargo test vela-extensions (WASM runtime)
+        run: cargo test -p vela-extensions --features wasmtime-runtime --locked
+      - name: cargo test --features extensions (WASM gate + federation soft-fail)
         run: cargo test -p vela-api --features extensions --lib --locked
 
   smoketest:
