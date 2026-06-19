@@ -11,11 +11,13 @@
 
 mod abi;
 mod config;
+mod emit;
 mod runtime;
 
 #[cfg(feature = "wasmtime-runtime")]
 mod plugin;
 
 pub use abi::{EventContext, Origin, Verdict};
-pub use config::{FailPolicy, PluginConfig, Points};
+pub use config::{Capabilities, FailPolicy, PluginConfig, Points};
+pub use emit::{EmitError, EmitRequest, EventEmitter};
 pub use runtime::{Decision, Runtime, RuntimeError};

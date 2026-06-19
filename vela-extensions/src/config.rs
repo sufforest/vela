@@ -25,6 +25,17 @@ impl Default for Points {
     }
 }
 
+/// Host capabilities granted to a plugin — the only things it can do to the
+/// world beyond returning a verdict / observing. **Least privilege: everything
+/// is off by default** and the operator opts in per plugin. `logging` is not
+/// here because it's always granted (harmless, pure output); the gated
+/// capabilities are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Capabilities {
+    /// `emit-event`: post events as the plugin's `@_ext_<name>` bot user.
+    pub emit_event: bool,
+}
+
 /// What to do when a plugin traps, runs out of fuel, or errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailPolicy {
@@ -57,6 +68,8 @@ pub struct PluginConfig {
     pub event_types: Option<Vec<String>>,
     /// Which extension points this plugin binds (decision / observation).
     pub points: Points,
+    /// Host capabilities the operator granted this plugin (least-privilege).
+    pub capabilities: Capabilities,
     /// Opaque config handed verbatim to the guest as `plugin_config`.
     pub config: Value,
 }

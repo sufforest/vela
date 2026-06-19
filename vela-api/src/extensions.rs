@@ -22,16 +22,21 @@
 //!   malformed entry are each absorbed and the entry is popped regardless.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tracing::{debug, warn};
+use vela_core::error::VelaError;
 
-use vela_extensions::{EventContext, Origin, Runtime};
+use vela_extensions::{EmitError, EmitRequest, EventContext, EventEmitter, Origin, Runtime};
 use vela_store::db::Database;
+
+use crate::router::AppState;
 
 /// Cap on queued-but-undrained observations. Reaching it means the worker is
 /// stalled or hopelessly behind; past it, the oldest entries are shed so the
@@ -233,6 +238,119 @@ async fn run_worker(
     }
 }
 
+/// vela-api's implementation of the extension `emit-event` capability. Resolves
+/// a plugin's `@_ext_<name>` bot user (creating it on first use) and emits
+/// through the shared `crate::admin::emit_event_as` path, so emitted events go
+/// through normal room authorization — the bot must be joined with power level.
+///
+/// The trait method is synchronous (it's called from the sandbox's blocking
+/// observation-worker thread), so it drives the async emit via `block_on` on a
+/// captured runtime handle — legal because the caller is a blocking-pool thread,
+/// not an async worker.
+///
+/// `AppState` is filled in via [`set_state`](Self::set_state) *after*
+/// construction: the runtime holds this emitter and `AppState` holds the
+/// runtime, so the emitter is built first (empty) and wired once `AppState`
+/// exists.
+pub struct ApiEventEmitter {
+    state: OnceLock<AppState>,
+    handle: Handle,
+}
+
+impl ApiEventEmitter {
+    /// Build an emitter bound to the current tokio runtime. Call from async
+    /// context (e.g. server startup) so `Handle::current()` is valid.
+    pub fn new() -> Arc<Self> {
+        Arc::new(ApiEventEmitter {
+            state: OnceLock::new(),
+            handle: Handle::current(),
+        })
+    }
+
+    /// Provide the `AppState` once it's been constructed.
+    pub fn set_state(&self, state: AppState) {
+        let _ = self.state.set(state);
+    }
+}
+
+impl EventEmitter for ApiEventEmitter {
+    fn emit(&self, plugin: &str, req: EmitRequest) -> Result<String, EmitError> {
+        let Some(state) = self.state.get() else {
+            warn!("extensions: emit called before AppState was wired");
+            return Err(EmitError::Internal);
+        };
+        let state = state.clone();
+        let plugin = plugin.to_string();
+        self.handle
+            .block_on(async move { emit_for_plugin(&state, &plugin, req).await })
+    }
+}
+
+async fn emit_for_plugin(
+    state: &AppState,
+    plugin: &str,
+    req: EmitRequest,
+) -> Result<String, EmitError> {
+    let bot_user_id = format!("@_ext_{plugin}:{}", state.config.server_name);
+    let bot_nid = ensure_plugin_bot(state, &bot_user_id).map_err(|e| {
+        warn!(plugin, error = %e, "extensions: failed to provision plugin bot");
+        EmitError::Internal
+    })?;
+
+    // Resolve the target room. An unknown room → not-permitted (nothing to join).
+    let room_nid = match state.db.get_nid(&req.room_id) {
+        Ok(Some(n)) => n,
+        _ => {
+            return Err(EmitError::NotPermitted(format!(
+                "unknown room {}",
+                req.room_id
+            )));
+        }
+    };
+
+    match crate::admin::emit_event_as(
+        state,
+        room_nid,
+        bot_nid,
+        &bot_user_id,
+        &req.event_type,
+        req.content,
+        req.state_key.as_deref(),
+    )
+    .await
+    {
+        Ok(event_id) => Ok(event_id.as_str().to_string()),
+        // A room-auth rejection (bot not joined / lacks power level) is the
+        // expected, operator-fixable case; everything else is internal.
+        Err(e) => match e.0 {
+            VelaError::Forbidden(reason) => {
+                debug!(plugin, %reason, "extensions: emit unauthorized");
+                Err(EmitError::Unauthorized)
+            }
+            other => {
+                warn!(plugin, error = %other, "extensions: emit failed");
+                Err(EmitError::Internal)
+            }
+        },
+    }
+}
+
+/// Resolve a plugin bot's `user_nid`, creating the (passwordless, never-logs-in)
+/// bot user on first use. Idempotent. Serialized in practice by the single
+/// observation worker, so no create race.
+fn ensure_plugin_bot(state: &AppState, bot_user_id: &str) -> Result<u64, rocksdb::Error> {
+    let nid = state.db.get_or_create_nid(bot_user_id)?;
+    // `get_or_create_nid` just created the nid mapping, so check the users-CF
+    // record itself (keyed by nid) to decide whether to provision — mirrors the
+    // admin-bot bootstrap. (Checking `user_exists`, which tests the nid mapping,
+    // would always be true here and never create the record.)
+    if state.db.get_user(nid)?.is_none() {
+        state.db.create_user(bot_user_id, "")?;
+        debug!(bot = bot_user_id, "extensions: provisioned plugin bot user");
+    }
+    Ok(nid)
+}
+
 #[cfg(all(test, feature = "extensions"))]
 mod tests {
     use super::*;
@@ -256,6 +374,7 @@ mod tests {
                 check_event: false,
                 on_event: true,
             },
+            capabilities: vela_extensions::Capabilities::default(),
             config: json!({ "mode": mode }),
         }])
         .expect("observer runtime loads")

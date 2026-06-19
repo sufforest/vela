@@ -8,7 +8,9 @@
 #![cfg(feature = "wasmtime-runtime")]
 
 use serde_json::{Value, json};
-use vela_extensions::{Decision, EventContext, FailPolicy, Origin, PluginConfig, Points, Runtime};
+use vela_extensions::{
+    Capabilities, Decision, EventContext, FailPolicy, Origin, PluginConfig, Points, Runtime,
+};
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/spam_guest.wasm");
 
@@ -24,6 +26,7 @@ fn plugin(name: &str, mode: &str) -> PluginConfig {
         wall_ms: 0,        // wall-clock deadline off unless a test sets it
         event_types: None,
         points: Points::default(), // decision-only unless a test overrides
+        capabilities: Capabilities::default(), // no caps unless a test overrides
         config: json!({ "mode": mode }),
     }
 }
@@ -530,4 +533,110 @@ fn on_event_log_flood_is_host_bounded() {
     // The exact contract: at most MAX_LOG_CALLS (64) honored + 1 suppression
     // notice. 10k calls collapse to ≤65 — pin it tightly, not just "< a lot".
     assert!(n <= 65, "the host must bound a log flood to 64+1, got {n}");
+}
+
+// --- emit-event capability (host import + injected service) -----------------
+
+use std::sync::Mutex;
+use vela_extensions::{EmitError, EmitRequest, EventEmitter};
+
+const EMIT_FIXTURE: &[u8] = include_bytes!("fixtures/emit_guest.wasm");
+
+/// Records every emit the host forwarded — so a test can assert the host's
+/// pre-emit gates (grant, allowlist, state rejection, rate cap) let through
+/// exactly what they should.
+#[derive(Default)]
+struct MockEmitter {
+    calls: Mutex<Vec<EmitRequest>>,
+}
+
+impl EventEmitter for MockEmitter {
+    fn emit(&self, _plugin: &str, req: EmitRequest) -> Result<String, EmitError> {
+        self.calls.lock().unwrap().push(req);
+        Ok("$mockevent:example.org".to_string())
+    }
+}
+
+fn emit_config(mode: &str, granted: bool) -> PluginConfig {
+    PluginConfig {
+        name: "emitter".into(),
+        wasm: EMIT_FIXTURE.to_vec(),
+        fail_policy: FailPolicy::Open,
+        fuel: 50_000_000,
+        wall_ms: 0,
+        memory_pages: 256,
+        event_types: None,
+        points: Points {
+            check_event: false,
+            on_event: true,
+        },
+        capabilities: Capabilities {
+            emit_event: granted,
+        },
+        config: json!({ "mode": mode }),
+    }
+}
+
+fn emit_runtime(mode: &str, mock: std::sync::Arc<MockEmitter>) -> Runtime {
+    Runtime::with_emitter(
+        vec![emit_config(mode, true)],
+        Some(mock as std::sync::Arc<dyn EventEmitter>),
+    )
+    .expect("emit-granted runtime loads")
+}
+
+#[test]
+fn emit_posts_through_the_injected_emitter_when_granted() {
+    let mock = std::sync::Arc::new(MockEmitter::default());
+    let rt = emit_runtime("emit_message", mock.clone());
+    rt.on_event(&ctx_for(&message("hi"), "m.room.message"));
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "one message should reach the emitter");
+    assert_eq!(calls[0].event_type, "m.room.message");
+    assert_eq!(calls[0].room_id, "!room:example.org");
+}
+
+#[test]
+fn emit_rejects_state_events_before_the_emitter() {
+    let mock = std::sync::Arc::new(MockEmitter::default());
+    let rt = emit_runtime("emit_state", mock.clone());
+    rt.on_event(&ctx_for(&message("hi"), "m.room.message"));
+    assert!(
+        mock.calls.lock().unwrap().is_empty(),
+        "a state-event emit must be rejected by the host, never reach the emitter"
+    );
+}
+
+#[test]
+fn emit_rejects_non_allowlisted_types_before_the_emitter() {
+    let mock = std::sync::Arc::new(MockEmitter::default());
+    let rt = emit_runtime("emit_member", mock.clone());
+    rt.on_event(&ctx_for(&message("hi"), "m.room.message"));
+    assert!(
+        mock.calls.lock().unwrap().is_empty(),
+        "a disallowed event type must be rejected by the host"
+    );
+}
+
+#[test]
+fn emit_is_rate_capped_per_plugin() {
+    let mock = std::sync::Arc::new(MockEmitter::default());
+    let rt = emit_runtime("emit_flood", mock.clone());
+    rt.on_event(&ctx_for(&message("hi"), "m.room.message"));
+    let n = mock.calls.lock().unwrap().len();
+    assert!(
+        n > 0 && n <= 20,
+        "a 100-emit flood must be capped at the burst (20), got {n}"
+    );
+}
+
+#[test]
+fn ungranted_plugin_importing_emit_fails_to_load() {
+    // The emit fixture imports `emit`; without the grant the host doesn't link
+    // that interface, so the component can't instantiate — the enforcement that
+    // an ungranted plugin simply cannot acquire the capability.
+    assert!(
+        Runtime::new(vec![emit_config("emit_message", false)]).is_err(),
+        "an ungranted plugin that imports emit must fail to load"
+    );
 }

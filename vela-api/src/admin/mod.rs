@@ -122,6 +122,18 @@ pub fn assert_bot_localpart_not_reserved(
             "the localpart {reserved:?} is reserved for the server admin bot"
         ))));
     }
+    // The `_ext_` prefix is reserved for extension plugin bots (`@_ext_<name>`).
+    // Reserving it keeps the loop-protection invariant honest: events from any
+    // `@_ext_` sender are dropped from observation, so a human must not be able
+    // to take such a name (their messages would silently vanish from on_event).
+    if requested_localpart
+        .to_ascii_lowercase()
+        .starts_with("_ext_")
+    {
+        return Err(ApiError(VelaError::Forbidden(
+            "the \"_ext_\" localpart prefix is reserved for extension plugin bots".to_string(),
+        )));
+    }
     Ok(())
 }
 
@@ -1863,20 +1875,7 @@ fn bot_auth_user(state: &AppState) -> Result<crate::middleware::auth::Authentica
 /// Post a `m.notice` to the admin room as the bot. Inline send: builds
 /// the event, runs auth_check, persists, dispatches sync wake-ups.
 async fn send_bot_notice(state: &AppState, room_nid: u64, reply: Reply) -> Result<(), ApiError> {
-    let signing_key = get_or_create_signing_key(state)?;
-    let server_name = &state.config.server_name;
-    let room_version = state
-        .db
-        .get_room_version_typed(room_nid)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    let room_id_str = state
-        .db
-        .resolve_nid(room_nid)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        .ok_or_else(|| ApiError(VelaError::Store("admin room id lookup failed".into())))?;
-    let room_id = RoomId::parse(&room_id_str)
-        .map_err(|_| ApiError(VelaError::Store("admin room id malformed".into())))?;
-
+    let bot = bot_auth_user(state)?;
     let mut content = Map::new();
     content.insert("msgtype".into(), Value::String("m.notice".into()));
     content.insert("body".into(), Value::String(reply.text));
@@ -1887,7 +1886,52 @@ async fn send_bot_notice(state: &AppState, room_nid: u64, reply: Reply) -> Resul
         );
         content.insert("formatted_body".into(), Value::String(html));
     }
-    let content_val = Value::Object(content);
+    emit_event_as(
+        state,
+        room_nid,
+        bot.user_nid,
+        &bot.user_id,
+        "m.room.message",
+        Value::Object(content),
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Build, authorise, persist, and dispatch a single event into a room **as a
+/// given local user** — the shared primitive behind the admin bot
+/// ([`send_bot_notice`]) and the extension `emit-event` capability. The caller
+/// supplies the sender (a server-controlled local user — the admin bot or a
+/// plugin's `@_ext_*` bot), the event type, content, and an optional state key.
+///
+/// Authorisation is **not** bypassed: the event runs through `authorise_event`
+/// against current room state, so the sender must be joined with sufficient
+/// power level or this returns an error. Federation broadcast is included so an
+/// emitted event reaches the room's remote peers (a no-op for local-only rooms).
+/// Returns the new event's id.
+pub(crate) async fn emit_event_as(
+    state: &AppState,
+    room_nid: u64,
+    sender_nid: u64,
+    sender_user_id: &str,
+    event_type: &str,
+    content: Value,
+    state_key: Option<&str>,
+) -> Result<EventId, ApiError> {
+    let signing_key = get_or_create_signing_key(state)?;
+    let server_name = &state.config.server_name;
+    let room_version = state
+        .db
+        .get_room_version_typed(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let room_id_str = state
+        .db
+        .resolve_nid(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        .ok_or_else(|| ApiError(VelaError::Store("emit: room id lookup failed".into())))?;
+    let room_id = RoomId::parse(&room_id_str)
+        .map_err(|_| ApiError(VelaError::Store("emit: room id malformed".into())))?;
 
     let lock = state
         .room_locks
@@ -1921,7 +1965,6 @@ async fn send_bot_notice(state: &AppState, room_nid: u64, reply: Reply) -> Resul
         }
     }
 
-    let bot = bot_auth_user(state)?;
     let auth_events = {
         let lookup = |etype: &str, skey: &str| -> Option<EventId> {
             let tn = state.db.get_nid(etype).ok()??;
@@ -1934,19 +1977,19 @@ async fn send_bot_notice(state: &AppState, room_nid: u64, reply: Reply) -> Resul
                 .and_then(|s| EventId::parse(&s).ok())
         };
         select_auth_events(
-            "m.room.message",
-            &bot.user_id,
-            None,
-            Some(&content_val),
+            event_type,
+            sender_user_id,
+            state_key,
+            Some(&content),
             room_version,
             &lookup,
         )
     };
     let (event, event_id) = build_event(
-        "m.room.message",
-        None,
-        content_val,
-        &bot.user_id,
+        event_type,
+        state_key,
+        content,
+        sender_user_id,
         Some(&room_id),
         &prev_event_ids,
         &auth_events,
@@ -1958,10 +2001,20 @@ async fn send_bot_notice(state: &AppState, room_nid: u64, reply: Reply) -> Resul
     authorise_event(state, room_nid, &event_id, &event, None)?;
     let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&event);
+    // Bound event size like a normal send, so a plugin (or the admin bot) can't
+    // persist an event larger than the PDU limit that peers would then reject.
+    crate::room::send::enforce_event_size(&json_bytes)?;
     let type_nid = state
         .db
-        .get_or_create_nid("m.room.message")
+        .get_or_create_nid(event_type)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let state_key_nid = match state_key {
+        Some(sk) => state
+            .db
+            .get_or_create_nid(sk)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?,
+        None => 0,
+    };
     let auth_nids: Vec<u64> = auth_events
         .iter()
         .filter_map(|id| state.db.get_event_nid_by_id(id.as_str()).ok().flatten())
@@ -1977,14 +2030,14 @@ async fn send_bot_notice(state: &AppState, room_nid: u64, reply: Reply) -> Resul
             event_id.as_str(),
             room_nid,
             type_nid,
-            bot.user_nid,
-            0,
+            sender_nid,
+            state_key_nid,
             origin_ts,
             max_depth + 1,
             &json_bytes,
             &extremity_nids,
             &auth_nids,
-            false,
+            state_key.is_some(),
             false,
         )
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
@@ -1992,10 +2045,17 @@ async fn send_bot_notice(state: &AppState, room_nid: u64, reply: Reply) -> Resul
         .db
         .update_room_bump(room_nid, origin_ts, event_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    // Reach the room's remote peers (no-op for a local-only room).
+    state.federation_sender.broadcast(room_nid, event_nid);
     if let Some(sender) = state.room_senders.get(&Nid(room_nid)) {
         let _ = sender.send(stream_pos);
     }
-    Ok(())
+    // NOTE: like the admin bot, this path does not (yet) run relation indexing,
+    // push dispatch, or appservice interest for the emitted event — so a
+    // plugin-emitted reaction won't show in /relations and a reply won't push.
+    // Acceptable for v1 (notices/bot output); revisit when plugins post
+    // user-facing replies that should notify.
+    Ok(event_id)
 }
 
 fn now_ms() -> u64 {

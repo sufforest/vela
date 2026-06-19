@@ -596,6 +596,28 @@ mod admin_integration_tests {
         assert!(matches!(err.0, VelaError::Forbidden(_)));
     }
 
+    /// The `_ext_` localpart prefix is reserved for extension plugin bots — a
+    /// human must not register `@_ext_*`, or their events would be silently
+    /// dropped from observation (loop protection skips that prefix).
+    #[tokio::test]
+    async fn register_refuses_ext_prefix() {
+        let (state, _tmp) = build_test_state();
+        crate::admin::bootstrap(&state).await.unwrap();
+        state
+            .db
+            .create_registration_token("tok-a", 0, 0, 0)
+            .unwrap();
+        let auth = json!({"type": "m.login.registration_token", "token": "tok-a"});
+        let err = register(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            body_with(Some(auth), "_ext_evil", "secret123"),
+        )
+        .await
+        .expect_err("_ext_ prefix reserved");
+        assert!(matches!(err.0, VelaError::Forbidden(_)));
+    }
+
     /// First human registrant is auto-invited to the admin room.
     /// Second registrant is not.
     #[tokio::test]

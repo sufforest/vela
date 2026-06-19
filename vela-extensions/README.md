@@ -30,6 +30,7 @@ name = "keyword-filter"                # for logs, errors, metrics
 wasm_path = "/etc/vela/plugins/keyword-filter.wasm"
 event_types = ["m.room.message"]       # optional; omit to run for all events
 points = ["check_event"]               # which hooks: check_event and/or on_event
+capabilities = []                      # host caps to grant, e.g. ["emit-event"]
 fail_policy = "open"                   # "open" (default) | "closed"
 fuel = 50000000                        # per-call CPU budget (≈ instructions)
 wall_ms = 100                          # per-call wall-clock budget; 0 disables
@@ -43,6 +44,7 @@ config = { banned = ["spam"] }         # opaque JSON, handed to the plugin
 | `wasm_path` | — (required) | path to the `.wasm` component |
 | `event_types` | all | only invoke for these event types |
 | `points` | `["check_event"]` | hooks the plugin binds: `check_event` (sync decision) and/or `on_event` (async observation) |
+| `capabilities` | `[]` | host capabilities to grant (least-privilege): `emit-event` lets it post events as its bot. `logging` is always on |
 | `fail_policy` | `open` | on trap/timeout: `open` allows, `closed` blocks |
 | `fuel` | 50,000,000 | per-call instruction budget |
 | `wall_ms` | 100 | per-call wall-clock budget (ms); `0` = off |
@@ -84,12 +86,23 @@ Two extension points (a plugin binds either or both via `points`):
   observer is sandbox-bounded and can't stall the queue behind it.
 
 Plugins are **stateless** and get only the **host capabilities** you grant — no
-network, disk, or syscalls. Today the one capability is **logging**: a plugin can
-write a line to vela's log, emitted at the `vela::extensions::plugin` target and
-tagged with the plugin's name (so you can filter or route it), with the message
-truncated and the line count per call bounded so a chatty plugin can't flood the
-log. Otherwise a plugin sees only the event and its own config. (`emit-event` and
-a small `kv` store are planned as further capabilities.)
+network, disk, or syscalls. Granted least-privilege per plugin via `capabilities`:
+
+- **`logging`** (always on) — write a line to vela's log at the
+  `vela::extensions::plugin` target, tagged with the plugin's name (so you can
+  filter or route it); the message is truncated and the per-call line count
+  bounded so a chatty plugin can't flood the log. Pure output.
+- **`emit-event`** (grant with `capabilities = ["emit-event"]`, needs the
+  `on_event` point) — post an event into a room as the plugin's own bot user,
+  `@_ext_<name>`. The bot is a real, passwordless user; **invite it** to a room
+  and give it power level for it to act there — emits go through normal room
+  authorization, so an un-invited bot just gets rejected (no auth bypass). v1
+  allows messages, reactions, and redactions (no state events); emits are
+  rate-capped per plugin, and a plugin never observes its own emitted events
+  (loop protection). Use it for auto-responders, moderation actions, and bots.
+
+Otherwise a plugin sees only the event and its own config. (A small per-plugin
+`kv` store is planned as a further capability.)
 
 ## Security model
 
