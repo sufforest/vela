@@ -15,7 +15,7 @@
 //!   window between persisting an event and queuing it drops that one
 //!   observation — acceptable for observation (it isn't moderation; that's the
 //!   inline decision path).
-//! - **Bounded.** The queue is capped ([`MAX_DEPTH`]); if the worker stalls or
+//! - **Bounded.** The queue is capped (`MAX_DEPTH`); if the worker stalls or
 //!   falls far behind, the oldest entries are shed (and logged) so a stuck
 //!   observer can't grow the on-disk queue without limit.
 //! - **No single entry can wedge it.** A plugin trap, a host-side panic, and a
