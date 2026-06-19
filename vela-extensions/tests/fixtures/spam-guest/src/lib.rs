@@ -12,6 +12,8 @@
 //!               call is a fresh instance it must always Allow — proves the
 //!               stateless contract behaviorally
 //!   "block"   → always Block
+//!   "log"     → (on_event) emit one line at each level via the logging cap
+//!   "logflood"→ (on_event) call the logging cap 10k× → host must bound it
 //!   (default) → Block iff the event JSON contains "SPAM", else Allow
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -102,12 +104,33 @@ fn blocked(reason: &str) -> Verdict {
     })
 }
 
-// Observation hook. Exercises the same sandbox-bound trap modes so on_event's
-// fuel/memory/wall bounds are testable; otherwise a no-op (there's nothing for
-// an observer to do without host capabilities yet).
+// Observation hook. Exercises the sandbox-bound trap modes (so on_event's
+// fuel/memory/wall bounds are testable) and the `logging` host capability.
 impl exports::vela::extension::observation::Guest for Component {
     fn on_event(ctx: exports::vela::extension::observation::EventContext) {
+        run_log_modes(&ctx.plugin_config);
         run_trap_modes(&ctx.plugin_config);
+    }
+}
+
+// Exercise the `logging` host import (a host capability — the guest calling back
+// into vela). "logflood" calls it far past the host's per-call budget to prove
+// the host bounds it; "log" emits one line at each level.
+fn run_log_modes(cfg: &str) {
+    use vela::extension::logging::{log, LogLevel};
+    if cfg.contains("logflood") {
+        for i in 0..10_000u32 {
+            log(LogLevel::Info, "flood");
+            core::hint::black_box(i);
+        }
+        return;
+    }
+    if cfg.contains("log") {
+        log(LogLevel::Error, "observed event (error)");
+        log(LogLevel::Warn, "observed event (warn)");
+        log(LogLevel::Info, "observed event (info)");
+        log(LogLevel::Debug, "observed event (debug)");
+        log(LogLevel::Trace, "observed event (trace)");
     }
 }
 

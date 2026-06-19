@@ -3,9 +3,12 @@
 // generates its side with `wit-bindgen`. The Component Model lifts these typed
 // records across the sandbox boundary — no hand-rolled linear-memory marshaling.
 //
-// Versioned by the package version. An incompatible change bumps it; the host
-// refuses to instantiate a component whose interface version it doesn't know.
-package vela:extension@0.2.0;
+// Versioned by the package version. Adding an export is breaking (a guest must
+// provide it); adding an import — a host capability the guest may ignore — is
+// compatible, so it's a minor bump. Components match structurally: a guest
+// instantiates as long as it exports what the world requires and imports only
+// capabilities the host granted it.
+package vela:extension@0.3.0;
 
 interface decision {
     // Where an event originated. A `block` verdict is a hard reject for `local`
@@ -44,8 +47,9 @@ interface decision {
         block(block-reason),
     }
 
-    // The decision hook (sync, on the critical path). Pure: no host
-    // capabilities are granted here.
+    // The decision hook (sync, on the critical path). Host capabilities are
+    // reachable from here at the world level, but the SDK withholds them to keep
+    // the hot path pure — capabilities are surfaced through the observation hook.
     check-event: func(ctx: event-context) -> verdict;
 }
 
@@ -59,11 +63,32 @@ interface observation {
     on-event: func(ctx: event-context);
 }
 
+// Host capabilities — IMPORTS the guest may call back into. These are the only
+// way out of the sandbox: a plugin can do nothing to the world except through
+// the capabilities the host grants it. v1 grants `logging` (write a line to
+// vela's log, attributed to the plugin); `kv` and `emit-event` are added as
+// sibling interfaces later, each grantable independently.
+interface logging {
+    enum log-level {
+        error,
+        warn,
+        info,
+        debug,
+        trace,
+    }
+
+    // Write one line to vela's log, tagged with this plugin's name. Pure output:
+    // no events, no I/O. Best-effort — the host may truncate the message and
+    // rate-limit calls within a single invocation.
+    log: func(level: log-level, message: string);
+}
+
 // A plugin component exports both interfaces. A plugin that only cares about one
 // no-ops the other (the SDK provides no-op defaults); the operator's `points`
-// config decides which the host actually invokes. Later versions add
-// host-capability imports (log, kv, emit-event…) for the action/bot shape.
+// config decides which the host actually invokes. It may also import host
+// capabilities (`logging` today) — the host provides those it grants.
 world plugin {
+    import logging;
     export decision;
     export observation;
 }

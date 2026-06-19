@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::Value;
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use crate::abi::{EventContext, Origin, Verdict};
@@ -19,6 +19,18 @@ use crate::config::PluginConfig;
 /// resolution of the per-plugin `wall_ms` deadline.
 const EPOCH_TICK_MS: u64 = 10;
 
+/// Longest plugin log message the host will emit; longer is truncated. Bounds
+/// the log *volume* a `log` call produces — not the transient host allocation of
+/// lifting the guest string, which the Component Model materializes in full
+/// before truncation (bounded instead by the guest's own linear-memory cap).
+const MAX_LOG_LEN: usize = 2048;
+
+/// Most `log` calls the host honors per single plugin invocation; further calls
+/// are dropped. `HostState` is fresh per call, so this resets every event —
+/// it bounds a tight log loop within one `on_event`/`check_event` (fuel bounds
+/// the total, this bounds the line count).
+const MAX_LOG_CALLS: u32 = 64;
+
 mod bindings {
     wasmtime::component::bindgen!({
         path: "wit/extension.wit",
@@ -27,11 +39,56 @@ mod bindings {
 }
 
 use bindings::exports::vela::extension::decision as wit;
+use bindings::vela::extension::logging::{Host as LoggingHost, LogLevel};
 
 /// Per-store host state. Holds the resource limiter so memory growth is capped
-/// per instantiation; fuel lives on the store itself.
+/// per instantiation; fuel lives on the store itself. Also carries the plugin
+/// name (to attribute its log lines) and a per-invocation log-call counter.
 struct HostState {
     limits: StoreLimits,
+    name: String,
+    log_calls: u32,
+}
+
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 char.
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+impl LoggingHost for HostState {
+    /// A plugin calling the `logging` capability. Forwarded to vela's `tracing`
+    /// at a fixed target (`vela::extensions::plugin`) so operators can filter
+    /// all plugin output, tagged with the plugin name so it's attributable.
+    /// Bounded: message truncated to [`MAX_LOG_LEN`], at most [`MAX_LOG_CALLS`]
+    /// lines per invocation. The message is passed as an *argument*, never a
+    /// format string, so a plugin can't inject formatting.
+    fn log(&mut self, level: LogLevel, message: String) {
+        const TARGET: &str = "vela::extensions::plugin";
+        if self.log_calls >= MAX_LOG_CALLS {
+            if self.log_calls == MAX_LOG_CALLS {
+                self.log_calls += 1;
+                tracing::warn!(target: TARGET, plugin = %self.name, "plugin exceeded its per-call log budget; suppressing further lines");
+            }
+            return;
+        }
+        self.log_calls += 1;
+        let msg = truncate_on_char_boundary(&message, MAX_LOG_LEN);
+        let plugin = &*self.name;
+        match level {
+            LogLevel::Error => tracing::error!(target: TARGET, plugin, "{}", msg),
+            LogLevel::Warn => tracing::warn!(target: TARGET, plugin, "{}", msg),
+            LogLevel::Info => tracing::info!(target: TARGET, plugin, "{}", msg),
+            LogLevel::Debug => tracing::debug!(target: TARGET, plugin, "{}", msg),
+            LogLevel::Trace => tracing::trace!(target: TARGET, plugin, "{}", msg),
+        }
+    }
 }
 
 /// A loaded, ready-to-instantiate plugin. The component is compiled once at
@@ -84,8 +141,14 @@ impl Plugin {
         let component =
             Component::new(engine, &cfg.wasm).map_err(|e| PluginError::Load(e.to_string()))?;
 
-        // PR1 grants no host capabilities, so the linker is empty.
-        let linker: Linker<HostState> = Linker::new(engine);
+        // Grant host capabilities by adding them to the linker. A plugin that
+        // doesn't import `logging` simply ignores it; one that does gets it.
+        let mut linker: Linker<HostState> = Linker::new(engine);
+        bindings::vela::extension::logging::add_to_linker::<_, HasSelf<HostState>>(
+            &mut linker,
+            |s| s,
+        )
+        .map_err(|e| PluginError::Load(e.to_string()))?;
         let pre = linker
             .instantiate_pre(&component)
             .and_then(bindings::PluginPre::new)
@@ -111,7 +174,14 @@ impl Plugin {
         let limits = StoreLimitsBuilder::new()
             .memory_size(self.cfg.memory_pages as usize * 64 * 1024)
             .build();
-        let mut store = Store::new(&self.engine, HostState { limits });
+        let mut store = Store::new(
+            &self.engine,
+            HostState {
+                limits,
+                name: self.cfg.name.clone(),
+                log_calls: 0,
+            },
+        );
         store.limiter(|s| &mut s.limits);
         store
             .set_fuel(self.cfg.fuel)
@@ -226,5 +296,25 @@ impl Drop for EpochTicker {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_respects_char_boundaries_and_cap() {
+        // Under the cap: returned whole.
+        assert_eq!(truncate_on_char_boundary("hello", 64), "hello");
+        // ASCII over the cap: cut exactly at the cap.
+        let s = "a".repeat(100);
+        assert_eq!(truncate_on_char_boundary(&s, 10).len(), 10);
+        // Multibyte over the cap: cut backwards to a char boundary, never mid-char
+        // (so the result is always valid UTF-8 and never panics).
+        let m = "é".repeat(100); // each 'é' is 2 bytes
+        let cut = truncate_on_char_boundary(&m, 5); // 5 lands mid-char → backs to 4
+        assert_eq!(cut.len(), 4);
+        assert!(cut.chars().all(|c| c == 'é'));
     }
 }

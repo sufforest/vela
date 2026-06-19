@@ -471,3 +471,63 @@ fn a_plugin_can_bind_both_points() {
     assert!(rt.binds_on_event());
     rt.on_event(&ctx_for(&message("hi"), "m.room.message")); // no-op observe, returns
 }
+
+// --- logging capability (the first host import) ----------------------------
+
+/// Minimal tracing subscriber that counts events at a target — proves the
+/// `logging` host import reaches vela's log, with no dev-dependency. Span
+/// methods are stubs; only `event` is observed.
+struct LogCounter {
+    target: &'static str,
+    count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl tracing::Subscriber for LogCounter {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if event.metadata().target() == self.target {
+            self.count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+fn count_plugin_logs(rt: &Runtime, ctx: &EventContext<'_>) -> usize {
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sub = LogCounter {
+        target: "vela::extensions::plugin",
+        count: count.clone(),
+    };
+    tracing::subscriber::with_default(sub, || rt.on_event(ctx));
+    count.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[test]
+fn on_event_logging_capability_reaches_velas_log() {
+    // The guest calls back into the host via the `logging` import; the line must
+    // arrive at vela's plugin log target. The "log" fixture emits one per level.
+    let rt = Runtime::new(vec![observer("logger", "log")]).expect("loads");
+    let n = count_plugin_logs(&rt, &ctx_for(&message("hello"), "m.room.message"));
+    assert_eq!(n, 5, "one line per level should reach the log");
+}
+
+#[test]
+fn on_event_log_flood_is_host_bounded() {
+    // A plugin that calls the logging cap 10k× must not flood the log: the host
+    // caps lines per invocation, so far fewer than 10k reach tracing.
+    let rt = Runtime::new(vec![observer("flooder", "logflood")]).expect("loads");
+    let n = count_plugin_logs(&rt, &ctx_for(&message("hello"), "m.room.message"));
+    assert!(n > 0, "some lines should be emitted");
+    // The exact contract: at most MAX_LOG_CALLS (64) honored + 1 suppression
+    // notice. 10k calls collapse to ≤65 — pin it tightly, not just "< a lot".
+    assert!(n <= 65, "the host must bound a log flood to 64+1, got {n}");
+}
