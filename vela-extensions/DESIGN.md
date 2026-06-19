@@ -86,9 +86,13 @@ way; feature-off it's a no-op the optimizer deletes. No `#[cfg]` at call sites.
 The dependency surface is therefore **opt-out, not unconditional** — which
 removes wasmtime's one cost that actually bit us. `wit-bindgen` is **not** a
 host dependency (the host uses wasmtime's built-in `component::bindgen!`); it
-belongs only in the guest SDK (PR3).
+belongs only in the guest SDK.
 
-## Architecture (built for the end state, in stages)
+## Architecture (the design)
+
+The target architecture the runtime is built into — see **What's built** below
+for current status. The shape is deliberate: the platform grows by *addition*
+(new points, new capabilities), not by changing the dispatcher or the contract.
 
 ```
 event ─→ Dispatcher ──┬─ sync decision points  (inline, bounded, fail-open)
@@ -127,7 +131,7 @@ adding capabilities/points, never by changing the dispatcher or interface.**
   a tight **fuel + memory budget**, **fail-open**, and **serialize the event
   once**, shared across interested plugins, only when any is interested.
   **Field projection** from the manifest → serialize only requested fields.
-  JSON marshaling — not wasmi execution — is the real cost; these gates kill
+  JSON marshaling — not wasm execution — is the real cost; these gates kill
   it.
 - **Async observation/action path:** dispatched to a **worker pool**, never
   blocking send/receive. Bots / code-judge / heavy work run here.
@@ -210,39 +214,50 @@ version — interface evolution is a WIT change, not a wire-format hack.
   per-call budget and can add an epoch deadline as a wall-clock backstop —
   having both is a concrete win over an interpreter's fuel-only metering.
 
-## Staged plan (each stage = a real slice of the end state)
+## What's built
 
-1. **PR1 — the crate core:** the WIT interface + `component::bindgen!`,
-   wasmtime runtime behind the **`wasmtime-runtime` feature** (types + no-op
-   `Runtime` compile without it), `Plugin` (component load/instantiate, fuel +
-   memory limits via `StoreLimits`, fail policy), `Runtime` dispatch for
-   `check_event` with multi-plugin block-if-any + scoped activation, config
-   types, **adversarial sandbox tests** (infinite loop → fuel trap; memory bomb
-   → cap; trap/garbage → fail policy) + happy path. Self-contained — no vela-api
-   wiring. Test fixtures are real components (a tiny Rust guest compiled to a
-   component, or hand-authored component WAT).
-2. **PR2 — wire the sync decision path (done):** `[extensions]` config +
-   loading, `AppState.extensions`, the `check_event` gate on **local send**
-   (both message + state paths, after auth / before persist), block →
-   `M_FORBIDDEN`-style 403 carrying the plugin's errcode/reason, decision +
-   latency metrics, serialize-once across plugins, and the **epoch wall-clock
-   deadline** backstop. Integration test against the real fixture component.
-   The runtime is **opt-in at the binary level** (`--features extensions`; the
-   release Docker image builds with it) so the default `cargo build` and the
-   `cargo test --workspace` CI job stay wasmtime-free — otherwise every vela-api
-   test binary would statically link wasmtime. A dedicated CI job runs the gate
-   tests with the feature on.
-3. **PR3 — SDK + example:** `vela-extension-sdk` + an example plugin compiled
-   to real `.wasm`; operator docs.
-4. **PR4+ — async path + capabilities:** worker pool, `kv-state`,
-   `emit-event` (identity + loop protection) → action hooks/bots; then
-   federation soft-fail, scope routing, `http-fetch`/`timer`/`query`, the
-   multi-language typed SDK; re-evaluate wasmtime if heavy-compute arrives.
+Each was a self-contained slice; together they form a usable, sandboxed
+moderation platform.
 
-## Explicitly deferred (so we don't sleepwalk into them)
+- **Runtime core** — the WIT interface + `component::bindgen!`; the wasmtime
+  runtime behind the `wasmtime-runtime` feature (the types + a no-op `Runtime`
+  compile without it); `Plugin` (component load/instantiate under fuel + memory
+  + wall-clock limits, fail policy); `Runtime` dispatch for `check_event`
+  (multi-plugin block-if-any + scoped activation), serializing the event once
+  and sharing it across plugins. Adversarial sandbox tests: infinite loop →
+  fuel trap, memory bomb → cap, unbounded recursion → stack trap, explicit
+  trap/garbage → fail policy, plus concurrency and statelessness.
+- **Local-send enforcement** — `[extensions]` config + loading,
+  `AppState.extensions`, the `check_event` gate on local message + state sends
+  (after auth, before persist); a block → 403 with the plugin's errcode/reason.
+  Decision + latency metrics.
+- **Opt-in build** — the runtime is opt-in (`--features extensions`; the release
+  Docker image builds with it). `vela-extensions` has no default features, so
+  `cargo build --workspace` stays wasmtime-free; a dedicated CI job runs the
+  runtime tests with the feature on.
+- **SDK + example** — `vela-extension-sdk` (ergonomic guest wrapper +
+  `export_plugin!`) and the `keyword-filter` example, in a detached
+  `extensions/` workspace; the author + operator READMEs.
+- **Hot reload** — `SIGHUP` re-reads `[extensions]` and atomically swaps the
+  plugin set (`ArcSwap`, lock-free on the send path), keep-old-on-failure.
+- **Federation moderation** — `check_event` on inbound federated events; a block
+  **soft-fails** the event (stored, hidden from local `/sync` + `/event`, still
+  served to peer servers), never hard-rejects.
 
-`emit-event` carries an identity + re-entrancy/loop-protection design bigger
-than "add callbacks." Federation soft-fail is a deliberate vertical, not a
-freebie. Arbitrary-nested-WASM execution is intentionally **not** a host
+## Future direction & non-goals
+
+The platform grows by adding extension points and capabilities, never by
+changing the dispatcher:
+
+- **More decision points** at the spec's other discretion places (registration,
+  media upload, login, invites/joins) — each a registry entry of the same
+  decision shape.
+- **An async observation/action path** (a worker pool off the hot path) plus
+  host capabilities (`kv` state; `emit-event` with a per-plugin bot identity +
+  loop protection) — these unlock observation and bots.
+
+Non-goal: arbitrary-nested-WASM execution is intentionally **not** a host
 capability — a code-judge bundles its own interpreter, bounded by the generic
-sandbox limits (proves the capability set is general).
+sandbox limits (which proves the capability set is general). The platform ships
+generic *mechanisms*; specific behaviors (bots, judges, scanners) are plugins
+built on top, authored out of repo.
