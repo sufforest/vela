@@ -2167,6 +2167,63 @@ impl Database {
         Ok(max)
     }
 
+    /// Push one observed event onto the WASM extension observation
+    /// queue. One global stream keyed by `seq` (BE); the worker drains
+    /// it oldest-first and runs every `on_event`-bound plugin.
+    pub fn push_observe_queue(&self, seq: u64, value: &Value) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("wasm_observe_queue").unwrap();
+        self.db
+            .put_cf(&cf, keys::encode_u64(seq), value.to_string().as_bytes())
+    }
+
+    /// Peek the oldest pending observation. Returns `(seq, value)` so
+    /// the caller can delete it after the plugins have run.
+    pub fn peek_observe_queue(&self) -> Result<Option<(u64, Value)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("wasm_observe_queue").unwrap();
+        for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (k, v) = item?;
+            if k.len() != 8 {
+                continue;
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&k);
+            let seq = u64::from_be_bytes(buf);
+            if let Ok(val) = serde_json::from_slice::<Value>(&v) {
+                return Ok(Some((seq, val)));
+            }
+            // Unparseable entry: drop it so the queue can make progress.
+            self.db.delete_cf(&cf, &k)?;
+        }
+        Ok(None)
+    }
+
+    /// Remove an observation after its plugins have run. Idempotent.
+    pub fn pop_observe_queue(&self, seq: u64) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("wasm_observe_queue").unwrap();
+        self.db.delete_cf(&cf, keys::encode_u64(seq))
+    }
+
+    /// Boot-time scan of the observation queue: `(highest seq, entry count)`.
+    /// The max primes the in-memory sequence counter so ids aren't reused; the
+    /// count primes the depth gauge so the backpressure cap accounts for
+    /// entries a previous run left behind.
+    pub fn observe_queue_bounds(&self) -> Result<(Option<u64>, u64), rocksdb::Error> {
+        let cf = self.db.cf_handle("wasm_observe_queue").unwrap();
+        let mut max = None;
+        let mut count = 0u64;
+        for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (k, _) = item?;
+            if k.len() != 8 {
+                continue;
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&k);
+            max = Some(u64::from_be_bytes(buf));
+            count += 1;
+        }
+        Ok((max, count))
+    }
+
     /// Append an abuse report into `event_reports`. Key is
     /// `[ts_ns_be][reporter_nid_be]`. Nanosecond resolution avoids
     /// same-millisecond collisions when one user submits multiple

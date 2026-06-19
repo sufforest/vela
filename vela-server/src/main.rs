@@ -918,14 +918,6 @@ fn build_extension_runtime(
                 p.name
             );
         }
-        if points.on_event {
-            // Host-side observation dispatch isn't wired yet; an on_event plugin
-            // loads and validates but isn't invoked. Make that loud, not silent.
-            tracing::warn!(
-                plugin = %p.name,
-                "extensions: on_event is bound but observation dispatch is not wired yet — this plugin will not be invoked"
-            );
-        }
         configs.push(vela_extensions::PluginConfig {
             name: p.name.clone(),
             wasm,
@@ -1246,6 +1238,7 @@ fn main() -> anyhow::Result<()> {
         let extensions = Arc::new(arc_swap::ArcSwap::from_pointee(build_extension_runtime(
             &config.extensions,
         )?));
+        let observe_queue = vela_api::extensions::ObserveQueue::new(&db);
 
         // SIGHUP → re-read [extensions] from the config file and atomically swap
         // the plugin set in. A bad new config (missing file, invalid component)
@@ -1403,6 +1396,7 @@ fn main() -> anyhow::Result<()> {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
             extensions,
+            observe_queue,
         };
 
         // Admin bot + admin room bootstrap. Idempotent: creates the
@@ -1423,6 +1417,14 @@ fn main() -> anyhow::Result<()> {
         // Always on — there's no useful "off" mode (would mean stale
         // presence survives forever, which is the bug this fixes).
         let _presence_sweeper_handle = vela_api::presence::presence_sweeper::spawn(state.clone());
+
+        // Extension async observation worker. Drains the durable observation
+        // queue and runs every `on_event`-bound plugin off the request path.
+        // Always running (cheap when idle), so a SIGHUP that adds an on_event
+        // plugin starts being observed without a restart.
+        let _observe_worker_handle = state
+            .observe_queue
+            .spawn_worker(db.clone(), state.extensions.clone());
 
         // Start per-AS outbound delivery workers for every persisted
         // registration. Workers exit cleanly when their AS is

@@ -140,6 +140,26 @@ fn local_extension_gate(
     }
 }
 
+/// Queue a just-persisted local event for the async observation point
+/// (`on_event`). No-op — and no serialization — unless some plugin binds
+/// `on_event`. Best-effort: the event is already persisted and federated, so a
+/// failed enqueue is logged inside the queue, never surfaced to the client.
+fn observe_local_event(
+    state: &AppState,
+    event: &serde_json::Map<String, Value>,
+    room_id: &str,
+    sender: &str,
+    event_type: &str,
+) {
+    // Lock-free snapshot, like the decision gate: a concurrent SIGHUP reload
+    // can't tear this check.
+    if state.extensions.load().binds_on_event() {
+        state
+            .observe_queue
+            .enqueue(&state.db, event, room_id, sender, event_type);
+    }
+}
+
 pub(crate) async fn send_message_inner(
     state: AppState,
     user: AuthenticatedUser,
@@ -338,6 +358,9 @@ pub(crate) async fn send_message_inner(
 
     // Federate to remote servers that have joined members in this room.
     state.federation_sender.broadcast(room_nid, event_nid);
+
+    // Observe (async): hand the persisted event to any on_event plugins.
+    observe_local_event(&state, &event, room_id.as_str(), &user.user_id, &event_type);
 
     // Store transaction for idempotency
     state
@@ -720,6 +743,9 @@ pub(crate) async fn send_state_inner(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     state.federation_sender.broadcast(room_nid, event_nid);
+
+    // Observe (async): hand the persisted state event to any on_event plugins.
+    observe_local_event(&state, &event, room_id.as_str(), &user.user_id, &event_type);
 
     if let Some(sender) = state.room_senders.get(&Nid(room_nid)) {
         let _ = sender.send(stream_pos);

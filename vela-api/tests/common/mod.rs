@@ -141,6 +141,7 @@ impl Harness {
             Arc::new(vela_api::appservice::AsRegistry::open(db.clone()).expect("as registry"));
         let appservice_outbox =
             vela_api::appservice::outbox::AsOutbox::new(db.clone(), appservice_registry.clone());
+        let observe_queue = vela_api::extensions::ObserveQueue::new(&db);
         let state = AppState {
             db,
             config: Arc::new(ServerConfig {
@@ -201,6 +202,7 @@ impl Harness {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
             extensions: vela_api::router::empty_extension_runtime(),
+            observe_queue,
         };
         let router = build_router(state.clone());
         Harness {
