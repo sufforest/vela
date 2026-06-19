@@ -2224,6 +2224,167 @@ impl Database {
         Ok((max, count))
     }
 
+    // --- WASM extension `kv` capability ------------------------------------
+    //
+    // Per-plugin key→value store. The host prepends `plugin_nid` to every key
+    // (hard isolation), values are `[expiry_ms:8 BE] | payload` (TTL; 0 = none),
+    // and a per-plugin byte gauge in `wasm_kv_quota` enforces the reject-on-full
+    // backstop. Callers MUST serialize writes per plugin (the quota
+    // read-modify-write is not internally locked); `ApiKvStore` holds that lock.
+
+    /// Read a plugin's kv entry. Returns the payload, or `None` if absent or
+    /// expired. An expired entry is left in place for the sweep to reap — `get`
+    /// never writes, so it needs no lock.
+    pub fn kv_get(
+        &self,
+        plugin_nid: u64,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<Vec<u8>>, rocksdb::Error> {
+        let cf = self.db.cf_handle("wasm_kv").unwrap();
+        match self
+            .db
+            .get_cf(&cf, keys::encode_u64_bytes(plugin_nid, key))?
+        {
+            Some(raw) if raw.len() >= 8 => {
+                let mut e = [0u8; 8];
+                e.copy_from_slice(&raw[..8]);
+                let expiry = u64::from_be_bytes(e);
+                if expiry != 0 && now_ms >= expiry {
+                    Ok(None)
+                } else {
+                    Ok(Some(raw[8..].to_vec()))
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Set a plugin's kv entry with an optional TTL (`expiry_ms == 0` → no
+    /// expiry), enforcing `quota_bytes` (counting key+value bytes). Returns
+    /// `Ok(false)` if the write would exceed the quota (rejected, nothing
+    /// written), `Ok(true)` if stored.
+    pub fn kv_set(
+        &self,
+        plugin_nid: u64,
+        key: &[u8],
+        value: &[u8],
+        expiry_ms: u64,
+        quota_bytes: u64,
+    ) -> Result<bool, rocksdb::Error> {
+        let cf = self.db.cf_handle("wasm_kv").unwrap();
+        let qcf = self.db.cf_handle("wasm_kv_quota").unwrap();
+        let full = keys::encode_u64_bytes(plugin_nid, key);
+        let new_size = (key.len() + value.len()) as u64;
+        let old_size = match self.db.get_cf(&cf, &full)? {
+            Some(raw) => (key.len() + raw.len().saturating_sub(8)) as u64,
+            None => 0,
+        };
+        let projected = self.kv_quota_get(plugin_nid)?.saturating_sub(old_size) + new_size;
+        if projected > quota_bytes {
+            return Ok(false);
+        }
+        let mut stored = Vec::with_capacity(8 + value.len());
+        stored.extend_from_slice(&expiry_ms.to_be_bytes());
+        stored.extend_from_slice(value);
+        let mut batch = WriteBatch::default();
+        batch.put_cf(&cf, &full, &stored);
+        batch.put_cf(
+            &qcf,
+            keys::encode_u64(plugin_nid),
+            keys::encode_u64(projected),
+        );
+        self.db.write(batch)?;
+        Ok(true)
+    }
+
+    /// Delete a plugin's kv entry, decrementing its quota gauge. Idempotent.
+    pub fn kv_delete(&self, plugin_nid: u64, key: &[u8]) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("wasm_kv").unwrap();
+        let qcf = self.db.cf_handle("wasm_kv_quota").unwrap();
+        let full = keys::encode_u64_bytes(plugin_nid, key);
+        let Some(raw) = self.db.get_cf(&cf, &full)? else {
+            return Ok(());
+        };
+        let size = (key.len() + raw.len().saturating_sub(8)) as u64;
+        let cur = self.kv_quota_get(plugin_nid)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(&cf, &full);
+        batch.put_cf(
+            &qcf,
+            keys::encode_u64(plugin_nid),
+            keys::encode_u64(cur.saturating_sub(size)),
+        );
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Current quota usage (bytes) for a plugin.
+    pub fn kv_quota_get(&self, plugin_nid: u64) -> Result<u64, rocksdb::Error> {
+        let qcf = self.db.cf_handle("wasm_kv_quota").unwrap();
+        Ok(match self.db.get_cf(&qcf, keys::encode_u64(plugin_nid))? {
+            Some(b) if b.len() == 8 => {
+                let mut x = [0u8; 8];
+                x.copy_from_slice(&b);
+                u64::from_be_bytes(x)
+            }
+            _ => 0,
+        })
+    }
+
+    /// Plugin namespace nids that have a quota gauge (i.e. have stored data).
+    /// The sweeper iterates these and reaps each under that plugin's write lock.
+    pub fn kv_quota_plugins(&self) -> Result<Vec<u64>, rocksdb::Error> {
+        let qcf = self.db.cf_handle("wasm_kv_quota").unwrap();
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(&qcf, IteratorMode::Start) {
+            let (k, _) = item?;
+            if k.len() == 8 {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&k);
+                out.push(u64::from_be_bytes(b));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reap one plugin's expired entries and recompute its quota gauge from the
+    /// survivors — **authoritative**, so it heals any drift. Returns the count
+    /// reaped. The caller MUST hold this plugin's write lock (same as set/delete)
+    /// so the gauge rewrite can't race a concurrent write; processing one plugin
+    /// at a time (vs a global scan) is what makes that lock scope possible.
+    pub fn kv_sweep_plugin(&self, plugin_nid: u64, now_ms: u64) -> Result<u64, rocksdb::Error> {
+        let cf = self.db.cf_handle("wasm_kv").unwrap();
+        let qcf = self.db.cf_handle("wasm_kv_quota").unwrap();
+        let prefix = keys::encode_u64(plugin_nid);
+        let mut reaped = 0u64;
+        let mut surviving = 0u64;
+        let mut batch = WriteBatch::default();
+        for item in self.db.prefix_iterator_cf(&cf, prefix) {
+            let (k, v) = item?;
+            // prefix_iterator can run past the prefix — stop at the boundary.
+            if k.len() < 8 || k[..8] != prefix[..] {
+                break;
+            }
+            if v.len() < 8 {
+                continue;
+            }
+            let mut e = [0u8; 8];
+            e.copy_from_slice(&v[..8]);
+            let expiry = u64::from_be_bytes(e);
+            if expiry != 0 && now_ms >= expiry {
+                batch.delete_cf(&cf, &k);
+                reaped += 1;
+            } else {
+                surviving += ((k.len() - 8) + (v.len() - 8)) as u64;
+            }
+        }
+        // Always rewrite the gauge (even with nothing reaped) so it heals drift.
+        batch.put_cf(&qcf, prefix, keys::encode_u64(surviving));
+        self.db.write(batch)?;
+        Ok(reaped)
+    }
+
     /// Append an abuse report into `event_reports`. Key is
     /// `[ts_ns_be][reporter_nid_be]`. Nanosecond resolution avoids
     /// same-millisecond collisions when one user submits multiple
@@ -9268,5 +9429,122 @@ mod outbox_migration_tests {
             .unwrap()
             .unwrap();
         assert_eq!(untouched, keys::encode_u64(2));
+    }
+}
+
+#[cfg(test)]
+mod kv_tests {
+    use super::*;
+
+    fn db() -> (Database, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        (db, tmp)
+    }
+
+    const Q: u64 = 4 * 1024 * 1024;
+
+    #[test]
+    fn set_get_delete_roundtrip() {
+        let (db, _t) = db();
+        assert!(db.kv_set(7, b"k", b"hello", 0, Q).unwrap());
+        assert_eq!(
+            db.kv_get(7, b"k", 1000).unwrap().as_deref(),
+            Some(&b"hello"[..])
+        );
+        db.kv_delete(7, b"k").unwrap();
+        assert_eq!(db.kv_get(7, b"k", 1000).unwrap(), None);
+        // Delete is idempotent.
+        db.kv_delete(7, b"k").unwrap();
+    }
+
+    #[test]
+    fn ttl_expires_on_read() {
+        let (db, _t) = db();
+        // expiry at t=500.
+        assert!(db.kv_set(7, b"k", b"v", 500, Q).unwrap());
+        assert_eq!(db.kv_get(7, b"k", 499).unwrap().as_deref(), Some(&b"v"[..]));
+        assert_eq!(
+            db.kv_get(7, b"k", 500).unwrap(),
+            None,
+            "expired at exactly the deadline"
+        );
+        assert_eq!(db.kv_get(7, b"k", 999).unwrap(), None);
+    }
+
+    #[test]
+    fn quota_rejects_over_budget() {
+        let (db, _t) = db();
+        // Tiny quota: 10 bytes. key(1)+value(8)=9 fits; a second 9-byte entry won't.
+        assert!(db.kv_set(7, b"a", b"01234567", 0, 10).unwrap());
+        assert!(
+            !db.kv_set(7, b"b", b"01234567", 0, 10).unwrap(),
+            "second entry exceeds quota"
+        );
+        // Overwriting the existing key with a same-size value still fits (delta 0).
+        assert!(db.kv_set(7, b"a", b"76543210", 0, 10).unwrap());
+        // Freeing space lets a new entry in.
+        db.kv_delete(7, b"a").unwrap();
+        assert!(db.kv_set(7, b"b", b"01234567", 0, 10).unwrap());
+    }
+
+    #[test]
+    fn plugins_are_isolated() {
+        let (db, _t) = db();
+        db.kv_set(1, b"same", b"one", 0, Q).unwrap();
+        db.kv_set(2, b"same", b"two", 0, Q).unwrap();
+        assert_eq!(
+            db.kv_get(1, b"same", 0).unwrap().as_deref(),
+            Some(&b"one"[..])
+        );
+        assert_eq!(
+            db.kv_get(2, b"same", 0).unwrap().as_deref(),
+            Some(&b"two"[..])
+        );
+        // Plugin 1 deleting its key doesn't touch plugin 2's.
+        db.kv_delete(1, b"same").unwrap();
+        assert_eq!(db.kv_get(1, b"same", 0).unwrap(), None);
+        assert_eq!(
+            db.kv_get(2, b"same", 0).unwrap().as_deref(),
+            Some(&b"two"[..])
+        );
+    }
+
+    #[test]
+    fn sweep_reaps_expired_and_resets_quota() {
+        let (db, _t) = db();
+        db.kv_set(7, b"keep", b"v", 0, Q).unwrap(); // no expiry
+        db.kv_set(7, b"gone1", b"v", 100, Q).unwrap();
+        db.kv_set(7, b"gone2", b"v", 200, Q).unwrap();
+        let before = db.kv_quota_get(7).unwrap();
+        assert!(before > 0);
+        assert_eq!(
+            db.kv_quota_plugins().unwrap(),
+            vec![7],
+            "one plugin has data"
+        );
+
+        let reaped = db.kv_sweep_plugin(7, 1_000).unwrap();
+        assert_eq!(reaped, 2, "both expired entries reaped");
+        // The survivor stays; the gauge is recomputed to just its size.
+        assert_eq!(
+            db.kv_get(7, b"keep", 1_000).unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
+        assert_eq!(db.kv_quota_get(7).unwrap(), (b"keep".len() + 1) as u64);
+    }
+
+    #[test]
+    fn sweep_heals_a_drifted_gauge_even_with_nothing_expired() {
+        let (db, _t) = db();
+        db.kv_set(7, b"a", b"12345", 0, Q).unwrap(); // no TTL
+        // Corrupt the gauge to simulate drift from a raced write.
+        let qcf = db.db.cf_handle("wasm_kv_quota").unwrap();
+        db.db
+            .put_cf(&qcf, keys::encode_u64(7), keys::encode_u64(9_999))
+            .unwrap();
+        // A sweep with nothing expired still recomputes the gauge authoritatively.
+        assert_eq!(db.kv_sweep_plugin(7, 1_000).unwrap(), 0);
+        assert_eq!(db.kv_quota_get(7).unwrap(), (b"a".len() + 5) as u64);
     }
 }

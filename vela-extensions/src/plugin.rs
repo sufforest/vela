@@ -12,13 +12,20 @@ use serde_json::Value;
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
+use crate::HostServices;
 use crate::abi::{EventContext, Origin, Verdict};
 use crate::config::PluginConfig;
 use crate::emit::{EmitLimiter, EmitRequest, EventEmitter, emit_type_allowed};
+use crate::kv::KvStore;
 
 /// How often the epoch ticker advances the engine's epoch. This is the
 /// resolution of the per-plugin `wall_ms` deadline.
 const EPOCH_TICK_MS: u64 = 10;
+
+/// Per-op size caps for the `kv` capability. Bound a single key/value; total
+/// footprint is bounded by the per-plugin quota (enforced in the store).
+const MAX_KV_KEY: usize = 256;
+const MAX_KV_VALUE: usize = 64 * 1024;
 
 /// Per-plugin emit rate cap (token bucket): sustained rate and burst. A
 /// legitimate bot emits in occasional bursts; this bounds a runaway/loop far
@@ -49,6 +56,7 @@ use bindings::exports::vela::extension::decision as wit;
 use bindings::vela::extension::emit::{
     EmitError as WitEmitError, Host as EmitHost, NewEvent as WitNewEvent,
 };
+use bindings::vela::extension::kv::{Host as KvHost, KvError as WitKvError};
 use bindings::vela::extension::logging::{Host as LoggingHost, LogLevel};
 
 /// Per-store host state. Holds the resource limiter so memory growth is capped
@@ -61,6 +69,57 @@ struct HostState {
     name: String,
     log_calls: u32,
     emit: Option<EmitCtx>,
+    kv: Option<KvCtx>,
+}
+
+/// Backs the `kv` capability for one invocation. Present for any kv-granted
+/// plugin (both points — kv is synchronous, so a stateful `check_event` is fine,
+/// unlike emit which is on_event-only). The store is shared (`Arc`).
+struct KvCtx {
+    store: Arc<dyn KvStore>,
+    plugin: String,
+}
+
+impl KvHost for HostState {
+    fn get(&mut self, key: Vec<u8>) -> Result<Option<Vec<u8>>, WitKvError> {
+        let ctx = self.kv.as_ref().ok_or_else(kv_not_granted)?;
+        if key.len() > MAX_KV_KEY {
+            return Err(WitKvError::NotPermitted("key too large".into()));
+        }
+        ctx.store.get(&ctx.plugin, &key).map_err(Into::into)
+    }
+
+    fn set(&mut self, key: Vec<u8>, value: Vec<u8>, ttl_ms: Option<u64>) -> Result<(), WitKvError> {
+        let ctx = self.kv.as_ref().ok_or_else(kv_not_granted)?;
+        if key.len() > MAX_KV_KEY {
+            return Err(WitKvError::NotPermitted("key too large".into()));
+        }
+        if value.len() > MAX_KV_VALUE {
+            return Err(WitKvError::NotPermitted("value too large".into()));
+        }
+        ctx.store
+            .set(&ctx.plugin, &key, &value, ttl_ms)
+            .map_err(Into::into)
+    }
+
+    fn delete(&mut self, key: Vec<u8>) -> Result<(), WitKvError> {
+        let ctx = self.kv.as_ref().ok_or_else(kv_not_granted)?;
+        ctx.store.delete(&ctx.plugin, &key).map_err(Into::into)
+    }
+}
+
+fn kv_not_granted() -> WitKvError {
+    WitKvError::NotPermitted("the kv capability is not granted to this plugin".into())
+}
+
+impl From<crate::kv::KvError> for WitKvError {
+    fn from(e: crate::kv::KvError) -> Self {
+        match e {
+            crate::kv::KvError::NotPermitted(m) => WitKvError::NotPermitted(m),
+            crate::kv::KvError::QuotaExceeded => WitKvError::QuotaExceeded,
+            crate::kv::KvError::Internal => WitKvError::Internal,
+        }
+    }
 }
 
 /// Backs the `emit-event` capability for one invocation. Present only when the
@@ -182,6 +241,9 @@ pub(crate) struct Plugin {
     emitter: Option<Arc<dyn EventEmitter>>,
     /// Per-plugin emit rate cap, shared across invocations.
     emit_limiter: Arc<EmitLimiter>,
+    /// The host kv service, present only when granted `kv` *and* a store was
+    /// injected.
+    kv: Option<Arc<dyn KvStore>>,
 }
 
 /// Why a plugin invocation failed. The runtime maps these onto the plugin's
@@ -224,15 +286,15 @@ impl Plugin {
     pub(crate) fn load(
         engine: &Engine,
         cfg: PluginConfig,
-        emitter: Option<Arc<dyn EventEmitter>>,
+        services: &HostServices,
     ) -> Result<Self, PluginError> {
         let component =
             Component::new(engine, &cfg.wasm).map_err(|e| PluginError::Load(e.to_string()))?;
 
         // Grant host capabilities by adding them to the linker. `logging` is
-        // always linked (harmless). `emit` is linked ONLY when the operator
-        // granted it — so an ungranted plugin that imports `emit` fails to
-        // instantiate (the enforcement), and one that doesn't import it is
+        // always linked (harmless). `emit` and `kv` are linked ONLY when the
+        // operator granted them — so an ungranted plugin that imports one fails
+        // to instantiate (the enforcement), and one that doesn't import it is
         // unaffected.
         let mut linker: Linker<HostState> = Linker::new(engine);
         bindings::vela::extension::logging::add_to_linker::<_, HasSelf<HostState>>(
@@ -247,24 +309,33 @@ impl Plugin {
             )
             .map_err(|e| PluginError::Load(e.to_string()))?;
         }
+        if cfg.capabilities.kv {
+            bindings::vela::extension::kv::add_to_linker::<_, HasSelf<HostState>>(
+                &mut linker,
+                |s| s,
+            )
+            .map_err(|e| PluginError::Load(e.to_string()))?;
+        }
         let pre = linker
             .instantiate_pre(&component)
             .and_then(bindings::PluginPre::new)
             .map_err(|e| PluginError::Load(e.to_string()))?;
 
-        // Only hold the emitter when the plugin is actually granted emit — a
-        // belt to the linker's suspenders (the host fn also checks the ctx).
-        let emitter = if cfg.capabilities.emit_event {
-            emitter
-        } else {
-            None
-        };
+        // Only hold a service when the plugin is actually granted it — a belt to
+        // the linker's suspenders (the host fns also check their ctx).
+        let emitter = cfg
+            .capabilities
+            .emit_event
+            .then(|| services.emitter.clone())
+            .flatten();
+        let kv = cfg.capabilities.kv.then(|| services.kv.clone()).flatten();
         Ok(Plugin {
             engine: engine.clone(),
             pre,
             cfg,
             emitter,
             emit_limiter: Arc::new(EmitLimiter::new(EMIT_RATE_PER_SEC, EMIT_BURST)),
+            kv,
         })
     }
 
@@ -293,6 +364,12 @@ impl Plugin {
             }),
             _ => None,
         };
+        // kv is available from BOTH points (it's synchronous — no block_on — so a
+        // stateful check_event is fine), so it's wired regardless of allow_emit.
+        let kv = self.kv.as_ref().map(|store| KvCtx {
+            store: store.clone(),
+            plugin: self.cfg.name.clone(),
+        });
         let mut store = Store::new(
             &self.engine,
             HostState {
@@ -300,6 +377,7 @@ impl Plugin {
                 name: self.cfg.name.clone(),
                 log_calls: 0,
                 emit,
+                kv,
             },
         );
         store.limiter(|s| &mut s.limits);

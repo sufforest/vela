@@ -12,6 +12,7 @@
 mod abi;
 mod config;
 mod emit;
+mod kv;
 mod runtime;
 
 #[cfg(feature = "wasmtime-runtime")]
@@ -20,4 +21,16 @@ mod plugin;
 pub use abi::{EventContext, Origin, Verdict};
 pub use config::{Capabilities, FailPolicy, PluginConfig, Points};
 pub use emit::{EmitError, EmitRequest, EventEmitter};
+pub use kv::{KvError, KvStore};
 pub use runtime::{Decision, Runtime, RuntimeError};
+
+/// The host services injected into a [`Runtime`] — the implementations of the
+/// capabilities that call back into the homeserver. vela-api fills these in and
+/// hands them to `Runtime::with_services`; each future internals-touching
+/// capability adds a field. `Default` (all `None`) = nothing injected, for tests
+/// and wasmtime-free embedders.
+#[derive(Clone, Default)]
+pub struct HostServices {
+    pub emitter: Option<std::sync::Arc<dyn EventEmitter>>,
+    pub kv: Option<std::sync::Arc<dyn KvStore>>,
+}

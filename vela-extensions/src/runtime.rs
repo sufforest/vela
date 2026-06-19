@@ -34,6 +34,7 @@ mod imp {
     use std::sync::Arc;
 
     use super::*;
+    use crate::HostServices;
     use crate::abi::Verdict;
     use crate::config::FailPolicy;
     use crate::emit::EventEmitter;
@@ -48,19 +49,35 @@ mod imp {
     }
 
     impl Runtime {
-        /// Compile every configured plugin with no host emit service — every
-        /// `emit-event`-granted plugin's emits will fail `not-permitted`. Used by
-        /// tests and wasmtime-free embedders; vela-server uses [`with_emitter`].
+        /// Compile every configured plugin with no host services injected —
+        /// every capability-granted plugin's calls fail. Used by tests and
+        /// wasmtime-free embedders; vela-server uses [`with_services`].
         pub fn new(configs: Vec<PluginConfig>) -> Result<Self, RuntimeError> {
-            Self::with_emitter(configs, None)
+            Self::with_services(configs, HostServices::default())
         }
 
-        /// Compile every configured plugin, injecting the host `emit-event`
-        /// service. Fails if any component is invalid — a misconfigured server
-        /// should refuse to start, not silently run with a missing policy.
+        /// Compile every configured plugin, injecting only the `emit-event`
+        /// service. Convenience over [`with_services`] for emit-only callers.
         pub fn with_emitter(
             configs: Vec<PluginConfig>,
             emitter: Option<Arc<dyn EventEmitter>>,
+        ) -> Result<Self, RuntimeError> {
+            Self::with_services(
+                configs,
+                HostServices {
+                    emitter,
+                    ..Default::default()
+                },
+            )
+        }
+
+        /// Compile every configured plugin, injecting the host capability
+        /// services (emit, kv, …). Fails if any component is invalid — a
+        /// misconfigured server should refuse to start, not silently run with a
+        /// missing policy.
+        pub fn with_services(
+            configs: Vec<PluginConfig>,
+            services: HostServices,
         ) -> Result<Self, RuntimeError> {
             let engine = Plugin::new_engine().map_err(|e| RuntimeError(e.to_string()))?;
             // Only run the epoch ticker if some plugin actually uses a
@@ -69,7 +86,7 @@ mod imp {
             let mut plugins = Vec::with_capacity(configs.len());
             for cfg in configs {
                 let name = cfg.name.clone();
-                let plugin = Plugin::load(&engine, cfg, emitter.clone())
+                let plugin = Plugin::load(&engine, cfg, &services)
                     .map_err(|e| RuntimeError(format!("plugin '{name}': {e}")))?;
                 plugins.push(plugin);
             }
@@ -192,8 +209,15 @@ mod imp {
     pub struct Runtime;
 
     impl Runtime {
-        /// Mirrors the real runtime's signature; the injected emitter is ignored
+        /// Mirrors the real runtime's signatures; injected services are ignored
         /// (no plugins run without wasmtime).
+        pub fn with_services(
+            configs: Vec<PluginConfig>,
+            _services: crate::HostServices,
+        ) -> Result<Self, RuntimeError> {
+            Self::new(configs)
+        }
+
         pub fn with_emitter(
             configs: Vec<PluginConfig>,
             _emitter: Option<std::sync::Arc<dyn crate::emit::EventEmitter>>,

@@ -572,6 +572,7 @@ fn emit_config(mode: &str, granted: bool) -> PluginConfig {
         },
         capabilities: Capabilities {
             emit_event: granted,
+            ..Default::default()
         },
         config: json!({ "mode": mode }),
     }
@@ -638,5 +639,126 @@ fn ungranted_plugin_importing_emit_fails_to_load() {
     assert!(
         Runtime::new(vec![emit_config("emit_message", false)]).is_err(),
         "an ungranted plugin that imports emit must fail to load"
+    );
+}
+
+// --- kv capability (host import + injected store) ---------------------------
+
+use std::collections::HashMap;
+use vela_extensions::{HostServices, KvError, KvStore};
+
+const KV_FIXTURE: &[u8] = include_bytes!("fixtures/kv_guest.wasm");
+
+/// `(plugin name, key)` → value.
+type KvMap = HashMap<(String, Vec<u8>), Vec<u8>>;
+
+/// A real (HashMap-backed) kv store so the stateful-decision test actually
+/// counts across calls. Ignores TTL/quota — those are the store's job, tested
+/// in vela-store; here we exercise the host import + dispatch.
+#[derive(Default)]
+struct MockKv {
+    store: Mutex<KvMap>,
+}
+
+impl KvStore for MockKv {
+    fn get(&self, plugin: &str, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        Ok(self
+            .store
+            .lock()
+            .unwrap()
+            .get(&(plugin.to_string(), key.to_vec()))
+            .cloned())
+    }
+    fn set(
+        &self,
+        plugin: &str,
+        key: &[u8],
+        value: &[u8],
+        _ttl: Option<u64>,
+    ) -> Result<(), KvError> {
+        self.store
+            .lock()
+            .unwrap()
+            .insert((plugin.to_string(), key.to_vec()), value.to_vec());
+        Ok(())
+    }
+    fn delete(&self, plugin: &str, key: &[u8]) -> Result<(), KvError> {
+        self.store
+            .lock()
+            .unwrap()
+            .remove(&(plugin.to_string(), key.to_vec()));
+        Ok(())
+    }
+}
+
+fn kv_config(mode: &str, granted: bool) -> PluginConfig {
+    let mut p = plugin("kvp", mode);
+    p.wasm = KV_FIXTURE.to_vec();
+    p.points = Points {
+        check_event: true,
+        on_event: true,
+    };
+    p.capabilities = Capabilities {
+        kv: granted,
+        ..Default::default()
+    };
+    p
+}
+
+fn kv_runtime(mode: &str, mock: std::sync::Arc<MockKv>) -> Runtime {
+    Runtime::with_services(
+        vec![kv_config(mode, true)],
+        HostServices {
+            kv: Some(mock as std::sync::Arc<dyn KvStore>),
+            ..Default::default()
+        },
+    )
+    .expect("kv-granted runtime loads")
+}
+
+#[test]
+fn kv_backs_a_stateful_check_event() {
+    // The killer use: a decision that remembers. The fixture counts calls in kv
+    // and blocks after the 3rd — so kv must work on the decision hot path, and
+    // state must persist across the (stateless) per-call instances.
+    let mock = std::sync::Arc::new(MockKv::default());
+    let rt = kv_runtime("ratelimit", mock);
+    let allow = |rt: &Runtime| rt.check_event(&ctx_for(&message("hi"), "m.room.message"));
+    assert_eq!(allow(&rt), Decision::Allow, "1st");
+    assert_eq!(allow(&rt), Decision::Allow, "2nd");
+    assert_eq!(allow(&rt), Decision::Allow, "3rd");
+    assert!(matches!(allow(&rt), Decision::Block { .. }), "4th blocked");
+}
+
+#[test]
+fn kv_set_persists_through_the_store() {
+    let mock = std::sync::Arc::new(MockKv::default());
+    let rt = kv_runtime("kv_set", mock.clone());
+    rt.on_event(&ctx_for(&message("hi"), "m.room.message"));
+    let stored = mock
+        .store
+        .lock()
+        .unwrap()
+        .get(&("kvp".to_string(), b"k".to_vec()))
+        .cloned();
+    assert_eq!(stored.as_deref(), Some(&b"v"[..]), "set reached the store");
+}
+
+#[test]
+fn kv_rejects_oversized_key_before_the_store() {
+    let mock = std::sync::Arc::new(MockKv::default());
+    let rt = kv_runtime("kv_bigkey", mock.clone());
+    rt.on_event(&ctx_for(&message("hi"), "m.room.message"));
+    assert!(
+        mock.store.lock().unwrap().is_empty(),
+        "a 300-byte key must be rejected by the host, never reach the store"
+    );
+}
+
+#[test]
+fn ungranted_plugin_importing_kv_fails_to_load() {
+    assert!(
+        Runtime::new(vec![kv_config("kv_set", false)]).is_err(),
+        "an ungranted plugin that imports kv must fail to load"
     );
 }

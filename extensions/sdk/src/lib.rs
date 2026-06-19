@@ -226,6 +226,76 @@ impl Caps {
         let content = serde_json::json!({ "msgtype": "m.text", "body": body });
         self.emit(room_id, "m.room.message", &content)
     }
+
+    /// Read a key from this plugin's private kv store (needs the `kv`
+    /// capability). `None` if absent or expired. Bytes are whatever you stored.
+    pub fn kv_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        bindings::vela::extension::kv::get(key).map_err(KvError::from)
+    }
+
+    /// Write a key with no expiry. The host caps key/value size and enforces a
+    /// per-plugin byte quota (`KvError::QuotaExceeded` when full).
+    pub fn kv_set(&self, key: &[u8], value: &[u8]) -> Result<(), KvError> {
+        bindings::vela::extension::kv::set(key, value, None).map_err(KvError::from)
+    }
+
+    /// Write a key with a time-to-live in milliseconds — it disappears after
+    /// `ttl_ms`. The right tool for rate-limit counters and dedup markers (they
+    /// self-clean, so the store doesn't fill up).
+    pub fn kv_set_ttl(&self, key: &[u8], value: &[u8], ttl_ms: u64) -> Result<(), KvError> {
+        bindings::vela::extension::kv::set(key, value, Some(ttl_ms)).map_err(KvError::from)
+    }
+
+    /// Delete a key. Idempotent.
+    pub fn kv_delete(&self, key: &[u8]) -> Result<(), KvError> {
+        bindings::vela::extension::kv::delete(key).map_err(KvError::from)
+    }
+
+    /// [`kv_get`](Self::kv_get) + JSON-decode. `None` if absent or the stored
+    /// bytes don't decode as `T` (it's your own data; treat as a cache miss).
+    pub fn kv_get_json<T: DeserializeOwned>(&self, key: &[u8]) -> Result<Option<T>, KvError> {
+        Ok(self
+            .kv_get(key)?
+            .and_then(|b| serde_json::from_slice(&b).ok()))
+    }
+
+    /// JSON-encode + [`kv_set_ttl`](Self::kv_set_ttl) (`ttl_ms = 0` → no expiry).
+    pub fn kv_set_json<T: serde::Serialize>(
+        &self,
+        key: &[u8],
+        value: &T,
+        ttl_ms: u64,
+    ) -> Result<(), KvError> {
+        let bytes = serde_json::to_vec(value).map_err(|_| KvError::Internal)?;
+        if ttl_ms == 0 {
+            self.kv_set(key, &bytes)
+        } else {
+            self.kv_set_ttl(key, &bytes, ttl_ms)
+        }
+    }
+}
+
+/// Why a [`Caps`] kv op failed. `#[non_exhaustive]` — match with a `_` arm.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KvError {
+    /// Not granted, or the key/value exceeded a per-op size cap.
+    NotPermitted(String),
+    /// This plugin is over its byte budget — free space (delete / shorter TTL).
+    QuotaExceeded,
+    /// Internal host failure (logged server-side), or a JSON encode error.
+    Internal,
+}
+
+impl From<bindings::vela::extension::kv::KvError> for KvError {
+    fn from(e: bindings::vela::extension::kv::KvError) -> Self {
+        use bindings::vela::extension::kv::KvError as W;
+        match e {
+            W::NotPermitted(m) => KvError::NotPermitted(m),
+            W::QuotaExceeded => KvError::QuotaExceeded,
+            W::Internal => KvError::Internal,
+        }
+    }
 }
 
 /// Why an [`Caps::emit`] failed. `#[non_exhaustive]` — match with a `_` arm.

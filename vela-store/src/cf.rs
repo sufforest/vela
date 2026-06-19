@@ -296,4 +296,15 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // unused when no plugin binds `on_event` (or the `extensions`
     // feature is off).
     "wasm_observe_queue",
+    // Per-plugin key→value store for the WASM extension `kv` capability. Key:
+    // `[plugin_nid:8 BE] | user_key_bytes` — the host prepends the plugin_nid,
+    // so a plugin can't form a key outside its own namespace (hard isolation).
+    // Value: `[expiry_ms:8 BE] | payload` — expiry 0 = no TTL; a `get` past
+    // expiry returns absent (the entry lingers until the sweep reaps it).
+    // Opaque bytes; bounded by the per-plugin quota (below) + per-op size caps.
+    "wasm_kv",
+    // Per-plugin byte budget gauge for `wasm_kv`. Key: `[plugin_nid:8 BE]`,
+    // value `u64 BE` = total (key+value) bytes that plugin stores. Updated
+    // incrementally on set/delete and recomputed (self-healing) by the sweep.
+    "wasm_kv_quota",
 ];
