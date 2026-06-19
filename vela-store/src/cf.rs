@@ -285,4 +285,15 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // Outgoing_device_list_updates/Device_list_updates_reach_
     // incorrectly_(kicked|absent)_*.
     "partial_state_pending_dlu",
+    // Durable queue feeding the WASM extension async observation point
+    // (`on_event`). One global stream: key `[seq:8 BE]`, value the
+    // serialized observed event (event JSON + room_id + sender + type).
+    // A locally-sent event is pushed here after it's persisted, and a
+    // single background worker drains it in order and runs every
+    // `on_event`-bound plugin. Survives restart (at-least-once: an
+    // observer may see an event twice if we crash between running it
+    // and popping it), so observers must be idempotent. Empty and
+    // unused when no plugin binds `on_event` (or the `extensions`
+    // feature is off).
+    "wasm_observe_queue",
 ];

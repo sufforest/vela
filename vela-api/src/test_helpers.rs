@@ -59,6 +59,8 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
             typing_stream.clone(),
         ],
     ));
+    // Build the observation queue before `db` is moved into the struct.
+    let observe_queue = crate::extensions::ObserveQueue::new(&db);
     let state = AppState {
         db,
         config: Arc::new(ServerConfig {
@@ -125,6 +127,9 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
         // No plugins in tests; an empty runtime allows everything (and pulls no
         // wasmtime when the feature is off).
         extensions: crate::router::empty_extension_runtime(),
+        // Inert: nothing binds on_event in the harness, so nothing is enqueued
+        // and no worker drains it.
+        observe_queue,
     };
     (state, tmp)
 }

@@ -72,12 +72,16 @@ Two extension points (a plugin binds either or both via `points`):
   state events, after auth, before persist — a block rejects the send with the
   plugin's errcode/reason, HTTP 403) and **inbound federated events** (a block
   soft-fails — see below). Returns *allow* or *block*.
-- **`on_event`** — the async observation hook: off the request path, after an
-  event is persisted, with no verdict (an observer can't block) — for audit,
-  metrics, and (as host capabilities land) automation. The runtime and SDK
-  support it now; the host begins dispatching `on_event` plugins in a following
-  change, so an `on_event` plugin loads and validates but isn't invoked until
-  then.
+- **`on_event`** — the async observation hook, on **local sends** (after the
+  event is persisted, off the request path). No verdict — an observer can't
+  block — for audit, metrics, and (as host capabilities land) automation. Each
+  persisted event is put on a durable queue that a background worker drains and
+  hands to every `on_event` plugin. Delivery is **best-effort**: at-least-once
+  once an event is queued (a crash between running an observer and clearing the
+  entry re-runs it on restart), so observers should be **idempotent**. The queue
+  is **bounded** — a stalled or far-behind observer sheds its oldest backlog
+  rather than growing on disk without limit — and a trapping, panicking, or slow
+  observer is sandbox-bounded and can't stall the queue behind it.
 
 Plugins are **stateless** and get **no host capabilities** yet — no network,
 disk, or syscalls. They see the event and their own config.

@@ -409,6 +409,11 @@ pub struct AppState {
     /// the plugin set atomically without locking the send hot path — readers
     /// `.load()` a snapshot, the reloader `.store()`s a freshly-built runtime.
     pub extensions: Arc<arc_swap::ArcSwap<vela_extensions::Runtime>>,
+    /// Durable queue feeding the WASM extension async observation point. The
+    /// send path enqueues a persisted local event here (only when some plugin
+    /// binds `on_event`); a background worker drains it and runs the observers
+    /// off the request path. Cheap to clone; inert when nothing binds `on_event`.
+    pub observe_queue: crate::extensions::ObserveQueue,
 }
 
 /// An empty extension runtime (no plugins) — allows everything. Lets external
