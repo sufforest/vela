@@ -28,6 +28,13 @@ use exports::vela::extension::decision::{BlockReason, EventContext, Guest, Verdi
 struct Component;
 
 impl Guest for Component {
+    // Registration point unused by this fixture — default allow.
+    fn check_registration(
+        _ctx: exports::vela::extension::decision::RegistrationContext,
+    ) -> Verdict {
+        Verdict::Allow
+    }
+
     fn check_event(ctx: EventContext) -> Verdict {
         let cfg = ctx.plugin_config.as_str();
 

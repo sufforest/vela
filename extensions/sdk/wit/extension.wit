@@ -11,7 +11,7 @@
 // components regardless of what changed; the committed fixtures/examples are
 // rebuilt with each bump. (Within a fixed version, a guest still instantiates as
 // long as it exports what the world requires and imports only granted caps.)
-package vela:extension@0.5.0;
+package vela:extension@0.6.0;
 
 interface decision {
     // Where an event originated. A `block` verdict is a hard reject for `local`
@@ -54,6 +54,27 @@ interface decision {
     // reachable from here at the world level, but the SDK withholds them to keep
     // the hot path pure — capabilities are surfaced through the observation hook.
     check-event: func(ctx: event-context) -> verdict;
+
+    // Signup metadata handed to a plugin at /register, before the account is
+    // created — a second decision point (different context + call site, same
+    // allow/block verdict). A block rejects the registration with the verdict's
+    // errcode/reason. The `kv` capability works here too (stateful rate limits).
+    record registration-context {
+        // Requested localpart, e.g. "alice".
+        username: string,
+        // How they're registering. Today the /register handler emits "open" or
+        // "token"; "oidc" / "guest" / "appservice" are reserved for future call
+        // sites (those signup paths don't invoke this point yet).
+        kind: string,
+        // An opaque IP token per the plugin's operator-set `client_ip` tier:
+        // absent (none), a non-reversible HMAC (hashed — a rate-limit key that
+        // reveals nothing about the address), or the raw IP (full). Treat it as
+        // an opaque key unless the plugin was granted `full`.
+        client-ip: option<string>,
+        // This plugin's opaque config, verbatim JSON. Empty string if none.
+        plugin-config: string,
+    }
+    check-registration: func(ctx: registration-context) -> verdict;
 }
 
 // Async observation: the host calls this off the request hot path (a worker

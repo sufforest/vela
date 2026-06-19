@@ -9,7 +9,8 @@
 
 use serde_json::{Value, json};
 use vela_extensions::{
-    Capabilities, Decision, EventContext, FailPolicy, Origin, PluginConfig, Points, Runtime,
+    Capabilities, ClientIpTier, Decision, EventContext, FailPolicy, Origin, PluginConfig, Points,
+    Runtime,
 };
 
 const FIXTURE: &[u8] = include_bytes!("fixtures/spam_guest.wasm");
@@ -27,6 +28,7 @@ fn plugin(name: &str, mode: &str) -> PluginConfig {
         event_types: None,
         points: Points::default(), // decision-only unless a test overrides
         capabilities: Capabilities::default(), // no caps unless a test overrides
+        client_ip: ClientIpTier::default(),
         config: json!({ "mode": mode }),
     }
 }
@@ -394,6 +396,7 @@ fn observer(name: &str, mode: &str) -> PluginConfig {
     p.points = Points {
         check_event: false,
         on_event: true,
+        check_registration: false,
     };
     p
 }
@@ -465,6 +468,7 @@ fn a_plugin_can_bind_both_points() {
     p.points = Points {
         check_event: true,
         on_event: true,
+        check_registration: false,
     };
     let rt = Runtime::new(vec![p]).expect("loads");
     assert!(matches!(
@@ -569,11 +573,13 @@ fn emit_config(mode: &str, granted: bool) -> PluginConfig {
         points: Points {
             check_event: false,
             on_event: true,
+            check_registration: false,
         },
         capabilities: Capabilities {
             emit_event: granted,
             ..Default::default()
         },
+        client_ip: ClientIpTier::default(),
         config: json!({ "mode": mode }),
     }
 }
@@ -697,6 +703,7 @@ fn kv_config(mode: &str, granted: bool) -> PluginConfig {
     p.points = Points {
         check_event: true,
         on_event: true,
+        check_registration: false,
     };
     p.capabilities = Capabilities {
         kv: granted,
@@ -760,5 +767,84 @@ fn ungranted_plugin_importing_kv_fails_to_load() {
     assert!(
         Runtime::new(vec![kv_config("kv_set", false)]).is_err(),
         "an ungranted plugin that imports kv must fail to load"
+    );
+}
+
+// --- check_registration point ----------------------------------------------
+
+use vela_extensions::RegistrationContext;
+
+const REGISTER_FIXTURE: &[u8] = include_bytes!("fixtures/register_guest.wasm");
+
+fn register_config(mode: &str, tier: ClientIpTier) -> PluginConfig {
+    let mut p = plugin("reg", mode);
+    p.wasm = REGISTER_FIXTURE.to_vec();
+    p.points = Points {
+        check_event: false,
+        on_event: false,
+        check_registration: true,
+    };
+    p.client_ip = tier;
+    p
+}
+
+fn reg_ctx<'a>(
+    username: &'a str,
+    full: Option<&'a str>,
+    hashed: Option<&'a str>,
+) -> RegistrationContext<'a> {
+    RegistrationContext {
+        username,
+        kind: "open",
+        client_ip_full: full,
+        client_ip_hashed: hashed,
+    }
+}
+
+#[test]
+fn register_blocks_a_banned_username() {
+    let rt = Runtime::new(vec![register_config("block_spam", ClientIpTier::None)]).expect("loads");
+    assert!(matches!(
+        rt.check_registration(&reg_ctx("spammer", None, None)),
+        Decision::Block { .. }
+    ));
+    assert_eq!(
+        rt.check_registration(&reg_ctx("alice", None, None)),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn register_ip_tier_controls_what_the_plugin_sees() {
+    // The fixture allows iff a client-ip token was exposed — so the verdict
+    // reveals which tier passed an IP through. Same context, three tiers.
+    let none = Runtime::new(vec![register_config("ip_present", ClientIpTier::None)]).unwrap();
+    let hashed = Runtime::new(vec![register_config("ip_present", ClientIpTier::Hashed)]).unwrap();
+    let full = Runtime::new(vec![register_config("ip_present", ClientIpTier::Full)]).unwrap();
+    let ctx = reg_ctx("alice", Some("1.2.3.4"), Some("HASHED-TOKEN"));
+    assert!(
+        matches!(none.check_registration(&ctx), Decision::Block { .. }),
+        "tier none must withhold the IP"
+    );
+    assert_eq!(
+        hashed.check_registration(&ctx),
+        Decision::Allow,
+        "hashed exposes a token"
+    );
+    assert_eq!(
+        full.check_registration(&ctx),
+        Decision::Allow,
+        "full exposes the raw IP"
+    );
+}
+
+#[test]
+fn check_registration_skips_unbound_plugins() {
+    // A decision-only (check_event) plugin must not fire at registration.
+    let rt = Runtime::new(vec![plugin("dec", "block")]).expect("loads");
+    assert!(!rt.binds_check_registration());
+    assert_eq!(
+        rt.check_registration(&reg_ctx("spammer", None, None)),
+        Decision::Allow
     );
 }

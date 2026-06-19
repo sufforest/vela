@@ -13,8 +13,8 @@ use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use crate::HostServices;
-use crate::abi::{EventContext, Origin, Verdict};
-use crate::config::PluginConfig;
+use crate::abi::{EventContext, Origin, RegistrationContext, Verdict};
+use crate::config::{ClientIpTier, PluginConfig};
 use crate::emit::{EmitLimiter, EmitRequest, EventEmitter, emit_type_allowed};
 use crate::kv::KvStore;
 
@@ -339,23 +339,21 @@ impl Plugin {
         })
     }
 
-    /// Build a fresh, bounded store, instantiate the component, and marshal the
-    /// wire event context — shared by `check_event` and `on_event`. A fresh
-    /// instance per call keeps plugins stateless; fuel/memory/wall are bounded
-    /// per config. `event_json` is serialized once by the runtime and shared
-    /// across plugins (not re-serialized per plugin).
-    fn prepare(
+    /// Build a fresh, bounded store and instantiate the component — the per-call
+    /// setup shared by every point. A fresh instance per call keeps plugins
+    /// stateless; fuel/memory/wall are bounded per config. `allow_emit` gates the
+    /// emit capability (only the off-request-path `on_event`); kv is wired
+    /// whenever granted (it's synchronous, fine on any path).
+    fn make_store(
         &self,
-        event_json: &str,
-        ctx: &EventContext<'_>,
         allow_emit: bool,
-    ) -> Result<(Store<HostState>, bindings::Plugin, wit::EventContext), PluginError> {
+    ) -> Result<(Store<HostState>, bindings::Plugin), PluginError> {
         let limits = StoreLimitsBuilder::new()
             .memory_size(self.cfg.memory_pages as usize * 64 * 1024)
             .build();
         // Wire the emit capability only for an on_event call of a granted plugin
-        // (`allow_emit`) with an injected emitter. check_event runs on the async
-        // request path where emit's `block_on` would panic, so emit is None there.
+        // (`allow_emit`) with an injected emitter. The decision paths run inline
+        // on the async request thread where emit's `block_on` would panic.
         let emit = match (allow_emit, &self.emitter) {
             (true, Some(emitter)) => Some(EmitCtx {
                 emitter: emitter.clone(),
@@ -364,8 +362,6 @@ impl Plugin {
             }),
             _ => None,
         };
-        // kv is available from BOTH points (it's synchronous — no block_on — so a
-        // stateful check_event is fine), so it's wired regardless of allow_emit.
         let kv = self.kv.as_ref().map(|store| KvCtx {
             store: store.clone(),
             plugin: self.cfg.name.clone(),
@@ -399,7 +395,19 @@ impl Plugin {
             .pre
             .instantiate(&mut store)
             .map_err(|e| PluginError::Trap(e.to_string()))?;
+        Ok((store, instance))
+    }
 
+    /// `make_store` + marshal the event wire context — shared by `check_event`
+    /// and `on_event`. `event_json` is serialized once by the runtime and shared
+    /// across plugins (not re-serialized per plugin).
+    fn prepare(
+        &self,
+        event_json: &str,
+        ctx: &EventContext<'_>,
+        allow_emit: bool,
+    ) -> Result<(Store<HostState>, bindings::Plugin, wit::EventContext), PluginError> {
+        let (store, instance) = self.make_store(allow_emit)?;
         let wire = wit::EventContext {
             event: event_json.to_string(),
             room_id: ctx.room_id.to_string(),
@@ -451,6 +459,40 @@ impl Plugin {
             .call_on_event(&mut store, &wire)
             .map_err(|e| PluginError::Trap(e.to_string()))?;
         Ok(())
+    }
+
+    /// Run the registration decision hook for one signup → a verdict. Like
+    /// `check_event` it's on the request path (no emit), but kv is available
+    /// (stateful signup rate limits).
+    pub(crate) fn check_registration(
+        &self,
+        ctx: &RegistrationContext<'_>,
+    ) -> Result<Verdict, PluginError> {
+        let (mut store, instance) = self.make_store(false)?;
+        // Apply this plugin's IP tier at marshal time: it sees only the form its
+        // operator-granted tier permits.
+        let client_ip = match self.cfg.client_ip {
+            ClientIpTier::None => None,
+            ClientIpTier::Hashed => ctx.client_ip_hashed,
+            ClientIpTier::Full => ctx.client_ip_full,
+        };
+        let wire = wit::RegistrationContext {
+            username: ctx.username.to_string(),
+            kind: ctx.kind.to_string(),
+            client_ip: client_ip.map(|s| s.to_string()),
+            plugin_config: config_json(&self.cfg.config),
+        };
+        let verdict = instance
+            .vela_extension_decision()
+            .call_check_registration(&mut store, &wire)
+            .map_err(|e| PluginError::Trap(e.to_string()))?;
+        Ok(match verdict {
+            wit::Verdict::Allow => Verdict::Allow,
+            wit::Verdict::Block(r) => Verdict::Block {
+                errcode: r.errcode,
+                reason: r.reason,
+            },
+        })
     }
 }
 

@@ -144,8 +144,9 @@ struct ExtensionPluginSection {
     memory_pages: u32,
     /// Only invoke for these event types; omitted → all events.
     event_types: Option<Vec<String>>,
-    /// Which extension points this plugin binds: "check_event" (sync decision)
-    /// and/or "on_event" (async observation). Defaults to ["check_event"].
+    /// Which extension points this plugin binds: "check_event" (sync decision),
+    /// "on_event" (async observation), "check_registration" (anti-spam signup).
+    /// Defaults to ["check_event"].
     #[serde(default = "default_points")]
     points: Vec<String>,
     /// Host capabilities granted to this plugin (least-privilege; default none).
@@ -153,6 +154,10 @@ struct ExtensionPluginSection {
     /// always granted and not listed here.
     #[serde(default)]
     capabilities: Vec<String>,
+    /// How much of the client IP a `check_registration` plugin sees:
+    /// "none" (default) | "hashed" (a rate-limit token, no PII) | "full" (raw IP).
+    #[serde(default = "default_client_ip")]
+    client_ip: String,
     /// Opaque JSON handed to the guest verbatim as `plugin_config`.
     #[serde(default)]
     config: serde_json::Value,
@@ -163,6 +168,9 @@ fn default_fail_policy() -> String {
 }
 fn default_points() -> Vec<String> {
     vec!["check_event".to_string()]
+}
+fn default_client_ip() -> String {
+    "none".to_string()
 }
 fn default_plugin_fuel() -> u64 {
     50_000_000
@@ -907,20 +915,37 @@ fn build_extension_runtime(
         let mut points = vela_extensions::Points {
             check_event: false,
             on_event: false,
+            check_registration: false,
         };
         for point in &p.points {
             match point.as_str() {
                 "check_event" => points.check_event = true,
                 "on_event" => points.on_event = true,
+                "check_registration" => points.check_registration = true,
                 other => anyhow::bail!(
-                    "extension '{}': unknown point {other:?} (expected \"check_event\" or \"on_event\")",
+                    "extension '{}': unknown point {other:?} (expected \"check_event\", \"on_event\", or \"check_registration\")",
                     p.name
                 ),
             }
         }
-        if !points.check_event && !points.on_event {
+        if !points.check_event && !points.on_event && !points.check_registration {
             anyhow::bail!(
                 "extension '{}': points is empty — a plugin bound to no point can never run",
+                p.name
+            );
+        }
+        let client_ip = match p.client_ip.as_str() {
+            "none" => vela_extensions::ClientIpTier::None,
+            "hashed" => vela_extensions::ClientIpTier::Hashed,
+            "full" => vela_extensions::ClientIpTier::Full,
+            other => anyhow::bail!(
+                "extension '{}': unknown client_ip {other:?} (expected \"none\", \"hashed\", or \"full\")",
+                p.name
+            ),
+        };
+        if client_ip != vela_extensions::ClientIpTier::None && !points.check_registration {
+            anyhow::bail!(
+                "extension '{}': client_ip is only used by the \"check_registration\" point",
                 p.name
             );
         }
@@ -954,6 +979,7 @@ fn build_extension_runtime(
             event_types: p.event_types.clone(),
             points,
             capabilities,
+            client_ip,
             config: p.config.clone(),
         });
     }

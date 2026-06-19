@@ -19,3 +19,4 @@ build_one() {
 build_one spam-guest spam_guest.wasm
 build_one emit-guest emit_guest.wasm
 build_one kv-guest kv_guest.wasm
+build_one register-guest register_guest.wasm
