@@ -60,9 +60,12 @@ no-op, and the operator's `points` config decides which the host invokes.
   inbound federated event.
 - **`Plugin::on_event(&Event, &Caps)`** — the async observation hook (default:
   no-op). Runs off the request path after persist; no return (an observer can't
-  block). Delivery is at-least-once, so make it idempotent. `Caps` is the
-  host-capabilities handle — empty for now; `log`, `emit-event`, and `kv` are
-  added to it later (your signature won't change).
+  block). Delivery is at-least-once, so make it idempotent.
+- **`Caps`** — the host-capabilities handle. Today: `caps.log(msg)` (and
+  `.debug` / `.warn` / `.error` / `.trace`) writes a line to vela's log, tagged
+  with your plugin name; the host truncates long messages and rate-limits a tight
+  loop, so it's safe to call freely. `emit-event` and `kv` are added here later —
+  your `on_event` signature won't change.
 - **`Event`** — `room_id()`, `sender()`, `event_type()`, `origin()`,
   `event()` (the full event as parsed JSON), `message_body()` (`content.body`
   if present), and `config::<T>()` / `try_config::<T>()` to read your

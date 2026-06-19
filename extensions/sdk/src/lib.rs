@@ -152,12 +152,47 @@ impl Event {
     }
 }
 
-/// Host capabilities granted to a plugin. **Empty in v1** — a forward-compatible
-/// seam: `log`, `emit-event`, and `kv` are *added here* in later stages, so a
-/// plugin's [`Plugin::on_event`] signature never has to change as capabilities
-/// grow. `#[non_exhaustive]` so adding methods isn't a breaking change.
+/// Host capabilities granted to a plugin — the only way for plugin code to reach
+/// out of the sandbox. v1 grants **logging** (write a line to vela's log,
+/// attributed to your plugin). `emit-event` and `kv` are *added here* in later
+/// stages, so a plugin's [`Plugin::on_event`] signature never has to change as
+/// capabilities grow. `#[non_exhaustive]` so adding methods isn't a breaking
+/// change.
 #[non_exhaustive]
 pub struct Caps {}
+
+impl Caps {
+    /// Write an info-level line to vela's log, tagged with your plugin's name.
+    /// The host truncates very long messages and rate-limits a tight log loop,
+    /// so this is safe to call freely. Pure output — no events, no I/O.
+    pub fn log(&self, message: impl AsRef<str>) {
+        self.emit(bindings::vela::extension::logging::LogLevel::Info, message);
+    }
+
+    /// Log at trace level.
+    pub fn trace(&self, message: impl AsRef<str>) {
+        self.emit(bindings::vela::extension::logging::LogLevel::Trace, message);
+    }
+
+    /// Log at debug level.
+    pub fn debug(&self, message: impl AsRef<str>) {
+        self.emit(bindings::vela::extension::logging::LogLevel::Debug, message);
+    }
+
+    /// Log at warn level.
+    pub fn warn(&self, message: impl AsRef<str>) {
+        self.emit(bindings::vela::extension::logging::LogLevel::Warn, message);
+    }
+
+    /// Log at error level.
+    pub fn error(&self, message: impl AsRef<str>) {
+        self.emit(bindings::vela::extension::logging::LogLevel::Error, message);
+    }
+
+    fn emit(&self, level: bindings::vela::extension::logging::LogLevel, message: impl AsRef<str>) {
+        bindings::vela::extension::logging::log(level, message.as_ref());
+    }
+}
 
 /// Implement this for your plugin type, then `export_plugin!(YourType)`. A plugin
 /// can implement the **decision** hook ([`Plugin::check_event`]), the async

@@ -12,7 +12,7 @@
 //! ```
 
 use serde::Deserialize;
-use vela_extension_sdk::{export_plugin, Decision, Event, Plugin};
+use vela_extension_sdk::{export_plugin, Caps, Decision, Event, Plugin};
 
 #[derive(Deserialize, Default)]
 // Reject mistyped keys so a config typo surfaces (the SDK traps on invalid
@@ -53,6 +53,30 @@ impl Plugin for KeywordFilter {
             }
         } else {
             Decision::allow()
+        }
+    }
+
+    // Observation runs off the request path, so it can do the bookkeeping the
+    // decision hook shouldn't: here, log a banned-term hit (attributed to this
+    // plugin in vela's log) without leaking which term to the sender. Enable it
+    // with `points = ["check_event", "on_event"]`.
+    fn on_event(ev: &Event, caps: &Caps) {
+        let Some(body) = ev.message_body() else {
+            return;
+        };
+        let cfg: Config = ev.config();
+        let body = body.to_lowercase();
+        if cfg
+            .banned
+            .iter()
+            .filter(|w| !w.is_empty())
+            .any(|w| body.contains(&w.to_lowercase()))
+        {
+            caps.log(format!(
+                "blocked-term hit from {} in {}",
+                ev.sender(),
+                ev.room_id()
+            ));
         }
     }
 }

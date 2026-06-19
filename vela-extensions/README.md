@@ -83,8 +83,13 @@ Two extension points (a plugin binds either or both via `points`):
   rather than growing on disk without limit — and a trapping, panicking, or slow
   observer is sandbox-bounded and can't stall the queue behind it.
 
-Plugins are **stateless** and get **no host capabilities** yet — no network,
-disk, or syscalls. They see the event and their own config.
+Plugins are **stateless** and get only the **host capabilities** you grant — no
+network, disk, or syscalls. Today the one capability is **logging**: a plugin can
+write a line to vela's log, emitted at the `vela::extensions::plugin` target and
+tagged with the plugin's name (so you can filter or route it), with the message
+truncated and the line count per call bounded so a chatty plugin can't flood the
+log. Otherwise a plugin sees only the event and its own config. (`emit-event` and
+a small `kv` store are planned as further capabilities.)
 
 ## Security model
 
