@@ -11,7 +11,7 @@
 // components regardless of what changed; the committed fixtures/examples are
 // rebuilt with each bump. (Within a fixed version, a guest still instantiates as
 // long as it exports what the world requires and imports only granted caps.)
-package vela:extension@0.4.0;
+package vela:extension@0.5.0;
 
 interface decision {
     // Where an event originated. A `block` verdict is a hard reject for `local`
@@ -119,9 +119,35 @@ interface emit {
 // no-ops the other (the SDK provides no-op defaults); the operator's `points`
 // config decides which the host actually invokes. It may also import host
 // capabilities (`logging` today) — the host provides those it grants.
+// The `kv` capability — a small per-plugin key→value store (the Redis model:
+// flat keys, optional TTL, byte quota). Granted per-plugin; usable from BOTH
+// points (it's synchronous, so a stateful `check_event` can rate-limit/dedup).
+// Keys are namespaced by the host per plugin — a plugin can't read another's.
+// Opaque bytes both ways; the plugin serializes its own values.
+interface kv {
+    variant kv-error {
+        // not granted, or the key/value exceeds the per-op size cap
+        not-permitted(string),
+        // this plugin is over its byte budget — free space (delete / shorter TTL)
+        quota-exceeded,
+        // internal store failure (logged host-side)
+        internal,
+    }
+    // Read a key. Absent or expired → `none`.
+    get: func(key: list<u8>) -> result<option<list<u8>>, kv-error>;
+    // Write a key, optionally with a relative time-to-live in milliseconds.
+    // `none` (or `some(0)`) = no expiry. The host turns ttl into an absolute
+    // wall-clock deadline — TTLs are not monotonic, so a server clock step can
+    // make an entry expire a little early or late (fine for counters/dedup).
+    set: func(key: list<u8>, value: list<u8>, ttl-ms: option<u64>) -> result<_, kv-error>;
+    // Delete a key. Idempotent.
+    delete: func(key: list<u8>) -> result<_, kv-error>;
+}
+
 world plugin {
     import logging;
     import emit;
+    import kv;
     export decision;
     export observation;
 }

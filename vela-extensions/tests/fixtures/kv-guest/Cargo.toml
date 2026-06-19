@@ -1,0 +1,23 @@
+# Test-only guest plugin exercising the `kv` capability (a host import).
+# Separate from spam-guest because importing `kv` means it only instantiates
+# when the host grants it. Built via `tests/fixtures/build.sh`; the artifact is
+# committed as `kv_guest.wasm`.
+[package]
+name = "kv-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+panic = "abort"
+
+[workspace]

@@ -71,8 +71,12 @@ no-op, and the operator's `points` config decides which the host invokes.
     from `on_event`; the bot must be invited to the room with power level, or you
     get `EmitError::Unauthorized`. Allowed types: message, reaction, redaction;
     rate-capped per plugin.
-
-  `kv` is added here later — your `on_event` signature won't change.
+  - `caps.kv_get(key)` / `kv_set(key, val)` / `kv_set_ttl(key, val, ttl_ms)` /
+    `kv_delete(key)` (plus `kv_get_json` / `kv_set_json`) — your plugin's private
+    key→value store (needs the `kv` capability). Works from **both** hooks, so
+    `check_event` can be stateful (rate-limit, dedup). Keys/values are
+    size-capped and a per-plugin byte quota applies (`KvError::QuotaExceeded`);
+    use a TTL on counters/markers so they self-clean.
 - **`Event`** — `room_id()`, `sender()`, `event_type()`, `origin()`,
   `event()` (the full event as parsed JSON), `message_body()` (`content.body`
   if present), and `config::<T>()` / `try_config::<T>()` to read your

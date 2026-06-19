@@ -44,7 +44,7 @@ config = { banned = ["spam"] }         # opaque JSON, handed to the plugin
 | `wasm_path` | — (required) | path to the `.wasm` component |
 | `event_types` | all | only invoke for these event types |
 | `points` | `["check_event"]` | hooks the plugin binds: `check_event` (sync decision) and/or `on_event` (async observation) |
-| `capabilities` | `[]` | host capabilities to grant (least-privilege): `emit-event` lets it post events as its bot. `logging` is always on |
+| `capabilities` | `[]` | host capabilities to grant (least-privilege): `emit-event` (post as its bot), `kv` (private key→value store). `logging` is always on |
 | `fail_policy` | `open` | on trap/timeout: `open` allows, `closed` blocks |
 | `fuel` | 50,000,000 | per-call instruction budget |
 | `wall_ms` | 100 | per-call wall-clock budget (ms); `0` = off |
@@ -100,9 +100,15 @@ network, disk, or syscalls. Granted least-privilege per plugin via `capabilities
   allows messages, reactions, and redactions (no state events); emits are
   rate-capped per plugin, and a plugin never observes its own emitted events
   (loop protection). Use it for auto-responders, moderation actions, and bots.
+- **`kv`** (grant with `capabilities = ["kv"]`) — a small private key→value
+  store, `get`/`set`/`delete` over opaque bytes, with an optional per-key TTL.
+  Each plugin gets its own isolated namespace (it can't read another's). Works
+  from **both** points, so a `check_event` can be **stateful** — rate-limit a
+  user, dedup, count toward a threshold. Bounded: per-op size caps and a
+  per-plugin byte quota (`quota-exceeded` when full); set a TTL on counters and
+  dedup markers so they self-clean. Use it to give a bot memory.
 
-Otherwise a plugin sees only the event and its own config. (A small per-plugin
-`kv` store is planned as a further capability.)
+Otherwise a plugin sees only the event and its own config.
 
 ## Security model
 

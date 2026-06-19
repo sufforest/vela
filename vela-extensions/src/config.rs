@@ -34,6 +34,8 @@ impl Default for Points {
 pub struct Capabilities {
     /// `emit-event`: post events as the plugin's `@_ext_<name>` bot user.
     pub emit_event: bool,
+    /// `kv`: a small per-plugin key→value store (get/set/delete, TTL, quota).
+    pub kv: bool,
 }
 
 /// What to do when a plugin traps, runs out of fuel, or errors.

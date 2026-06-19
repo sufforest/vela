@@ -33,7 +33,9 @@ use tokio::sync::Notify;
 use tracing::{debug, warn};
 use vela_core::error::VelaError;
 
-use vela_extensions::{EmitError, EmitRequest, EventContext, EventEmitter, Origin, Runtime};
+use vela_extensions::{
+    EmitError, EmitRequest, EventContext, EventEmitter, KvError, KvStore, Origin, Runtime,
+};
 use vela_store::db::Database;
 
 use crate::router::AppState;
@@ -351,6 +353,119 @@ fn ensure_plugin_bot(state: &AppState, bot_user_id: &str) -> Result<u64, rocksdb
     Ok(nid)
 }
 
+/// Per-plugin byte budget for the `kv` capability — the reject-on-full backstop
+/// (TTL is the routine space manager). Generous for counter/flag workloads;
+/// bounded so N granted plugins can't surprise an operator on disk.
+const KV_QUOTA_BYTES: u64 = 4 * 1024 * 1024;
+
+/// vela-api's implementation of the extension `kv` capability. A thin layer over
+/// the `wasm_kv` store: resolves the plugin's namespace nid, converts a relative
+/// TTL to an absolute deadline against the wall clock, and serializes writes
+/// per plugin (the store's quota read-modify-write isn't internally locked).
+/// Synchronous — kv has no async, so no `block_on` and no `AppState` needed.
+pub struct ApiKvStore {
+    db: Arc<Database>,
+    /// plugin name → its `wasm_kv` namespace nid (cache; the nid is stable).
+    nids: dashmap::DashMap<String, u64>,
+    /// Per-plugin write lock, keyed by namespace nid.
+    locks: dashmap::DashMap<u64, Arc<std::sync::Mutex<()>>>,
+}
+
+impl ApiKvStore {
+    pub fn new(db: Arc<Database>) -> Arc<Self> {
+        Arc::new(ApiKvStore {
+            db,
+            nids: dashmap::DashMap::new(),
+            locks: dashmap::DashMap::new(),
+        })
+    }
+
+    /// Stable namespace nid for a plugin (cached). Derived from a synthetic id so
+    /// it never collides with a real user/room nid.
+    fn nid(&self, plugin: &str) -> Result<u64, KvError> {
+        if let Some(n) = self.nids.get(plugin) {
+            return Ok(*n);
+        }
+        let n = self
+            .db
+            .get_or_create_nid(&format!("ext_kv:{plugin}"))
+            .map_err(|_| KvError::Internal)?;
+        self.nids.insert(plugin.to_string(), n);
+        Ok(n)
+    }
+
+    fn lock(&self, nid: u64) -> Arc<std::sync::Mutex<()>> {
+        self.locks
+            .entry(nid)
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// The TTL sweep: reap expired entries and heal the quota gauge, one plugin
+    /// at a time, **each under that plugin's write lock** so the gauge rewrite
+    /// can't race a concurrent `set`/`delete`. Run periodically off the async
+    /// runtime (it does blocking scans). Returns the total reaped.
+    pub fn sweep(&self) -> u64 {
+        let now = now_ms();
+        let plugins = match self.db.kv_quota_plugins() {
+            Ok(p) => p,
+            Err(_) => return 0,
+        };
+        let mut total = 0;
+        for nid in plugins {
+            let lock = self.lock(nid);
+            let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+            total += self.db.kv_sweep_plugin(nid, now).unwrap_or(0);
+        }
+        total
+    }
+}
+
+impl KvStore for ApiKvStore {
+    fn get(&self, plugin: &str, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        let nid = self.nid(plugin)?;
+        self.db
+            .kv_get(nid, key, now_ms())
+            .map_err(|_| KvError::Internal)
+    }
+
+    fn set(
+        &self,
+        plugin: &str,
+        key: &[u8],
+        value: &[u8],
+        ttl_ms: Option<u64>,
+    ) -> Result<(), KvError> {
+        let nid = self.nid(plugin)?;
+        let expiry = match ttl_ms {
+            Some(t) if t > 0 => now_ms().saturating_add(t),
+            _ => 0,
+        };
+        let lock = self.lock(nid);
+        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        match self.db.kv_set(nid, key, value, expiry, KV_QUOTA_BYTES) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(KvError::QuotaExceeded),
+            Err(_) => Err(KvError::Internal),
+        }
+    }
+
+    fn delete(&self, plugin: &str, key: &[u8]) -> Result<(), KvError> {
+        let nid = self.nid(plugin)?;
+        let lock = self.lock(nid);
+        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.db.kv_delete(nid, key).map_err(|_| KvError::Internal)
+    }
+}
+
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[cfg(all(test, feature = "extensions"))]
 mod tests {
     use super::*;
@@ -498,5 +613,28 @@ mod tests {
             .unwrap()
             .expect("post-restart entry");
         assert!(seq2 > seq1, "restart must not reuse an undrained seq");
+    }
+
+    #[test]
+    fn api_kv_store_roundtrips_and_isolates_plugins() {
+        let (db, _tmp) = temp_db();
+        let kv = ApiKvStore::new(db);
+
+        // Round-trip through the real store (exercises nid resolution + lock).
+        kv.set("p", b"k", b"hello", None).unwrap();
+        assert_eq!(kv.get("p", b"k").unwrap().as_deref(), Some(&b"hello"[..]));
+        kv.delete("p", b"k").unwrap();
+        assert_eq!(kv.get("p", b"k").unwrap(), None);
+
+        // Two plugins, same key — each resolves to its own namespace nid.
+        kv.set("a", b"k", b"1", None).unwrap();
+        kv.set("b", b"k", b"2", None).unwrap();
+        assert_eq!(kv.get("a", b"k").unwrap().as_deref(), Some(&b"1"[..]));
+        assert_eq!(kv.get("b", b"k").unwrap().as_deref(), Some(&b"2"[..]));
+
+        // A TTL'd write is readable immediately (deterministic expiry is covered
+        // by the vela-store tests, which control the clock).
+        kv.set("p", b"t", b"v", Some(60_000)).unwrap();
+        assert_eq!(kv.get("p", b"t").unwrap().as_deref(), Some(&b"v"[..]));
     }
 }
