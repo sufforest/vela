@@ -5,11 +5,17 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["wasmtime-runtime"]
-# The sandboxed WASM runtime. With it OFF, the crate still exposes its types
-# (Verdict, EventContext, PluginConfig) and a no-op Runtime that returns Allow,
-# but pulls ZERO wasmtime/Cranelift crates — so vela can build without WASM
-# support (`--no-default-features`). Plumbed up via vela-api/vela-server.
+# NO default features on purpose. The crate defaults to its types + the no-op
+# Runtime (zero wasmtime/Cranelift). This keeps `cargo build --workspace` lean:
+# were `wasmtime-runtime` a default, feature unification would drag wasmtime into
+# every vela-api test binary (the member is built with its own defaults), bloating
+# the link and occasionally OOMing the linker. The real runtime is opt-in via the
+# `extensions` feature on vela-api/vela-server, and the crate's own wasmtime tests
+# run under a dedicated `--features wasmtime-runtime` CI step.
+default = []
+# The sandboxed WASM runtime. With it OFF (the default), the crate still exposes
+# its types (Verdict, EventContext, PluginConfig) and a no-op Runtime that returns
+# Allow, but pulls ZERO wasmtime/Cranelift crates.
 wasmtime-runtime = ["dep:wasmtime"]
 
 [dependencies]
