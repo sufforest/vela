@@ -691,6 +691,7 @@ mod admin_integration_tests {
     #[cfg(feature = "extensions")]
     #[tokio::test]
     async fn registration_blocked_by_extension() {
+        // Gitignored fixture — run vela-extensions/tests/fixtures/build.sh first (CI does).
         const REG: &[u8] =
             include_bytes!("../../../vela-extensions/tests/fixtures/register_guest.wasm");
         let (state, _tmp) = build_test_state();

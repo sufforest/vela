@@ -1,9 +1,10 @@
 //! Adversarial sandbox + dispatch tests for the extension runtime, driven by
-//! one committed fixture component (`fixtures/spam_guest.wasm`) that switches
-//! behavior by config. These exercise the security-critical promises: untrusted
-//! code can't burn unbounded CPU or memory, and the dispatcher's block-if-any /
-//! scoping / fail-policy semantics hold.
+//! one fixture component (`fixtures/spam_guest.wasm`) that switches behavior by
+//! config. These exercise the security-critical promises: untrusted code can't
+//! burn unbounded CPU or memory, and the dispatcher's block-if-any / scoping /
+//! fail-policy semantics hold.
 //!
+//! The fixtures are gitignored — run `tests/fixtures/build.sh` first (CI does).
 //! Gated on the runtime feature — with it off, `Runtime` is a no-op.
 #![cfg(feature = "wasmtime-runtime")]
 
