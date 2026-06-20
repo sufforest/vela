@@ -400,6 +400,7 @@ fn observer(name: &str, mode: &str) -> PluginConfig {
         check_registration: false,
         check_media_upload: false,
         check_profile_update: false,
+        check_room_create: false,
     };
     p
 }
@@ -474,6 +475,7 @@ fn a_plugin_can_bind_both_points() {
         check_registration: false,
         check_media_upload: false,
         check_profile_update: false,
+        check_room_create: false,
     };
     let rt = Runtime::new(vec![p]).expect("loads");
     assert!(matches!(
@@ -581,6 +583,7 @@ fn emit_config(mode: &str, granted: bool) -> PluginConfig {
             check_registration: false,
             check_media_upload: false,
             check_profile_update: false,
+            check_room_create: false,
         },
         capabilities: Capabilities {
             emit_event: granted,
@@ -713,6 +716,7 @@ fn kv_config(mode: &str, granted: bool) -> PluginConfig {
         check_registration: false,
         check_media_upload: false,
         check_profile_update: false,
+        check_room_create: false,
     };
     p.capabilities = Capabilities {
         kv: granted,
@@ -794,6 +798,7 @@ fn register_config(mode: &str, tier: ClientIpTier) -> PluginConfig {
         check_registration: true,
         check_media_upload: false,
         check_profile_update: false,
+        check_room_create: false,
     };
     p.client_ip = tier;
     p
@@ -875,6 +880,7 @@ fn media_config(mode: &str) -> PluginConfig {
         check_registration: false,
         check_media_upload: true,
         check_profile_update: false,
+        check_room_create: false,
     };
     p
 }
@@ -941,6 +947,7 @@ fn profile_config(mode: &str) -> PluginConfig {
         check_registration: false,
         check_media_upload: false,
         check_profile_update: true,
+        check_room_create: false,
     };
     p
 }
@@ -1002,6 +1009,96 @@ fn check_profile_update_skips_unbound() {
     assert!(!rt.binds_check_profile_update());
     assert_eq!(
         rt.check_profile_update(&profile_ctx(ProfileField::DisplayName, Some("evil"))),
+        Decision::Allow
+    );
+}
+
+// --- check_room_create point -----------------------------------------------
+
+use vela_extensions::RoomCreate;
+
+const ROOM_CREATE_FIXTURE: &[u8] = include_bytes!("fixtures/room_create_guest.wasm");
+
+fn room_create_config(mode: &str) -> PluginConfig {
+    let mut p = plugin("room", mode);
+    p.wasm = ROOM_CREATE_FIXTURE.to_vec();
+    p.points = Points {
+        check_event: false,
+        on_event: false,
+        check_registration: false,
+        check_media_upload: false,
+        check_profile_update: false,
+        check_room_create: true,
+    };
+    p
+}
+
+fn room_ctx<'a>(
+    name: Option<&'a str>,
+    visibility: Option<&'a str>,
+    invite: &'a [String],
+) -> RoomCreate<'a> {
+    RoomCreate {
+        creator: "@a:example.org",
+        room_id: "!r:example.org",
+        room_version: "12",
+        preset: "private_chat",
+        visibility,
+        name,
+        topic: None,
+        alias_localpart: None,
+        invite,
+        is_direct: false,
+    }
+}
+
+#[test]
+fn room_create_blocks_public() {
+    let rt = Runtime::new(vec![room_create_config("block_public")]).expect("loads");
+    assert!(matches!(
+        rt.check_room_create(&room_ctx(None, Some("public"), &[])),
+        Decision::Block { .. }
+    ));
+    assert_eq!(
+        rt.check_room_create(&room_ctx(None, Some("private"), &[])),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn room_create_blocks_banned_name() {
+    let rt = Runtime::new(vec![room_create_config("block_name")]).expect("loads");
+    assert!(matches!(
+        rt.check_room_create(&room_ctx(Some("evil lair"), None, &[])),
+        Decision::Block { .. }
+    ));
+    assert_eq!(
+        rt.check_room_create(&room_ctx(Some("book club"), None, &[])),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn room_create_caps_invites() {
+    let rt = Runtime::new(vec![room_create_config("max_invites_2")]).expect("loads");
+    let many = vec!["@b:x".to_string(), "@c:x".to_string(), "@d:x".to_string()];
+    assert!(matches!(
+        rt.check_room_create(&room_ctx(None, None, &many)),
+        Decision::Block { .. }
+    ));
+    let few = vec!["@b:x".to_string(), "@c:x".to_string()];
+    assert_eq!(
+        rt.check_room_create(&room_ctx(None, None, &few)),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn check_room_create_skips_unbound() {
+    let rt = Runtime::new(vec![plugin("dec", "block")]).expect("loads");
+    assert!(!rt.binds_check_room_create());
+    assert_eq!(
+        rt.check_room_create(&room_ctx(Some("evil"), Some("public"), &[])),
         Decision::Allow
     );
 }

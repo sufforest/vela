@@ -467,11 +467,86 @@ impl Profile {
     }
 }
 
+/// An ergonomic view over a room creation at the `check_room_create` point — a
+/// user creating a room, before anything is persisted.
+pub struct RoomCreate {
+    raw: bindings::exports::vela::extension::decision::RoomCreateContext,
+}
+
+impl RoomCreate {
+    fn new(raw: bindings::exports::vela::extension::decision::RoomCreateContext) -> Self {
+        RoomCreate { raw }
+    }
+
+    /// The creating user, `@user:server`.
+    pub fn creator(&self) -> &str {
+        &self.raw.creator
+    }
+
+    /// The room id the server derived for this creation.
+    pub fn room_id(&self) -> &str {
+        &self.raw.room_id
+    }
+
+    /// The room version.
+    pub fn room_version(&self) -> &str {
+        &self.raw.room_version
+    }
+
+    /// The resolved preset, normally `public_chat` / `private_chat` /
+    /// `trusted_private_chat`. Client-supplied and not validated against that set,
+    /// so key a "no public rooms" rule on [`RoomCreate::visibility`], not this.
+    pub fn preset(&self) -> &str {
+        &self.raw.preset
+    }
+
+    /// Requested directory visibility (`public` / `private`), or `None`. A
+    /// "no public rooms" rule keys on this.
+    pub fn visibility(&self) -> Option<&str> {
+        self.raw.visibility.as_deref()
+    }
+
+    /// Requested room name, or `None`.
+    pub fn name(&self) -> Option<&str> {
+        self.raw.name.as_deref()
+    }
+
+    /// Requested room topic, or `None`.
+    pub fn topic(&self) -> Option<&str> {
+        self.raw.topic.as_deref()
+    }
+
+    /// Requested alias localpart (e.g. `foo` for `#foo:server`), or `None`.
+    pub fn alias_localpart(&self) -> Option<&str> {
+        self.raw.alias_localpart.as_deref()
+    }
+
+    /// Users invited at creation time (an invite-bomb signal / target list).
+    pub fn invite(&self) -> &[String] {
+        &self.raw.invite
+    }
+
+    /// Whether the client marked this a direct (1:1) room.
+    pub fn is_direct(&self) -> bool {
+        self.raw.is_direct
+    }
+
+    /// This plugin's operator-supplied config as `T` — see [`Event::config`].
+    pub fn config<T: DeserializeOwned + Default>(&self) -> T {
+        if self.raw.plugin_config.is_empty() {
+            return T::default();
+        }
+        serde_json::from_str(&self.raw.plugin_config)
+            .expect("plugin config is present but invalid for the requested type")
+    }
+}
+
 /// Implement this for your plugin type, then `export_plugin!(YourType)`. A plugin
 /// can implement any of the hooks — [`Plugin::check_event`] (decision on events),
 /// [`Plugin::on_event`] (async observation), [`Plugin::check_registration`]
 /// (decision at signup), [`Plugin::check_media_upload`] (decision at upload),
-/// [`Plugin::check_profile_update`] (decision at a profile change) — the unused
+/// [`Plugin::check_profile_update`] (decision at a profile change),
+/// [`Plugin::check_room_create`] (decision at room creation) — the unused
 /// ones default to allow/no-op, and the operator's `points` config decides which
 /// the host invokes.
 pub trait Plugin {
@@ -506,6 +581,14 @@ pub trait Plugin {
     /// for anti-impersonation and name/avatar policy; the `kv` capability works
     /// here, so per-user churn limits are natural.
     fn check_profile_update(_profile: &Profile) -> Decision {
+        Decision::allow()
+    }
+
+    /// Decide whether to allow or block a room creation, at `createRoom` before
+    /// anything is persisted. Default: allow. Use it for anti-spam, invite-bomb
+    /// caps, no-public-rooms, and alias policy; the `kv` capability works here, so
+    /// per-creator rate limits are natural.
+    fn check_room_create(_room: &RoomCreate) -> Decision {
         Decision::allow()
     }
 }
@@ -584,6 +667,22 @@ pub fn dispatch_check_profile_update<P: Plugin>(
     }
 }
 
+/// Bridge from the raw room-create entry point to [`Plugin::check_room_create`].
+/// Called by [`export_plugin!`]; not for direct use.
+#[doc(hidden)]
+pub fn dispatch_check_room_create<P: Plugin>(
+    ctx: bindings::exports::vela::extension::decision::RoomCreateContext,
+) -> bindings::exports::vela::extension::decision::Verdict {
+    use bindings::exports::vela::extension::decision as wit;
+    let room = RoomCreate::new(ctx);
+    match P::check_room_create(&room) {
+        Decision::Allow => wit::Verdict::Allow,
+        Decision::Block { errcode, reason } => {
+            wit::Verdict::Block(wit::BlockReason { errcode, reason })
+        }
+    }
+}
+
 /// Export your [`Plugin`] implementation as the component's entry point. Call
 /// this exactly once at the crate root.
 #[macro_export]
@@ -610,6 +709,11 @@ macro_rules! export_plugin {
                 ctx: $crate::bindings::exports::vela::extension::decision::ProfileContext,
             ) -> $crate::bindings::exports::vela::extension::decision::Verdict {
                 $crate::dispatch_check_profile_update::<$plugin>(ctx)
+            }
+            fn check_room_create(
+                ctx: $crate::bindings::exports::vela::extension::decision::RoomCreateContext,
+            ) -> $crate::bindings::exports::vela::extension::decision::Verdict {
+                $crate::dispatch_check_room_create::<$plugin>(ctx)
             }
         }
         impl $crate::bindings::exports::vela::extension::observation::Guest for __VelaPluginGlue {

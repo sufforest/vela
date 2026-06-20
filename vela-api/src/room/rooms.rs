@@ -80,6 +80,43 @@ fn select_auth_from_created(
     )
 }
 
+/// Sandboxed room-create decision hook, run before anything is persisted. No-op
+/// when no plugin binds the point. A block rejects the creation (403, plugin's
+/// errcode) — anti-spam / invite-bomb / no-public-rooms / alias policy.
+fn room_create_gate(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    room_id: &str,
+    room_version: &str,
+    preset: &str,
+    body: &CreateRoomRequest,
+) -> Result<(), ApiError> {
+    // Lock-free snapshot, like the other decision gates.
+    let rt = state.extensions.load();
+    if !rt.binds_check_room_create() {
+        return Ok(());
+    }
+    let ctx = vela_extensions::RoomCreate {
+        creator: &user.user_id,
+        room_id,
+        room_version,
+        preset,
+        visibility: body.visibility.as_deref(),
+        name: body.name.as_deref(),
+        topic: body.topic.as_deref(),
+        alias_localpart: body.room_alias_name.as_deref(),
+        invite: body.invite.as_deref().unwrap_or(&[]),
+        is_direct: body.is_direct.unwrap_or(false),
+    };
+    match rt.check_room_create(&ctx) {
+        vela_extensions::Decision::Allow => Ok(()),
+        vela_extensions::Decision::Block { errcode, reason } => {
+            tracing::info!(creator = %user.user_id, room_id, %errcode, %reason, "extension blocked room creation");
+            Err(ApiError(VelaError::ExtensionBlocked { errcode, reason }))
+        }
+    }
+}
+
 /// POST /_matrix/client/v3/createRoom
 #[allow(unused_assignments)]
 pub async fn create_room(
@@ -436,6 +473,19 @@ pub async fn create_room(
             Some(&room_id)
         );
     }
+
+    // Sandboxed room-create decision hook — runs once the request is fully
+    // resolved but before ANY persistence (the alias write just below is the
+    // first DB write), so a block leaves no orphan state — no alias, no nid, no
+    // events.
+    room_create_gate(
+        &state,
+        &user,
+        room_id.as_str(),
+        room_version.as_str(),
+        preset,
+        &body,
+    )?;
 
     // --- 6b. room_alias_name ---
     // Register the alias and pin it as the canonical alias. The alias
@@ -1371,5 +1421,91 @@ mod auto_encrypt_tests {
     fn all_never_injects_for_public() {
         assert!(should_auto_encrypt(All, "private_chat", false));
         assert!(!should_auto_encrypt(All, "public_chat", false));
+    }
+}
+
+#[cfg(all(test, feature = "extensions"))]
+mod room_create_extension_tests {
+    use super::create_room;
+    use crate::middleware::auth::AuthenticatedUser;
+    use crate::test_helpers::build_test_state;
+    use axum::extract::State;
+    use vela_core::error::VelaError;
+
+    // Gitignored fixture — run vela-extensions/tests/fixtures/build.sh first (CI does).
+    const ROOM_CREATE: &[u8] =
+        include_bytes!("../../../vela-extensions/tests/fixtures/room_create_guest.wasm");
+
+    fn auth(nid: u64) -> AuthenticatedUser {
+        AuthenticatedUser {
+            user_nid: nid,
+            user_id: "@a:test".into(),
+            device_id: "D".into(),
+            appservice_nid: None,
+        }
+    }
+
+    fn load_plugin(state: &crate::router::AppState, mode: &str) {
+        let rt = vela_extensions::Runtime::new(vec![vela_extensions::PluginConfig {
+            name: "room".into(),
+            wasm: ROOM_CREATE.to_vec(),
+            fail_policy: vela_extensions::FailPolicy::Closed,
+            fuel: 50_000_000,
+            wall_ms: 0,
+            memory_pages: 256,
+            event_types: None,
+            points: vela_extensions::Points {
+                check_event: false,
+                on_event: false,
+                check_registration: false,
+                check_media_upload: false,
+                check_profile_update: false,
+                check_room_create: true,
+            },
+            capabilities: Default::default(),
+            client_ip: Default::default(),
+            config: serde_json::json!({ "mode": mode }),
+        }])
+        .expect("room plugin loads");
+        state.extensions.store(std::sync::Arc::new(rt));
+    }
+
+    /// A room-create plugin blocks a banned room name before anything is
+    /// persisted, and a clean creation still goes through.
+    #[tokio::test]
+    async fn create_room_blocked_by_extension() {
+        let (state, _tmp) = build_test_state();
+        let nid = state.db.create_user("@a:test", "").expect("create user");
+        load_plugin(&state, "block_name");
+
+        // Banned name → blocked before persist. The request also asks for an
+        // alias, which must NOT be left behind (the gate runs before the alias
+        // write — regression guard for the orphan-alias path).
+        let err = create_room(
+            State(state.clone()),
+            auth(nid),
+            axum::body::Bytes::from(r#"{"name":"evil lair","room_alias_name":"evilroom"}"#),
+        )
+        .await
+        .expect_err("banned room name blocked");
+        assert!(matches!(err.0, VelaError::ExtensionBlocked { .. }));
+        assert!(
+            state
+                .db
+                .get_room_alias("#evilroom:test")
+                .expect("alias lookup")
+                .is_none(),
+            "a blocked creation must not leave an orphan alias"
+        );
+
+        // A clean name is allowed and the room is created.
+        let ok = create_room(
+            State(state.clone()),
+            auth(nid),
+            axum::body::Bytes::from(r#"{"name":"book club"}"#),
+        )
+        .await
+        .expect("clean room creation allowed");
+        assert!(ok.0.get("room_id").is_some(), "created room returns an id");
     }
 }

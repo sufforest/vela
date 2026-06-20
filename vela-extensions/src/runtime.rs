@@ -3,7 +3,7 @@
 //! states; with `wasmtime-runtime` off it degrades to a no-op that allows
 //! everything, so call sites in vela-api never need `#[cfg]`.
 
-use crate::abi::{EventContext, MediaContext, ProfileUpdate, RegistrationContext};
+use crate::abi::{EventContext, MediaContext, ProfileUpdate, RegistrationContext, RoomCreate};
 use crate::config::PluginConfig;
 
 /// The aggregate outcome of a decision point across all plugins.
@@ -299,6 +299,43 @@ mod imp {
             }
             Decision::Allow
         }
+
+        /// True if any plugin binds the room-create point — lets the createRoom
+        /// handler skip the gate when none is set.
+        pub fn binds_check_room_create(&self) -> bool {
+            self.plugins.iter().any(|p| p.cfg.points.check_room_create)
+        }
+
+        /// Run the room-create decision point: block-if-any, same fail-policy as
+        /// `check_event`. A block rejects the creation before anything persists.
+        /// No event-type scoping.
+        pub fn check_room_create(&self, ctx: &RoomCreate<'_>) -> Decision {
+            for plugin in &self.plugins {
+                if !plugin.cfg.points.check_room_create {
+                    continue;
+                }
+                let verdict = match plugin.check_room_create(ctx) {
+                    Ok(v) => v,
+                    Err(e) => match plugin.cfg.fail_policy {
+                        FailPolicy::Open => {
+                            tracing::warn!(plugin = %plugin.cfg.name, error = %e, "extension check_room_create failed; failing open (allow)");
+                            continue;
+                        }
+                        FailPolicy::Closed => {
+                            tracing::warn!(plugin = %plugin.cfg.name, error = %e, "extension check_room_create failed; failing closed (block)");
+                            return Decision::Block {
+                                errcode: "M_FORBIDDEN".to_string(),
+                                reason: "extension policy unavailable".to_string(),
+                            };
+                        }
+                    },
+                };
+                if let Verdict::Block { errcode, reason } = verdict {
+                    return Decision::Block { errcode, reason };
+                }
+            }
+            Decision::Allow
+        }
     }
 
     /// A plugin with no `event_types` filter runs for everything; otherwise only
@@ -389,6 +426,14 @@ mod imp {
         }
 
         pub fn check_profile_update(&self, _ctx: &ProfileUpdate<'_>) -> Decision {
+            Decision::Allow
+        }
+
+        pub fn binds_check_room_create(&self) -> bool {
+            false
+        }
+
+        pub fn check_room_create(&self, _ctx: &RoomCreate<'_>) -> Decision {
             Decision::Allow
         }
     }

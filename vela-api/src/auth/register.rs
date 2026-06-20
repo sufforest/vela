@@ -715,6 +715,7 @@ mod admin_integration_tests {
                 check_registration: true,
                 check_media_upload: false,
                 check_profile_update: false,
+                check_room_create: false,
             },
             capabilities: Default::default(),
             client_ip: Default::default(),

@@ -29,7 +29,7 @@ Each `[[extensions.plugin]]` block loads one component:
 name = "keyword-filter"                # for logs, errors, metrics
 wasm_path = "/etc/vela/plugins/keyword-filter.wasm"
 event_types = ["m.room.message"]       # optional; omit to run for all events
-points = ["check_event"]               # check_event/on_event/check_registration/check_media_upload/check_profile_update
+points = ["check_event"]               # check_event/on_event/check_registration/check_media_upload/check_profile_update/check_room_create
 capabilities = []                      # host caps to grant, e.g. ["emit-event"]
 client_ip = "none"                     # check_registration IP tier: none|hashed|full
 fail_policy = "open"                   # "open" (default) | "closed"
@@ -44,7 +44,7 @@ config = { banned = ["spam"] }         # opaque JSON, handed to the plugin
 | `name` | — (required) | identifier in logs/errors/metrics |
 | `wasm_path` | — (required) | path to the `.wasm` component |
 | `event_types` | all | only invoke for these event types |
-| `points` | `["check_event"]` | hooks the plugin binds: `check_event` (decision on events), `on_event` (async observation), `check_registration` (decision at signup), `check_media_upload` (decision at media upload), `check_profile_update` (decision at a profile change) |
+| `points` | `["check_event"]` | hooks the plugin binds: `check_event` (decision on events), `on_event` (async observation), `check_registration` (decision at signup), `check_media_upload` (decision at media upload), `check_profile_update` (decision at a profile change), `check_room_create` (decision at room creation) |
 | `capabilities` | `[]` | host capabilities to grant (least-privilege): `emit-event` (post as its bot), `kv` (private key→value store). `logging` is always on |
 | `client_ip` | `"none"` | what a `check_registration` plugin sees of the client IP: `none`, `hashed` (a rate-limit token, no PII), or `full` (raw IP) |
 | `fail_policy` | `open` | on trap/timeout: `open` allows, `closed` blocks |
@@ -70,7 +70,7 @@ moderation. (Unix only; on other platforms, restart to reload.)
 
 ## What plugins can do
 
-Five extension points (a plugin binds any of them via `points`):
+Six extension points (a plugin binds any of them via `points`):
 
 - **`check_event`** — the sync decision hook, on **local sends** (message and
   state events, after auth, before persist — a block rejects the send with the
@@ -113,6 +113,14 @@ Five extension points (a plugin binds any of them via `points`):
   policy. Local only: a remote user's profile change arrives as an `m.room.member`
   event and is a `check_event` concern. The `kv` capability works here (per-user
   churn limits).
+- **`check_room_create`** — the sync decision hook at **`POST /createRoom`**,
+  before anything is persisted; a block rejects the creation (403, plugin's
+  errcode). The plugin sees the creator, the resolved preset, the requested
+  visibility (so a no-public-rooms rule keys on it), name/topic, the alias
+  localpart, the invite list (an invite-bomb signal), and `is_direct`. Use it for
+  anti-spam, invite-bomb caps, no-public-rooms, and alias policy. Local only:
+  rooms federate via joins, not creation. The `kv` capability works here (per-creator
+  rate limits), so a config-driven policy plugin can enforce declarative rules.
 
 Plugins are **stateless** and get only the **host capabilities** you grant — no
 network, disk, or syscalls. Granted least-privilege per plugin via `capabilities`:

@@ -14,7 +14,8 @@ use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use crate::HostServices;
 use crate::abi::{
-    EventContext, MediaContext, Origin, ProfileField, ProfileUpdate, RegistrationContext, Verdict,
+    EventContext, MediaContext, Origin, ProfileField, ProfileUpdate, RegistrationContext,
+    RoomCreate, Verdict,
 };
 use crate::config::{ClientIpTier, PluginConfig};
 use crate::emit::{EmitLimiter, EmitRequest, EventEmitter, emit_type_allowed};
@@ -545,6 +546,36 @@ impl Plugin {
         let verdict = instance
             .vela_extension_decision()
             .call_check_profile_update(&mut store, &wire)
+            .map_err(|e| PluginError::Trap(e.to_string()))?;
+        Ok(match verdict {
+            wit::Verdict::Allow => Verdict::Allow,
+            wit::Verdict::Block(r) => Verdict::Block {
+                errcode: r.errcode,
+                reason: r.reason,
+            },
+        })
+    }
+
+    /// Run the room-create decision hook for one createRoom → a verdict. On the
+    /// request path (no emit); kv is available (per-creator rate limits).
+    pub(crate) fn check_room_create(&self, ctx: &RoomCreate<'_>) -> Result<Verdict, PluginError> {
+        let (mut store, instance) = self.make_store(false)?;
+        let wire = wit::RoomCreateContext {
+            creator: ctx.creator.to_string(),
+            room_id: ctx.room_id.to_string(),
+            room_version: ctx.room_version.to_string(),
+            preset: ctx.preset.to_string(),
+            visibility: ctx.visibility.map(|s| s.to_string()),
+            name: ctx.name.map(|s| s.to_string()),
+            topic: ctx.topic.map(|s| s.to_string()),
+            alias_localpart: ctx.alias_localpart.map(|s| s.to_string()),
+            invite: ctx.invite.to_vec(),
+            is_direct: ctx.is_direct,
+            plugin_config: config_json(&self.cfg.config),
+        };
+        let verdict = instance
+            .vela_extension_decision()
+            .call_check_room_create(&mut store, &wire)
             .map_err(|e| PluginError::Trap(e.to_string()))?;
         Ok(match verdict {
             wit::Verdict::Allow => Verdict::Allow,

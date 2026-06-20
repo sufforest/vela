@@ -25,6 +25,13 @@ fn blocked(reason: &str) -> Verdict {
 }
 
 impl Guest for Component {
+    // Room-create point unused by this fixture — default allow.
+    fn check_room_create(
+        _ctx: exports::vela::extension::decision::RoomCreateContext,
+    ) -> Verdict {
+        Verdict::Allow
+    }
+
     fn check_event(_ctx: DecCtx) -> Verdict {
         Verdict::Allow
     }

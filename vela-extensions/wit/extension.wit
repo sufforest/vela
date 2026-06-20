@@ -11,7 +11,7 @@
 // components regardless of what changed; the committed fixtures/examples are
 // rebuilt with each bump. (Within a fixed version, a guest still instantiates as
 // long as it exports what the world requires and imports only granted caps.)
-package vela:extension@0.8.0;
+package vela:extension@0.9.0;
 
 interface decision {
     // Where an event originated. A `block` verdict is a hard reject for `local`
@@ -126,6 +126,38 @@ interface decision {
         plugin-config: string,
     }
     check-profile-update: func(ctx: profile-context) -> verdict;
+
+    // A user creating a room, at `POST /createRoom`, before anything is persisted.
+    // Room-creation policy: anti-spam, invite-bomb caps, no-public-rooms, alias
+    // policy. A block rejects the creation with the verdict's errcode/reason. Local
+    // only: rooms federate via joins, not creation. The `kv` capability works here
+    // (per-creator rate limits). `visibility` is the requested directory listing
+    // intent (so a no-public-rooms rule keys on it) — the create-vs-publish split
+    // folds into one point.
+    record room-create-context {
+        // The creating user, @user:server.
+        creator: string,
+        // The room id the server derived for this creation.
+        room-id: string,
+        room-version: string,
+        // Resolved preset, normally "public_chat" | "private_chat" |
+        // "trusted_private_chat". Client-supplied and not validated against that
+        // set, so an unknown value can pass through (the server treats unknown as
+        // private); key a "no public rooms" rule on `visibility`, not `preset`.
+        preset: string,
+        // Requested directory visibility, "public" | "private"; `none` if unset.
+        visibility: option<string>,
+        name: option<string>,
+        topic: option<string>,
+        // Requested alias localpart, e.g. "foo" for #foo:server; `none` if unset.
+        alias-localpart: option<string>,
+        // Users invited at creation time (an invite-bomb signal / target list).
+        invite: list<string>,
+        is-direct: bool,
+        // This plugin's opaque config, verbatim JSON. Empty string if none.
+        plugin-config: string,
+    }
+    check-room-create: func(ctx: room-create-context) -> verdict;
 }
 
 // Async observation: the host calls this off the request hot path (a worker

@@ -85,6 +85,27 @@ pub struct ProfileUpdate<'a> {
     pub value: Option<&'a str>,
 }
 
+/// A user creating a room, handed to a plugin before anything is persisted.
+/// Borrowed.
+pub struct RoomCreate<'a> {
+    /// The creating user, `@user:server`.
+    pub creator: &'a str,
+    /// The room id the server derived for this creation.
+    pub room_id: &'a str,
+    pub room_version: &'a str,
+    /// Resolved preset: `public_chat` / `private_chat` / `trusted_private_chat`.
+    pub preset: &'a str,
+    /// Requested directory visibility (`public` / `private`), or `None`.
+    pub visibility: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub topic: Option<&'a str>,
+    /// Requested alias localpart (e.g. `foo` for `#foo:server`), or `None`.
+    pub alias_localpart: Option<&'a str>,
+    /// Users invited at creation time.
+    pub invite: &'a [String],
+    pub is_direct: bool,
+}
+
 /// What a plugin returns from a decision point. Converted from the generated
 /// Component-Model `verdict` variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
