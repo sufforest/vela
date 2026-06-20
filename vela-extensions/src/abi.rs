@@ -66,6 +66,25 @@ pub struct MediaContext<'a> {
     pub sha256: &'a str,
 }
 
+/// Which profile field a user is setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileField {
+    DisplayName,
+    AvatarUrl,
+}
+
+/// A user setting their own display name or avatar, handed to a plugin before the
+/// change is persisted or propagated. Borrowed.
+pub struct ProfileUpdate<'a> {
+    /// The user changing their own profile.
+    pub user_id: &'a str,
+    /// Which field is being set.
+    pub field: ProfileField,
+    /// The proposed new value; `None` means the user is clearing the field. For
+    /// `AvatarUrl` this is the mxc:// URI, not the image.
+    pub value: Option<&'a str>,
+}
+
 /// What a plugin returns from a decision point. Converted from the generated
 /// Component-Model `verdict` variant.
 #[derive(Debug, Clone, PartialEq, Eq)]

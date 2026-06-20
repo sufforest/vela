@@ -18,6 +18,8 @@ pub struct Points {
     pub check_registration: bool,
     /// Sync decision hook at media upload (content/MIME/hash policy).
     pub check_media_upload: bool,
+    /// Sync decision hook at a profile update (display name / avatar policy).
+    pub check_profile_update: bool,
 }
 
 impl Default for Points {
@@ -27,6 +29,7 @@ impl Default for Points {
             on_event: false,
             check_registration: false,
             check_media_upload: false,
+            check_profile_update: false,
         }
     }
 }

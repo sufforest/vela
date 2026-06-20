@@ -399,6 +399,7 @@ fn observer(name: &str, mode: &str) -> PluginConfig {
         on_event: true,
         check_registration: false,
         check_media_upload: false,
+        check_profile_update: false,
     };
     p
 }
@@ -472,6 +473,7 @@ fn a_plugin_can_bind_both_points() {
         on_event: true,
         check_registration: false,
         check_media_upload: false,
+        check_profile_update: false,
     };
     let rt = Runtime::new(vec![p]).expect("loads");
     assert!(matches!(
@@ -578,6 +580,7 @@ fn emit_config(mode: &str, granted: bool) -> PluginConfig {
             on_event: true,
             check_registration: false,
             check_media_upload: false,
+            check_profile_update: false,
         },
         capabilities: Capabilities {
             emit_event: granted,
@@ -709,6 +712,7 @@ fn kv_config(mode: &str, granted: bool) -> PluginConfig {
         on_event: true,
         check_registration: false,
         check_media_upload: false,
+        check_profile_update: false,
     };
     p.capabilities = Capabilities {
         kv: granted,
@@ -789,6 +793,7 @@ fn register_config(mode: &str, tier: ClientIpTier) -> PluginConfig {
         on_event: false,
         check_registration: true,
         check_media_upload: false,
+        check_profile_update: false,
     };
     p.client_ip = tier;
     p
@@ -869,6 +874,7 @@ fn media_config(mode: &str) -> PluginConfig {
         on_event: false,
         check_registration: false,
         check_media_upload: true,
+        check_profile_update: false,
     };
     p
 }
@@ -916,6 +922,86 @@ fn check_media_upload_skips_unbound() {
     assert!(!rt.binds_check_media_upload());
     assert_eq!(
         rt.check_media_upload(&media_ctx("application/x-msdownload", "00")),
+        Decision::Allow
+    );
+}
+
+// --- check_profile_update point --------------------------------------------
+
+use vela_extensions::{ProfileField, ProfileUpdate};
+
+const PROFILE_FIXTURE: &[u8] = include_bytes!("fixtures/profile_guest.wasm");
+
+fn profile_config(mode: &str) -> PluginConfig {
+    let mut p = plugin("profile", mode);
+    p.wasm = PROFILE_FIXTURE.to_vec();
+    p.points = Points {
+        check_event: false,
+        on_event: false,
+        check_registration: false,
+        check_media_upload: false,
+        check_profile_update: true,
+    };
+    p
+}
+
+fn profile_ctx(field: ProfileField, value: Option<&str>) -> ProfileUpdate<'_> {
+    ProfileUpdate {
+        user_id: "@a:example.org",
+        field,
+        value,
+    }
+}
+
+#[test]
+fn profile_blocks_banned_display_name() {
+    let rt = Runtime::new(vec![profile_config("block_name")]).expect("loads");
+    assert!(matches!(
+        rt.check_profile_update(&profile_ctx(ProfileField::DisplayName, Some("evil bob"))),
+        Decision::Block { .. }
+    ));
+    // A clean name is allowed.
+    assert_eq!(
+        rt.check_profile_update(&profile_ctx(ProfileField::DisplayName, Some("bob"))),
+        Decision::Allow
+    );
+    // Clearing the name (None) is allowed.
+    assert_eq!(
+        rt.check_profile_update(&profile_ctx(ProfileField::DisplayName, None)),
+        Decision::Allow
+    );
+    // The name rule doesn't touch the avatar field.
+    assert_eq!(
+        rt.check_profile_update(&profile_ctx(ProfileField::AvatarUrl, Some("evil"))),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn profile_blocks_non_mxc_avatar() {
+    let rt = Runtime::new(vec![profile_config("block_avatar")]).expect("loads");
+    assert!(matches!(
+        rt.check_profile_update(&profile_ctx(
+            ProfileField::AvatarUrl,
+            Some("https://evil.example/x.png")
+        )),
+        Decision::Block { .. }
+    ));
+    assert_eq!(
+        rt.check_profile_update(&profile_ctx(
+            ProfileField::AvatarUrl,
+            Some("mxc://example.org/abc")
+        )),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn check_profile_update_skips_unbound() {
+    let rt = Runtime::new(vec![plugin("dec", "block")]).expect("loads");
+    assert!(!rt.binds_check_profile_update());
+    assert_eq!(
+        rt.check_profile_update(&profile_ctx(ProfileField::DisplayName, Some("evil"))),
         Decision::Allow
     );
 }
