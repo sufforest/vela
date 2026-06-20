@@ -50,6 +50,22 @@ pub struct RegistrationContext<'a> {
     pub client_ip_hashed: Option<&'a str>,
 }
 
+/// The media-upload metadata the host hands a plugin, after the bytes are stored
+/// but before the upload is downloadable. v1 carries no raw content — the upload
+/// streams, so only an in-stream hash + metadata are available. Borrowed.
+pub struct MediaContext<'a> {
+    /// Client-declared MIME type.
+    pub content_type: &'a str,
+    /// Original filename, or empty.
+    pub filename: &'a str,
+    /// Size in bytes.
+    pub size: u64,
+    /// The uploading user's id.
+    pub uploader: &'a str,
+    /// Lowercase hex SHA-256 of the content.
+    pub sha256: &'a str,
+}
+
 /// What a plugin returns from a decision point. Converted from the generated
 /// Component-Model `verdict` variant.
 #[derive(Debug, Clone, PartialEq, Eq)]

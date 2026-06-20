@@ -712,6 +712,7 @@ mod admin_integration_tests {
                 check_event: false,
                 on_event: false,
                 check_registration: true,
+                check_media_upload: false,
             },
             capabilities: Default::default(),
             client_ip: Default::default(),

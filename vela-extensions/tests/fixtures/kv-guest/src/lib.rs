@@ -25,6 +25,12 @@ use vela::extension::kv;
 struct Component;
 
 impl Guest for Component {
+    fn check_media_upload(
+        _ctx: exports::vela::extension::decision::MediaContext,
+    ) -> Verdict {
+        Verdict::Allow
+    }
+
     fn check_registration(
         _ctx: exports::vela::extension::decision::RegistrationContext,
     ) -> Verdict {

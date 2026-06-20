@@ -397,6 +397,7 @@ fn observer(name: &str, mode: &str) -> PluginConfig {
         check_event: false,
         on_event: true,
         check_registration: false,
+        check_media_upload: false,
     };
     p
 }
@@ -469,6 +470,7 @@ fn a_plugin_can_bind_both_points() {
         check_event: true,
         on_event: true,
         check_registration: false,
+        check_media_upload: false,
     };
     let rt = Runtime::new(vec![p]).expect("loads");
     assert!(matches!(
@@ -574,6 +576,7 @@ fn emit_config(mode: &str, granted: bool) -> PluginConfig {
             check_event: false,
             on_event: true,
             check_registration: false,
+            check_media_upload: false,
         },
         capabilities: Capabilities {
             emit_event: granted,
@@ -704,6 +707,7 @@ fn kv_config(mode: &str, granted: bool) -> PluginConfig {
         check_event: true,
         on_event: true,
         check_registration: false,
+        check_media_upload: false,
     };
     p.capabilities = Capabilities {
         kv: granted,
@@ -783,6 +787,7 @@ fn register_config(mode: &str, tier: ClientIpTier) -> PluginConfig {
         check_event: false,
         on_event: false,
         check_registration: true,
+        check_media_upload: false,
     };
     p.client_ip = tier;
     p
@@ -845,6 +850,71 @@ fn check_registration_skips_unbound_plugins() {
     assert!(!rt.binds_check_registration());
     assert_eq!(
         rt.check_registration(&reg_ctx("spammer", None, None)),
+        Decision::Allow
+    );
+}
+
+// --- check_media_upload point ----------------------------------------------
+
+use vela_extensions::MediaContext;
+
+const MEDIA_FIXTURE: &[u8] = include_bytes!("fixtures/media_guest.wasm");
+
+fn media_config(mode: &str) -> PluginConfig {
+    let mut p = plugin("media", mode);
+    p.wasm = MEDIA_FIXTURE.to_vec();
+    p.points = Points {
+        check_event: false,
+        on_event: false,
+        check_registration: false,
+        check_media_upload: true,
+    };
+    p
+}
+
+fn media_ctx<'a>(content_type: &'a str, sha256: &'a str) -> MediaContext<'a> {
+    MediaContext {
+        content_type,
+        filename: "f.bin",
+        size: 3,
+        uploader: "@a:example.org",
+        sha256,
+    }
+}
+
+#[test]
+fn media_blocks_by_content_type() {
+    let rt = Runtime::new(vec![media_config("block_exe")]).expect("loads");
+    assert!(matches!(
+        rt.check_media_upload(&media_ctx("application/x-msdownload", "00")),
+        Decision::Block { .. }
+    ));
+    assert_eq!(
+        rt.check_media_upload(&media_ctx("image/png", "00")),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn media_blocks_by_known_hash() {
+    let rt = Runtime::new(vec![media_config("block_hash")]).expect("loads");
+    let bad = "2f05d4b689d270cafb02285f35f44866f7dc8a2d368a3f9d1124373eeab31fb1";
+    assert!(matches!(
+        rt.check_media_upload(&media_ctx("image/png", bad)),
+        Decision::Block { .. }
+    ));
+    assert_eq!(
+        rt.check_media_upload(&media_ctx("image/png", "deadbeef")),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn check_media_upload_skips_unbound() {
+    let rt = Runtime::new(vec![plugin("dec", "block")]).expect("loads");
+    assert!(!rt.binds_check_media_upload());
+    assert_eq!(
+        rt.check_media_upload(&media_ctx("application/x-msdownload", "00")),
         Decision::Allow
     );
 }

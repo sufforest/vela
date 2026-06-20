@@ -28,6 +28,12 @@ use exports::vela::extension::decision::{BlockReason, EventContext, Guest, Verdi
 struct Component;
 
 impl Guest for Component {
+    fn check_media_upload(
+        _ctx: exports::vela::extension::decision::MediaContext,
+    ) -> Verdict {
+        Verdict::Allow
+    }
+
     // Registration point unused by this fixture — default allow.
     fn check_registration(
         _ctx: exports::vela::extension::decision::RegistrationContext,
