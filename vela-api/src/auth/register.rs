@@ -238,6 +238,20 @@ pub async fn register(
         return Err(VelaError::UserInUse.into());
     }
 
+    // Anti-spam: sandboxed registration-policy hook (no-op when no plugin binds
+    // it). Before the expensive argon2 hash + token consume, so a blocked signup
+    // wastes nothing. A block is a hard reject (we refuse to create the account).
+    registration_gate(
+        &state,
+        &username,
+        if provided_token.is_some() {
+            "token"
+        } else {
+            "open"
+        },
+        &headers,
+    )?;
+
     // Hash password with argon2
     let salt: [u8; 16] = rand::random();
     let password_hash = hash_password(password, &salt);
@@ -500,6 +514,81 @@ fn mint_uia_session() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Sandboxed registration-policy hook (anti-spam signup). No-op — and no work —
+/// when no plugin binds `check_registration`. A block is a hard reject: we
+/// refuse to create the account, surfacing the plugin's errcode/reason (403).
+fn registration_gate(
+    state: &AppState,
+    username: &str,
+    kind: &str,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    // Lock-free snapshot, like the send gate; a concurrent SIGHUP can't tear it.
+    let rt = state.extensions.load();
+    if !rt.binds_check_registration() {
+        return Ok(());
+    }
+    let ip = client_ip_from_headers(headers);
+    let hashed = ip.as_deref().map(|ip| hash_client_ip(state, ip));
+    let ctx = vela_extensions::RegistrationContext {
+        username,
+        kind,
+        client_ip_full: ip.as_deref(),
+        client_ip_hashed: hashed.as_deref(),
+    };
+    match rt.check_registration(&ctx) {
+        vela_extensions::Decision::Allow => Ok(()),
+        vela_extensions::Decision::Block { errcode, reason } => {
+            tracing::info!(username, kind, %errcode, %reason, "extension blocked registration");
+            Err(ApiError(VelaError::ExtensionBlocked { errcode, reason }))
+        }
+    }
+}
+
+/// The client IP from the first hop of `X-Forwarded-For`.
+///
+/// IMPORTANT: this is only trustworthy behind a reverse proxy that **overwrites**
+/// `X-Forwarded-For` (the standard Matrix deployment). A *direct* client can set
+/// the header to anything — and because a `check_registration` plugin can
+/// *block* on this value, a spoofer could both evade an IP-based block and forge
+/// a victim's IP. So it's a best-effort key for proxied deployments, never a
+/// security boundary; an operator who exposes the homeserver directly should not
+/// grant the `hashed`/`full` IP tiers. (vela's request rate-limiter keys on the
+/// real TCP peer instead; we use XFF here because, behind a proxy, the peer is
+/// the proxy, not the client. Unifying these behind a trusted-proxy config is a
+/// future refinement.) Absent/garbage header → `None`.
+fn client_ip_from_headers(headers: &HeaderMap) -> Option<String> {
+    let xff = headers.get("x-forwarded-for")?.to_str().ok()?;
+    let first = xff.split(',').next()?.trim();
+    (!first.is_empty()).then(|| first.to_string())
+}
+
+/// A non-reversible token for an IP — URL-safe base64 of `HMAC(subkey, ip)`,
+/// where `subkey` is derived from the server signing seed (one KDF step) so the
+/// IP-token key is **cryptographically independent of the signing key** — one
+/// key, one purpose. The token is stable, server-specific, and unreversible by a
+/// plugin (which never holds the subkey, so it can't recompute it for a guessed
+/// IP). This is what the `hashed` tier hands a plugin.
+fn hash_client_ip(state: &AppState, ip: &str) -> String {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    // Derive a dedicated subkey from the signing seed. The subkey is a hash
+    // output — it can't sign and can't be reversed to the seed — so using it as
+    // an HMAC key never puts the server's identity key at risk.
+    let subkey = {
+        let mut mac = <HmacSha256>::new_from_slice(state.signing_key.secret_bytes())
+            .expect("HMAC accepts any key length");
+        mac.update(b"vela-ext-registration-ip-key/v1");
+        mac.finalize().into_bytes()
+    };
+    let mut mac = <HmacSha256>::new_from_slice(&subkey).expect("HMAC accepts any key length");
+    mac.update(ip.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
 /// If `new_user_nid` is the very first registrant after server
 /// bootstrap, send them an invite to the admin room as the bot. Skips
 /// silently when there's no admin room yet (pre-bootstrap), when an
@@ -594,6 +683,62 @@ mod admin_integration_tests {
         .await
         .expect_err("bot localpart reserved");
         assert!(matches!(err.0, VelaError::Forbidden(_)));
+    }
+
+    /// A `check_registration` plugin can block a signup — the anti-spam point,
+    /// end to end: a blocking plugin rejects `/register` with its errcode before
+    /// the account is created.
+    #[cfg(feature = "extensions")]
+    #[tokio::test]
+    async fn registration_blocked_by_extension() {
+        const REG: &[u8] =
+            include_bytes!("../../../vela-extensions/tests/fixtures/register_guest.wasm");
+        let (state, _tmp) = build_test_state();
+        crate::admin::bootstrap(&state).await.unwrap();
+        state
+            .db
+            .create_registration_token("tok-a", 0, 0, 0)
+            .unwrap();
+        // Inject a plugin that blocks usernames containing "spam".
+        let rt = vela_extensions::Runtime::new(vec![vela_extensions::PluginConfig {
+            name: "reg".into(),
+            wasm: REG.to_vec(),
+            fail_policy: vela_extensions::FailPolicy::Closed,
+            fuel: 50_000_000,
+            wall_ms: 0,
+            memory_pages: 256,
+            event_types: None,
+            points: vela_extensions::Points {
+                check_event: false,
+                on_event: false,
+                check_registration: true,
+            },
+            capabilities: Default::default(),
+            client_ip: Default::default(),
+            config: json!({ "mode": "block_spam" }),
+        }])
+        .expect("register plugin loads");
+        state.extensions.store(Arc::new(rt));
+
+        let auth = json!({"type": "m.login.registration_token", "token": "tok-a"});
+        // A spammy username is rejected...
+        let err = register(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            body_with(Some(auth.clone()), "spammer", "secret123"),
+        )
+        .await
+        .expect_err("registration blocked by the plugin");
+        assert!(matches!(err.0, VelaError::ExtensionBlocked { .. }));
+
+        // ...a clean username goes through.
+        register(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            body_with(Some(auth), "alice", "secret123"),
+        )
+        .await
+        .expect("clean registration allowed");
     }
 
     /// The `_ext_` localpart prefix is reserved for extension plugin bots — a

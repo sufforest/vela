@@ -22,6 +22,12 @@ use vela::extension::emit::{emit_event, NewEvent};
 struct Component;
 
 impl Guest for Component {
+    fn check_registration(
+        _ctx: exports::vela::extension::decision::RegistrationContext,
+    ) -> Verdict {
+        Verdict::Allow
+    }
+
     fn check_event(_ctx: DecCtx) -> Verdict {
         // Decision-irrelevant; this fixture is about observation + emit.
         Verdict::Allow

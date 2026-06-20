@@ -488,8 +488,10 @@ mod tests {
             points: Points {
                 check_event: false,
                 on_event: true,
+                check_registration: false,
             },
             capabilities: vela_extensions::Capabilities::default(),
+            client_ip: vela_extensions::ClientIpTier::default(),
             config: json!({ "mode": mode }),
         }])
         .expect("observer runtime loads")

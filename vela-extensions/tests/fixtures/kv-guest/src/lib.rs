@@ -25,6 +25,12 @@ use vela::extension::kv;
 struct Component;
 
 impl Guest for Component {
+    fn check_registration(
+        _ctx: exports::vela::extension::decision::RegistrationContext,
+    ) -> Verdict {
+        Verdict::Allow
+    }
+
     fn check_event(ctx: DecCtx) -> Verdict {
         if !ctx.plugin_config.contains("ratelimit") {
             return Verdict::Allow;

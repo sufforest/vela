@@ -3,7 +3,7 @@
 //! states; with `wasmtime-runtime` off it degrades to a no-op that allows
 //! everything, so call sites in vela-api never need `#[cfg]`.
 
-use crate::abi::EventContext;
+use crate::abi::{EventContext, RegistrationContext};
 use crate::config::PluginConfig;
 
 /// The aggregate outcome of a decision point across all plugins.
@@ -165,6 +165,44 @@ mod imp {
             self.plugins.iter().any(|p| p.cfg.points.on_event)
         }
 
+        /// True if any plugin binds the registration point — lets the register
+        /// handler skip the gate entirely when nothing is configured.
+        pub fn binds_check_registration(&self) -> bool {
+            self.plugins.iter().any(|p| p.cfg.points.check_registration)
+        }
+
+        /// Run the registration decision point across all `check_registration`-
+        /// bound plugins: block-if-any, same fail-policy as `check_event`. A
+        /// block aborts the signup (a hard reject — registration is a local
+        /// action we simply refuse). No event-type scoping applies here.
+        pub fn check_registration(&self, ctx: &RegistrationContext<'_>) -> Decision {
+            for plugin in &self.plugins {
+                if !plugin.cfg.points.check_registration {
+                    continue;
+                }
+                let verdict = match plugin.check_registration(ctx) {
+                    Ok(v) => v,
+                    Err(e) => match plugin.cfg.fail_policy {
+                        FailPolicy::Open => {
+                            tracing::warn!(plugin = %plugin.cfg.name, error = %e, "extension check_registration failed; failing open (allow)");
+                            continue;
+                        }
+                        FailPolicy::Closed => {
+                            tracing::warn!(plugin = %plugin.cfg.name, error = %e, "extension check_registration failed; failing closed (block)");
+                            return Decision::Block {
+                                errcode: "M_FORBIDDEN".to_string(),
+                                reason: "extension policy unavailable".to_string(),
+                            };
+                        }
+                    },
+                };
+                if let Verdict::Block { errcode, reason } = verdict {
+                    return Decision::Block { errcode, reason };
+                }
+            }
+            Decision::Allow
+        }
+
         /// Run the async observation point: every `on_event`-bound, scoped plugin
         /// sees the event. No verdict (an observer cannot block); a failing
         /// observer is logged and skipped — `fail_policy` does not apply (there
@@ -253,6 +291,14 @@ mod imp {
         }
 
         pub fn on_event(&self, _ctx: &EventContext<'_>) {}
+
+        pub fn binds_check_registration(&self) -> bool {
+            false
+        }
+
+        pub fn check_registration(&self, _ctx: &RegistrationContext<'_>) -> Decision {
+            Decision::Allow
+        }
     }
 }
 

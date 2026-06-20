@@ -5,7 +5,8 @@
 
 use serde_json::{Value, json};
 use vela_extensions::{
-    Capabilities, Decision, EventContext, FailPolicy, Origin, PluginConfig, Points, Runtime,
+    Capabilities, ClientIpTier, Decision, EventContext, FailPolicy, Origin, PluginConfig, Points,
+    Runtime,
 };
 
 const KEYWORD_FILTER: &[u8] =
@@ -24,6 +25,7 @@ fn runtime(config: Value) -> Runtime {
         event_types: None,
         points: Points::default(),
         capabilities: Capabilities::default(),
+        client_ip: ClientIpTier::default(),
         config,
     }])
     .expect("example plugin loads in the host runtime")
@@ -118,6 +120,7 @@ fn malformed_config_traps_and_is_resolved_by_fail_policy() {
         event_types: None,
         points: Points::default(),
         capabilities: Capabilities::default(),
+        client_ip: ClientIpTier::default(),
         config: bad,
     }])
     .expect("loads");

@@ -325,10 +325,58 @@ impl From<bindings::vela::extension::emit::EmitError> for EmitError {
     }
 }
 
+/// An ergonomic view over the signup metadata at the registration point.
+pub struct Registration {
+    raw: bindings::exports::vela::extension::decision::RegistrationContext,
+}
+
+impl Registration {
+    fn new(raw: bindings::exports::vela::extension::decision::RegistrationContext) -> Self {
+        Registration { raw }
+    }
+
+    /// The requested localpart, e.g. `"alice"`.
+    pub fn username(&self) -> &str {
+        &self.raw.username
+    }
+
+    /// How they're registering: `"open"`, `"token"`, `"oidc"`, `"guest"`,
+    /// `"appservice"`.
+    pub fn kind(&self) -> &str {
+        &self.raw.kind
+    }
+
+    /// An opaque IP token for rate-limiting (per the operator's `client_ip`
+    /// tier), or `None` if not exposed. Treat it as an opaque key — only as a
+    /// real address if your plugin was granted the `full` tier.
+    pub fn client_ip(&self) -> Option<&str> {
+        self.raw.client_ip.as_deref()
+    }
+
+    /// This plugin's operator-supplied config as `T` — see [`Event::config`] for
+    /// the default-vs-panic semantics.
+    pub fn config<T: DeserializeOwned + Default>(&self) -> T {
+        if self.raw.plugin_config.is_empty() {
+            return T::default();
+        }
+        serde_json::from_str(&self.raw.plugin_config)
+            .expect("plugin config is present but invalid for the requested type")
+    }
+
+    /// This plugin's config as `T`, distinguishing absent / valid / invalid.
+    pub fn try_config<T: DeserializeOwned>(&self) -> Result<Option<T>, serde_json::Error> {
+        if self.raw.plugin_config.is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_str(&self.raw.plugin_config).map(Some)
+    }
+}
+
 /// Implement this for your plugin type, then `export_plugin!(YourType)`. A plugin
-/// can implement the **decision** hook ([`Plugin::check_event`]), the async
-/// **observation** hook ([`Plugin::on_event`]), or both — the unused one defaults
-/// to a no-op, and the operator's `points` config decides which the host invokes.
+/// can implement any of the hooks — [`Plugin::check_event`] (decision on events),
+/// [`Plugin::on_event`] (async observation), [`Plugin::check_registration`]
+/// (decision at signup) — the unused ones default to allow/no-op, and the
+/// operator's `points` config decides which the host invokes.
 pub trait Plugin {
     /// Decide whether to allow or block one event (sync, on the hot path).
     /// Default: allow.
@@ -340,6 +388,13 @@ pub trait Plugin {
     /// observer cannot block. Default: no-op. Override to audit, emit metrics,
     /// or (with future capabilities via `caps`) act.
     fn on_event(_event: &Event, _caps: &Caps) {}
+
+    /// Decide whether to allow or block a signup, at `/register` before the
+    /// account is created. Default: allow. The `kv` capability works here, so a
+    /// stateful rate-limit is natural.
+    fn check_registration(_reg: &Registration) -> Decision {
+        Decision::allow()
+    }
 }
 
 /// Bridge from the raw decision entry point to [`Plugin::check_event`].
@@ -368,6 +423,22 @@ pub fn dispatch_on_event<P: Plugin>(
     P::on_event(&event, &Caps {});
 }
 
+/// Bridge from the raw registration entry point to [`Plugin::check_registration`].
+/// Called by [`export_plugin!`]; not for direct use.
+#[doc(hidden)]
+pub fn dispatch_check_registration<P: Plugin>(
+    ctx: bindings::exports::vela::extension::decision::RegistrationContext,
+) -> bindings::exports::vela::extension::decision::Verdict {
+    use bindings::exports::vela::extension::decision as wit;
+    let reg = Registration::new(ctx);
+    match P::check_registration(&reg) {
+        Decision::Allow => wit::Verdict::Allow,
+        Decision::Block { errcode, reason } => {
+            wit::Verdict::Block(wit::BlockReason { errcode, reason })
+        }
+    }
+}
+
 /// Export your [`Plugin`] implementation as the component's entry point. Call
 /// this exactly once at the crate root.
 #[macro_export]
@@ -379,6 +450,11 @@ macro_rules! export_plugin {
                 ctx: $crate::bindings::exports::vela::extension::decision::EventContext,
             ) -> $crate::bindings::exports::vela::extension::decision::Verdict {
                 $crate::dispatch::<$plugin>(ctx)
+            }
+            fn check_registration(
+                ctx: $crate::bindings::exports::vela::extension::decision::RegistrationContext,
+            ) -> $crate::bindings::exports::vela::extension::decision::Verdict {
+                $crate::dispatch_check_registration::<$plugin>(ctx)
             }
         }
         impl $crate::bindings::exports::vela::extension::observation::Guest for __VelaPluginGlue {

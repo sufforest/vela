@@ -61,6 +61,11 @@ no-op, and the operator's `points` config decides which the host invokes.
 - **`Plugin::on_event(&Event, &Caps)`** — the async observation hook (default:
   no-op). Runs off the request path after persist; no return (an observer can't
   block). Delivery is at-least-once, so make it idempotent.
+- **`Plugin::check_registration(&Registration) -> Decision`** — the signup
+  decision hook at `/register` (default: allow). `Registration` gives
+  `username()`, `kind()`, `client_ip()` (an opaque rate-limit token per the
+  operator's tier), and `config()`. The `kv` capability works here, so a stateful
+  per-IP rate-limiter is a few lines.
 - **`Caps`** — the host-capabilities handle:
   - `caps.log(msg)` (and `.debug` / `.warn` / `.error` / `.trace`) — write a line
     to vela's log, tagged with your plugin name; truncated and rate-limited by the

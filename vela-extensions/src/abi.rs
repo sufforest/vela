@@ -32,6 +32,24 @@ pub struct EventContext<'a> {
     pub origin: Origin,
 }
 
+/// The signup metadata the host hands the runtime at the registration decision
+/// point, before the account is created. Borrowed, like [`EventContext`]. The
+/// host supplies BOTH IP forms it knows; each plugin is shown only the one its
+/// `client_ip` tier permits (none / hashed / full), so the per-plugin privacy
+/// choice is applied at marshal time.
+pub struct RegistrationContext<'a> {
+    /// Requested localpart, e.g. `"alice"`.
+    pub username: &'a str,
+    /// Registration method: `"open"`, `"token"`, `"oidc"`, `"guest"`,
+    /// `"appservice"`.
+    pub kind: &'a str,
+    /// The raw client IP, if the host has it. Shown only to `full`-tier plugins.
+    pub client_ip_full: Option<&'a str>,
+    /// A non-reversible HMAC of the IP (a rate-limit key, no PII), if computed.
+    /// Shown to `hashed`-tier plugins.
+    pub client_ip_hashed: Option<&'a str>,
+}
+
 /// What a plugin returns from a decision point. Converted from the generated
 /// Component-Model `verdict` variant.
 #[derive(Debug, Clone, PartialEq, Eq)]

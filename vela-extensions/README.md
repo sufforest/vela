@@ -29,8 +29,9 @@ Each `[[extensions.plugin]]` block loads one component:
 name = "keyword-filter"                # for logs, errors, metrics
 wasm_path = "/etc/vela/plugins/keyword-filter.wasm"
 event_types = ["m.room.message"]       # optional; omit to run for all events
-points = ["check_event"]               # which hooks: check_event and/or on_event
+points = ["check_event"]               # check_event / on_event / check_registration
 capabilities = []                      # host caps to grant, e.g. ["emit-event"]
+client_ip = "none"                     # check_registration IP tier: none|hashed|full
 fail_policy = "open"                   # "open" (default) | "closed"
 fuel = 50000000                        # per-call CPU budget (≈ instructions)
 wall_ms = 100                          # per-call wall-clock budget; 0 disables
@@ -43,8 +44,9 @@ config = { banned = ["spam"] }         # opaque JSON, handed to the plugin
 | `name` | — (required) | identifier in logs/errors/metrics |
 | `wasm_path` | — (required) | path to the `.wasm` component |
 | `event_types` | all | only invoke for these event types |
-| `points` | `["check_event"]` | hooks the plugin binds: `check_event` (sync decision) and/or `on_event` (async observation) |
+| `points` | `["check_event"]` | hooks the plugin binds: `check_event` (decision on events), `on_event` (async observation), `check_registration` (decision at signup) |
 | `capabilities` | `[]` | host capabilities to grant (least-privilege): `emit-event` (post as its bot), `kv` (private key→value store). `logging` is always on |
+| `client_ip` | `"none"` | what a `check_registration` plugin sees of the client IP: `none`, `hashed` (a rate-limit token, no PII), or `full` (raw IP) |
 | `fail_policy` | `open` | on trap/timeout: `open` allows, `closed` blocks |
 | `fuel` | 50,000,000 | per-call instruction budget |
 | `wall_ms` | 100 | per-call wall-clock budget (ms); `0` = off |
@@ -68,7 +70,7 @@ moderation. (Unix only; on other platforms, restart to reload.)
 
 ## What plugins can do
 
-Two extension points (a plugin binds either or both via `points`):
+Three extension points (a plugin binds any of them via `points`):
 
 - **`check_event`** — the sync decision hook, on **local sends** (message and
   state events, after auth, before persist — a block rejects the send with the
@@ -84,6 +86,16 @@ Two extension points (a plugin binds either or both via `points`):
   is **bounded** — a stalled or far-behind observer sheds its oldest backlog
   rather than growing on disk without limit — and a trapping, panicking, or slow
   observer is sandbox-bounded and can't stall the queue behind it.
+- **`check_registration`** — the sync decision hook at **`/register`**, before
+  the account is created (anti-spam signup). The plugin sees the requested
+  username, the registration method, and — per its `client_ip` tier — an IP token
+  for rate-limiting; a block rejects the signup (403, plugin's errcode). The `kv`
+  capability works here, so a stateful rate-limiter is natural. The IP comes from
+  `X-Forwarded-For`, so it's only trustworthy behind a **reverse proxy that
+  overwrites that header** — a directly-exposed server lets clients spoof it, and
+  since a plugin can *block* on it, only grant the `hashed`/`full` IP tiers when
+  you're behind such a proxy. The `hashed` tier gives a per-client rate-limit key
+  that reveals no actual IP.
 
 Plugins are **stateless** and get only the **host capabilities** you grant — no
 network, disk, or syscalls. Granted least-privilege per plugin via `capabilities`:

@@ -14,6 +14,8 @@ pub struct Points {
     pub check_event: bool,
     /// Async observation hook, off the hot path.
     pub on_event: bool,
+    /// Sync decision hook at user registration (anti-spam signup).
+    pub check_registration: bool,
 }
 
 impl Default for Points {
@@ -21,6 +23,7 @@ impl Default for Points {
         Points {
             check_event: true,
             on_event: false,
+            check_registration: false,
         }
     }
 }
@@ -36,6 +39,21 @@ pub struct Capabilities {
     pub emit_event: bool,
     /// `kv`: a small per-plugin key→value store (get/set/delete, TTL, quota).
     pub kv: bool,
+}
+
+/// How much of the client IP a registration plugin may see — least-privilege,
+/// per plugin. The host gives the plugin the rate-limit *key*, not the
+/// *identity*, unless `Full` is explicitly granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClientIpTier {
+    /// No IP. Username + method only.
+    #[default]
+    None,
+    /// A non-reversible HMAC token: a perfect rate-limit key, reveals nothing
+    /// about the address. The recommended setting for rate-limiters.
+    Hashed,
+    /// The raw IP, for reputation/geo — the operator's explicit choice.
+    Full,
 }
 
 /// What to do when a plugin traps, runs out of fuel, or errors.
@@ -72,6 +90,8 @@ pub struct PluginConfig {
     pub points: Points,
     /// Host capabilities the operator granted this plugin (least-privilege).
     pub capabilities: Capabilities,
+    /// How much of the client IP a `check_registration` plugin sees.
+    pub client_ip: ClientIpTier,
     /// Opaque config handed verbatim to the guest as `plugin_config`.
     pub config: Value,
 }
