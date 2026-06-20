@@ -1,6 +1,7 @@
 //! Proves an SDK-built example plugin loads and runs in the host runtime — the
 //! end-to-end SDK→host contract over the shared WIT. The component is the
-//! committed `keyword-filter` example, built from `extensions/`.
+//! `keyword-filter` example; build it (gitignored) with
+//! `extensions/build-examples.sh` first — CI does.
 #![cfg(feature = "wasmtime-runtime")]
 
 use serde_json::{Value, json};

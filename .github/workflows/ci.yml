@@ -155,9 +155,18 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Install libclang
         run: sudo apt-get update && sudo apt-get install -y libclang-dev
+
+      # wasm-tools turns the guest core modules into components. Use the
+      # prebuilt binary — `cargo install wasm-tools` compiles for minutes.
+      - name: Install wasm-tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -170,6 +179,14 @@ jobs:
         run: cargo test -p vela-server --features otel --locked
       - name: cargo test --features otel (vela-api OTLP export)
         run: cargo test -p vela-api --features otel --test otlp_export --locked
+
+      # The wasm fixtures + example aren't committed — build them from source
+      # (see docs/extension-fixtures-build-design.md). The tests below then run
+      # against this fresh build, so a fixture can't drift from its source.
+      - name: Build wasm fixtures + example
+        run: |
+          vela-extensions/tests/fixtures/build.sh
+          extensions/build-examples.sh
       # Extensions are opt-in: vela-extensions has NO default features, so the
       # default `cargo test --workspace` builds it (and every vela-api test
       # binary) without wasmtime. Exercise the WASM runtime explicitly here.
@@ -283,8 +300,9 @@ jobs:
     # Build + lint the guest-side extension SDK and example plugins. They live in
     # a detached `extensions/` workspace (own lockfile, wasm32 target) so the
     # main workspace never compiles them — this job is what keeps them honest.
-    # The host integration test that runs the built example lives in the regular
-    # `cargo test` job (it loads the committed `.wasm`).
+    # The host integration test that runs the built example lives in the
+    # `features` job, which builds the component from source first (the `.wasm`
+    # is not committed — see docs/extension-fixtures-build-design.md).
     name: build extensions (wasm32)
     runs-on: ubuntu-latest
     steps:

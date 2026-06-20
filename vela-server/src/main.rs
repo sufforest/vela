@@ -1025,21 +1025,41 @@ mod reload_tests {
         (dir, path)
     }
 
-    fn example_wasm() -> String {
-        concat!(
+    /// Plugin bytes for the reload test to point `wasm_path` at. With the
+    /// `extensions` feature off the runtime is the no-op stub — it never compiles
+    /// the bytes, so a wasm-header stub keeps the test self-contained (no built
+    /// artifact needed). With the feature on the real runtime compiles the
+    /// component, so load the built example (run `extensions/build-examples.sh`).
+    #[cfg(not(feature = "extensions"))]
+    fn plugin_wasm() -> Vec<u8> {
+        b"\0asm\x01\0\0\0".to_vec()
+    }
+    #[cfg(feature = "extensions")]
+    fn plugin_wasm() -> Vec<u8> {
+        std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../extensions/examples/keyword-filter/keyword-filter.wasm"
-        )
-        .to_string()
+        ))
+        .expect("build the example first: extensions/build-examples.sh")
     }
 
     #[test]
     fn reloads_a_valid_config() {
-        let (_dir, path) = write_config(&format!(
-            "[[extensions.plugin]]\nname = \"kf\"\nwasm_path = \"{}\"\n\
-             config = {{ banned = [\"spam\"] }}\n",
-            example_wasm()
-        ));
+        // Write the plugin and the config into one tempdir so the test owns its
+        // wasm file rather than depending on a built artifact at a fixed path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wasm = dir.path().join("plugin.wasm");
+        std::fs::write(&wasm, plugin_wasm()).expect("write wasm");
+        let path = dir.path().join("vela.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[[extensions.plugin]]\nname = \"kf\"\nwasm_path = \"{}\"\n\
+                 config = {{ banned = [\"spam\"] }}\n",
+                wasm.display()
+            ),
+        )
+        .expect("write config");
         let (_rt, count) =
             super::reload_extension_runtime(&path, vela_extensions::HostServices::default())
                 .expect("valid config reloads");

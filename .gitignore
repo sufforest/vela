@@ -1,6 +1,12 @@
 # Build
 target/
 
+# Generated wasm components — built from source by the build scripts, never
+# committed (see docs/extension-fixtures-build-design.md). The guest Cargo.lock
+# files stay tracked for reproducible builds.
+vela-extensions/tests/fixtures/*.wasm
+extensions/examples/**/*.wasm
+
 # IDE
 .idea/
 .vscode/

@@ -1048,6 +1048,7 @@ mod media_extension_tests {
     use crate::test_helpers::build_test_state;
     use axum::extract::Query;
 
+    // Gitignored fixture — run vela-extensions/tests/fixtures/build.sh first (CI does).
     const MEDIA: &[u8] = include_bytes!("../../../vela-extensions/tests/fixtures/media_guest.wasm");
 
     fn user() -> AuthenticatedUser {
