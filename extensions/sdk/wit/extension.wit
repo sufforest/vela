@@ -11,7 +11,7 @@
 // components regardless of what changed; the committed fixtures/examples are
 // rebuilt with each bump. (Within a fixed version, a guest still instantiates as
 // long as it exports what the world requires and imports only granted caps.)
-package vela:extension@0.7.0;
+package vela:extension@0.8.0;
 
 interface decision {
     // Where an event originated. A `block` verdict is a hard reject for `local`
@@ -99,6 +99,33 @@ interface decision {
         plugin-config: string,
     }
     check-media-upload: func(ctx: media-context) -> verdict;
+
+    // A user setting their own display name or avatar, at the `/profile`
+    // endpoints — before the change is persisted or propagated. Anti-impersonation
+    // and name/avatar policy (a block rejects the update with the verdict's
+    // errcode/reason). Local only: a remote user's profile change arrives as an
+    // `m.room.member` PDU and is a `check-event` concern, so this point never sees
+    // federation traffic. The `kv` capability works here (per-user churn limits).
+    enum profile-field {
+        display-name,
+        avatar-url,
+    }
+    record profile-context {
+        // The user changing their own profile.
+        user-id: string,
+        // Which field is being set.
+        field: profile-field,
+        // The proposed new value; `none` means the user is clearing the field
+        // (the host normalizes an empty string to `none`, so clearing always looks
+        // the same regardless of which endpoint cleared it). For `avatar-url` this
+        // is the mxc:// URI, not the image — image scanning is
+        // `check-media-upload`'s job at upload time, so a profile plugin can
+        // enforce URI/domain policy but cannot inspect pixels.
+        value: option<string>,
+        // This plugin's opaque config, verbatim JSON. Empty string if none.
+        plugin-config: string,
+    }
+    check-profile-update: func(ctx: profile-context) -> verdict;
 }
 
 // Async observation: the host calls this off the request hot path (a worker

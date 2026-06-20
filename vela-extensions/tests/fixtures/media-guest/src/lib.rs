@@ -27,6 +27,13 @@ fn blocked(reason: &str) -> Verdict {
 }
 
 impl Guest for Component {
+    // Profile point unused by this fixture — default allow.
+    fn check_profile_update(
+        _ctx: exports::vela::extension::decision::ProfileContext,
+    ) -> Verdict {
+        Verdict::Allow
+    }
+
     fn check_event(_ctx: DecCtx) -> Verdict {
         Verdict::Allow
     }

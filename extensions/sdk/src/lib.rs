@@ -418,12 +418,62 @@ impl Media {
     }
 }
 
+/// Which profile field a user is setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileField {
+    DisplayName,
+    AvatarUrl,
+}
+
+/// An ergonomic view over a profile update at the `check_profile_update` point —
+/// a user setting their own display name or avatar, before it's persisted.
+pub struct Profile {
+    raw: bindings::exports::vela::extension::decision::ProfileContext,
+}
+
+impl Profile {
+    fn new(raw: bindings::exports::vela::extension::decision::ProfileContext) -> Self {
+        Profile { raw }
+    }
+
+    /// The user changing their own profile.
+    pub fn user_id(&self) -> &str {
+        &self.raw.user_id
+    }
+
+    /// Which field is being set.
+    pub fn field(&self) -> ProfileField {
+        use bindings::exports::vela::extension::decision::ProfileField as Wit;
+        match self.raw.field {
+            Wit::DisplayName => ProfileField::DisplayName,
+            Wit::AvatarUrl => ProfileField::AvatarUrl,
+        }
+    }
+
+    /// The proposed new value, or `None` if the user is clearing the field. For
+    /// [`ProfileField::AvatarUrl`] this is the mxc:// URI, not the image (image
+    /// scanning is `check_media_upload`'s job).
+    pub fn value(&self) -> Option<&str> {
+        self.raw.value.as_deref()
+    }
+
+    /// This plugin's operator-supplied config as `T` — see [`Event::config`].
+    pub fn config<T: DeserializeOwned + Default>(&self) -> T {
+        if self.raw.plugin_config.is_empty() {
+            return T::default();
+        }
+        serde_json::from_str(&self.raw.plugin_config)
+            .expect("plugin config is present but invalid for the requested type")
+    }
+}
+
 /// Implement this for your plugin type, then `export_plugin!(YourType)`. A plugin
 /// can implement any of the hooks — [`Plugin::check_event`] (decision on events),
 /// [`Plugin::on_event`] (async observation), [`Plugin::check_registration`]
-/// (decision at signup), [`Plugin::check_media_upload`] (decision at upload) —
-/// the unused ones default to allow/no-op, and the operator's `points` config
-/// decides which the host invokes.
+/// (decision at signup), [`Plugin::check_media_upload`] (decision at upload),
+/// [`Plugin::check_profile_update`] (decision at a profile change) — the unused
+/// ones default to allow/no-op, and the operator's `points` config decides which
+/// the host invokes.
 pub trait Plugin {
     /// Decide whether to allow or block one event (sync, on the hot path).
     /// Default: allow.
@@ -448,6 +498,14 @@ pub trait Plugin {
     /// deletes the stored bytes. v1 sees a hash + metadata (match `sha256()`
     /// against a blocklist, or filter by MIME/size/filename).
     fn check_media_upload(_media: &Media) -> Decision {
+        Decision::allow()
+    }
+
+    /// Decide whether to allow or block a profile update — a user setting their
+    /// own display name or avatar, before it's persisted. Default: allow. Use it
+    /// for anti-impersonation and name/avatar policy; the `kv` capability works
+    /// here, so per-user churn limits are natural.
+    fn check_profile_update(_profile: &Profile) -> Decision {
         Decision::allow()
     }
 }
@@ -510,6 +568,22 @@ pub fn dispatch_check_media_upload<P: Plugin>(
     }
 }
 
+/// Bridge from the raw profile entry point to [`Plugin::check_profile_update`].
+/// Called by [`export_plugin!`]; not for direct use.
+#[doc(hidden)]
+pub fn dispatch_check_profile_update<P: Plugin>(
+    ctx: bindings::exports::vela::extension::decision::ProfileContext,
+) -> bindings::exports::vela::extension::decision::Verdict {
+    use bindings::exports::vela::extension::decision as wit;
+    let profile = Profile::new(ctx);
+    match P::check_profile_update(&profile) {
+        Decision::Allow => wit::Verdict::Allow,
+        Decision::Block { errcode, reason } => {
+            wit::Verdict::Block(wit::BlockReason { errcode, reason })
+        }
+    }
+}
+
 /// Export your [`Plugin`] implementation as the component's entry point. Call
 /// this exactly once at the crate root.
 #[macro_export]
@@ -531,6 +605,11 @@ macro_rules! export_plugin {
                 ctx: $crate::bindings::exports::vela::extension::decision::MediaContext,
             ) -> $crate::bindings::exports::vela::extension::decision::Verdict {
                 $crate::dispatch_check_media_upload::<$plugin>(ctx)
+            }
+            fn check_profile_update(
+                ctx: $crate::bindings::exports::vela::extension::decision::ProfileContext,
+            ) -> $crate::bindings::exports::vela::extension::decision::Verdict {
+                $crate::dispatch_check_profile_update::<$plugin>(ctx)
             }
         }
         impl $crate::bindings::exports::vela::extension::observation::Guest for __VelaPluginGlue {

@@ -28,6 +28,13 @@ use exports::vela::extension::decision::{BlockReason, EventContext, Guest, Verdi
 struct Component;
 
 impl Guest for Component {
+    // Profile point unused by this fixture — default allow.
+    fn check_profile_update(
+        _ctx: exports::vela::extension::decision::ProfileContext,
+    ) -> Verdict {
+        Verdict::Allow
+    }
+
     fn check_media_upload(
         _ctx: exports::vela::extension::decision::MediaContext,
     ) -> Verdict {

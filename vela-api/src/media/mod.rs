@@ -1079,6 +1079,7 @@ mod media_extension_tests {
                 on_event: false,
                 check_registration: false,
                 check_media_upload: true,
+                check_profile_update: false,
             },
             capabilities: Default::default(),
             client_ip: Default::default(),

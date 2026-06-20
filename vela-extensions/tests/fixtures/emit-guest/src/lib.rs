@@ -22,6 +22,13 @@ use vela::extension::emit::{emit_event, NewEvent};
 struct Component;
 
 impl Guest for Component {
+    // Profile point unused by this fixture — default allow.
+    fn check_profile_update(
+        _ctx: exports::vela::extension::decision::ProfileContext,
+    ) -> Verdict {
+        Verdict::Allow
+    }
+
     fn check_media_upload(
         _ctx: exports::vela::extension::decision::MediaContext,
     ) -> Verdict {

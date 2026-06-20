@@ -267,6 +267,38 @@ pub struct SetDisplaynameRequest {
     pub displayname: Option<String>,
 }
 
+/// Sandboxed profile-update decision hook, run before the change is persisted or
+/// propagated. No-op when no plugin binds the point. A block rejects the update
+/// (403, plugin's errcode) — anti-impersonation / name policy. For `AvatarUrl`
+/// the plugin sees the mxc:// URI, not the image.
+fn profile_gate(
+    state: &AppState,
+    user_id: &str,
+    field: vela_extensions::ProfileField,
+    value: Option<&str>,
+) -> Result<(), ApiError> {
+    // Lock-free snapshot, like the other decision gates.
+    let rt = state.extensions.load();
+    if !rt.binds_check_profile_update() {
+        return Ok(());
+    }
+    // Clearing the field reaches here as `null` (None) on the displayname/avatar
+    // PUT but as `""` on the MSC4133 set/delete path — normalize both to None so a
+    // plugin sees a single "cleared" shape.
+    let ctx = vela_extensions::ProfileUpdate {
+        user_id,
+        field,
+        value: value.filter(|v| !v.is_empty()),
+    };
+    match rt.check_profile_update(&ctx) {
+        vela_extensions::Decision::Allow => Ok(()),
+        vela_extensions::Decision::Block { errcode, reason } => {
+            tracing::info!(user_id, ?field, %errcode, %reason, "extension blocked profile update");
+            Err(ApiError(VelaError::ExtensionBlocked { errcode, reason }))
+        }
+    }
+}
+
 /// PUT /_matrix/client/v3/profile/{userId}/displayname
 pub async fn set_displayname(
     State(state): State<AppState>,
@@ -277,6 +309,13 @@ pub async fn set_displayname(
     if user.user_id != user_id {
         return Err(VelaError::Forbidden("can only set own profile".into()).into());
     }
+
+    profile_gate(
+        &state,
+        &user.user_id,
+        vela_extensions::ProfileField::DisplayName,
+        body.displayname.as_deref(),
+    )?;
 
     state
         .db
@@ -362,6 +401,13 @@ pub async fn set_avatar_url(
         return Err(VelaError::Forbidden("can only set own profile".into()).into());
     }
 
+    profile_gate(
+        &state,
+        &user.user_id,
+        vela_extensions::ProfileField::AvatarUrl,
+        body.avatar_url.as_deref(),
+    )?;
+
     state
         .db
         .update_user_profile(user.user_nid, None, body.avatar_url.as_deref())
@@ -409,5 +455,88 @@ mod tests {
         // Malformed → treated as local (storage layer surfaces the
         // clean 404 rather than mis-routing).
         assert!(is_local_user("not-a-user-id", "hs1"));
+    }
+}
+
+#[cfg(all(test, feature = "extensions"))]
+mod profile_extension_tests {
+    use super::*;
+    use crate::test_helpers::build_test_state;
+
+    // Gitignored fixture — run vela-extensions/tests/fixtures/build.sh first (CI does).
+    const PROFILE: &[u8] =
+        include_bytes!("../../../vela-extensions/tests/fixtures/profile_guest.wasm");
+
+    fn auth(nid: u64) -> AuthenticatedUser {
+        AuthenticatedUser {
+            user_nid: nid,
+            user_id: "@a:test".into(),
+            device_id: "D".into(),
+            appservice_nid: None,
+        }
+    }
+
+    fn load_profile_plugin(state: &AppState, mode: &str) {
+        let rt = vela_extensions::Runtime::new(vec![vela_extensions::PluginConfig {
+            name: "profile".into(),
+            wasm: PROFILE.to_vec(),
+            fail_policy: vela_extensions::FailPolicy::Closed,
+            fuel: 50_000_000,
+            wall_ms: 0,
+            memory_pages: 256,
+            event_types: None,
+            points: vela_extensions::Points {
+                check_event: false,
+                on_event: false,
+                check_registration: false,
+                check_media_upload: false,
+                check_profile_update: true,
+            },
+            capabilities: Default::default(),
+            client_ip: Default::default(),
+            config: serde_json::json!({ "mode": mode }),
+        }])
+        .expect("profile plugin loads");
+        state.extensions.store(std::sync::Arc::new(rt));
+    }
+
+    /// A profile plugin blocks a banned display name before it's persisted, and a
+    /// clean name still goes through and is stored — proving the gate runs ahead
+    /// of the write.
+    #[tokio::test]
+    async fn displayname_blocked_by_extension() {
+        let (state, _tmp) = build_test_state();
+        let nid = state.db.create_user("@a:test", "").expect("create user");
+        load_profile_plugin(&state, "block_name");
+
+        // Banned name → blocked, and nothing is persisted.
+        let err = set_displayname(
+            State(state.clone()),
+            auth(nid),
+            Path("@a:test".into()),
+            Json(SetDisplaynameRequest {
+                displayname: Some("evil mod".into()),
+            }),
+        )
+        .await
+        .expect_err("banned displayname blocked");
+        assert!(matches!(err.0, VelaError::ExtensionBlocked { .. }));
+        assert!(
+            read_displayname(&state, nid).is_none(),
+            "blocked name must not be persisted"
+        );
+
+        // A clean name is allowed and stored.
+        set_displayname(
+            State(state.clone()),
+            auth(nid),
+            Path("@a:test".into()),
+            Json(SetDisplaynameRequest {
+                displayname: Some("alice".into()),
+            }),
+        )
+        .await
+        .expect("clean displayname allowed");
+        assert_eq!(read_displayname(&state, nid).as_deref(), Some("alice"));
     }
 }

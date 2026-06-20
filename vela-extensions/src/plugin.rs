@@ -13,7 +13,9 @@ use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use crate::HostServices;
-use crate::abi::{EventContext, MediaContext, Origin, RegistrationContext, Verdict};
+use crate::abi::{
+    EventContext, MediaContext, Origin, ProfileField, ProfileUpdate, RegistrationContext, Verdict,
+};
 use crate::config::{ClientIpTier, PluginConfig};
 use crate::emit::{EmitLimiter, EmitRequest, EventEmitter, emit_type_allowed};
 use crate::kv::KvStore;
@@ -513,6 +515,36 @@ impl Plugin {
         let verdict = instance
             .vela_extension_decision()
             .call_check_media_upload(&mut store, &wire)
+            .map_err(|e| PluginError::Trap(e.to_string()))?;
+        Ok(match verdict {
+            wit::Verdict::Allow => Verdict::Allow,
+            wit::Verdict::Block(r) => Verdict::Block {
+                errcode: r.errcode,
+                reason: r.reason,
+            },
+        })
+    }
+
+    /// Run the profile-update decision hook for one display-name/avatar change →
+    /// a verdict. On the request path (no emit); kv is available (per-user churn
+    /// limits).
+    pub(crate) fn check_profile_update(
+        &self,
+        ctx: &ProfileUpdate<'_>,
+    ) -> Result<Verdict, PluginError> {
+        let (mut store, instance) = self.make_store(false)?;
+        let wire = wit::ProfileContext {
+            user_id: ctx.user_id.to_string(),
+            field: match ctx.field {
+                ProfileField::DisplayName => wit::ProfileField::DisplayName,
+                ProfileField::AvatarUrl => wit::ProfileField::AvatarUrl,
+            },
+            value: ctx.value.map(|s| s.to_string()),
+            plugin_config: config_json(&self.cfg.config),
+        };
+        let verdict = instance
+            .vela_extension_decision()
+            .call_check_profile_update(&mut store, &wire)
             .map_err(|e| PluginError::Trap(e.to_string()))?;
         Ok(match verdict {
             wit::Verdict::Allow => Verdict::Allow,

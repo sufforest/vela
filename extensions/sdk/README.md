@@ -73,6 +73,13 @@ no-op, and the operator's `points` config decides which the host invokes.
   `config()`. Match known-bad hashes or enforce type/size policy; a block deletes
   the stored bytes. Media in E2EE rooms is encrypted before upload, so you only see
   ciphertext there. The `kv` capability works here too (hash blocklists, quotas).
+- **`Plugin::check_profile_update(&Profile) -> Decision`** — the profile-update
+  decision hook (default: allow), when a user sets their own display name or
+  avatar, before it's persisted. `Profile` gives `user_id()`, `field()` (a
+  `ProfileField`), `value()` (the proposed value, `None` when clearing — for an
+  avatar the mxc:// URI, not the image), and `config()`. Use it for
+  anti-impersonation and name/avatar policy; the `kv` capability works here too
+  (per-user churn limits).
 - **`Caps`** — the host-capabilities handle:
   - `caps.log(msg)` (and `.debug` / `.warn` / `.error` / `.trace`) — write a line
     to vela's log, tagged with your plugin name; truncated and rate-limited by the
