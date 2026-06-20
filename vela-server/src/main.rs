@@ -916,19 +916,25 @@ fn build_extension_runtime(
             check_event: false,
             on_event: false,
             check_registration: false,
+            check_media_upload: false,
         };
         for point in &p.points {
             match point.as_str() {
                 "check_event" => points.check_event = true,
                 "on_event" => points.on_event = true,
                 "check_registration" => points.check_registration = true,
+                "check_media_upload" => points.check_media_upload = true,
                 other => anyhow::bail!(
-                    "extension '{}': unknown point {other:?} (expected \"check_event\", \"on_event\", or \"check_registration\")",
+                    "extension '{}': unknown point {other:?} (expected \"check_event\", \"on_event\", \"check_registration\", or \"check_media_upload\")",
                     p.name
                 ),
             }
         }
-        if !points.check_event && !points.on_event && !points.check_registration {
+        if !points.check_event
+            && !points.on_event
+            && !points.check_registration
+            && !points.check_media_upload
+        {
             anyhow::bail!(
                 "extension '{}': points is empty — a plugin bound to no point can never run",
                 p.name

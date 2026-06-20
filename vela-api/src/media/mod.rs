@@ -44,7 +44,16 @@ pub async fn upload(
     let media_id = Uuid::new_v4().to_string().replace('-', "");
 
     let max = state.config.max_upload_size;
-    let reader = body_to_capped_reader(body, max);
+    // Hash the upload in-stream only when a media plugin is configured (free
+    // otherwise). Tee the capped reader through SHA-256 as it flows to storage —
+    // no extra buffering, works for any size. One runtime snapshot drives both
+    // the decision to hash and the check itself, so a concurrent reload can't
+    // leave us hashing without checking (or checking a different plugin set).
+    let rt = state.extensions.load_full();
+    let (reader, hasher) = maybe_hashing_reader(
+        body_to_capped_reader(body, max),
+        rt.binds_check_media_upload(),
+    );
 
     // Stream straight into the backend — no double buffering. Bytes
     // pass through the size-cap adapter, then `put_stream` writes
@@ -56,6 +65,24 @@ pub async fn upload(
         .await
         .map_err(stream_io_to_api_err)?;
 
+    // Sandboxed media-upload decision hook, after the bytes are stored but
+    // before metadata commits (so a blocked upload is never downloadable). A
+    // block deletes the stored bytes and rejects the upload.
+    let filename = query.filename.as_deref().unwrap_or("");
+    media_gate(
+        &state,
+        rt.as_ref(),
+        &MediaUpload {
+            media_id: &media_id,
+            content_type: &content_type,
+            filename,
+            size: written,
+            uploader: user.user_id.as_str(),
+        },
+        hasher,
+    )
+    .await?;
+
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -63,7 +90,7 @@ pub async fn upload(
 
     let metadata = json!({
         "content_type": content_type,
-        "filename": query.filename.as_deref().unwrap_or(""),
+        "filename": filename,
         "size": written,
         "uploader": user.user_id,
         "created_at": now_ms,
@@ -180,12 +207,31 @@ pub async fn upload_to_id(
         .to_string();
 
     let max = state.config.max_upload_size;
-    let reader = body_to_capped_reader(body, max);
+    let rt = state.extensions.load_full();
+    let (reader, hasher) = maybe_hashing_reader(
+        body_to_capped_reader(body, max),
+        rt.binds_check_media_upload(),
+    );
     let written = state
         .media_store
         .put_stream(&media_id, reader)
         .await
         .map_err(stream_io_to_api_err)?;
+
+    let filename = query.filename.as_deref().unwrap_or("");
+    media_gate(
+        &state,
+        rt.as_ref(),
+        &MediaUpload {
+            media_id: &media_id,
+            content_type: &content_type,
+            filename,
+            size: written,
+            uploader: user.user_id.as_str(),
+        },
+        hasher,
+    )
+    .await?;
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -193,7 +239,7 @@ pub async fn upload_to_id(
         .as_millis() as u64;
     let metadata = json!({
         "content_type": content_type,
-        "filename": query.filename.as_deref().unwrap_or(""),
+        "filename": filename,
         "size": written,
         "uploader": user.user_id,
         "created_at": now_ms,
@@ -212,6 +258,112 @@ fn custom_media_err(status: u16, errcode: &'static str, msg: &str) -> ApiError {
         errcode,
         msg: msg.to_string(),
     })
+}
+
+/// An `AsyncRead` that SHA-256-hashes bytes as they flow through, so an upload
+/// can be hashed in-stream (no buffering) on the way to storage.
+struct HashingReader {
+    inner: Pin<Box<dyn AsyncRead + Send + Unpin>>,
+    hasher: std::sync::Arc<std::sync::Mutex<sha2::Sha256>>,
+}
+
+impl AsyncRead for HashingReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use sha2::Digest;
+        let before = buf.filled().len();
+        let r = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &r {
+            let new = &buf.filled()[before..];
+            if !new.is_empty() {
+                self.hasher.lock().unwrap().update(new);
+            }
+        }
+        r
+    }
+}
+
+/// Wrap `reader` to hash as it streams when `enabled`; otherwise pass it through.
+/// Returns the (possibly-wrapped) reader and the shared hasher to finalize after.
+#[allow(clippy::type_complexity)]
+fn maybe_hashing_reader(
+    reader: Pin<Box<dyn AsyncRead + Send + Unpin>>,
+    enabled: bool,
+) -> (
+    Pin<Box<dyn AsyncRead + Send + Unpin>>,
+    Option<std::sync::Arc<std::sync::Mutex<sha2::Sha256>>>,
+) {
+    use sha2::Digest;
+    if !enabled {
+        return (reader, None);
+    }
+    let hasher = std::sync::Arc::new(std::sync::Mutex::new(sha2::Sha256::new()));
+    (
+        Box::pin(HashingReader {
+            inner: reader,
+            hasher: hasher.clone(),
+        }),
+        Some(hasher),
+    )
+}
+
+/// The identifying facts about a stored upload, handed to the media gate.
+/// Bundled (rather than passed positionally) so the `&str` fields can't be
+/// transposed at a call site.
+struct MediaUpload<'a> {
+    media_id: &'a str,
+    content_type: &'a str,
+    filename: &'a str,
+    size: u64,
+    uploader: &'a str,
+}
+
+/// Sandboxed media-upload decision hook. No-op when no plugin binds it (and
+/// `hasher` is then `None`). Called after the bytes are stored but before
+/// metadata commits; a block **deletes the stored bytes** (so blocked media is
+/// never downloadable) and rejects the upload with the plugin's errcode. `rt` is
+/// the same runtime snapshot used to decide whether to hash, so the decision and
+/// the check always see one plugin set.
+async fn media_gate(
+    state: &AppState,
+    rt: &vela_extensions::Runtime,
+    upload: &MediaUpload<'_>,
+    hasher: Option<std::sync::Arc<std::sync::Mutex<sha2::Sha256>>>,
+) -> Result<(), ApiError> {
+    use sha2::Digest;
+    use std::fmt::Write as _;
+    let Some(hasher) = hasher else {
+        return Ok(());
+    };
+    let digest = hasher.lock().unwrap().clone().finalize();
+    let mut sha256 = String::with_capacity(64);
+    for b in digest {
+        let _ = write!(sha256, "{b:02x}");
+    }
+
+    let ctx = vela_extensions::MediaContext {
+        content_type: upload.content_type,
+        filename: upload.filename,
+        size: upload.size,
+        uploader: upload.uploader,
+        sha256: &sha256,
+    };
+    match rt.check_media_upload(&ctx) {
+        vela_extensions::Decision::Allow => Ok(()),
+        vela_extensions::Decision::Block { errcode, reason } => {
+            // Blocked media must never be servable — drop the bytes we streamed.
+            // Even if the delete fails the upload stays unreachable (metadata is
+            // never written), but log it so an operator can reap the orphan.
+            if let Err(e) = state.media_store.delete(upload.media_id).await {
+                tracing::warn!(media_id = upload.media_id, error = %e, "failed to delete blocked media");
+            }
+            tracing::info!(media_id = upload.media_id, uploader = upload.uploader, %errcode, %reason, "extension blocked media upload");
+            Err(ApiError(VelaError::ExtensionBlocked { errcode, reason }))
+        }
+    }
 }
 
 /// Sentinel string carried inside `io::Error` when the request body
@@ -688,6 +840,11 @@ fn preview_http_client() -> Result<reqwest::Client, reqwest::Error> {
 /// register metadata, and return `(mxc, size, width, height)`.
 /// Width/height are None for image formats we don't probe (everything
 /// except PNG today; expand as needed).
+///
+/// Deliberately not run through `media_gate`: this is the server's own
+/// URL-preview thumbnail cache, not a user upload. The `check_media_upload`
+/// point scopes to client uploads; if scanning preview images is wanted later,
+/// gate here too.
 async fn ingest_remote_image(
     state: &AppState,
     user: &AuthenticatedUser,
@@ -883,4 +1040,74 @@ async fn download_remote(
     builder
         .body(Body::from(media.bytes))
         .map_err(|e| ApiError(VelaError::Unknown(e.to_string())))
+}
+
+#[cfg(all(test, feature = "extensions"))]
+mod media_extension_tests {
+    use super::*;
+    use crate::test_helpers::build_test_state;
+    use axum::extract::Query;
+
+    const MEDIA: &[u8] = include_bytes!("../../../vela-extensions/tests/fixtures/media_guest.wasm");
+
+    fn user() -> AuthenticatedUser {
+        AuthenticatedUser {
+            user_nid: 1,
+            user_id: "@a:test".into(),
+            device_id: "D".into(),
+            appservice_nid: None,
+        }
+    }
+
+    /// A media plugin blocks an upload whose content hashes to a known-bad value
+    /// (sha256 of "bad") — proving the gate runs, the in-stream hash is computed,
+    /// and a clean upload still goes through.
+    #[tokio::test]
+    async fn upload_blocked_by_known_hash() {
+        let (state, _tmp) = build_test_state();
+        let rt = vela_extensions::Runtime::new(vec![vela_extensions::PluginConfig {
+            name: "media".into(),
+            wasm: MEDIA.to_vec(),
+            fail_policy: vela_extensions::FailPolicy::Closed,
+            fuel: 50_000_000,
+            wall_ms: 0,
+            memory_pages: 256,
+            event_types: None,
+            points: vela_extensions::Points {
+                check_event: false,
+                on_event: false,
+                check_registration: false,
+                check_media_upload: true,
+            },
+            capabilities: Default::default(),
+            client_ip: Default::default(),
+            config: serde_json::json!({ "mode": "block_hash" }),
+        }])
+        .expect("media plugin loads");
+        state.extensions.store(std::sync::Arc::new(rt));
+
+        // "bad" hashes to the fixture's blocklisted value → rejected.
+        let err = upload(
+            State(state.clone()),
+            user(),
+            Query(UploadQuery { filename: None }),
+            axum::http::HeaderMap::new(),
+            Body::from("bad"),
+        )
+        .await
+        .expect_err("known-bad upload blocked");
+        assert!(matches!(err.0, VelaError::ExtensionBlocked { .. }));
+
+        // A clean upload still succeeds (different hash → allowed).
+        let ok = upload(
+            State(state.clone()),
+            user(),
+            Query(UploadQuery { filename: None }),
+            axum::http::HeaderMap::new(),
+            Body::from("good"),
+        )
+        .await
+        .expect("clean upload allowed");
+        assert!(ok.0.get("content_uri").is_some());
+    }
 }

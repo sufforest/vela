@@ -29,7 +29,7 @@ Each `[[extensions.plugin]]` block loads one component:
 name = "keyword-filter"                # for logs, errors, metrics
 wasm_path = "/etc/vela/plugins/keyword-filter.wasm"
 event_types = ["m.room.message"]       # optional; omit to run for all events
-points = ["check_event"]               # check_event / on_event / check_registration
+points = ["check_event"]               # check_event/on_event/check_registration/check_media_upload
 capabilities = []                      # host caps to grant, e.g. ["emit-event"]
 client_ip = "none"                     # check_registration IP tier: none|hashed|full
 fail_policy = "open"                   # "open" (default) | "closed"
@@ -44,7 +44,7 @@ config = { banned = ["spam"] }         # opaque JSON, handed to the plugin
 | `name` | — (required) | identifier in logs/errors/metrics |
 | `wasm_path` | — (required) | path to the `.wasm` component |
 | `event_types` | all | only invoke for these event types |
-| `points` | `["check_event"]` | hooks the plugin binds: `check_event` (decision on events), `on_event` (async observation), `check_registration` (decision at signup) |
+| `points` | `["check_event"]` | hooks the plugin binds: `check_event` (decision on events), `on_event` (async observation), `check_registration` (decision at signup), `check_media_upload` (decision at media upload) |
 | `capabilities` | `[]` | host capabilities to grant (least-privilege): `emit-event` (post as its bot), `kv` (private key→value store). `logging` is always on |
 | `client_ip` | `"none"` | what a `check_registration` plugin sees of the client IP: `none`, `hashed` (a rate-limit token, no PII), or `full` (raw IP) |
 | `fail_policy` | `open` | on trap/timeout: `open` allows, `closed` blocks |
@@ -70,7 +70,7 @@ moderation. (Unix only; on other platforms, restart to reload.)
 
 ## What plugins can do
 
-Three extension points (a plugin binds any of them via `points`):
+Four extension points (a plugin binds any of them via `points`):
 
 - **`check_event`** — the sync decision hook, on **local sends** (message and
   state events, after auth, before persist — a block rejects the send with the
@@ -96,6 +96,14 @@ Three extension points (a plugin binds any of them via `points`):
   since a plugin can *block* on it, only grant the `hashed`/`full` IP tiers when
   you're behind such a proxy. The `hashed` tier gives a per-client rate-limit key
   that reveals no actual IP.
+- **`check_media_upload`** — the sync decision hook at media upload, after the
+  bytes are stored but **before** the upload is downloadable; a block deletes the
+  stored bytes and rejects the upload (403, plugin's errcode). The plugin sees the
+  **content type, filename, size, uploader, and a SHA-256** computed in-stream — a
+  hash, not the bytes — so it can match known-bad hashes or enforce type/size
+  policy without the raw content. Media in E2EE rooms is encrypted before upload,
+  so a plugin only ever sees *ciphertext* there; this scans cleartext uploads. The
+  `kv` capability works here, so a hash blocklist or per-uploader quota is natural.
 
 Plugins are **stateless** and get only the **host capabilities** you grant — no
 network, disk, or syscalls. Granted least-privilege per plugin via `capabilities`:

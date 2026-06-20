@@ -1,0 +1,21 @@
+# Test-only guest plugin exercising the `check_media_upload` point. Built via
+# `tests/fixtures/build.sh`; the artifact is committed as `media_guest.wasm`.
+[package]
+name = "media-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+panic = "abort"
+
+[workspace]

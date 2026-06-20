@@ -26,6 +26,12 @@ fn blocked(reason: &str) -> Verdict {
 }
 
 impl Guest for Component {
+    fn check_media_upload(
+        _ctx: exports::vela::extension::decision::MediaContext,
+    ) -> Verdict {
+        Verdict::Allow
+    }
+
     fn check_event(_ctx: DecCtx) -> Verdict {
         Verdict::Allow
     }

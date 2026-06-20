@@ -18,7 +18,7 @@ mod runtime;
 #[cfg(feature = "wasmtime-runtime")]
 mod plugin;
 
-pub use abi::{EventContext, Origin, RegistrationContext, Verdict};
+pub use abi::{EventContext, MediaContext, Origin, RegistrationContext, Verdict};
 pub use config::{Capabilities, ClientIpTier, FailPolicy, PluginConfig, Points};
 pub use emit::{EmitError, EmitRequest, EventEmitter};
 pub use kv::{KvError, KvStore};

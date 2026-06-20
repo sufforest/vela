@@ -16,6 +16,8 @@ pub struct Points {
     pub on_event: bool,
     /// Sync decision hook at user registration (anti-spam signup).
     pub check_registration: bool,
+    /// Sync decision hook at media upload (content/MIME/hash policy).
+    pub check_media_upload: bool,
 }
 
 impl Default for Points {
@@ -24,6 +26,7 @@ impl Default for Points {
             check_event: true,
             on_event: false,
             check_registration: false,
+            check_media_upload: false,
         }
     }
 }

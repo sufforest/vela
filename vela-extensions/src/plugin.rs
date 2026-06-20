@@ -13,7 +13,7 @@ use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use crate::HostServices;
-use crate::abi::{EventContext, Origin, RegistrationContext, Verdict};
+use crate::abi::{EventContext, MediaContext, Origin, RegistrationContext, Verdict};
 use crate::config::{ClientIpTier, PluginConfig};
 use crate::emit::{EmitLimiter, EmitRequest, EventEmitter, emit_type_allowed};
 use crate::kv::KvStore;
@@ -485,6 +485,34 @@ impl Plugin {
         let verdict = instance
             .vela_extension_decision()
             .call_check_registration(&mut store, &wire)
+            .map_err(|e| PluginError::Trap(e.to_string()))?;
+        Ok(match verdict {
+            wit::Verdict::Allow => Verdict::Allow,
+            wit::Verdict::Block(r) => Verdict::Block {
+                errcode: r.errcode,
+                reason: r.reason,
+            },
+        })
+    }
+
+    /// Run the media-upload decision hook for one upload → a verdict. On the
+    /// request path (no emit); kv is available (stateful per-uploader limits).
+    pub(crate) fn check_media_upload(
+        &self,
+        ctx: &MediaContext<'_>,
+    ) -> Result<Verdict, PluginError> {
+        let (mut store, instance) = self.make_store(false)?;
+        let wire = wit::MediaContext {
+            content_type: ctx.content_type.to_string(),
+            filename: ctx.filename.to_string(),
+            size: ctx.size,
+            uploader: ctx.uploader.to_string(),
+            sha256: ctx.sha256.to_string(),
+            plugin_config: config_json(&self.cfg.config),
+        };
+        let verdict = instance
+            .vela_extension_decision()
+            .call_check_media_upload(&mut store, &wire)
             .map_err(|e| PluginError::Trap(e.to_string()))?;
         Ok(match verdict {
             wit::Verdict::Allow => Verdict::Allow,

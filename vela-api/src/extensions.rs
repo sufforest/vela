@@ -489,6 +489,7 @@ mod tests {
                 check_event: false,
                 on_event: true,
                 check_registration: false,
+                check_media_upload: false,
             },
             capabilities: vela_extensions::Capabilities::default(),
             client_ip: vela_extensions::ClientIpTier::default(),

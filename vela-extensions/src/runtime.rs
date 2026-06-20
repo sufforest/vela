@@ -3,7 +3,7 @@
 //! states; with `wasmtime-runtime` off it degrades to a no-op that allows
 //! everything, so call sites in vela-api never need `#[cfg]`.
 
-use crate::abi::{EventContext, RegistrationContext};
+use crate::abi::{EventContext, MediaContext, RegistrationContext};
 use crate::config::PluginConfig;
 
 /// The aggregate outcome of a decision point across all plugins.
@@ -51,13 +51,13 @@ mod imp {
     impl Runtime {
         /// Compile every configured plugin with no host services injected —
         /// every capability-granted plugin's calls fail. Used by tests and
-        /// wasmtime-free embedders; vela-server uses [`with_services`].
+        /// wasmtime-free embedders; vela-server uses [`Self::with_services`].
         pub fn new(configs: Vec<PluginConfig>) -> Result<Self, RuntimeError> {
             Self::with_services(configs, HostServices::default())
         }
 
         /// Compile every configured plugin, injecting only the `emit-event`
-        /// service. Convenience over [`with_services`] for emit-only callers.
+        /// service. Convenience over [`Self::with_services`] for emit-only callers.
         pub fn with_emitter(
             configs: Vec<PluginConfig>,
             emitter: Option<Arc<dyn EventEmitter>>,
@@ -223,6 +223,43 @@ mod imp {
                 }
             }
         }
+
+        /// True if any plugin binds the media-upload point — lets the upload
+        /// handler skip the gate (and the in-stream hashing) when none is set.
+        pub fn binds_check_media_upload(&self) -> bool {
+            self.plugins.iter().any(|p| p.cfg.points.check_media_upload)
+        }
+
+        /// Run the media-upload decision point: block-if-any, same fail-policy as
+        /// `check_event`. A block rejects the upload (the host deletes the stored
+        /// bytes). No event-type scoping.
+        pub fn check_media_upload(&self, ctx: &MediaContext<'_>) -> Decision {
+            for plugin in &self.plugins {
+                if !plugin.cfg.points.check_media_upload {
+                    continue;
+                }
+                let verdict = match plugin.check_media_upload(ctx) {
+                    Ok(v) => v,
+                    Err(e) => match plugin.cfg.fail_policy {
+                        FailPolicy::Open => {
+                            tracing::warn!(plugin = %plugin.cfg.name, error = %e, "extension check_media_upload failed; failing open (allow)");
+                            continue;
+                        }
+                        FailPolicy::Closed => {
+                            tracing::warn!(plugin = %plugin.cfg.name, error = %e, "extension check_media_upload failed; failing closed (block)");
+                            return Decision::Block {
+                                errcode: "M_FORBIDDEN".to_string(),
+                                reason: "extension policy unavailable".to_string(),
+                            };
+                        }
+                    },
+                };
+                if let Verdict::Block { errcode, reason } = verdict {
+                    return Decision::Block { errcode, reason };
+                }
+            }
+            Decision::Allow
+        }
     }
 
     /// A plugin with no `event_types` filter runs for everything; otherwise only
@@ -297,6 +334,14 @@ mod imp {
         }
 
         pub fn check_registration(&self, _ctx: &RegistrationContext<'_>) -> Decision {
+            Decision::Allow
+        }
+
+        pub fn binds_check_media_upload(&self) -> bool {
+            false
+        }
+
+        pub fn check_media_upload(&self, _ctx: &MediaContext<'_>) -> Decision {
             Decision::Allow
         }
     }

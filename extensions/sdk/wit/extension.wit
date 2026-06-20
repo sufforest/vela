@@ -11,7 +11,7 @@
 // components regardless of what changed; the committed fixtures/examples are
 // rebuilt with each bump. (Within a fixed version, a guest still instantiates as
 // long as it exports what the world requires and imports only granted caps.)
-package vela:extension@0.6.0;
+package vela:extension@0.7.0;
 
 interface decision {
     // Where an event originated. A `block` verdict is a hard reject for `local`
@@ -75,6 +75,30 @@ interface decision {
         plugin-config: string,
     }
     check-registration: func(ctx: registration-context) -> verdict;
+
+    // Media-upload metadata, after the bytes are stored but before the upload is
+    // downloadable. v1 is hash + metadata only (the upload streams, so the bytes
+    // aren't buffered): enough for exact known-bad-hash blocklists and
+    // MIME/size/filename policy. A block deletes the stored bytes and rejects the
+    // upload — blocked media is never servable. (Raw content for novel scanning
+    // is a later phase that needs a streaming/read-back interface.) E2EE media is
+    // already ciphertext at upload, so it's unscannable by nature — the server
+    // never decrypts.
+    record media-context {
+        // Client-declared MIME type.
+        content-type: string,
+        // Original filename if the client sent one; else empty.
+        filename: string,
+        // Size in bytes.
+        size: u64,
+        // The uploading user's id.
+        uploader: string,
+        // Lowercase hex SHA-256 of the content, computed in-stream.
+        sha256: string,
+        // This plugin's opaque config, verbatim JSON. Empty string if none.
+        plugin-config: string,
+    }
+    check-media-upload: func(ctx: media-context) -> verdict;
 }
 
 // Async observation: the host calls this off the request hot path (a worker
