@@ -492,6 +492,7 @@ mod profile_extension_tests {
                 check_media_upload: false,
                 check_profile_update: true,
                 check_room_create: false,
+                filter_sync_event: false,
             },
             capabilities: Default::default(),
             client_ip: Default::default(),

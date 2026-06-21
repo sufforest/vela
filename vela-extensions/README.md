@@ -29,7 +29,7 @@ Each `[[extensions.plugin]]` block loads one component:
 name = "keyword-filter"                # for logs, errors, metrics
 wasm_path = "/etc/vela/plugins/keyword-filter.wasm"
 event_types = ["m.room.message"]       # optional; omit to run for all events
-points = ["check_event"]               # check_event/on_event/check_registration/check_media_upload/check_profile_update/check_room_create
+points = ["check_event"]               # check_event/on_event/check_registration/check_media_upload/check_profile_update/check_room_create/filter_sync_event
 capabilities = []                      # host caps to grant, e.g. ["emit-event"]
 client_ip = "none"                     # check_registration IP tier: none|hashed|full
 fail_policy = "open"                   # "open" (default) | "closed"
@@ -44,7 +44,7 @@ config = { banned = ["spam"] }         # opaque JSON, handed to the plugin
 | `name` | — (required) | identifier in logs/errors/metrics |
 | `wasm_path` | — (required) | path to the `.wasm` component |
 | `event_types` | all | only invoke for these event types |
-| `points` | `["check_event"]` | hooks the plugin binds: `check_event` (decision on events), `on_event` (async observation), `check_registration` (decision at signup), `check_media_upload` (decision at media upload), `check_profile_update` (decision at a profile change), `check_room_create` (decision at room creation) |
+| `points` | `["check_event"]` | hooks the plugin binds: `check_event` (decision on events), `on_event` (async observation), `check_registration` (decision at signup), `check_media_upload` (decision at media upload), `check_profile_update` (decision at a profile change), `check_room_create` (decision at room creation), `filter_sync_event` (per-viewer read filter at `/sync`) |
 | `capabilities` | `[]` | host capabilities to grant (least-privilege): `emit-event` (post as its bot), `kv` (private key→value store). `logging` is always on |
 | `client_ip` | `"none"` | what a `check_registration` plugin sees of the client IP: `none`, `hashed` (a rate-limit token, no PII), or `full` (raw IP) |
 | `fail_policy` | `open` | on trap/timeout: `open` allows, `closed` blocks |
@@ -80,7 +80,7 @@ moderation. (Unix only; on other platforms, restart to reload.)
 
 ## What plugins can do
 
-Six extension points (a plugin binds any of them via `points`):
+Seven extension points (a plugin binds any of them via `points`):
 
 - **`check_event`** — the sync decision hook, on **local sends** (message and
   state events, after auth, before persist — a block rejects the send with the
@@ -132,6 +132,19 @@ Six extension points (a plugin binds any of them via `points`):
   rooms federate via joins, not creation. The `kv` capability works here (per-creator
   rate limits) — the [`room-policy` example](../extensions/examples/room-policy)
   drives all of these from a declarative config block.
+- **`filter_sync_event`** — the **read-path** filter: as `/sync` builds a user's
+  timeline, decide per event whether *that viewer* sees it. Returns show/hide (a
+  hidden event is silently dropped, no errcode), and is excluded from that room's
+  unread/notification count too (counts are taken from the returned timeline).
+  **It shapes the live `/sync` view, not access:** a hidden event is still
+  fetchable via `/messages`, `/context`, and `/event` — this is **not** an
+  access-control boundary. Use it for live-feed view-shaping (cut noise, apply
+  content policy on the active timeline); for actual removal, block at write time
+  (`check_event`) or redact. It runs on the `/sync` hot path **per delivered
+  timeline event per viewer**, so scope it tightly with `event_types` and keep it
+  cheap; an operator who doesn't bind it pays nothing. Timeline events only —
+  filtering state would corrupt the client's room state. The `kv` capability works
+  here (a stateful per-viewer policy).
 
 Plugins are **stateless** and get only the **host capabilities** you grant — no
 network, disk, or syscalls. Granted least-privilege per plugin via `capabilities`:

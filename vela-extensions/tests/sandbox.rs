@@ -401,6 +401,7 @@ fn observer(name: &str, mode: &str) -> PluginConfig {
         check_media_upload: false,
         check_profile_update: false,
         check_room_create: false,
+        filter_sync_event: false,
     };
     p
 }
@@ -476,6 +477,7 @@ fn a_plugin_can_bind_both_points() {
         check_media_upload: false,
         check_profile_update: false,
         check_room_create: false,
+        filter_sync_event: false,
     };
     let rt = Runtime::new(vec![p]).expect("loads");
     assert!(matches!(
@@ -584,6 +586,7 @@ fn emit_config(mode: &str, granted: bool) -> PluginConfig {
             check_media_upload: false,
             check_profile_update: false,
             check_room_create: false,
+            filter_sync_event: false,
         },
         capabilities: Capabilities {
             emit_event: granted,
@@ -736,6 +739,7 @@ fn kv_config(mode: &str, granted: bool) -> PluginConfig {
         check_media_upload: false,
         check_profile_update: false,
         check_room_create: false,
+        filter_sync_event: false,
     };
     p.capabilities = Capabilities {
         kv: granted,
@@ -824,6 +828,7 @@ fn register_config(mode: &str, tier: ClientIpTier) -> PluginConfig {
         check_media_upload: false,
         check_profile_update: false,
         check_room_create: false,
+        filter_sync_event: false,
     };
     p.client_ip = tier;
     p
@@ -906,6 +911,7 @@ fn media_config(mode: &str) -> PluginConfig {
         check_media_upload: true,
         check_profile_update: false,
         check_room_create: false,
+        filter_sync_event: false,
     };
     p
 }
@@ -973,6 +979,7 @@ fn profile_config(mode: &str) -> PluginConfig {
         check_media_upload: false,
         check_profile_update: true,
         check_room_create: false,
+        filter_sync_event: false,
     };
     p
 }
@@ -1054,6 +1061,7 @@ fn room_create_config(mode: &str) -> PluginConfig {
         check_media_upload: false,
         check_profile_update: false,
         check_room_create: true,
+        filter_sync_event: false,
     };
     p
 }
@@ -1126,4 +1134,60 @@ fn check_room_create_skips_unbound() {
         rt.check_room_create(&room_ctx(Some("evil"), Some("public"), &[])),
         Decision::Allow
     );
+}
+
+// --- filter_sync_event point (read path) -----------------------------------
+
+use vela_extensions::SyncEvent;
+
+const SYNC_FILTER_FIXTURE: &[u8] = include_bytes!("fixtures/sync_filter_guest.wasm");
+
+fn sync_filter_config(mode: &str) -> PluginConfig {
+    let mut p = plugin("sync", mode);
+    p.wasm = SYNC_FILTER_FIXTURE.to_vec();
+    p.points = Points {
+        check_event: false,
+        on_event: false,
+        check_registration: false,
+        check_media_upload: false,
+        check_profile_update: false,
+        check_room_create: false,
+        filter_sync_event: true,
+    };
+    p
+}
+
+fn sync_ctx<'a>(viewer: &'a str, sender: &'a str) -> SyncEvent<'a> {
+    SyncEvent {
+        viewer,
+        room_id: "!r:example.org",
+        event: "{}",
+        event_type: "m.room.message",
+        sender,
+    }
+}
+
+#[test]
+fn sync_filter_hides_flagged_sender() {
+    let rt = Runtime::new(vec![sync_filter_config("hide_sender")]).expect("loads");
+    // An event from an "evil" sender is hidden; a normal one is shown.
+    assert!(!rt.filter_sync_event(&sync_ctx("@bob:x", "@evil:x")));
+    assert!(rt.filter_sync_event(&sync_ctx("@bob:x", "@alice:x")));
+}
+
+#[test]
+fn sync_filter_is_per_viewer() {
+    let rt = Runtime::new(vec![sync_filter_config("hide_for_alice")]).expect("loads");
+    // Everything is hidden from the alice viewer, shown to everyone else — proves
+    // the decision keys on the viewer, not just the event.
+    assert!(!rt.filter_sync_event(&sync_ctx("@alice:x", "@bob:x")));
+    assert!(rt.filter_sync_event(&sync_ctx("@carol:x", "@bob:x")));
+}
+
+#[test]
+fn filter_sync_event_skips_unbound() {
+    let rt = Runtime::new(vec![plugin("dec", "block")]).expect("loads");
+    assert!(!rt.binds_filter_sync_event());
+    // Unbound → always shows.
+    assert!(rt.filter_sync_event(&sync_ctx("@alice:x", "@evil:x")));
 }

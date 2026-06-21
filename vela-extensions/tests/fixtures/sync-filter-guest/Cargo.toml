@@ -1,0 +1,21 @@
+# Test-only guest plugin exercising the `filter_sync_event` point. Built via
+# `tests/fixtures/build.sh` to a gitignored `sync_filter_guest.wasm` (CI builds it).
+[package]
+name = "sync-filter-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+panic = "abort"
+
+[workspace]

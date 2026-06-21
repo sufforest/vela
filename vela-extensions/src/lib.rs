@@ -20,7 +20,7 @@ mod plugin;
 
 pub use abi::{
     EventContext, MediaContext, Origin, ProfileField, ProfileUpdate, RegistrationContext,
-    RoomCreate, Verdict,
+    RoomCreate, SyncEvent, Verdict,
 };
 pub use config::{Capabilities, ClientIpTier, FailPolicy, PluginConfig, Points};
 pub use emit::{EmitError, EmitRequest, EventEmitter};

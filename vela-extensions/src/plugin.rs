@@ -15,7 +15,7 @@ use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use crate::HostServices;
 use crate::abi::{
     EventContext, MediaContext, Origin, ProfileField, ProfileUpdate, RegistrationContext,
-    RoomCreate, Verdict,
+    RoomCreate, SyncEvent, Verdict,
 };
 use crate::config::{Capabilities, ClientIpTier, PluginConfig};
 use crate::emit::{EmitLimiter, EmitRequest, EventEmitter, emit_type_allowed};
@@ -648,6 +648,25 @@ impl Plugin {
                 reason: r.reason,
             },
         })
+    }
+
+    /// Run the read-path sync filter for one (viewer, event) → show/hide. On the
+    /// `/sync` request path (no emit); kv is available (a stateful per-viewer
+    /// policy). Returns `true` to show the event, `false` to hide it.
+    pub(crate) fn filter_sync_event(&self, ctx: &SyncEvent<'_>) -> Result<bool, PluginError> {
+        let (mut store, instance) = self.make_store(false)?;
+        let wire = wit::SyncEventContext {
+            viewer: ctx.viewer.to_string(),
+            room_id: ctx.room_id.to_string(),
+            event: ctx.event.to_string(),
+            event_type: ctx.event_type.to_string(),
+            sender: ctx.sender.to_string(),
+            plugin_config: config_json(&self.cfg.config),
+        };
+        instance
+            .vela_extension_decision()
+            .call_filter_sync_event(&mut store, &wire)
+            .map_err(|e| PluginError::Trap(e.to_string()))
     }
 }
 

@@ -919,6 +919,7 @@ fn build_extension_runtime(
             check_media_upload: false,
             check_profile_update: false,
             check_room_create: false,
+            filter_sync_event: false,
         };
         for point in &p.points {
             match point.as_str() {
@@ -928,8 +929,9 @@ fn build_extension_runtime(
                 "check_media_upload" => points.check_media_upload = true,
                 "check_profile_update" => points.check_profile_update = true,
                 "check_room_create" => points.check_room_create = true,
+                "filter_sync_event" => points.filter_sync_event = true,
                 other => anyhow::bail!(
-                    "extension '{}': unknown point {other:?} (expected \"check_event\", \"on_event\", \"check_registration\", \"check_media_upload\", \"check_profile_update\", or \"check_room_create\")",
+                    "extension '{}': unknown point {other:?} (expected \"check_event\", \"on_event\", \"check_registration\", \"check_media_upload\", \"check_profile_update\", \"check_room_create\", or \"filter_sync_event\")",
                     p.name
                 ),
             }
@@ -940,6 +942,7 @@ fn build_extension_runtime(
             && !points.check_media_upload
             && !points.check_profile_update
             && !points.check_room_create
+            && !points.filter_sync_event
         {
             anyhow::bail!(
                 "extension '{}': points is empty — a plugin bound to no point can never run",
