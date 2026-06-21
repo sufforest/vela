@@ -83,9 +83,13 @@ moderation. (Unix only; on other platforms, restart to reload.)
 Eight extension points (a plugin binds any of them via `points`):
 
 - **`check_event`** — the sync decision hook, on **local sends** (message and
-  state events, after auth, before persist — a block rejects the send with the
-  plugin's errcode/reason, HTTP 403) and **inbound federated events** (a block
-  soft-fails — see below). Returns *allow* or *block*.
+  state events via `/send` and `/state`, after auth, before persist — a block
+  rejects the send with the plugin's errcode/reason, HTTP 403) and **inbound
+  federated events** (a block soft-fails — see below). Returns *allow* or *block*.
+  Scope: it sees `/send` and `/state` events and inbound federation — **not** local
+  membership-endpoint actions (join, invite, kick, ban, etc. build their events
+  directly, bypassing this gate), so it can't gate a local invite or join today (a
+  future `check_invite`/`check_join` would).
 - **`on_event`** — the async observation hook, on **local sends** (after the
   event is persisted, off the request path). No verdict — an observer can't
   block — for audit, metrics, and (as host capabilities land) automation. Each
@@ -184,6 +188,12 @@ Otherwise a plugin sees only the event and its own config.
   plugins' memory.
 - **Bounded:** every call has a fuel (CPU), memory, and optional wall-clock
   budget; exceeding any traps the call.
+- **On the request path:** the decision points run **inline on the request**, so a
+  plugin's `fuel`/`wall_ms` budget is also its latency tax — a slow plugin slows
+  the send/login/sync it gates. The defaults (`fuel = 50M`, `wall_ms = 100`) suit a
+  *trusted* policy plugin; for genuinely untrusted code set them aggressively low,
+  and scope hot-path points (`check_event`, `filter_sync_event`) with `event_types`.
+  (Observation, `on_event`, already runs off the request path.)
 - **Fail policy:** a trapping/erroring plugin is resolved per its `fail_policy` —
   `open` favors availability, `closed` favors safety.
 - **Multiple plugins** at a point are **block-if-any** (any block wins).

@@ -896,7 +896,31 @@ fn build_extension_runtime(
     services: vela_extensions::HostServices,
 ) -> anyhow::Result<vela_extensions::Runtime> {
     let mut configs = Vec::with_capacity(section.plugin.len());
+    let mut seen_names = std::collections::HashSet::new();
     for p in &section.plugin {
+        // The name is injected into the bot user id (`@_ext_<name>`) and the kv
+        // namespace, so it must be a safe localpart and unique — a `:` makes a
+        // malformed bot id, and a duplicate silently shares another plugin's kv
+        // store and bot identity (breaking isolation).
+        if p.name.is_empty()
+            || !p
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+        {
+            anyhow::bail!(
+                "extension '{}': name must be non-empty and use only [a-z0-9_-] \
+                 (it becomes the @_ext_<name> bot id and kv namespace)",
+                p.name
+            );
+        }
+        if !seen_names.insert(p.name.as_str()) {
+            anyhow::bail!(
+                "extension '{}': duplicate plugin name — names must be unique (they \
+                 key the kv namespace and bot identity)",
+                p.name
+            );
+        }
         let wasm = std::fs::read(&p.wasm_path).map_err(|e| {
             anyhow::anyhow!(
                 "extension '{}': reading wasm at {}: {e}",
@@ -961,9 +985,12 @@ fn build_extension_runtime(
                 p.name
             ),
         };
-        if client_ip != vela_extensions::ClientIpTier::None && !points.check_registration {
+        if client_ip != vela_extensions::ClientIpTier::None
+            && !points.check_registration
+            && !points.check_login
+        {
             anyhow::bail!(
-                "extension '{}': client_ip is only used by the \"check_registration\" point",
+                "extension '{}': client_ip is only used by the \"check_registration\" and \"check_login\" points",
                 p.name
             );
         }
@@ -1097,6 +1124,67 @@ mod reload_tests {
                 .is_err(),
             "a bad reload must error, not panic or silently succeed"
         );
+    }
+
+    #[test]
+    fn login_plugin_accepts_client_ip() {
+        // A login-only plugin with a non-none client_ip tier must be accepted —
+        // regression: the validator previously required check_registration, so a
+        // per-IP login rate-limiter (the headline check_login use) aborted startup.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wasm = dir.path().join("plugin.wasm");
+        std::fs::write(&wasm, plugin_wasm()).expect("write wasm");
+        let path = dir.path().join("vela.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[[extensions.plugin]]\nname = \"login\"\nwasm_path = \"{}\"\n\
+                 points = [\"check_login\"]\nclient_ip = \"hashed\"\n",
+                wasm.display()
+            ),
+        )
+        .expect("write config");
+        let (_rt, count) =
+            super::reload_extension_runtime(&path, vela_extensions::HostServices::default())
+                .expect("a login plugin with client_ip must be accepted");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn rejects_a_malformed_plugin_name() {
+        // A `:` in the name would make a malformed @_ext_<name> bot id. The charset
+        // check runs before the wasm read, so the error is the name, not the file.
+        let (_dir, path) = write_config(
+            "[[extensions.plugin]]\nname = \"bad:name\"\nwasm_path = \"/no/such.wasm\"\n",
+        );
+        let err = super::reload_extension_runtime(&path, vela_extensions::HostServices::default())
+            .err()
+            .expect("a malformed plugin name must be rejected");
+        assert!(err.contains("name must be"), "wrong error: {err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_plugin_names() {
+        // Two plugins sharing a name would silently share one kv namespace + bot.
+        // Both point at a readable wasm so the *duplicate* check is what errors,
+        // not a missing file (the dup check precedes the wasm read on iteration 2).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wasm = dir.path().join("plugin.wasm");
+        std::fs::write(&wasm, plugin_wasm()).expect("write wasm");
+        let path = dir.path().join("vela.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[[extensions.plugin]]\nname = \"dup\"\nwasm_path = \"{w}\"\n\
+                 [[extensions.plugin]]\nname = \"dup\"\nwasm_path = \"{w}\"\n",
+                w = wasm.display()
+            ),
+        )
+        .expect("write config");
+        let err = super::reload_extension_runtime(&path, vela_extensions::HostServices::default())
+            .err()
+            .expect("duplicate plugin names must be rejected");
+        assert!(err.contains("duplicate"), "wrong error: {err}");
     }
 }
 

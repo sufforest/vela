@@ -90,7 +90,7 @@ pub struct PluginConfig {
     pub wasm: Vec<u8>,
     pub fail_policy: FailPolicy,
     /// Per-call CPU budget. wasmtime meters *fuel* (≈ executed instructions),
-    /// not wall-clock time — see `DESIGN.md`.
+    /// not wall-clock time; `wall_ms` is the time backstop.
     pub fuel: u64,
     /// Per-call wall-clock budget in milliseconds, enforced via wasmtime epoch
     /// interruption as a backstop to `fuel` (fuel bounds work, not time — a
