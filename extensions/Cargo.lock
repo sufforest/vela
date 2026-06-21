@@ -131,6 +131,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "room-policy"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "vela-extension-sdk",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"

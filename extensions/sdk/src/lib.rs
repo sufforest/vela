@@ -150,6 +150,74 @@ impl Event {
         }
         serde_json::from_str(&self.raw.plugin_config).map(Some)
     }
+
+    /// This plugin's key→value store (needs the `kv` capability) — lets a
+    /// `check_event` decision be stateful (rate-limit, dedup, count). See [`Kv`].
+    pub fn kv(&self) -> Kv {
+        Kv::new()
+    }
+}
+
+/// A handle to your plugin's private key→value store (the `kv` capability).
+/// Reachable from **every** hook: the decision contexts expose it via `kv()`
+/// (e.g. [`RoomCreate::kv`], [`Event::kv`]) and [`Caps`] via [`Caps::kv`], so a
+/// `check_*` decision can be stateful (rate-limit, dedup, count) just like an
+/// observer. Operations call the host directly and return
+/// [`KvError::NotPermitted`] if the operator didn't grant `kv`. Keys are
+/// namespaced to your plugin by the host — you can't read another plugin's.
+#[derive(Clone, Copy)]
+pub struct Kv {
+    _seal: (),
+}
+
+impl Kv {
+    fn new() -> Self {
+        Kv { _seal: () }
+    }
+
+    /// Read a key. `None` if absent or expired. Bytes are whatever you stored.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
+        bindings::vela::extension::kv::get(key).map_err(KvError::from)
+    }
+
+    /// Write a key with no expiry. The host caps key/value size and enforces a
+    /// per-plugin byte quota ([`KvError::QuotaExceeded`] when full).
+    pub fn set(&self, key: &[u8], value: &[u8]) -> Result<(), KvError> {
+        bindings::vela::extension::kv::set(key, value, None).map_err(KvError::from)
+    }
+
+    /// Write a key with a time-to-live in milliseconds — it disappears after
+    /// `ttl_ms`. The right tool for rate-limit counters and dedup markers (they
+    /// self-clean, so the store doesn't fill up).
+    pub fn set_ttl(&self, key: &[u8], value: &[u8], ttl_ms: u64) -> Result<(), KvError> {
+        bindings::vela::extension::kv::set(key, value, Some(ttl_ms)).map_err(KvError::from)
+    }
+
+    /// Delete a key. Idempotent.
+    pub fn delete(&self, key: &[u8]) -> Result<(), KvError> {
+        bindings::vela::extension::kv::delete(key).map_err(KvError::from)
+    }
+
+    /// [`get`](Self::get) + JSON-decode. `None` if absent or the stored bytes
+    /// don't decode as `T` (it's your own data; treat as a cache miss).
+    pub fn get_json<T: DeserializeOwned>(&self, key: &[u8]) -> Result<Option<T>, KvError> {
+        Ok(self.get(key)?.and_then(|b| serde_json::from_slice(&b).ok()))
+    }
+
+    /// JSON-encode + [`set_ttl`](Self::set_ttl) (`ttl_ms = 0` → no expiry).
+    pub fn set_json<T: serde::Serialize>(
+        &self,
+        key: &[u8],
+        value: &T,
+        ttl_ms: u64,
+    ) -> Result<(), KvError> {
+        let bytes = serde_json::to_vec(value).map_err(|_| KvError::Internal)?;
+        if ttl_ms == 0 {
+            self.set(key, &bytes)
+        } else {
+            self.set_ttl(key, &bytes, ttl_ms)
+        }
+    }
 }
 
 /// Host capabilities granted to a plugin — the only way for plugin code to reach
@@ -227,51 +295,45 @@ impl Caps {
         self.emit(room_id, "m.room.message", &content)
     }
 
-    /// Read a key from this plugin's private kv store (needs the `kv`
-    /// capability). `None` if absent or expired. Bytes are whatever you stored.
+    /// This plugin's private key→value store (needs the `kv` capability) — the
+    /// same store the decision contexts reach via `kv()`. See [`Kv`].
+    pub fn kv(&self) -> Kv {
+        Kv::new()
+    }
+
+    /// Read a key. Shorthand for `self.kv().get(key)`.
     pub fn kv_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, KvError> {
-        bindings::vela::extension::kv::get(key).map_err(KvError::from)
+        self.kv().get(key)
     }
 
-    /// Write a key with no expiry. The host caps key/value size and enforces a
-    /// per-plugin byte quota (`KvError::QuotaExceeded` when full).
+    /// Write a key with no expiry. Shorthand for `self.kv().set(key, value)`.
     pub fn kv_set(&self, key: &[u8], value: &[u8]) -> Result<(), KvError> {
-        bindings::vela::extension::kv::set(key, value, None).map_err(KvError::from)
+        self.kv().set(key, value)
     }
 
-    /// Write a key with a time-to-live in milliseconds — it disappears after
-    /// `ttl_ms`. The right tool for rate-limit counters and dedup markers (they
-    /// self-clean, so the store doesn't fill up).
+    /// Write a key with a TTL in ms. Shorthand for `self.kv().set_ttl(...)`.
     pub fn kv_set_ttl(&self, key: &[u8], value: &[u8], ttl_ms: u64) -> Result<(), KvError> {
-        bindings::vela::extension::kv::set(key, value, Some(ttl_ms)).map_err(KvError::from)
+        self.kv().set_ttl(key, value, ttl_ms)
     }
 
-    /// Delete a key. Idempotent.
+    /// Delete a key. Shorthand for `self.kv().delete(key)`.
     pub fn kv_delete(&self, key: &[u8]) -> Result<(), KvError> {
-        bindings::vela::extension::kv::delete(key).map_err(KvError::from)
+        self.kv().delete(key)
     }
 
-    /// [`kv_get`](Self::kv_get) + JSON-decode. `None` if absent or the stored
-    /// bytes don't decode as `T` (it's your own data; treat as a cache miss).
+    /// [`kv_get`](Self::kv_get) + JSON-decode. Shorthand for `self.kv().get_json(key)`.
     pub fn kv_get_json<T: DeserializeOwned>(&self, key: &[u8]) -> Result<Option<T>, KvError> {
-        Ok(self
-            .kv_get(key)?
-            .and_then(|b| serde_json::from_slice(&b).ok()))
+        self.kv().get_json(key)
     }
 
-    /// JSON-encode + [`kv_set_ttl`](Self::kv_set_ttl) (`ttl_ms = 0` → no expiry).
+    /// JSON-encode + set with TTL. Shorthand for `self.kv().set_json(...)`.
     pub fn kv_set_json<T: serde::Serialize>(
         &self,
         key: &[u8],
         value: &T,
         ttl_ms: u64,
     ) -> Result<(), KvError> {
-        let bytes = serde_json::to_vec(value).map_err(|_| KvError::Internal)?;
-        if ttl_ms == 0 {
-            self.kv_set(key, &bytes)
-        } else {
-            self.kv_set_ttl(key, &bytes, ttl_ms)
-        }
+        self.kv().set_json(key, value, ttl_ms)
     }
 }
 
@@ -370,6 +432,12 @@ impl Registration {
         }
         serde_json::from_str(&self.raw.plugin_config).map(Some)
     }
+
+    /// This plugin's key→value store (needs the `kv` capability) — a stateful
+    /// per-IP signup rate-limiter is a few lines. See [`Kv`].
+    pub fn kv(&self) -> Kv {
+        Kv::new()
+    }
 }
 
 /// An ergonomic view over the media-upload metadata at the media point. v1 has
@@ -406,6 +474,12 @@ impl Media {
     /// Lowercase hex SHA-256 of the content — match against a known-bad-hash list.
     pub fn sha256(&self) -> &str {
         &self.raw.sha256
+    }
+
+    /// This plugin's key→value store (needs the `kv` capability) — e.g. a hash
+    /// blocklist or per-uploader quota. See [`Kv`].
+    pub fn kv(&self) -> Kv {
+        Kv::new()
     }
 
     /// This plugin's operator-supplied config as `T` — see [`Event::config`].
@@ -455,6 +529,12 @@ impl Profile {
     /// scanning is `check_media_upload`'s job).
     pub fn value(&self) -> Option<&str> {
         self.raw.value.as_deref()
+    }
+
+    /// This plugin's key→value store (needs the `kv` capability) — e.g. per-user
+    /// display-name churn limits. See [`Kv`].
+    pub fn kv(&self) -> Kv {
+        Kv::new()
     }
 
     /// This plugin's operator-supplied config as `T` — see [`Event::config`].
@@ -529,6 +609,12 @@ impl RoomCreate {
     /// Whether the client marked this a direct (1:1) room.
     pub fn is_direct(&self) -> bool {
         self.raw.is_direct
+    }
+
+    /// This plugin's key→value store (needs the `kv` capability) — e.g. a
+    /// per-creator "rooms created today" counter for a rate limit. See [`Kv`].
+    pub fn kv(&self) -> Kv {
+        Kv::new()
     }
 
     /// This plugin's operator-supplied config as `T` — see [`Event::config`].

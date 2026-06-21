@@ -19,3 +19,4 @@ build() {
 }
 
 build keyword-filter "$here/examples/keyword-filter/keyword-filter.wasm"
+build room-policy "$here/examples/room-policy/room-policy.wasm"

@@ -4,7 +4,7 @@
 # at the repo root must never try to build them. Build with build-examples.sh.
 [workspace]
 resolver = "2"
-members = ["sdk", "examples/keyword-filter"]
+members = ["sdk", "examples/keyword-filter", "examples/room-policy"]
 
 # Small, trap-on-panic wasm artifacts. Applies to every example.
 [profile.release]

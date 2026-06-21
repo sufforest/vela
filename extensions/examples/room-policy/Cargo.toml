@@ -1,0 +1,12 @@
+[package]
+name = "room-policy"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vela-extension-sdk = { path = "../../sdk" }
+serde = { version = "1", features = ["derive"] }
