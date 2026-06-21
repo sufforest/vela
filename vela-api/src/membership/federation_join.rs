@@ -428,10 +428,18 @@ pub async fn send_join_v2(
         .and_then(|n| state.db.get_room_version_typed(n).ok())
         .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
 
-    // Verify the signature over the event.
+    // Verify the signature over the event. Pass the signing key ids so a
+    // rotated origin key is re-fetched rather than rejected against the cache.
+    let wanted: Vec<&str> = event_obj
+        .get("signatures")
+        .and_then(|v| v.as_object())
+        .and_then(|s| s.get(sender_domain))
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().map(String::as_str).collect())
+        .unwrap_or_default();
     let keys = state
         .remote_keys
-        .get_or_fetch(sender_domain)
+        .get_or_fetch_signed(sender_domain, &wanted)
         .await
         .map_err(|_| {
             err_response(

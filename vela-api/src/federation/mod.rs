@@ -937,4 +937,183 @@ mod tests {
             "notary signature must verify against vela's key",
         );
     }
+
+    /// A server that reuses a hostname:port with a fresh signing key — the
+    /// Docker ephemeral-port reuse behind the msc3902 flake, and ordinary key
+    /// rotation in production — must be picked up: a time-valid cache missing
+    /// the live key id is re-fetched, not trusted blindly.
+    #[tokio::test]
+    async fn key_cache_refetches_when_cached_doc_lacks_signing_key() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let remote = "rotator.example";
+
+        // The live server publishes `key_new`.
+        let server = MockServer::start().await;
+        let key_new = ServerSigningKey::generate();
+        let body = build_server_key_response(&key_new, remote, now, &[]);
+        Mock::given(method("GET"))
+            .and(path("/_matrix/key/v2/server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Value::Object(body)))
+            .mount(&server)
+            .await;
+
+        let (state, _tmp) = crate::test_helpers::build_test_state();
+        state
+            .federation_client
+            .set_base_url_override(remote, &server.uri());
+
+        // Seed a still-time-valid cache with a *different* key, fetched long
+        // enough ago to be past the refetch cooldown — the previous occupant.
+        let key_old = ServerSigningKey::generate();
+        let stale = crate::federation::federation_client::RemoteKeys {
+            verify_keys: std::collections::HashMap::from([(
+                key_old.key_id().to_string(),
+                key_old.public_key_base64(),
+            )]),
+            valid_until_ts: now + 7 * 24 * 60 * 60 * 1000,
+            fetched_at: now.saturating_sub(60_000),
+        };
+        state.remote_keys.insert_for_test(remote, stale);
+
+        // The plain time-based lookup is stale: it never sees the live key.
+        let timed = state.remote_keys.get_or_fetch(remote).await.unwrap();
+        assert!(
+            !timed.verify_keys.contains_key(key_new.key_id()),
+            "time-only get_or_fetch must return the stale cached document",
+        );
+
+        // The key-aware lookup notices the unknown key id and re-fetches.
+        let refetched = state
+            .remote_keys
+            .get_or_fetch_signed(remote, &[key_new.key_id()])
+            .await
+            .unwrap();
+        assert!(
+            refetched.verify_keys.contains_key(key_new.key_id()),
+            "get_or_fetch_signed must re-fetch and pick up the rotated key",
+        );
+    }
+
+    /// The storm guard: a document fetched within the cooldown is served from
+    /// cache even when it lacks the wanted key, so a peer can't make us hammer
+    /// a victim's key endpoint by signing with random key ids.
+    #[tokio::test]
+    async fn key_cache_does_not_refetch_within_cooldown() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let remote = "flooder.example";
+
+        // The live server would serve `key_live`, but we must NOT reach it.
+        let server = MockServer::start().await;
+        let key_live = ServerSigningKey::generate();
+        let body = build_server_key_response(&key_live, remote, now, &[]);
+        Mock::given(method("GET"))
+            .and(path("/_matrix/key/v2/server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Value::Object(body)))
+            .mount(&server)
+            .await;
+
+        let (state, _tmp) = crate::test_helpers::build_test_state();
+        state
+            .federation_client
+            .set_base_url_override(remote, &server.uri());
+
+        // Seed a doc fetched *just now* (inside the cooldown) lacking the key.
+        // Stamp `fetched_at` immediately before the call — capturing it at the
+        // top of the test would race the (sometimes >1s) mock/state setup and
+        // let the cooldown lapse. The cooldown threshold itself is covered
+        // deterministically by `cache_suffices_when_missing_key_but_within_cooldown`.
+        let key_old = ServerSigningKey::generate();
+        let fetched_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let fresh = crate::federation::federation_client::RemoteKeys {
+            verify_keys: std::collections::HashMap::from([(
+                key_old.key_id().to_string(),
+                key_old.public_key_base64(),
+            )]),
+            valid_until_ts: fetched_now + 7 * 24 * 60 * 60 * 1000,
+            fetched_at: fetched_now,
+        };
+        state.remote_keys.insert_for_test(remote, fresh);
+
+        let served = state
+            .remote_keys
+            .get_or_fetch_signed(remote, &[key_live.key_id()])
+            .await
+            .unwrap();
+        assert!(
+            !served.verify_keys.contains_key(key_live.key_id()),
+            "within the cooldown the cache must be served without re-fetching",
+        );
+    }
+
+    /// A failed refetch (origin unreachable / 5xx) still refreshes the cooldown
+    /// stamp, so a stream of events signed with an unknown key from a broken
+    /// server can't trigger one timeout-prone fetch per event.
+    #[tokio::test]
+    async fn key_cache_failed_refetch_still_arms_cooldown() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let remote = "broken.example";
+        let server = MockServer::start().await;
+        // Every key fetch 5xxs.
+        Mock::given(method("GET"))
+            .and(path("/_matrix/key/v2/server"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let (state, _tmp) = crate::test_helpers::build_test_state();
+        state
+            .federation_client
+            .set_base_url_override(remote, &server.uri());
+
+        // Seed a stale (past-cooldown) doc missing the wanted key.
+        let key_old = ServerSigningKey::generate();
+        let seed_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let stale = crate::federation::federation_client::RemoteKeys {
+            verify_keys: std::collections::HashMap::from([(
+                key_old.key_id().to_string(),
+                key_old.public_key_base64(),
+            )]),
+            valid_until_ts: seed_now + 7 * 24 * 60 * 60 * 1000,
+            fetched_at: seed_now.saturating_sub(60_000),
+        };
+        state.remote_keys.insert_for_test(remote, stale);
+
+        // The refetch is attempted and fails: fall back to the cached keys...
+        let served = state
+            .remote_keys
+            .get_or_fetch_signed(remote, &["ed25519:never_published"])
+            .await
+            .unwrap();
+        assert!(
+            served.verify_keys.contains_key(key_old.key_id()),
+            "failed refetch must fall back to the cached keys",
+        );
+        // ...but the cooldown stamp was refreshed, so the next lookup serves
+        // from cache rather than retrying the fetch on every event.
+        let after = state.remote_keys.get_or_fetch(remote).await.unwrap();
+        assert!(
+            after.fetched_at >= seed_now,
+            "a failed refetch must refresh fetched_at to arm the cooldown",
+        );
+    }
 }

@@ -291,7 +291,20 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
         );
     }
 
-    let sender_keys = match state.remote_keys.get_or_fetch(&sender_domain).await {
+    // Pass the key ids this event is signed with so a sender that rotated its
+    // signing key is re-fetched rather than rejected against a stale cache.
+    let wanted: Vec<&str> = obj
+        .get("signatures")
+        .and_then(|v| v.as_object())
+        .and_then(|s| s.get(&sender_domain))
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    let sender_keys = match state
+        .remote_keys
+        .get_or_fetch_signed(&sender_domain, &wanted)
+        .await
+    {
         Ok(k) => k,
         Err(e) => {
             warn!(domain = %sender_domain, error = %e, "failed to fetch sender keys");
@@ -2498,9 +2511,16 @@ async fn persist_fetched_event_inner(
         .sender_domain()
         .ok_or_else(|| "fetched event has malformed sender".to_string())?
         .to_string();
+    let wanted: Vec<&str> = obj
+        .get("signatures")
+        .and_then(|v| v.as_object())
+        .and_then(|s| s.get(&sender_domain))
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().map(String::as_str).collect())
+        .unwrap_or_default();
     let keys = state
         .remote_keys
-        .get_or_fetch(&sender_domain)
+        .get_or_fetch_signed(&sender_domain, &wanted)
         .await
         .map_err(|e| format!("cannot fetch keys for {sender_domain}: {e}"))?;
     let sigs = obj

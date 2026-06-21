@@ -44,6 +44,13 @@ impl RemoteKeys {
     pub fn is_valid_at(&self, now_ms: u64) -> bool {
         self.valid_until_ts > now_ms
     }
+
+    /// Whether this document can verify a signature made with one of `wanted`
+    /// key ids. An empty `wanted` means the caller needs no specific key (any
+    /// valid document will do) — the behaviour of the plain time-based fetch.
+    fn covers_any(&self, wanted: &[&str]) -> bool {
+        wanted.is_empty() || wanted.iter().any(|k| self.verify_keys.contains_key(*k))
+    }
 }
 
 /// Errors that can arise while fetching or validating remote keys or signing
@@ -1387,6 +1394,28 @@ pub struct RemoteKeyCache {
     client: FederationClient,
 }
 
+/// Minimum interval between key (re)fetches for the *same* server triggered by
+/// an unknown key id. Signing keys rotate, so a key id we've never seen is
+/// normally legitimate and we re-fetch to pick it up — but a hostile peer must
+/// not be able to make us hammer a victim's `/_matrix/key/v2/server` by signing
+/// requests with random key ids, so a server we fetched within this window is
+/// served from cache (the caller then rejects the unverifiable request). 1s
+/// bounds the worst case to ~1 key fetch/sec/server while still recovering from
+/// a real rotation within a second.
+const MIN_KEY_REFETCH_MS: u64 = 1_000;
+
+/// Whether a cached key document is good enough to serve a request signed by
+/// one of `wanted`, or whether the caller must (re)fetch.
+///
+/// Serve the cache iff it is still time-valid **and** either it already has one
+/// of the wanted keys, or it was fetched within `min_refetch_ms` (the storm
+/// guard above). An expired document, or a valid one missing the wanted key
+/// past the cooldown, forces a fetch.
+fn cache_suffices(cached: &RemoteKeys, wanted: &[&str], now: u64, min_refetch_ms: u64) -> bool {
+    cached.is_valid_at(now)
+        && (cached.covers_any(wanted) || now.saturating_sub(cached.fetched_at) < min_refetch_ms)
+}
+
 impl RemoteKeyCache {
     pub fn new(db: Arc<Database>, client: FederationClient) -> Self {
         Self {
@@ -1398,19 +1427,53 @@ impl RemoteKeyCache {
 
     /// Return cached keys if present and still valid; otherwise fetch.
     /// On fetch, the result is written to both disk and memory.
+    ///
+    /// Time-based only: use [`get_or_fetch_signed`](Self::get_or_fetch_signed)
+    /// when you know which key id a request/event is signed with, so a rotated
+    /// signing key is picked up rather than rejected.
     pub async fn get_or_fetch(
         &self,
         server_name: &str,
     ) -> Result<Arc<RemoteKeys>, FederationClientError> {
+        self.get_or_fetch_signed(server_name, &[]).await
+    }
+
+    /// Like [`get_or_fetch`](Self::get_or_fetch), but aware of the `wanted` key
+    /// ids the request/event is signed with.
+    ///
+    /// A server can present a *current* signing key id we've never seen — it
+    /// rotated to a new key, or (under Complement) a port was reused by a fresh
+    /// server — while our cached document for it is still inside its
+    /// `valid_until_ts`. The plain time check then hands back a stale document
+    /// and we wrongly reject a legitimately-signed request. This variant
+    /// re-fetches when a time-valid cache is missing all of `wanted`,
+    /// rate-limited by `MIN_KEY_REFETCH_MS` so a peer can't induce a fetch
+    /// storm with bogus key ids. (This is what surfaces as the msc3902 flake
+    /// under Docker ephemeral-port reuse: a new test server reuses a port with
+    /// a fresh key while we still cache the previous occupant's key.)
+    pub async fn get_or_fetch_signed(
+        &self,
+        server_name: &str,
+        wanted: &[&str],
+    ) -> Result<Arc<RemoteKeys>, FederationClientError> {
         let now = now_ms();
 
         // 1. Memory
-        if let Some(keys) = self.memory.get(server_name) {
-            if keys.is_valid_at(now) {
-                return Ok(keys.clone());
+        if let Some(entry) = self.memory.get(server_name) {
+            let cached = entry.clone();
+            drop(entry);
+            if cache_suffices(&cached, wanted, now, MIN_KEY_REFETCH_MS) {
+                return Ok(cached);
             }
-            // Stale — drop and refetch
-            drop(keys);
+            if cached.is_valid_at(now) {
+                // Time-valid but signed with a key id we don't have and past
+                // the cooldown: re-fetch to pick up a rotated key, falling back
+                // to the cached document if the fetch fails (it still verifies
+                // requests using the keys we already hold).
+                return Ok(self.refetch_or(server_name, cached).await);
+            }
+            // Expired — drop and fall through to disk/network.
+            drop(cached);
             self.memory.remove(server_name);
         }
 
@@ -1421,19 +1484,58 @@ impl RemoteKeyCache {
         {
             let arc = Arc::new(keys);
             self.memory.insert(server_name.to_string(), arc.clone());
-            return Ok(arc);
+            if cache_suffices(&arc, wanted, now, MIN_KEY_REFETCH_MS) {
+                return Ok(arc);
+            }
+            return Ok(self.refetch_or(server_name, arc).await);
         }
 
-        // 3. Fetch
-        let keys = self.client.fetch_server_keys(server_name).await?;
-        let arc = Arc::new(keys);
+        // 3. Fetch (cold cache or expired) — propagate the error.
+        let arc = Arc::new(self.client.fetch_server_keys(server_name).await?);
+        self.store(server_name, &arc);
+        Ok(arc)
+    }
 
-        // Persist
-        if let Ok(bytes) = serde_json::to_vec(&*arc) {
+    /// Re-fetch keys for a server whose cached document lacks the wanted key
+    /// id, returning the fresh keys on success or the (cooldown-armed)
+    /// `fallback` on failure.
+    ///
+    /// The cooldown is armed in memory **before** the fetch is awaited. This
+    /// coalesces a concurrent burst: requests that arrive while the fetch is in
+    /// flight see a recently-refreshed cache and serve from it instead of each
+    /// launching their own fetch. That matters because the inbound-auth path
+    /// runs this for unauthenticated, attacker-chosen `(origin, key_id)` pairs,
+    /// where the fetch targets a third party — without the early stamp a single
+    /// connection burst would fan out into one (timeout-prone) fetch per
+    /// request. The stamp is memory-only: it is transient, needn't survive a
+    /// restart, and keeping it off disk avoids write churn under such a burst.
+    async fn refetch_or(&self, server_name: &str, fallback: Arc<RemoteKeys>) -> Arc<RemoteKeys> {
+        let stamped = Arc::new(RemoteKeys {
+            verify_keys: fallback.verify_keys.clone(),
+            valid_until_ts: fallback.valid_until_ts,
+            fetched_at: now_ms(),
+        });
+        self.memory.insert(server_name.to_string(), stamped.clone());
+
+        match self.client.fetch_server_keys(server_name).await {
+            Ok(keys) => {
+                let arc = Arc::new(keys);
+                self.store(server_name, &arc);
+                arc
+            }
+            Err(e) => {
+                debug!(%server_name, error = %e, "key refetch for unknown key id failed; using cached keys");
+                stamped
+            }
+        }
+    }
+
+    /// Write a key document to both disk and the in-memory cache.
+    fn store(&self, server_name: &str, arc: &Arc<RemoteKeys>) {
+        if let Ok(bytes) = serde_json::to_vec(&**arc) {
             let _ = self.db.store_remote_server_keys(server_name, &bytes);
         }
         self.memory.insert(server_name.to_string(), arc.clone());
-        Ok(arc)
     }
 
     /// Store a pre-fetched RemoteKeys directly. Used by tests (both
@@ -1509,6 +1611,91 @@ mod tests {
         body.insert("valid_until_ts".into(), json!(valid_until_ts));
         key.sign_json(&mut body, server_name);
         Value::Object(body)
+    }
+
+    /// Build a cached key document with the given key ids present.
+    fn keys_doc(valid_until_ts: u64, fetched_at: u64, key_ids: &[&str]) -> RemoteKeys {
+        RemoteKeys {
+            verify_keys: key_ids
+                .iter()
+                .map(|k| ((*k).to_string(), "AAAA".to_string()))
+                .collect(),
+            valid_until_ts,
+            fetched_at,
+        }
+    }
+
+    #[test]
+    fn cache_suffices_when_valid_and_has_key() {
+        let now = now_ms_fixed();
+        let doc = keys_doc(now + 60_000, now - 60_000, &["ed25519:a"]);
+        assert!(cache_suffices(
+            &doc,
+            &["ed25519:a"],
+            now,
+            MIN_KEY_REFETCH_MS
+        ));
+    }
+
+    #[test]
+    fn cache_refetches_when_valid_but_missing_key_and_cooled_down() {
+        let now = now_ms_fixed();
+        // Fetched well past the cooldown, signed with a key we don't have:
+        // must refetch (this is the rotation / port-reuse case).
+        let doc = keys_doc(now + 60_000, now - 60_000, &["ed25519:old"]);
+        assert!(!cache_suffices(
+            &doc,
+            &["ed25519:new"],
+            now,
+            MIN_KEY_REFETCH_MS
+        ));
+    }
+
+    #[test]
+    fn cache_suffices_when_missing_key_but_within_cooldown() {
+        let now = now_ms_fixed();
+        // Just fetched: serve the cache even though it lacks the key, so a
+        // peer signing with random key ids can't make us hammer the origin.
+        let doc = keys_doc(now + 60_000, now - 10, &["ed25519:old"]);
+        assert!(cache_suffices(
+            &doc,
+            &["ed25519:new"],
+            now,
+            MIN_KEY_REFETCH_MS
+        ));
+    }
+
+    #[test]
+    fn cache_never_suffices_when_expired() {
+        let now = now_ms_fixed();
+        // Expired forces a fetch even when it holds the wanted key, and even
+        // when freshly fetched.
+        let doc = keys_doc(now - 1, now, &["ed25519:a"]);
+        assert!(!cache_suffices(
+            &doc,
+            &["ed25519:a"],
+            now,
+            MIN_KEY_REFETCH_MS
+        ));
+    }
+
+    #[test]
+    fn cache_suffices_with_empty_wanted_mirrors_time_check() {
+        let now = now_ms_fixed();
+        // No specific key wanted (the plain get_or_fetch path): valid → serve,
+        // expired → fetch, regardless of contents.
+        assert!(cache_suffices(
+            &keys_doc(now + 1, now, &[]),
+            &[],
+            now,
+            MIN_KEY_REFETCH_MS
+        ));
+        assert!(!cache_suffices(
+            &keys_doc(now - 1, now, &[]),
+            &[],
+            now,
+            MIN_KEY_REFETCH_MS
+        ));
     }
 
     #[test]
