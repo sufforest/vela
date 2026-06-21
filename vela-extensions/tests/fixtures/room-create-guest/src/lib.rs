@@ -26,6 +26,13 @@ fn blocked(reason: &str) -> Verdict {
 }
 
 impl Guest for Component {
+    // Read-path sync filter unused by this fixture — show everything.
+    fn filter_sync_event(
+        _ctx: exports::vela::extension::decision::SyncEventContext,
+    ) -> bool {
+        true
+    }
+
     fn check_event(_ctx: DecCtx) -> Verdict {
         Verdict::Allow
     }

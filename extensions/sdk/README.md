@@ -87,6 +87,15 @@ no-op, and the operator's `points` config decides which the host invokes.
   invited users), `is_direct()`, and `config()`. Use it for anti-spam, invite-bomb
   caps, no-public-rooms, and alias policy; the `kv` capability works here too
   (per-creator rate limits), so a config block can drive declarative rules.
+- **`Plugin::filter_sync_event(&SyncEvent) -> bool`** — the read-path filter
+  (default: `true` = show), as `/sync` builds a user's timeline. Return `false` to
+  hide the event from this viewer. It shapes the live `/sync` view, **not** access:
+  a hidden event is still fetchable via `/messages`/`/context`/`/event`, so use it
+  for view-shaping, not isolation (block at write time for real removal).
+  `SyncEvent` gives `viewer()` (the user syncing), `room_id()`, `event_type()`,
+  `sender()`, `event()` (parsed JSON), `message_body()`, and `config()`. It runs on
+  the `/sync` hot path per delivered timeline event, so keep it cheap and scope it
+  with `event_types`; the `kv` capability works here too.
 - **`Caps`** — the host-capabilities handle:
   - `caps.log(msg)` (and `.debug` / `.warn` / `.error` / `.trace`) — write a line
     to vela's log, tagged with your plugin name; truncated and rate-limited by the

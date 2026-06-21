@@ -1008,6 +1008,31 @@ fn ensure_lazy_load_member_state(
     Ok(())
 }
 
+/// Apply the `filter_sync_event` read hook to one timeline event. Returns `true`
+/// (show) when there's no viewer — i.e. the point is unbound or the viewer's id
+/// couldn't be resolved — so it's a cheap no-op off the filter path. Serializing
+/// the event to JSON happens only when a viewer is set (a plugin is bound).
+fn sync_filter_shows(
+    rt: &vela_extensions::Runtime,
+    viewer: Option<&str>,
+    room_id: &str,
+    ev: &Value,
+) -> bool {
+    let Some(viewer) = viewer else {
+        return true;
+    };
+    let event_type = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let sender = ev.get("sender").and_then(|s| s.as_str()).unwrap_or("");
+    let event_json = ev.to_string();
+    rt.filter_sync_event(&vela_extensions::SyncEvent {
+        viewer,
+        room_id,
+        event: &event_json,
+        event_type,
+        sender,
+    })
+}
+
 fn build_room_sync_for_user(
     state: &AppState,
     room_nid: u64,
@@ -1020,6 +1045,20 @@ fn build_room_sync_for_user(
     safe_pos: u64,
     use_state_after: bool,
 ) -> Result<Value, ApiError> {
+    // Read-path sync filter: if a plugin binds `filter_sync_event`, resolve the
+    // viewer once and drop any timeline event the plugin hides from them. No-op
+    // (and no viewer lookup) when unbound, so an operator who doesn't use it pays
+    // nothing. An unresolved viewer (no nid, or a resolve error) leaves
+    // `sync_viewer = None`, which shows everything — a fail-open we accept because
+    // we can't run a per-viewer filter without a viewer; the filter is a view
+    // shaper, not an access boundary (the event is still served by /messages).
+    let sync_rt = state.extensions.load();
+    let sync_viewer = if sync_rt.binds_filter_sync_event() {
+        user_nid.and_then(|nid| state.db.resolve_nid(nid).ok().flatten())
+    } else {
+        None
+    };
+
     let (state_events, timeline_events, limited, prev_batch) = match since {
         None => {
             let state_nids = state
@@ -1043,7 +1082,9 @@ fn build_room_sync_for_user(
 
             let mut timeline_events = Vec::new();
             for (_, enid) in &timeline_entries {
-                if let Some(ev) = load_timeline_event(state, *enid, room_id, user_nid, device_id)? {
+                if let Some(ev) = load_timeline_event(state, *enid, room_id, user_nid, device_id)?
+                    && sync_filter_shows(&sync_rt, sync_viewer.as_deref(), room_id, &ev)
+                {
                     timeline_events.push(ev);
                 }
             }
@@ -1103,6 +1144,7 @@ fn build_room_sync_for_user(
                     }
                     if let Some(ev) =
                         load_timeline_event(state, *enid, room_id, user_nid, device_id)?
+                        && sync_filter_shows(&sync_rt, sync_viewer.as_deref(), room_id, &ev)
                     {
                         timeline_events.push(ev);
                     }
@@ -1185,6 +1227,7 @@ fn build_room_sync_for_user(
                     }
                     if let Some(ev) =
                         load_timeline_event(state, *enid, room_id, user_nid, device_id)?
+                        && sync_filter_shows(&sync_rt, sync_viewer.as_deref(), room_id, &ev)
                     {
                         timeline_events.push(ev);
                     }
@@ -3749,6 +3792,142 @@ mod tests {
             resp_after
                 .pointer("/rooms/join")
                 .unwrap_or(&serde_json::json!(null))
+        );
+    }
+
+    /// End-to-end: a bound `filter_sync_event` plugin drops a flagged sender's
+    /// message from the viewer's `/sync` timeline, while a normal message stays —
+    /// proving the read-path hook is wired into the timeline build.
+    #[cfg(feature = "extensions")]
+    #[test]
+    fn sync_filter_hides_flagged_sender_from_timeline() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!filt:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let bob = fake_user(&state, "@bob:example.com");
+        let evil_nid = db.get_or_create_nid("@evil:example.com").unwrap();
+        let good_nid = db.get_or_create_nid("@good:example.com").unwrap();
+        let type_create = db.get_or_create_nid("m.room.create").unwrap();
+        let type_member = db.get_or_create_nid("m.room.member").unwrap();
+        let skey_empty = db.get_or_create_nid("").unwrap();
+
+        db.create_room_meta(room_nid, room_id, "12").unwrap();
+        db.persist_event(
+            10,
+            "$c",
+            room_nid,
+            type_create,
+            bob.user_nid,
+            skey_empty,
+            1,
+            1,
+            &serde_json::to_vec(&serde_json::json!({
+                "type": "m.room.create", "sender": "@bob:example.com", "state_key": "",
+                "room_id": room_id, "content": {"room_version": "12"},
+                "origin_server_ts": 1, "depth": 1, "prev_events": [], "auth_events": [],
+            }))
+            .unwrap(),
+            &[],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+        db.persist_event(
+            11,
+            "$j",
+            room_nid,
+            type_member,
+            bob.user_nid,
+            bob.user_nid,
+            2,
+            2,
+            &serde_json::to_vec(&serde_json::json!({
+                "type": "m.room.member", "sender": "@bob:example.com",
+                "state_key": "@bob:example.com", "room_id": room_id,
+                "content": {"membership": "join"},
+                "origin_server_ts": 2, "depth": 2, "prev_events": ["$c"], "auth_events": ["$c"],
+            }))
+            .unwrap(),
+            &[10],
+            &[10],
+            true,
+            false,
+        )
+        .unwrap();
+        db.set_membership(room_nid, bob.user_nid, 1).unwrap();
+
+        // Two timeline messages: one from a flagged `@evil` sender, one normal.
+        persist_message(
+            db,
+            20,
+            "$evil",
+            room_nid,
+            room_id,
+            evil_nid,
+            "@evil:example.com",
+            "spam",
+            10,
+            10,
+        );
+        persist_message(
+            db,
+            21,
+            "$good",
+            room_nid,
+            room_id,
+            good_nid,
+            "@good:example.com",
+            "hello",
+            11,
+            11,
+        );
+
+        // A sync-filter plugin that hides events whose sender contains "evil".
+        const SYNC: &[u8] =
+            include_bytes!("../../../vela-extensions/tests/fixtures/sync_filter_guest.wasm");
+        let rt = vela_extensions::Runtime::new(vec![vela_extensions::PluginConfig {
+            name: "sync".into(),
+            wasm: SYNC.to_vec(),
+            fail_policy: vela_extensions::FailPolicy::Closed,
+            fuel: 50_000_000,
+            wall_ms: 0,
+            memory_pages: 256,
+            event_types: None,
+            points: vela_extensions::Points {
+                check_event: false,
+                on_event: false,
+                check_registration: false,
+                check_media_upload: false,
+                check_profile_update: false,
+                check_room_create: false,
+                filter_sync_event: true,
+            },
+            capabilities: Default::default(),
+            client_ip: Default::default(),
+            config: serde_json::json!({ "mode": "hide_sender" }),
+        }])
+        .expect("sync-filter plugin loads");
+        state.extensions.store(std::sync::Arc::new(rt));
+
+        let resp = build_sync_response(&state, &bob, &[room_nid], None).unwrap();
+        let senders: Vec<String> = resp
+            .pointer(&format!("/rooms/join/{room_id}/timeline/events"))
+            .and_then(|v| v.as_array())
+            .map(|evs| {
+                evs.iter()
+                    .filter_map(|e| e.get("sender").and_then(|s| s.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            senders.iter().any(|s| s == "@good:example.com"),
+            "the normal message must be shown; timeline senders: {senders:?}"
+        );
+        assert!(
+            !senders.iter().any(|s| s == "@evil:example.com"),
+            "the flagged sender's message must be hidden; timeline senders: {senders:?}"
         );
     }
 }

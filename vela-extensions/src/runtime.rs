@@ -3,7 +3,9 @@
 //! states; with `wasmtime-runtime` off it degrades to a no-op that allows
 //! everything, so call sites in vela-api never need `#[cfg]`.
 
-use crate::abi::{EventContext, MediaContext, ProfileUpdate, RegistrationContext, RoomCreate};
+use crate::abi::{
+    EventContext, MediaContext, ProfileUpdate, RegistrationContext, RoomCreate, SyncEvent,
+};
 use crate::config::PluginConfig;
 
 /// The aggregate outcome of a decision point across all plugins.
@@ -336,6 +338,41 @@ mod imp {
             }
             Decision::Allow
         }
+
+        /// True if any plugin binds the read-path sync filter — lets the sync
+        /// builder skip the per-event call when none is set.
+        pub fn binds_filter_sync_event(&self) -> bool {
+            self.plugins.iter().any(|p| p.cfg.points.filter_sync_event)
+        }
+
+        /// Run the read-path sync filter for one (viewer, event): the event is
+        /// shown only if EVERY bound, in-scope plugin keeps it — any plugin can
+        /// hide. On error, fail-policy decides: open → show, closed → hide. Honors
+        /// each plugin's `event_types` scope (a perf lever on this hot path).
+        pub fn filter_sync_event(&self, ctx: &SyncEvent<'_>) -> bool {
+            for plugin in &self.plugins {
+                if !plugin.cfg.points.filter_sync_event || !scoped_in(&plugin.cfg, ctx.event_type) {
+                    continue;
+                }
+                let show = match plugin.filter_sync_event(ctx) {
+                    Ok(v) => v,
+                    Err(e) => match plugin.cfg.fail_policy {
+                        FailPolicy::Open => {
+                            tracing::warn!(plugin = %plugin.cfg.name, error = %e, "extension filter_sync_event failed; failing open (show)");
+                            true
+                        }
+                        FailPolicy::Closed => {
+                            tracing::warn!(plugin = %plugin.cfg.name, error = %e, "extension filter_sync_event failed; failing closed (hide)");
+                            false
+                        }
+                    },
+                };
+                if !show {
+                    return false;
+                }
+            }
+            true
+        }
     }
 
     /// A plugin with no `event_types` filter runs for everything; otherwise only
@@ -435,6 +472,14 @@ mod imp {
 
         pub fn check_room_create(&self, _ctx: &RoomCreate<'_>) -> Decision {
             Decision::Allow
+        }
+
+        pub fn binds_filter_sync_event(&self) -> bool {
+            false
+        }
+
+        pub fn filter_sync_event(&self, _ctx: &SyncEvent<'_>) -> bool {
+            true
         }
     }
 }

@@ -22,6 +22,8 @@ pub struct Points {
     pub check_profile_update: bool,
     /// Sync decision hook at room creation (anti-spam / invite-bomb / alias policy).
     pub check_room_create: bool,
+    /// Read-path filter: per-viewer timeline event visibility at `/sync`.
+    pub filter_sync_event: bool,
 }
 
 impl Default for Points {
@@ -33,6 +35,7 @@ impl Default for Points {
             check_media_upload: false,
             check_profile_update: false,
             check_room_create: false,
+            filter_sync_event: false,
         }
     }
 }

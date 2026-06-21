@@ -11,7 +11,7 @@
 // components regardless of what changed; the committed fixtures/examples are
 // rebuilt with each bump. (Within a fixed version, a guest still instantiates as
 // long as it exports what the world requires and imports only granted caps.)
-package vela:extension@0.9.0;
+package vela:extension@0.10.0;
 
 interface decision {
     // Where an event originated. A `block` verdict is a hard reject for `local`
@@ -158,6 +158,28 @@ interface decision {
         plugin-config: string,
     }
     check-room-create: func(ctx: room-create-context) -> verdict;
+
+    // A read-path filter: as `/sync` builds a user's timeline, decide per event
+    // whether THIS viewer sees it (operator-controlled per-viewer visibility —
+    // quarantine, compliance, content policy). The first hook that's about who is
+    // *reading*, not about the event/action itself. It's a filter, not a
+    // verdict-with-reason: a hidden event is silently dropped, so the return is a
+    // plain bool (`true` = show, `false` = hide). Timeline events only (filtering
+    // state would corrupt the client's room state); the `kv` capability works here
+    // (a stateful per-viewer policy). Fail-policy: open → show, closed → hide.
+    record sync-event-context {
+        // The user doing the /sync — the viewer whose visibility is being decided.
+        viewer: string,
+        room-id: string,
+        // Canonical JSON of the event.
+        event: string,
+        // The `type` field, e.g. "m.room.message".
+        event-type: string,
+        sender: string,
+        // This plugin's opaque config, verbatim JSON. Empty string if none.
+        plugin-config: string,
+    }
+    filter-sync-event: func(ctx: sync-event-context) -> bool;
 }
 
 // Async observation: the host calls this off the request hot path (a worker

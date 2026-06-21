@@ -106,6 +106,19 @@ pub struct RoomCreate<'a> {
     pub is_direct: bool,
 }
 
+/// A timeline event being considered for one viewer's `/sync`, handed to a
+/// read-path filter plugin. Borrowed. `event` is canonical JSON.
+pub struct SyncEvent<'a> {
+    /// The user doing the `/sync` — whose visibility is being decided.
+    pub viewer: &'a str,
+    pub room_id: &'a str,
+    /// Canonical JSON of the event.
+    pub event: &'a str,
+    /// The event's `type`, e.g. `m.room.message`.
+    pub event_type: &'a str,
+    pub sender: &'a str,
+}
+
 /// What a plugin returns from a decision point. Converted from the generated
 /// Component-Model `verdict` variant.
 #[derive(Debug, Clone, PartialEq, Eq)]

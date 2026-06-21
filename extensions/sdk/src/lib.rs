@@ -627,14 +627,70 @@ impl RoomCreate {
     }
 }
 
+/// An ergonomic view over a timeline event being considered for one viewer's
+/// `/sync` — the read-path filter context. The first hook about who is *reading*.
+pub struct SyncEvent {
+    raw: bindings::exports::vela::extension::decision::SyncEventContext,
+}
+
+impl SyncEvent {
+    fn new(raw: bindings::exports::vela::extension::decision::SyncEventContext) -> Self {
+        SyncEvent { raw }
+    }
+
+    /// The user doing the `/sync` — the viewer whose visibility you're deciding.
+    pub fn viewer(&self) -> &str {
+        &self.raw.viewer
+    }
+
+    /// The room the event is in.
+    pub fn room_id(&self) -> &str {
+        &self.raw.room_id
+    }
+
+    /// The event's `type`, e.g. `m.room.message`.
+    pub fn event_type(&self) -> &str {
+        &self.raw.event_type
+    }
+
+    /// The event's sender.
+    pub fn sender(&self) -> &str {
+        &self.raw.sender
+    }
+
+    /// The full event as parsed JSON.
+    pub fn event(&self) -> Value {
+        serde_json::from_str(&self.raw.event).unwrap_or(Value::Null)
+    }
+
+    /// `content.body` if present (the message text) — see [`Event::message_body`].
+    pub fn message_body(&self) -> Option<String> {
+        self.event()
+            .get("content")
+            .and_then(|c| c.get("body"))
+            .and_then(|b| b.as_str())
+            .map(|s| s.to_string())
+    }
+
+    /// This plugin's operator-supplied config as `T` — see [`Event::config`].
+    pub fn config<T: DeserializeOwned + Default>(&self) -> T {
+        if self.raw.plugin_config.is_empty() {
+            return T::default();
+        }
+        serde_json::from_str(&self.raw.plugin_config)
+            .expect("plugin config is present but invalid for the requested type")
+    }
+}
+
 /// Implement this for your plugin type, then `export_plugin!(YourType)`. A plugin
 /// can implement any of the hooks — [`Plugin::check_event`] (decision on events),
 /// [`Plugin::on_event`] (async observation), [`Plugin::check_registration`]
 /// (decision at signup), [`Plugin::check_media_upload`] (decision at upload),
 /// [`Plugin::check_profile_update`] (decision at a profile change),
-/// [`Plugin::check_room_create`] (decision at room creation) — the unused
-/// ones default to allow/no-op, and the operator's `points` config decides which
-/// the host invokes.
+/// [`Plugin::check_room_create`] (decision at room creation),
+/// [`Plugin::filter_sync_event`] (per-viewer read filter at `/sync`) — the unused
+/// ones default to allow/show/no-op, and the operator's `points` config decides
+/// which the host invokes.
 pub trait Plugin {
     /// Decide whether to allow or block one event (sync, on the hot path).
     /// Default: allow.
@@ -676,6 +732,17 @@ pub trait Plugin {
     /// per-creator rate limits are natural.
     fn check_room_create(_room: &RoomCreate) -> Decision {
         Decision::allow()
+    }
+
+    /// Decide whether a viewer sees one timeline event in their `/sync` — the
+    /// read-path filter. Default: **show** (`true`). Return `false` to hide the
+    /// event from this viewer (operator-controlled per-viewer visibility:
+    /// quarantine, compliance, content policy). Timeline events only; the `kv`
+    /// capability works here, so a stateful per-viewer policy is natural. Runs on
+    /// the `/sync` hot path per delivered event, so keep it cheap and scope it with
+    /// `event_types`.
+    fn filter_sync_event(_event: &SyncEvent) -> bool {
+        true
     }
 }
 
@@ -769,6 +836,15 @@ pub fn dispatch_check_room_create<P: Plugin>(
     }
 }
 
+/// Bridge from the raw sync-filter entry point to [`Plugin::filter_sync_event`].
+/// Called by [`export_plugin!`]; not for direct use.
+#[doc(hidden)]
+pub fn dispatch_filter_sync_event<P: Plugin>(
+    ctx: bindings::exports::vela::extension::decision::SyncEventContext,
+) -> bool {
+    P::filter_sync_event(&SyncEvent::new(ctx))
+}
+
 /// Export your [`Plugin`] implementation as the component's entry point. Call
 /// this exactly once at the crate root.
 #[macro_export]
@@ -800,6 +876,11 @@ macro_rules! export_plugin {
                 ctx: $crate::bindings::exports::vela::extension::decision::RoomCreateContext,
             ) -> $crate::bindings::exports::vela::extension::decision::Verdict {
                 $crate::dispatch_check_room_create::<$plugin>(ctx)
+            }
+            fn filter_sync_event(
+                ctx: $crate::bindings::exports::vela::extension::decision::SyncEventContext,
+            ) -> bool {
+                $crate::dispatch_filter_sync_event::<$plugin>(ctx)
             }
         }
         impl $crate::bindings::exports::vela::extension::observation::Guest for __VelaPluginGlue {

@@ -26,6 +26,13 @@ fn blocked(reason: &str) -> Verdict {
 }
 
 impl Guest for Component {
+    // Read-path sync filter unused by this fixture — show everything.
+    fn filter_sync_event(
+        _ctx: exports::vela::extension::decision::SyncEventContext,
+    ) -> bool {
+        true
+    }
+
     // Room-create point unused by this fixture — default allow.
     fn check_room_create(
         _ctx: exports::vela::extension::decision::RoomCreateContext,

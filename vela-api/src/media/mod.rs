@@ -1081,6 +1081,7 @@ mod media_extension_tests {
                 check_media_upload: true,
                 check_profile_update: false,
                 check_room_create: false,
+                filter_sync_event: false,
             },
             capabilities: Default::default(),
             client_ip: Default::default(),
