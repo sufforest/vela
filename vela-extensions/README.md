@@ -120,7 +120,8 @@ Six extension points (a plugin binds any of them via `points`):
   localpart, the invite list (an invite-bomb signal), and `is_direct`. Use it for
   anti-spam, invite-bomb caps, no-public-rooms, and alias policy. Local only:
   rooms federate via joins, not creation. The `kv` capability works here (per-creator
-  rate limits), so a config-driven policy plugin can enforce declarative rules.
+  rate limits) — the [`room-policy` example](../extensions/examples/room-policy)
+  drives all of these from a declarative config block.
 
 Plugins are **stateless** and get only the **host capabilities** you grant — no
 network, disk, or syscalls. Granted least-privilege per plugin via `capabilities`:
