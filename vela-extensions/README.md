@@ -56,6 +56,16 @@ config = { banned = ["spam"] }         # opaque JSON, handed to the plugin
 A missing file, an unknown `fail_policy`, or an invalid component **aborts
 startup** — a misconfigured policy never silently no-ops.
 
+**Capability check.** At load, vela inspects what each plugin's code actually
+imports and reconciles it against your grant. If a plugin needs a capability you
+didn't grant, startup aborts with an error that names it and the fix — e.g.
+*"plugin 'room-policy': requires the `kv` capability … add `kv` to this plugin's
+`capabilities`"* — instead of a cryptic instantiation failure. A capability you
+grant but the plugin never uses is harmless and just logged. The component is the
+source of truth (the Component Model drops imports a plugin doesn't reference), so
+this can't be fooled by a stale or mistaken declaration — you always see exactly
+what a plugin can reach for.
+
 ## Reloading (SIGHUP)
 
 Send the server **`SIGHUP`** (`kill -HUP <pid>`, or `systemctl reload` with an
