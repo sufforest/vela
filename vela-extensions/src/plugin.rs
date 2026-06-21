@@ -17,7 +17,7 @@ use crate::abi::{
     EventContext, MediaContext, Origin, ProfileField, ProfileUpdate, RegistrationContext,
     RoomCreate, Verdict,
 };
-use crate::config::{ClientIpTier, PluginConfig};
+use crate::config::{Capabilities, ClientIpTier, PluginConfig};
 use crate::emit::{EmitLimiter, EmitRequest, EventEmitter, emit_type_allowed};
 use crate::kv::KvStore;
 
@@ -255,6 +255,11 @@ pub(crate) struct Plugin {
 pub(crate) enum PluginError {
     /// Compilation or linking of the component failed at load time.
     Load(String),
+    /// The component imports a host capability the operator didn't grant — caught
+    /// before instantiation so a misconfigured grant is an actionable error, not a
+    /// raw "import not provided" wasmtime trap. Carries the capability's config
+    /// token (e.g. `kv`, `emit-event`).
+    CapabilityRequired(&'static str),
     /// The guest trapped, ran out of fuel, or hit the memory cap.
     Trap(String),
 }
@@ -263,9 +268,31 @@ impl std::fmt::Display for PluginError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PluginError::Load(m) => write!(f, "plugin load failed: {m}"),
+            PluginError::CapabilityRequired(cap) => write!(
+                f,
+                "requires the `{cap}` capability (its code uses it) but it was not \
+                 granted — add `{cap}` to this plugin's `capabilities`, or load a \
+                 build that doesn't use it"
+            ),
             PluginError::Trap(m) => write!(f, "plugin trapped: {m}"),
         }
     }
+}
+
+/// The host capabilities that require an operator grant, each as
+/// `(wit interface path, config token, granted?)`. This is the single place
+/// capability reconciliation enumerates capabilities: it destructures
+/// `Capabilities` exhaustively, so **adding a capability field is a compile error
+/// here** until it's wired into reconciliation — the introspection can't silently
+/// miss a new capability and regress to a cryptic instantiation trap. Keep the
+/// `add_to_linker` calls in `load` in step. (`logging` is always linked and needs
+/// no grant, so it isn't listed.)
+fn capability_table(caps: &Capabilities) -> [(&'static str, &'static str, bool); 2] {
+    let Capabilities { emit_event, kv } = *caps;
+    [
+        ("vela:extension/emit", "emit-event", emit_event),
+        ("vela:extension/kv", "kv", kv),
+    ]
 }
 
 impl Plugin {
@@ -293,6 +320,43 @@ impl Plugin {
     ) -> Result<Self, PluginError> {
         let component =
             Component::new(engine, &cfg.wasm).map_err(|e| PluginError::Load(e.to_string()))?;
+
+        // Capability reconciliation (the manifest's enforcement core). The
+        // Component Model tree-shakes unused imports, so the component imports a
+        // capability iff its guest code references it — i.e. the binary tells us,
+        // unspoofably, what the plugin needs. Reconcile that against the operator's
+        // grant *before* instantiating, so a missing grant is an actionable error
+        // instead of a raw "import not provided" trap. Names look like
+        // `vela:extension/kv@0.9.0`; match the interface path, ignoring the version.
+        let ty = component.component_type();
+        let imported: Vec<&str> = ty
+            .imports(engine)
+            .map(|(name, _)| name.split('@').next().unwrap_or(name))
+            .collect();
+        let mut granted: Vec<&str> = Vec::new();
+        let mut unused: Vec<&str> = Vec::new();
+        for (path, token, is_granted) in capability_table(&cfg.capabilities) {
+            let needs = imported.contains(&path);
+            if needs && !is_granted {
+                return Err(PluginError::CapabilityRequired(token));
+            }
+            if is_granted {
+                granted.push(token);
+                if !needs {
+                    unused.push(token);
+                }
+            }
+        }
+        // Surface the reconciled picture so an operator can prune a capability
+        // granted but never used, and (at debug) see the per-plugin summary.
+        if !unused.is_empty() {
+            tracing::info!(
+                plugin = %cfg.name,
+                ?unused,
+                "extension is granted capabilities it never uses — consider removing them"
+            );
+        }
+        tracing::debug!(plugin = %cfg.name, ?granted, "extension capability check passed");
 
         // Grant host capabilities by adding them to the linker. `logging` is
         // always linked (harmless). `emit` and `kv` are linked ONLY when the

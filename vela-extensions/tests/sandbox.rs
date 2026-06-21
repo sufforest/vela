@@ -649,12 +649,31 @@ fn emit_is_rate_capped_per_plugin() {
 
 #[test]
 fn ungranted_plugin_importing_emit_fails_to_load() {
-    // The emit fixture imports `emit`; without the grant the host doesn't link
-    // that interface, so the component can't instantiate — the enforcement that
-    // an ungranted plugin simply cannot acquire the capability.
+    // The emit fixture imports `emit`; without the grant, capability reconciliation
+    // rejects it BEFORE instantiation with an actionable error that names the
+    // capability and the fix — not a raw wasmtime "import not provided" trap.
+    let msg = Runtime::new(vec![emit_config("emit_message", false)])
+        .err()
+        .expect("an ungranted plugin that imports emit must fail to load")
+        .to_string();
     assert!(
-        Runtime::new(vec![emit_config("emit_message", false)]).is_err(),
-        "an ungranted plugin that imports emit must fail to load"
+        msg.contains("emit-event") && msg.contains("capabilit"),
+        "error must name the missing capability and the fix, got: {msg}"
+    );
+}
+
+#[test]
+fn granting_an_unused_capability_is_harmless() {
+    // The spam fixture imports no capability; granting it kv is over-provisioning
+    // but must still load (the host warns about the unused grant, never rejects).
+    let mut p = plugin("p", "allow");
+    p.capabilities = Capabilities {
+        kv: true,
+        ..Default::default()
+    };
+    assert!(
+        Runtime::new(vec![p]).is_ok(),
+        "a plugin granted a capability it doesn't import must still load"
     );
 }
 
@@ -777,9 +796,15 @@ fn kv_rejects_oversized_key_before_the_store() {
 
 #[test]
 fn ungranted_plugin_importing_kv_fails_to_load() {
+    // Same enforcement for kv: rejected before instantiation with a clear,
+    // capability-naming error.
+    let msg = Runtime::new(vec![kv_config("kv_set", false)])
+        .err()
+        .expect("an ungranted plugin that imports kv must fail to load")
+        .to_string();
     assert!(
-        Runtime::new(vec![kv_config("kv_set", false)]).is_err(),
-        "an ungranted plugin that imports kv must fail to load"
+        msg.contains("`kv`") && msg.contains("capabilit"),
+        "error must name the missing kv capability and the fix, got: {msg}"
     );
 }
 
