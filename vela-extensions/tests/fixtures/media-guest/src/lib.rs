@@ -27,6 +27,13 @@ fn blocked(reason: &str) -> Verdict {
 }
 
 impl Guest for Component {
+    // Login point unused by this fixture — default allow.
+    fn check_login(
+        _ctx: exports::vela::extension::decision::LoginContext,
+    ) -> Verdict {
+        Verdict::Allow
+    }
+
     // Read-path sync filter unused by this fixture — show everything.
     fn filter_sync_event(
         _ctx: exports::vela::extension::decision::SyncEventContext,

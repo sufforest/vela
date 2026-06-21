@@ -19,8 +19,8 @@ mod runtime;
 mod plugin;
 
 pub use abi::{
-    EventContext, MediaContext, Origin, ProfileField, ProfileUpdate, RegistrationContext,
-    RoomCreate, SyncEvent, Verdict,
+    EventContext, LoginContext, MediaContext, Origin, ProfileField, ProfileUpdate,
+    RegistrationContext, RoomCreate, SyncEvent, Verdict,
 };
 pub use config::{Capabilities, ClientIpTier, FailPolicy, PluginConfig, Points};
 pub use emit::{EmitError, EmitRequest, EventEmitter};

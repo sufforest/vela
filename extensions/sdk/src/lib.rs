@@ -440,6 +440,49 @@ impl Registration {
     }
 }
 
+/// An ergonomic view over the login metadata at the `check_login` point — a login
+/// attempt, before the password is verified. Sibling of [`Registration`].
+pub struct Login {
+    raw: bindings::exports::vela::extension::decision::LoginContext,
+}
+
+impl Login {
+    fn new(raw: bindings::exports::vela::extension::decision::LoginContext) -> Self {
+        Login { raw }
+    }
+
+    /// The requested username/localpart (may not exist — don't leak existence).
+    pub fn username(&self) -> &str {
+        &self.raw.username
+    }
+
+    /// The login type, e.g. `"m.login.password"`.
+    pub fn login_type(&self) -> &str {
+        &self.raw.login_type
+    }
+
+    /// An opaque IP token for rate-limiting (per the operator's `client_ip` tier),
+    /// or `None` if not exposed. Treat as opaque unless granted the `full` tier.
+    pub fn client_ip(&self) -> Option<&str> {
+        self.raw.client_ip.as_deref()
+    }
+
+    /// This plugin's key→value store (needs the `kv` capability) — a per-IP/
+    /// username attempt counter for brute-force defense is a few lines. See [`Kv`].
+    pub fn kv(&self) -> Kv {
+        Kv::new()
+    }
+
+    /// This plugin's operator-supplied config as `T` — see [`Event::config`].
+    pub fn config<T: DeserializeOwned + Default>(&self) -> T {
+        if self.raw.plugin_config.is_empty() {
+            return T::default();
+        }
+        serde_json::from_str(&self.raw.plugin_config)
+            .expect("plugin config is present but invalid for the requested type")
+    }
+}
+
 /// An ergonomic view over the media-upload metadata at the media point. v1 has
 /// no raw content — uploads stream, so only a hash + metadata are available.
 pub struct Media {
@@ -710,6 +753,15 @@ pub trait Plugin {
         Decision::allow()
     }
 
+    /// Decide whether to allow or block a login, at `/login` before the password
+    /// is verified. Default: allow. Use it for anti-brute-force / credential-
+    /// stuffing and IP policy; the `kv` capability works here, so a per-IP attempt
+    /// counter is a few lines. A block keys on username/IP, not the auth result,
+    /// so it never leaks whether the credentials were valid.
+    fn check_login(_login: &Login) -> Decision {
+        Decision::allow()
+    }
+
     /// Decide whether to allow or block a media upload, after the bytes are
     /// stored but before the upload is downloadable. Default: allow. A block
     /// deletes the stored bytes. v1 sees a hash + metadata (match `sha256()`
@@ -781,6 +833,22 @@ pub fn dispatch_check_registration<P: Plugin>(
     use bindings::exports::vela::extension::decision as wit;
     let reg = Registration::new(ctx);
     match P::check_registration(&reg) {
+        Decision::Allow => wit::Verdict::Allow,
+        Decision::Block { errcode, reason } => {
+            wit::Verdict::Block(wit::BlockReason { errcode, reason })
+        }
+    }
+}
+
+/// Bridge from the raw login entry point to [`Plugin::check_login`].
+/// Called by [`export_plugin!`]; not for direct use.
+#[doc(hidden)]
+pub fn dispatch_check_login<P: Plugin>(
+    ctx: bindings::exports::vela::extension::decision::LoginContext,
+) -> bindings::exports::vela::extension::decision::Verdict {
+    use bindings::exports::vela::extension::decision as wit;
+    let login = Login::new(ctx);
+    match P::check_login(&login) {
         Decision::Allow => wit::Verdict::Allow,
         Decision::Block { errcode, reason } => {
             wit::Verdict::Block(wit::BlockReason { errcode, reason })
@@ -861,6 +929,11 @@ macro_rules! export_plugin {
                 ctx: $crate::bindings::exports::vela::extension::decision::RegistrationContext,
             ) -> $crate::bindings::exports::vela::extension::decision::Verdict {
                 $crate::dispatch_check_registration::<$plugin>(ctx)
+            }
+            fn check_login(
+                ctx: $crate::bindings::exports::vela::extension::decision::LoginContext,
+            ) -> $crate::bindings::exports::vela::extension::decision::Verdict {
+                $crate::dispatch_check_login::<$plugin>(ctx)
             }
             fn check_media_upload(
                 ctx: $crate::bindings::exports::vela::extension::decision::MediaContext,

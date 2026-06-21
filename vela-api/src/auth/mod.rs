@@ -4,6 +4,7 @@
 
 pub mod account;
 pub mod account_data;
+pub(crate) mod client_ip;
 pub mod devices;
 pub mod login;
 pub mod logout;

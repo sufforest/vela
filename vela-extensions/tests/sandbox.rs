@@ -402,6 +402,7 @@ fn observer(name: &str, mode: &str) -> PluginConfig {
         check_profile_update: false,
         check_room_create: false,
         filter_sync_event: false,
+        check_login: false,
     };
     p
 }
@@ -478,6 +479,7 @@ fn a_plugin_can_bind_both_points() {
         check_profile_update: false,
         check_room_create: false,
         filter_sync_event: false,
+        check_login: false,
     };
     let rt = Runtime::new(vec![p]).expect("loads");
     assert!(matches!(
@@ -587,6 +589,7 @@ fn emit_config(mode: &str, granted: bool) -> PluginConfig {
             check_profile_update: false,
             check_room_create: false,
             filter_sync_event: false,
+            check_login: false,
         },
         capabilities: Capabilities {
             emit_event: granted,
@@ -740,6 +743,7 @@ fn kv_config(mode: &str, granted: bool) -> PluginConfig {
         check_profile_update: false,
         check_room_create: false,
         filter_sync_event: false,
+        check_login: false,
     };
     p.capabilities = Capabilities {
         kv: granted,
@@ -829,6 +833,7 @@ fn register_config(mode: &str, tier: ClientIpTier) -> PluginConfig {
         check_profile_update: false,
         check_room_create: false,
         filter_sync_event: false,
+        check_login: false,
     };
     p.client_ip = tier;
     p
@@ -912,6 +917,7 @@ fn media_config(mode: &str) -> PluginConfig {
         check_profile_update: false,
         check_room_create: false,
         filter_sync_event: false,
+        check_login: false,
     };
     p
 }
@@ -980,6 +986,7 @@ fn profile_config(mode: &str) -> PluginConfig {
         check_profile_update: true,
         check_room_create: false,
         filter_sync_event: false,
+        check_login: false,
     };
     p
 }
@@ -1062,6 +1069,7 @@ fn room_create_config(mode: &str) -> PluginConfig {
         check_profile_update: false,
         check_room_create: true,
         filter_sync_event: false,
+        check_login: false,
     };
     p
 }
@@ -1153,6 +1161,7 @@ fn sync_filter_config(mode: &str) -> PluginConfig {
         check_profile_update: false,
         check_room_create: false,
         filter_sync_event: true,
+        check_login: false,
     };
     p
 }
@@ -1190,4 +1199,82 @@ fn filter_sync_event_skips_unbound() {
     assert!(!rt.binds_filter_sync_event());
     // Unbound → always shows.
     assert!(rt.filter_sync_event(&sync_ctx("@alice:x", "@evil:x")));
+}
+
+// --- check_login point ------------------------------------------------------
+
+use vela_extensions::LoginContext;
+
+const LOGIN_FIXTURE: &[u8] = include_bytes!("fixtures/login_guest.wasm");
+
+fn login_config(mode: &str, tier: ClientIpTier) -> PluginConfig {
+    let mut p = plugin("login", mode);
+    p.wasm = LOGIN_FIXTURE.to_vec();
+    p.points = Points {
+        check_event: false,
+        on_event: false,
+        check_registration: false,
+        check_media_upload: false,
+        check_profile_update: false,
+        check_room_create: false,
+        filter_sync_event: false,
+        check_login: true,
+    };
+    p.client_ip = tier;
+    p
+}
+
+fn login_ctx<'a>(
+    username: &'a str,
+    full: Option<&'a str>,
+    hashed: Option<&'a str>,
+) -> LoginContext<'a> {
+    LoginContext {
+        username,
+        login_type: "m.login.password",
+        client_ip_full: full,
+        client_ip_hashed: hashed,
+    }
+}
+
+#[test]
+fn login_blocks_a_banned_username() {
+    let rt = Runtime::new(vec![login_config("block_user", ClientIpTier::None)]).expect("loads");
+    assert!(matches!(
+        rt.check_login(&login_ctx("banned-bob", None, None)),
+        Decision::Block { .. }
+    ));
+    assert_eq!(
+        rt.check_login(&login_ctx("alice", None, None)),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn login_blocks_by_ip_per_tier() {
+    // The fixture blocks when the IP token contains "evil". Only the tier that
+    // exposes that token to the plugin triggers the block — proving the IP tiering
+    // (same as registration, the inverse direction).
+    let none = Runtime::new(vec![login_config("block_ip", ClientIpTier::None)]).unwrap();
+    let hashed = Runtime::new(vec![login_config("block_ip", ClientIpTier::Hashed)]).unwrap();
+    let ctx = login_ctx("alice", Some("9.9.9.9"), Some("evil-token"));
+    assert_eq!(
+        none.check_login(&ctx),
+        Decision::Allow,
+        "tier none withholds the IP → no block"
+    );
+    assert!(
+        matches!(hashed.check_login(&ctx), Decision::Block { .. }),
+        "hashed exposes the evil token → block"
+    );
+}
+
+#[test]
+fn check_login_skips_unbound() {
+    let rt = Runtime::new(vec![plugin("dec", "block")]).expect("loads");
+    assert!(!rt.binds_check_login());
+    assert_eq!(
+        rt.check_login(&login_ctx("banned-bob", None, None)),
+        Decision::Allow
+    );
 }

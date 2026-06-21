@@ -1,10 +1,12 @@
 use crate::middleware::json::Json;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use vela_core::error::VelaError;
 use vela_core::identifiers::{DeviceId, UserId};
 
+use crate::auth::client_ip::{client_ip_from_headers, hash_client_ip};
 use crate::middleware::error::ApiError;
 use crate::router::AppState;
 
@@ -51,9 +53,43 @@ pub struct LoginIdentifier {
     pub user: Option<String>,
 }
 
+/// Sandboxed login decision hook. No-op when no plugin binds the point. A block
+/// rejects the login (403, plugin's errcode). Sibling of `registration_gate`:
+/// privacy-tiered IP (login-specific HMAC subkey), kv for per-IP attempt counters.
+fn login_gate(
+    state: &AppState,
+    username: &str,
+    login_type: &str,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    // Lock-free snapshot, like the other gates.
+    let rt = state.extensions.load();
+    if !rt.binds_check_login() {
+        return Ok(());
+    }
+    let ip = client_ip_from_headers(headers);
+    let hashed = ip
+        .as_deref()
+        .map(|ip| hash_client_ip(state, ip, b"vela-ext-login-ip-key/v1"));
+    let ctx = vela_extensions::LoginContext {
+        username,
+        login_type,
+        client_ip_full: ip.as_deref(),
+        client_ip_hashed: hashed.as_deref(),
+    };
+    match rt.check_login(&ctx) {
+        vela_extensions::Decision::Allow => Ok(()),
+        vela_extensions::Decision::Block { errcode, reason } => {
+            tracing::info!(username, login_type, %errcode, %reason, "extension blocked login");
+            Err(ApiError(VelaError::ExtensionBlocked { errcode, reason }))
+        }
+    }
+}
+
 /// POST /_matrix/client/v3/login — authenticate and get access token.
 pub async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<Value>, ApiError> {
     // Spec v1.17 §"Server admin style permissions": servers that
@@ -103,6 +139,11 @@ pub async fn login(
         .and_then(|id| id.user.as_deref())
         .or(body.user.as_deref())
         .ok_or_else(|| ApiError(VelaError::BadJson("user identifier required".into())))?;
+
+    // Sandboxed login decision hook, before the DB lookup and the CPU-bound argon2
+    // verify — anti-brute-force / IP policy. A block keys on username/IP, not the
+    // auth result, so it doesn't leak whether the credentials were valid.
+    login_gate(&state, username, &body.login_type, &headers)?;
 
     // Build full user_id if only localpart provided. Localpart is lowercased
     // to match registration, which also downcases; otherwise uppercase-login
@@ -249,6 +290,7 @@ mod tests {
 
         let err = login(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             Json(LoginRequest {
                 login_type: "m.login.password".into(),
                 identifier: Some(LoginIdentifier {
@@ -268,6 +310,61 @@ mod tests {
         assert!(matches!(err.0, VelaError::UserDeactivated));
     }
 
+    /// A check_login plugin blocks a banned username before any DB lookup or
+    /// password check — proving the gate is wired ahead of the verify (the user
+    /// doesn't even need to exist).
+    #[cfg(feature = "extensions")]
+    #[tokio::test]
+    async fn login_blocked_by_extension() {
+        let (state, _tmp) = build_test_state();
+        const LOGIN: &[u8] =
+            include_bytes!("../../../vela-extensions/tests/fixtures/login_guest.wasm");
+        let rt = vela_extensions::Runtime::new(vec![vela_extensions::PluginConfig {
+            name: "login".into(),
+            wasm: LOGIN.to_vec(),
+            fail_policy: vela_extensions::FailPolicy::Closed,
+            fuel: 50_000_000,
+            wall_ms: 0,
+            memory_pages: 256,
+            event_types: None,
+            points: vela_extensions::Points {
+                check_event: false,
+                on_event: false,
+                check_registration: false,
+                check_media_upload: false,
+                check_profile_update: false,
+                check_room_create: false,
+                filter_sync_event: false,
+                check_login: true,
+            },
+            capabilities: Default::default(),
+            client_ip: Default::default(),
+            config: serde_json::json!({ "mode": "block_user" }),
+        }])
+        .expect("login plugin loads");
+        state.extensions.store(std::sync::Arc::new(rt));
+
+        let err = login(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(LoginRequest {
+                login_type: "m.login.password".into(),
+                identifier: Some(LoginIdentifier {
+                    id_type: "m.id.user".into(),
+                    user: Some("@banned-bob:example.com".into()),
+                }),
+                user: None,
+                password: Some("pw".into()),
+                device_id: None,
+                initial_device_display_name: None,
+                refresh_token: false,
+            }),
+        )
+        .await
+        .expect_err("banned username must be blocked");
+        assert!(matches!(err.0, VelaError::ExtensionBlocked { .. }));
+    }
+
     /// Active users authenticate normally — guards against any
     /// regression where the deactivation check accidentally rejects
     /// healthy accounts.
@@ -279,6 +376,7 @@ mod tests {
 
         let res = login(
             State(state.clone()),
+            axum::http::HeaderMap::new(),
             Json(LoginRequest {
                 login_type: "m.login.password".into(),
                 identifier: Some(LoginIdentifier {
@@ -328,6 +426,7 @@ mod tests {
         state.db.create_user("@alice:example.com", &hash).unwrap();
         let err = login(
             State(state),
+            axum::http::HeaderMap::new(),
             Json(LoginRequest {
                 login_type: "m.login.password".into(),
                 identifier: Some(LoginIdentifier {

@@ -26,3 +26,4 @@ build_one media-guest media_guest.wasm
 build_one profile-guest profile_guest.wasm
 build_one room-create-guest room_create_guest.wasm
 build_one sync-filter-guest sync_filter_guest.wasm
+build_one login-guest login_guest.wasm

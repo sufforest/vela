@@ -24,6 +24,8 @@ pub struct Points {
     pub check_room_create: bool,
     /// Read-path filter: per-viewer timeline event visibility at `/sync`.
     pub filter_sync_event: bool,
+    /// Sync decision hook at login (anti-brute-force / IP policy), before verify.
+    pub check_login: bool,
 }
 
 impl Default for Points {
@@ -36,6 +38,7 @@ impl Default for Points {
             check_profile_update: false,
             check_room_create: false,
             filter_sync_event: false,
+            check_login: false,
         }
     }
 }
@@ -53,7 +56,7 @@ pub struct Capabilities {
     pub kv: bool,
 }
 
-/// How much of the client IP a registration plugin may see — least-privilege,
+/// How much of the client IP a registration/login plugin may see — least-privilege,
 /// per plugin. The host gives the plugin the rate-limit *key*, not the
 /// *identity*, unless `Full` is explicitly granted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -102,7 +105,7 @@ pub struct PluginConfig {
     pub points: Points,
     /// Host capabilities the operator granted this plugin (least-privilege).
     pub capabilities: Capabilities,
-    /// How much of the client IP a `check_registration` plugin sees.
+    /// How much of the client IP a `check_registration` / `check_login` plugin sees.
     pub client_ip: ClientIpTier,
     /// Opaque config handed verbatim to the guest as `plugin_config`.
     pub config: Value,

@@ -66,6 +66,12 @@ no-op, and the operator's `points` config decides which the host invokes.
   `username()`, `kind()`, `client_ip()` (an opaque rate-limit token per the
   operator's tier), and `config()`. The `kv` capability works here, so a stateful
   per-IP rate-limiter is a few lines.
+- **`Plugin::check_login(&Login) -> Decision`** — the login decision hook
+  (default: allow), at `/login` before the password is verified. `Login` gives
+  `username()`, `login_type()`, `client_ip()` (an opaque rate-limit token per the
+  operator's tier), `kv()`, and `config()`. Use it for anti-brute-force / IP
+  policy; a per-IP attempt counter with `kv` is a few lines. A block keys on
+  username/IP, not the auth result, so it never leaks credential validity.
 - **`Plugin::check_media_upload(&Media) -> Decision`** — the media-upload decision
   hook (default: allow), after the bytes are stored but before the upload is
   downloadable. `Media` gives `content_type()`, `filename()`, `size()`,

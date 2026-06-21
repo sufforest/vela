@@ -4,7 +4,8 @@
 //! everything, so call sites in vela-api never need `#[cfg]`.
 
 use crate::abi::{
-    EventContext, MediaContext, ProfileUpdate, RegistrationContext, RoomCreate, SyncEvent,
+    EventContext, LoginContext, MediaContext, ProfileUpdate, RegistrationContext, RoomCreate,
+    SyncEvent,
 };
 use crate::config::PluginConfig;
 
@@ -191,6 +192,43 @@ mod imp {
                         }
                         FailPolicy::Closed => {
                             tracing::warn!(plugin = %plugin.cfg.name, error = %e, "extension check_registration failed; failing closed (block)");
+                            return Decision::Block {
+                                errcode: "M_FORBIDDEN".to_string(),
+                                reason: "extension policy unavailable".to_string(),
+                            };
+                        }
+                    },
+                };
+                if let Verdict::Block { errcode, reason } = verdict {
+                    return Decision::Block { errcode, reason };
+                }
+            }
+            Decision::Allow
+        }
+
+        /// True if any plugin binds the login point — lets the login handler skip
+        /// the gate entirely when nothing is configured.
+        pub fn binds_check_login(&self) -> bool {
+            self.plugins.iter().any(|p| p.cfg.points.check_login)
+        }
+
+        /// Run the login decision point: block-if-any, same fail-policy as
+        /// `check_event`. A block aborts the login (a hard reject). No event-type
+        /// scoping.
+        pub fn check_login(&self, ctx: &LoginContext<'_>) -> Decision {
+            for plugin in &self.plugins {
+                if !plugin.cfg.points.check_login {
+                    continue;
+                }
+                let verdict = match plugin.check_login(ctx) {
+                    Ok(v) => v,
+                    Err(e) => match plugin.cfg.fail_policy {
+                        FailPolicy::Open => {
+                            tracing::warn!(plugin = %plugin.cfg.name, error = %e, "extension check_login failed; failing open (allow)");
+                            continue;
+                        }
+                        FailPolicy::Closed => {
+                            tracing::warn!(plugin = %plugin.cfg.name, error = %e, "extension check_login failed; failing closed (block)");
                             return Decision::Block {
                                 errcode: "M_FORBIDDEN".to_string(),
                                 reason: "extension policy unavailable".to_string(),
@@ -447,6 +485,14 @@ mod imp {
         }
 
         pub fn check_registration(&self, _ctx: &RegistrationContext<'_>) -> Decision {
+            Decision::Allow
+        }
+
+        pub fn binds_check_login(&self) -> bool {
+            false
+        }
+
+        pub fn check_login(&self, _ctx: &LoginContext<'_>) -> Decision {
             Decision::Allow
         }
 
