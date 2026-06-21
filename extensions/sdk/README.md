@@ -80,6 +80,13 @@ no-op, and the operator's `points` config decides which the host invokes.
   avatar the mxc:// URI, not the image), and `config()`. Use it for
   anti-impersonation and name/avatar policy; the `kv` capability works here too
   (per-user churn limits).
+- **`Plugin::check_room_create(&RoomCreate) -> Decision`** — the room-create
+  decision hook (default: allow), at `createRoom` before anything is persisted.
+  `RoomCreate` gives `creator()`, `room_id()`, `room_version()`, `preset()`,
+  `visibility()`, `name()`, `topic()`, `alias_localpart()`, `invite()` (the
+  invited users), `is_direct()`, and `config()`. Use it for anti-spam, invite-bomb
+  caps, no-public-rooms, and alias policy; the `kv` capability works here too
+  (per-creator rate limits), so a config block can drive declarative rules.
 - **`Caps`** — the host-capabilities handle:
   - `caps.log(msg)` (and `.debug` / `.warn` / `.error` / `.trace`) — write a line
     to vela's log, tagged with your plugin name; truncated and rate-limited by the

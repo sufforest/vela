@@ -28,6 +28,13 @@ use exports::vela::extension::decision::{BlockReason, EventContext, Guest, Verdi
 struct Component;
 
 impl Guest for Component {
+    // Room-create point unused by this fixture — default allow.
+    fn check_room_create(
+        _ctx: exports::vela::extension::decision::RoomCreateContext,
+    ) -> Verdict {
+        Verdict::Allow
+    }
+
     // Profile point unused by this fixture — default allow.
     fn check_profile_update(
         _ctx: exports::vela::extension::decision::ProfileContext,

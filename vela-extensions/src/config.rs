@@ -20,6 +20,8 @@ pub struct Points {
     pub check_media_upload: bool,
     /// Sync decision hook at a profile update (display name / avatar policy).
     pub check_profile_update: bool,
+    /// Sync decision hook at room creation (anti-spam / invite-bomb / alias policy).
+    pub check_room_create: bool,
 }
 
 impl Default for Points {
@@ -30,6 +32,7 @@ impl Default for Points {
             check_registration: false,
             check_media_upload: false,
             check_profile_update: false,
+            check_room_create: false,
         }
     }
 }

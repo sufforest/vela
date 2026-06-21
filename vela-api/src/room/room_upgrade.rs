@@ -60,6 +60,12 @@ pub struct UpgradeBody {
 }
 
 #[allow(unused_assignments)]
+// Note: a room upgrade creates a new room version but is intentionally NOT run
+// through the `check_room_create` extension point. An upgrade continues an
+// existing room that already passed creation policy (it copies state and
+// tombstones the old room), so it's a continuation, not a fresh creation — gating
+// it would let policy break legitimate version migrations. New rooms from nothing
+// go through `create_room`, which is gated.
 pub async fn upgrade_room(
     State(state): State<AppState>,
     user: AuthenticatedUser,
