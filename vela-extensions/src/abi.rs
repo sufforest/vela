@@ -106,6 +106,20 @@ pub struct RoomCreate<'a> {
     pub is_direct: bool,
 }
 
+/// The login metadata the host hands a plugin at `/login`, before the password is
+/// verified. Mirrors [`RegistrationContext`] (same privacy-tiered IP). Borrowed.
+pub struct LoginContext<'a> {
+    /// The requested username/localpart (may not exist).
+    pub username: &'a str,
+    /// The login type, e.g. `"m.login.password"`.
+    pub login_type: &'a str,
+    /// The raw client IP, if the host has it. Shown only to `full`-tier plugins.
+    pub client_ip_full: Option<&'a str>,
+    /// A non-reversible HMAC of the IP (a rate-limit key, no PII), if computed.
+    /// Shown to `hashed`-tier plugins.
+    pub client_ip_hashed: Option<&'a str>,
+}
+
 /// A timeline event being considered for one viewer's `/sync`, handed to a
 /// read-path filter plugin. Borrowed. `event` is canonical JSON.
 pub struct SyncEvent<'a> {

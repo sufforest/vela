@@ -74,6 +74,7 @@ fn plugin_config(rules: Value, kv_granted: bool) -> PluginConfig {
             check_profile_update: false,
             check_room_create: true,
             filter_sync_event: false,
+            check_login: false,
         },
         capabilities: Capabilities {
             kv: kv_granted,

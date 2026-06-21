@@ -493,6 +493,7 @@ mod tests {
                 check_profile_update: false,
                 check_room_create: false,
                 filter_sync_event: false,
+                check_login: false,
             },
             capabilities: vela_extensions::Capabilities::default(),
             client_ip: vela_extensions::ClientIpTier::default(),

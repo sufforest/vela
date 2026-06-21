@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use vela_core::error::VelaError;
 use vela_core::identifiers::{DeviceId, UserId};
 
+use crate::auth::client_ip::{client_ip_from_headers, hash_client_ip};
 use crate::middleware::error::ApiError;
 use crate::router::AppState;
 
@@ -529,7 +530,9 @@ fn registration_gate(
         return Ok(());
     }
     let ip = client_ip_from_headers(headers);
-    let hashed = ip.as_deref().map(|ip| hash_client_ip(state, ip));
+    let hashed = ip
+        .as_deref()
+        .map(|ip| hash_client_ip(state, ip, b"vela-ext-registration-ip-key/v1"));
     let ctx = vela_extensions::RegistrationContext {
         username,
         kind,
@@ -543,50 +546,6 @@ fn registration_gate(
             Err(ApiError(VelaError::ExtensionBlocked { errcode, reason }))
         }
     }
-}
-
-/// The client IP from the first hop of `X-Forwarded-For`.
-///
-/// IMPORTANT: this is only trustworthy behind a reverse proxy that **overwrites**
-/// `X-Forwarded-For` (the standard Matrix deployment). A *direct* client can set
-/// the header to anything — and because a `check_registration` plugin can
-/// *block* on this value, a spoofer could both evade an IP-based block and forge
-/// a victim's IP. So it's a best-effort key for proxied deployments, never a
-/// security boundary; an operator who exposes the homeserver directly should not
-/// grant the `hashed`/`full` IP tiers. (vela's request rate-limiter keys on the
-/// real TCP peer instead; we use XFF here because, behind a proxy, the peer is
-/// the proxy, not the client. Unifying these behind a trusted-proxy config is a
-/// future refinement.) Absent/garbage header → `None`.
-fn client_ip_from_headers(headers: &HeaderMap) -> Option<String> {
-    let xff = headers.get("x-forwarded-for")?.to_str().ok()?;
-    let first = xff.split(',').next()?.trim();
-    (!first.is_empty()).then(|| first.to_string())
-}
-
-/// A non-reversible token for an IP — URL-safe base64 of `HMAC(subkey, ip)`,
-/// where `subkey` is derived from the server signing seed (one KDF step) so the
-/// IP-token key is **cryptographically independent of the signing key** — one
-/// key, one purpose. The token is stable, server-specific, and unreversible by a
-/// plugin (which never holds the subkey, so it can't recompute it for a guessed
-/// IP). This is what the `hashed` tier hands a plugin.
-fn hash_client_ip(state: &AppState, ip: &str) -> String {
-    use base64::Engine;
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
-
-    // Derive a dedicated subkey from the signing seed. The subkey is a hash
-    // output — it can't sign and can't be reversed to the seed — so using it as
-    // an HMAC key never puts the server's identity key at risk.
-    let subkey = {
-        let mut mac = <HmacSha256>::new_from_slice(state.signing_key.secret_bytes())
-            .expect("HMAC accepts any key length");
-        mac.update(b"vela-ext-registration-ip-key/v1");
-        mac.finalize().into_bytes()
-    };
-    let mut mac = <HmacSha256>::new_from_slice(&subkey).expect("HMAC accepts any key length");
-    mac.update(ip.as_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
 }
 
 /// If `new_user_nid` is the very first registrant after server
@@ -717,6 +676,7 @@ mod admin_integration_tests {
                 check_profile_update: false,
                 check_room_create: false,
                 filter_sync_event: false,
+                check_login: false,
             },
             capabilities: Default::default(),
             client_ip: Default::default(),

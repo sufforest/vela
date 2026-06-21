@@ -1082,6 +1082,7 @@ mod media_extension_tests {
                 check_profile_update: false,
                 check_room_create: false,
                 filter_sync_event: false,
+                check_login: false,
             },
             capabilities: Default::default(),
             client_ip: Default::default(),

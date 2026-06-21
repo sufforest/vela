@@ -14,8 +14,8 @@ use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use crate::HostServices;
 use crate::abi::{
-    EventContext, MediaContext, Origin, ProfileField, ProfileUpdate, RegistrationContext,
-    RoomCreate, SyncEvent, Verdict,
+    EventContext, LoginContext, MediaContext, Origin, ProfileField, ProfileUpdate,
+    RegistrationContext, RoomCreate, SyncEvent, Verdict,
 };
 use crate::config::{Capabilities, ClientIpTier, PluginConfig};
 use crate::emit::{EmitLimiter, EmitRequest, EventEmitter, emit_type_allowed};
@@ -552,6 +552,35 @@ impl Plugin {
         let verdict = instance
             .vela_extension_decision()
             .call_check_registration(&mut store, &wire)
+            .map_err(|e| PluginError::Trap(e.to_string()))?;
+        Ok(match verdict {
+            wit::Verdict::Allow => Verdict::Allow,
+            wit::Verdict::Block(r) => Verdict::Block {
+                errcode: r.errcode,
+                reason: r.reason,
+            },
+        })
+    }
+
+    /// Run the login decision hook for one login attempt → a verdict. Like
+    /// `check_registration`: request path (no emit), kv available (per-IP/username
+    /// attempt counters), IP shown per the plugin's tier.
+    pub(crate) fn check_login(&self, ctx: &LoginContext<'_>) -> Result<Verdict, PluginError> {
+        let (mut store, instance) = self.make_store(false)?;
+        let client_ip = match self.cfg.client_ip {
+            ClientIpTier::None => None,
+            ClientIpTier::Hashed => ctx.client_ip_hashed,
+            ClientIpTier::Full => ctx.client_ip_full,
+        };
+        let wire = wit::LoginContext {
+            username: ctx.username.to_string(),
+            login_type: ctx.login_type.to_string(),
+            client_ip: client_ip.map(|s| s.to_string()),
+            plugin_config: config_json(&self.cfg.config),
+        };
+        let verdict = instance
+            .vela_extension_decision()
+            .call_check_login(&mut store, &wire)
             .map_err(|e| PluginError::Trap(e.to_string()))?;
         Ok(match verdict {
             wit::Verdict::Allow => Verdict::Allow,

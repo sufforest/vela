@@ -18,6 +18,13 @@ use exports::vela::extension::observation::{EventContext as ObsCtx, Guest as Obs
 struct Component;
 
 impl Guest for Component {
+    // Login point unused by this fixture — default allow.
+    fn check_login(
+        _ctx: exports::vela::extension::decision::LoginContext,
+    ) -> Verdict {
+        Verdict::Allow
+    }
+
     fn check_event(_ctx: DecCtx) -> Verdict {
         Verdict::Allow
     }

@@ -29,9 +29,9 @@ Each `[[extensions.plugin]]` block loads one component:
 name = "keyword-filter"                # for logs, errors, metrics
 wasm_path = "/etc/vela/plugins/keyword-filter.wasm"
 event_types = ["m.room.message"]       # optional; omit to run for all events
-points = ["check_event"]               # check_event/on_event/check_registration/check_media_upload/check_profile_update/check_room_create/filter_sync_event
+points = ["check_event"]               # check_event/on_event/check_registration/check_login/check_media_upload/check_profile_update/check_room_create/filter_sync_event
 capabilities = []                      # host caps to grant, e.g. ["emit-event"]
-client_ip = "none"                     # check_registration IP tier: none|hashed|full
+client_ip = "none"                     # check_registration/check_login IP tier: none|hashed|full
 fail_policy = "open"                   # "open" (default) | "closed"
 fuel = 50000000                        # per-call CPU budget (≈ instructions)
 wall_ms = 100                          # per-call wall-clock budget; 0 disables
@@ -44,9 +44,9 @@ config = { banned = ["spam"] }         # opaque JSON, handed to the plugin
 | `name` | — (required) | identifier in logs/errors/metrics |
 | `wasm_path` | — (required) | path to the `.wasm` component |
 | `event_types` | all | only invoke for these event types |
-| `points` | `["check_event"]` | hooks the plugin binds: `check_event` (decision on events), `on_event` (async observation), `check_registration` (decision at signup), `check_media_upload` (decision at media upload), `check_profile_update` (decision at a profile change), `check_room_create` (decision at room creation), `filter_sync_event` (per-viewer read filter at `/sync`) |
+| `points` | `["check_event"]` | hooks the plugin binds: `check_event` (decision on events), `on_event` (async observation), `check_registration` (decision at signup), `check_login` (decision at login), `check_media_upload` (decision at media upload), `check_profile_update` (decision at a profile change), `check_room_create` (decision at room creation), `filter_sync_event` (per-viewer read filter at `/sync`) |
 | `capabilities` | `[]` | host capabilities to grant (least-privilege): `emit-event` (post as its bot), `kv` (private key→value store). `logging` is always on |
-| `client_ip` | `"none"` | what a `check_registration` plugin sees of the client IP: `none`, `hashed` (a rate-limit token, no PII), or `full` (raw IP) |
+| `client_ip` | `"none"` | what a `check_registration` / `check_login` plugin sees of the client IP: `none`, `hashed` (a rate-limit token, no PII), or `full` (raw IP) |
 | `fail_policy` | `open` | on trap/timeout: `open` allows, `closed` blocks |
 | `fuel` | 50,000,000 | per-call instruction budget |
 | `wall_ms` | 100 | per-call wall-clock budget (ms); `0` = off |
@@ -80,7 +80,7 @@ moderation. (Unix only; on other platforms, restart to reload.)
 
 ## What plugins can do
 
-Seven extension points (a plugin binds any of them via `points`):
+Eight extension points (a plugin binds any of them via `points`):
 
 - **`check_event`** — the sync decision hook, on **local sends** (message and
   state events, after auth, before persist — a block rejects the send with the
@@ -106,6 +106,13 @@ Seven extension points (a plugin binds any of them via `points`):
   since a plugin can *block* on it, only grant the `hashed`/`full` IP tiers when
   you're behind such a proxy. The `hashed` tier gives a per-client rate-limit key
   that reveals no actual IP.
+- **`check_login`** — the sync decision hook at **`/login`**, before the password
+  is verified — anti-brute-force / credential-stuffing, IP/geo blocking. The
+  sibling of `check_registration`: same privacy-tiered IP (its own HMAC subkey),
+  and `kv` works here so a per-IP attempt counter that blocks after N is a few
+  lines. A block keys on the username/IP, not the auth result, so it never leaks
+  whether the credentials were valid, and it runs before the DB lookup and the
+  CPU-bound hash. Same `X-Forwarded-For` trust caveat as `check_registration`.
 - **`check_media_upload`** — the sync decision hook at media upload, after the
   bytes are stored but **before** the upload is downloadable; a block deletes the
   stored bytes and rejects the upload (403, plugin's errcode). The plugin sees the

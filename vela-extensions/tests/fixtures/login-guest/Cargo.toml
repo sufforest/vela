@@ -1,0 +1,21 @@
+# Test-only guest plugin exercising the `check_login` point. Built via
+# `tests/fixtures/build.sh` to a gitignored `login_guest.wasm` (CI builds it).
+[package]
+name = "login-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+panic = "abort"
+
+[workspace]
