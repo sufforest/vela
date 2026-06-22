@@ -976,6 +976,7 @@ mod tests {
                 key_old.key_id().to_string(),
                 key_old.public_key_base64(),
             )]),
+            old_verify_keys: Default::default(),
             valid_until_ts: now + 7 * 24 * 60 * 60 * 1000,
             fetched_at: now.saturating_sub(60_000),
         };
@@ -1044,6 +1045,7 @@ mod tests {
                 key_old.key_id().to_string(),
                 key_old.public_key_base64(),
             )]),
+            old_verify_keys: Default::default(),
             valid_until_ts: fetched_now + 7 * 24 * 60 * 60 * 1000,
             fetched_at: fetched_now,
         };
@@ -1093,6 +1095,7 @@ mod tests {
                 key_old.key_id().to_string(),
                 key_old.public_key_base64(),
             )]),
+            old_verify_keys: Default::default(),
             valid_until_ts: seed_now + 7 * 24 * 60 * 60 * 1000,
             fetched_at: seed_now.saturating_sub(60_000),
         };

@@ -231,6 +231,7 @@ mod tests {
         );
         let remote_keys = crate::federation::federation_client::RemoteKeys {
             verify_keys,
+            old_verify_keys: Default::default(),
             valid_until_ts: now + 60_000,
             fetched_at: now,
         };
@@ -279,6 +280,47 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         // The middleware will try to fetch keys from unreachable.example and fail.
+        let err = verify_request(&state, req).await.expect_err("must reject");
+        assert_eq!(err, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn rejects_request_signed_with_rotated_out_key() {
+        let (state, _tmp) = crate::test_helpers::build_test_state();
+
+        // The remote's key is in old_verify_keys only (rotated out). Per spec it
+        // verifies historical events but MUST NOT authenticate a live request.
+        let remote_key = vela_core::events::sign::ServerSigningKey::generate();
+        let now = crate::federation::federation_client::now_ms();
+        let mut old_verify_keys = std::collections::HashMap::new();
+        old_verify_keys.insert(
+            remote_key.key_id().to_string(),
+            remote_key.public_key_base64(),
+        );
+        let remote_keys = crate::federation::federation_client::RemoteKeys {
+            verify_keys: Default::default(),
+            old_verify_keys,
+            valid_until_ts: now + 60_000,
+            fetched_at: now,
+        };
+        state
+            .remote_keys
+            .insert_for_test("remote.example", remote_keys);
+
+        let header = crate::federation::federation_client::build_x_matrix_header(
+            &remote_key,
+            "remote.example",
+            "GET",
+            "/_matrix/federation/v1/whatever",
+            "example.com",
+            None,
+        );
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/_matrix/federation/v1/whatever")
+            .header("authorization", header)
+            .body(Body::empty())
+            .unwrap();
         let err = verify_request(&state, req).await.expect_err("must reject");
         assert_eq!(err, StatusCode::UNAUTHORIZED);
     }

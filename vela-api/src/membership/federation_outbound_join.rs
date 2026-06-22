@@ -593,7 +593,7 @@ pub(crate) async fn persist_remote_event(
     let mut outcomes: Vec<String> = Vec::new();
     for (key_id, _) in sigs {
         tried.push(key_id.clone());
-        let Some(pub_b64) = keys.verify_keys.get(key_id) else {
+        let Some(pub_b64) = keys.event_verify_key(key_id) else {
             outcomes.push(format!("{key_id}=no-key"));
             continue;
         };
@@ -626,6 +626,7 @@ pub(crate) async fn persist_remote_event(
             %sender_domain,
             event_type = %etype,
             fetched_keys = ?keys.verify_keys.keys().collect::<Vec<_>>(),
+            fetched_old_keys = ?keys.old_verify_keys.keys().collect::<Vec<_>>(),
             tried_sig_keys = ?tried,
             outcomes = ?outcomes,
             "signature verification failed — tried all keys"

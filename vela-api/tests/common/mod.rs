@@ -357,6 +357,7 @@ impl StubRemote {
         verify_keys.insert(self.key.key_id().to_string(), self.key.public_key_base64());
         let keys = vela_api::federation::federation_client::RemoteKeys {
             verify_keys,
+            old_verify_keys: Default::default(),
             valid_until_ts: u64::MAX / 2,
             fetched_at: 0,
         };

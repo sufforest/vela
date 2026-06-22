@@ -29,10 +29,20 @@ pub const KEY_VALIDITY_CAP_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const FAR_FUTURE_CAP_MS: u64 = 100 * 365 * 24 * 60 * 60 * 1000;
 
 /// Parsed + validated key response, ready for caching.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoteKeys {
-    /// Map of key_id → unpadded-base64 public key bytes.
+    /// Map of key_id → unpadded-base64 public key bytes (current keys).
     pub verify_keys: HashMap<String, String>,
+    /// Rotated-out keys, key_id → unpadded-base64 public key bytes. Per the S2S
+    /// spec these are valid for verifying *events* only, never live federation
+    /// requests, so a server that rotated its signing key can still have its
+    /// older events validated. The spec's per-key `expired_ts` is intentionally
+    /// not stored: it would gate against the event's `origin_server_ts`, which
+    /// lives in the signed payload and is therefore attacker-chosen, so the
+    /// check adds no integrity — only the key bytes matter. `serde(default)`
+    /// keeps documents persisted before this field deserialisable.
+    #[serde(default)]
+    pub old_verify_keys: HashMap<String, String>,
     /// Effective validity, already capped by `min(response_valid_until, now + 7d)`.
     pub valid_until_ts: u64,
     /// Millisecond POSIX timestamp of when we fetched this.
@@ -46,10 +56,28 @@ impl RemoteKeys {
     }
 
     /// Whether this document can verify a signature made with one of `wanted`
-    /// key ids. An empty `wanted` means the caller needs no specific key (any
-    /// valid document will do) — the behaviour of the plain time-based fetch.
+    /// key ids — current or rotated-out. An empty `wanted` means the caller
+    /// needs no specific key (any valid document will do), the behaviour of the
+    /// plain time-based fetch. Old keys count here so a (legitimate) event
+    /// signed with a rotated-out key doesn't keep triggering pointless
+    /// re-fetches.
     fn covers_any(&self, wanted: &[&str]) -> bool {
-        wanted.is_empty() || wanted.iter().any(|k| self.verify_keys.contains_key(*k))
+        wanted.is_empty()
+            || wanted
+                .iter()
+                .any(|k| self.verify_keys.contains_key(*k) || self.old_verify_keys.contains_key(*k))
+    }
+
+    /// Public key (unpadded base64) for verifying an **event** signed with
+    /// `key_id`: a current key, or a rotated-out one from `old_verify_keys`.
+    /// Old keys verify events only — the X-Matrix request-auth path looks up
+    /// `verify_keys` directly so a live request can never be authed by a key
+    /// the server has rotated away.
+    pub fn event_verify_key(&self, key_id: &str) -> Option<&str> {
+        self.verify_keys
+            .get(key_id)
+            .or_else(|| self.old_verify_keys.get(key_id))
+            .map(String::as_str)
     }
 }
 
@@ -1221,6 +1249,24 @@ pub fn validate_key_response(
         verify_keys_map.insert(key_id.clone(), key_b64.to_string());
     }
 
+    // 5b. Old (rotated-out) verify keys: usable for verifying events only.
+    //     Best-effort — a malformed entry is skipped rather than failing the
+    //     whole response, since current keys (which gate live requests) must
+    //     not be held hostage to historical-key cruft. `expired_ts` is ignored
+    //     (see `RemoteKeys::old_verify_keys`).
+    let mut old_verify_keys_map: HashMap<String, String> = HashMap::new();
+    if let Some(old_obj) = obj.get("old_verify_keys").and_then(|v| v.as_object()) {
+        for (key_id, entry) in old_obj {
+            let Some(key_b64) = entry.get("key").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if decode_public_key(key_b64).is_err() {
+                continue;
+            }
+            old_verify_keys_map.insert(key_id.clone(), key_b64.to_string());
+        }
+    }
+
     // 3. Self-signature: at least one signature under signatures.{server_name}
     //    must use a key_id in verify_keys, and that signature must verify.
     let sigs_root = obj
@@ -1257,6 +1303,7 @@ pub fn validate_key_response(
 
     Ok(RemoteKeys {
         verify_keys: verify_keys_map,
+        old_verify_keys: old_verify_keys_map,
         valid_until_ts: capped_valid_until,
         fetched_at: now_ms,
     })
@@ -1512,6 +1559,7 @@ impl RemoteKeyCache {
     async fn refetch_or(&self, server_name: &str, fallback: Arc<RemoteKeys>) -> Arc<RemoteKeys> {
         let stamped = Arc::new(RemoteKeys {
             verify_keys: fallback.verify_keys.clone(),
+            old_verify_keys: fallback.old_verify_keys.clone(),
             valid_until_ts: fallback.valid_until_ts,
             fetched_at: now_ms(),
         });
@@ -1620,6 +1668,7 @@ mod tests {
                 .iter()
                 .map(|k| ((*k).to_string(), "AAAA".to_string()))
                 .collect(),
+            old_verify_keys: HashMap::new(),
             valid_until_ts,
             fetched_at,
         }
@@ -1696,6 +1745,70 @@ mod tests {
             now,
             MIN_KEY_REFETCH_MS
         ));
+    }
+
+    #[test]
+    fn event_verify_key_uses_current_then_old() {
+        let keys = RemoteKeys {
+            verify_keys: HashMap::from([("ed25519:cur".to_string(), "CURRENT".to_string())]),
+            old_verify_keys: HashMap::from([("ed25519:old".to_string(), "OLDKEY".to_string())]),
+            valid_until_ts: 0,
+            fetched_at: 0,
+        };
+        assert_eq!(keys.event_verify_key("ed25519:cur"), Some("CURRENT"));
+        assert_eq!(keys.event_verify_key("ed25519:old"), Some("OLDKEY"));
+        assert_eq!(keys.event_verify_key("ed25519:nope"), None);
+    }
+
+    #[test]
+    fn cache_suffices_covers_old_verify_keys() {
+        let now = now_ms_fixed();
+        let doc = RemoteKeys {
+            verify_keys: HashMap::from([("ed25519:cur".to_string(), "C".to_string())]),
+            old_verify_keys: HashMap::from([("ed25519:old".to_string(), "O".to_string())]),
+            valid_until_ts: now + 60_000,
+            fetched_at: now - 60_000,
+        };
+        // An event signed with the known *old* key must not trigger a refetch...
+        assert!(cache_suffices(
+            &doc,
+            &["ed25519:old"],
+            now,
+            MIN_KEY_REFETCH_MS
+        ));
+        // ...but a genuinely unknown key id still does.
+        assert!(!cache_suffices(
+            &doc,
+            &["ed25519:unknown"],
+            now,
+            MIN_KEY_REFETCH_MS
+        ));
+    }
+
+    #[test]
+    fn validates_response_with_old_verify_keys() {
+        let cur = ServerSigningKey::generate();
+        let old = ServerSigningKey::generate();
+        let old_pub = old.public_key_base64();
+        let mut body = sign_key_response(&cur, "them.example", now_ms_fixed() + 60_000);
+        // Inject an old_verify_keys entry, then re-sign with the current key so
+        // the document still self-verifies over its new contents.
+        let obj = body.as_object_mut().unwrap();
+        obj.insert(
+            "old_verify_keys".into(),
+            json!({ old.key_id(): { "key": old_pub, "expired_ts": 1000 } }),
+        );
+        obj.remove("signatures");
+        cur.sign_json(obj, "them.example");
+
+        let parsed =
+            validate_key_response(&body, "them.example", now_ms_fixed()).expect("valid response");
+        assert!(parsed.verify_keys.contains_key(cur.key_id()));
+        assert_eq!(
+            parsed.old_verify_keys.get(old.key_id()).map(String::as_str),
+            Some(old_pub.as_str()),
+            "old_verify_keys must be parsed into the cached document",
+        );
     }
 
     #[test]
