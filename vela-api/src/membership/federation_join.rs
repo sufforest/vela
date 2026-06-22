@@ -462,7 +462,7 @@ pub async fn send_join_v2(
         })?;
     let mut sig_verified = false;
     for (key_id, _) in sig_root {
-        let Some(pub_b64) = keys.verify_keys.get(key_id) else {
+        let Some(pub_b64) = keys.event_verify_key(key_id) else {
             continue;
         };
         let Ok(public_key) = decode_public_key(pub_b64) else {
@@ -1525,6 +1525,7 @@ mod tests {
             remote_sn,
             RemoteKeys {
                 verify_keys,
+                old_verify_keys: Default::default(),
                 valid_until_ts: u64::MAX / 2,
                 fetched_at: 0,
             },
@@ -1695,6 +1696,7 @@ mod tests {
             remote_sn,
             RemoteKeys {
                 verify_keys,
+                old_verify_keys: Default::default(),
                 valid_until_ts: u64::MAX / 2,
                 fetched_at: 0,
             },

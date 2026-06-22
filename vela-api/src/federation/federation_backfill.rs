@@ -186,7 +186,7 @@ async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Res
 
     let mut verified = false;
     for (key_id, _) in sigs {
-        let Some(pub_b64) = keys.verify_keys.get(key_id) else {
+        let Some(pub_b64) = keys.event_verify_key(key_id) else {
             continue;
         };
         let Ok(public_key) = vela_core::federation::keys::decode_public_key(pub_b64) else {

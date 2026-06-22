@@ -340,7 +340,7 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
 
     let mut verified = false;
     for (key_id, _) in sender_sigs {
-        let Some(pub_b64) = sender_keys.verify_keys.get(key_id) else {
+        let Some(pub_b64) = sender_keys.event_verify_key(key_id) else {
             continue;
         };
         let Ok(public_key) = decode_public_key(pub_b64) else {
@@ -2531,7 +2531,7 @@ async fn persist_fetched_event_inner(
         .ok_or_else(|| format!("no signatures from {sender_domain}"))?;
     let mut verified = false;
     for (key_id, _) in sigs {
-        let Some(pub_b64) = keys.verify_keys.get(key_id) else {
+        let Some(pub_b64) = keys.event_verify_key(key_id) else {
             continue;
         };
         let Ok(public_key) = vela_core::federation::keys::decode_public_key(pub_b64) else {

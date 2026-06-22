@@ -286,7 +286,7 @@ pub async fn send_leave_v2(
         .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
     let mut verified = false;
     for (key_id, _) in sigs {
-        let Some(pub_b64) = keys.verify_keys.get(key_id) else {
+        let Some(pub_b64) = keys.event_verify_key(key_id) else {
             continue;
         };
         let Ok(public_key) = decode_public_key(pub_b64) else {
