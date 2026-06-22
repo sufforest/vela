@@ -247,6 +247,9 @@ pub(crate) struct Plugin {
     /// The host kv service, present only when granted `kv` *and* a store was
     /// injected.
     kv: Option<Arc<dyn KvStore>>,
+    /// The plugin's opaque config serialized once at load — it's immutable, so
+    /// there's no reason to re-serialize it on every invocation.
+    config_json: String,
 }
 
 /// Why a plugin invocation failed. The runtime maps these onto the plugin's
@@ -396,6 +399,7 @@ impl Plugin {
             .then(|| services.emitter.clone())
             .flatten();
         let kv = cfg.capabilities.kv.then(|| services.kv.clone()).flatten();
+        let config_json = config_json(&cfg.config);
         Ok(Plugin {
             engine: engine.clone(),
             pre,
@@ -403,6 +407,7 @@ impl Plugin {
             emitter,
             emit_limiter: Arc::new(EmitLimiter::new(EMIT_RATE_PER_SEC, EMIT_BURST)),
             kv,
+            config_json,
         })
     }
 
@@ -484,7 +489,7 @@ impl Plugin {
                 Origin::Local => wit::Origin::Local,
                 Origin::Federation => wit::Origin::Federation,
             },
-            plugin_config: config_json(&self.cfg.config),
+            plugin_config: self.config_json.clone(),
         };
         Ok((store, instance, wire))
     }
@@ -547,7 +552,7 @@ impl Plugin {
             username: ctx.username.to_string(),
             kind: ctx.kind.to_string(),
             client_ip: client_ip.map(|s| s.to_string()),
-            plugin_config: config_json(&self.cfg.config),
+            plugin_config: self.config_json.clone(),
         };
         let verdict = instance
             .vela_extension_decision()
@@ -576,7 +581,7 @@ impl Plugin {
             username: ctx.username.to_string(),
             login_type: ctx.login_type.to_string(),
             client_ip: client_ip.map(|s| s.to_string()),
-            plugin_config: config_json(&self.cfg.config),
+            plugin_config: self.config_json.clone(),
         };
         let verdict = instance
             .vela_extension_decision()
@@ -604,7 +609,7 @@ impl Plugin {
             size: ctx.size,
             uploader: ctx.uploader.to_string(),
             sha256: ctx.sha256.to_string(),
-            plugin_config: config_json(&self.cfg.config),
+            plugin_config: self.config_json.clone(),
         };
         let verdict = instance
             .vela_extension_decision()
@@ -634,7 +639,7 @@ impl Plugin {
                 ProfileField::AvatarUrl => wit::ProfileField::AvatarUrl,
             },
             value: ctx.value.map(|s| s.to_string()),
-            plugin_config: config_json(&self.cfg.config),
+            plugin_config: self.config_json.clone(),
         };
         let verdict = instance
             .vela_extension_decision()
@@ -664,7 +669,7 @@ impl Plugin {
             alias_localpart: ctx.alias_localpart.map(|s| s.to_string()),
             invite: ctx.invite.to_vec(),
             is_direct: ctx.is_direct,
-            plugin_config: config_json(&self.cfg.config),
+            plugin_config: self.config_json.clone(),
         };
         let verdict = instance
             .vela_extension_decision()
@@ -690,7 +695,7 @@ impl Plugin {
             event: ctx.event.to_string(),
             event_type: ctx.event_type.to_string(),
             sender: ctx.sender.to_string(),
-            plugin_config: config_json(&self.cfg.config),
+            plugin_config: self.config_json.clone(),
         };
         instance
             .vela_extension_decision()

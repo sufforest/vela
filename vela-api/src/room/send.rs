@@ -109,7 +109,7 @@ fn local_extension_gate(
     sender: &str,
     event_type: &str,
 ) -> Result<(), ApiError> {
-    if extensions.is_empty() {
+    if !extensions.binds_check_event() {
         return Ok(());
     }
     let event_value = Value::Object(event.clone());

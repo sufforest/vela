@@ -78,7 +78,7 @@ fn extension_soft_fails_inbound(
     sender: &str,
     event_type: &str,
 ) -> bool {
-    if extensions.is_empty() {
+    if !extensions.binds_check_event() {
         return false;
     }
     let event_value = Value::Object(event_json.clone());

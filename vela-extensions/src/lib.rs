@@ -2,8 +2,9 @@
 //!
 //! Operators run **untrusted** policy logic (moderation today, automation
 //! later) at the Matrix spec's server-discretion points, in any language that
-//! compiles to a WASM component, isolated and resource-limited. See `DESIGN.md`
-//! and `wit/extension.wit` for the architecture and the host↔guest contract.
+//! compiles to a WASM component, isolated and resource-limited. See the
+//! [README](../README.md) and `wit/extension.wit` for the architecture and the
+//! host↔guest contract.
 //!
 //! The runtime is gated behind the default-on `wasmtime-runtime` feature. With
 //! it off, the types and a no-op [`Runtime`] (which allows everything) still

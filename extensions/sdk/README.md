@@ -4,7 +4,9 @@ Write sandboxed WASM extensions for the [vela](https://github.com/sufforest/vela
 Matrix homeserver in Rust.
 
 A vela extension is a WASM component that vela loads at runtime and runs at a
-server decision point — today, on locally-sent events. It runs **sandboxed**
+server decision, observation, or read-path point — on local sends and inbound
+federated events, at registration and login, at media upload, profile changes and
+room creation, and as a `/sync` timeline filter. It runs **sandboxed**
 (memory-isolated, with per-call CPU/memory/wall-clock budgets) and gets no host
 access it isn't granted, so an operator can run one without trusting its author.
 

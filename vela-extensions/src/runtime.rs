@@ -107,6 +107,14 @@ mod imp {
             self.plugins.is_empty()
         }
 
+        /// True if any plugin binds the `check_event` point — lets the send /
+        /// federation-receive path skip the event serialization when no plugin
+        /// actually decides on events (e.g. a config with only a `check_login`
+        /// plugin no longer pays per-send serialization).
+        pub fn binds_check_event(&self) -> bool {
+            self.plugins.iter().any(|p| p.cfg.points.check_event)
+        }
+
         /// Run the decision point. Semantics:
         /// - **block-if-any**: the first plugin that blocks wins (logical AND of
         ///   allows). A failed/fail-open plugin never overrides another's block.
@@ -468,6 +476,10 @@ mod imp {
 
         pub fn is_empty(&self) -> bool {
             true
+        }
+
+        pub fn binds_check_event(&self) -> bool {
+            false
         }
 
         pub fn check_event(&self, _ctx: &EventContext<'_>) -> Decision {
