@@ -28,6 +28,12 @@ pub const KEY_VALIDITY_CAP_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// into the future is comfortably "not legitimate."
 const FAR_FUTURE_CAP_MS: u64 = 100 * 365 * 24 * 60 * 60 * 1000;
 
+/// Hard cap on a `/_matrix/key/v2/server` response body. A legitimate key
+/// document is a few keys plus signatures — kilobytes even with a long
+/// rotation history — so 256 KiB is hugely generous while stopping a hostile
+/// peer from exhausting memory with an unbounded body.
+const MAX_KEY_RESPONSE_BYTES: usize = 256 * 1024;
+
 /// Parsed + validated key response, ready for caching.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoteKeys {
@@ -182,6 +188,38 @@ fn url_query_encode(s: &str) -> String {
     out
 }
 
+/// Read a `/_matrix/key/v2/server` response body into JSON, capped at `max`
+/// bytes. Rejects on an advertised `Content-Length` over the cap, and streams
+/// with a hard limit as the backstop (the length header may be absent or
+/// understated), so a hostile key server can't exhaust memory with an
+/// unbounded body.
+async fn read_capped_key_json(
+    mut resp: reqwest::Response,
+    max: usize,
+) -> Result<Value, FederationClientError> {
+    if let Some(len) = resp.content_length()
+        && len > max as u64
+    {
+        return Err(FederationClientError::Http(format!(
+            "key response too large: {len} bytes (cap {max})"
+        )));
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| FederationClientError::Http(e.to_string()))?
+    {
+        if buf.len() + chunk.len() > max {
+            return Err(FederationClientError::Http(format!(
+                "key response exceeds {max}-byte cap"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf).map_err(|e| FederationClientError::BadJson(e.to_string()))
+}
+
 impl FederationClient {
     pub fn new(
         signing_key: Arc<ServerSigningKey>,
@@ -302,9 +340,7 @@ impl FederationClient {
                 resp.status()
             )));
         }
-        resp.json()
-            .await
-            .map_err(|e| FederationClientError::BadJson(e.to_string()))
+        read_capped_key_json(resp, MAX_KEY_RESPONSE_BYTES).await
     }
 
     /// Fetch `GET /_matrix/key/v2/server` from `server_name` and validate.
@@ -354,10 +390,7 @@ impl FederationClient {
             )));
         }
 
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| FederationClientError::BadJson(e.to_string()))?;
+        let body = read_capped_key_json(resp, MAX_KEY_RESPONSE_BYTES).await?;
 
         let now_ms = now_ms();
         validate_key_response(&body, server_name, now_ms)
