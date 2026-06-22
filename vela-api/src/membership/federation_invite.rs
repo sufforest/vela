@@ -154,10 +154,18 @@ pub async fn invite_v2(
         crate::invite_filter::InviteAction::Allow => {}
     }
 
-    // Verify the origin's signature.
+    // Verify the origin's signature. Pass the signing key ids so a rotated
+    // origin key is re-fetched rather than rejected against the cache.
+    let wanted: Vec<&str> = event
+        .get("signatures")
+        .and_then(|v| v.as_object())
+        .and_then(|s| s.get(&sender_domain))
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().map(String::as_str).collect())
+        .unwrap_or_default();
     let keys = state
         .remote_keys
-        .get_or_fetch(&sender_domain)
+        .get_or_fetch_signed(&sender_domain, &wanted)
         .await
         .map_err(|e| {
             err(

@@ -570,9 +570,16 @@ pub(crate) async fn persist_remote_event(
 
     // Signature check against sender's domain.
     let sender_domain = pdu.sender_domain().ok_or("malformed sender")?.to_string();
+    let wanted: Vec<&str> = obj
+        .get("signatures")
+        .and_then(|v| v.as_object())
+        .and_then(|s| s.get(&sender_domain))
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().map(String::as_str).collect())
+        .unwrap_or_default();
     let keys = state
         .remote_keys
-        .get_or_fetch(&sender_domain)
+        .get_or_fetch_signed(&sender_domain, &wanted)
         .await
         .map_err(|e| format!("fetch keys {sender_domain}: {e}"))?;
     let sigs = obj

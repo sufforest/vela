@@ -248,10 +248,18 @@ pub async fn send_leave_v2(
         .clone();
     let _room_guard = lock.lock().await;
 
-    // Verify signature against origin's published keys.
+    // Verify signature against origin's published keys. Pass the signing key
+    // ids so a rotated origin key is re-fetched rather than rejected.
+    let wanted: Vec<&str> = event_obj
+        .get("signatures")
+        .and_then(|v| v.as_object())
+        .and_then(|s| s.get(sender_domain))
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().map(String::as_str).collect())
+        .unwrap_or_default();
     let keys = state
         .remote_keys
-        .get_or_fetch(sender_domain)
+        .get_or_fetch_signed(sender_domain, &wanted)
         .await
         .map_err(|e| {
             err(

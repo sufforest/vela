@@ -107,10 +107,12 @@ async fn verify_request(state: &AppState, req: Request) -> Result<Request, Statu
         }
     };
 
-    // 5. Fetch origin's keys.
+    // 5. Fetch origin's keys. Pass the key id the request is signed with so a
+    //    rotated signing key (or, in Complement, a port-reused server with a
+    //    fresh key) is re-fetched rather than rejected against a stale cache.
     let keys = state
         .remote_keys
-        .get_or_fetch(&auth.origin)
+        .get_or_fetch_signed(&auth.origin, &[auth.key.as_str()])
         .await
         .map_err(|e| {
             warn!(origin = %auth.origin, error = %e, "failed to fetch origin keys");

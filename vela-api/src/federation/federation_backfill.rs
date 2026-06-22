@@ -158,9 +158,16 @@ async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Res
         .ok_or_else(|| "malformed sender".to_string())?
         .to_string();
 
+    let wanted: Vec<&str> = obj
+        .get("signatures")
+        .and_then(|v| v.as_object())
+        .and_then(|s| s.get(&sender_domain))
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().map(String::as_str).collect())
+        .unwrap_or_default();
     let keys = state
         .remote_keys
-        .get_or_fetch(&sender_domain)
+        .get_or_fetch_signed(&sender_domain, &wanted)
         .await
         .map_err(|e| format!("fetch keys: {e}"))?;
     let sigs = obj
