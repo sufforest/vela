@@ -1119,4 +1119,39 @@ mod tests {
             "a failed refetch must refresh fetched_at to arm the cooldown",
         );
     }
+
+    /// A hostile key server returning an oversized body is rejected rather than
+    /// buffered unbounded into memory. (A normal-size body still works — the
+    /// other wiremock key-fetch tests exercise that path.)
+    #[tokio::test]
+    async fn key_fetch_rejects_oversized_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let remote = "huge.example";
+        let server = MockServer::start().await;
+        // ~512 KiB body, comfortably over the 256 KiB cap.
+        let big = "A".repeat(512 * 1024);
+        Mock::given(method("GET"))
+            .and(path("/_matrix/key/v2/server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "filler": big })))
+            .mount(&server)
+            .await;
+
+        let (state, _tmp) = crate::test_helpers::build_test_state();
+        state
+            .federation_client
+            .set_base_url_override(remote, &server.uri());
+
+        let err = state
+            .federation_client
+            .fetch_server_keys(remote)
+            .await
+            .expect_err("oversized key response must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("too large") || msg.contains("cap"),
+            "expected a size-cap error, got: {msg}",
+        );
+    }
 }
