@@ -34,6 +34,12 @@ const FAR_FUTURE_CAP_MS: u64 = 100 * 365 * 24 * 60 * 60 * 1000;
 /// peer from exhausting memory with an unbounded body.
 const MAX_KEY_RESPONSE_BYTES: usize = 256 * 1024;
 
+/// Hard cap on a general signed-federation response body (`/state`, `/backfill`,
+/// `send_join`, event fetches, transaction replies, …). These are legitimately
+/// large for big rooms, so the cap is generous — 100 MiB, matching Synapse's
+/// `MAX_RESPONSE_SIZE` — but still bounds memory against a hostile peer.
+const MAX_FEDERATION_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
+
 /// Parsed + validated key response, ready for caching.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoteKeys {
@@ -188,12 +194,11 @@ fn url_query_encode(s: &str) -> String {
     out
 }
 
-/// Read a `/_matrix/key/v2/server` response body into JSON, capped at `max`
-/// bytes. Rejects on an advertised `Content-Length` over the cap, and streams
-/// with a hard limit as the backstop (the length header may be absent or
-/// understated), so a hostile key server can't exhaust memory with an
-/// unbounded body.
-async fn read_capped_key_json(
+/// Read a federation response body into JSON, capped at `max` bytes. Rejects on
+/// an advertised `Content-Length` over the cap, and streams with a hard limit
+/// as the backstop (the length header may be absent or understated), so a
+/// hostile peer can't exhaust memory with an unbounded body.
+async fn read_capped_json(
     mut resp: reqwest::Response,
     max: usize,
 ) -> Result<Value, FederationClientError> {
@@ -201,7 +206,7 @@ async fn read_capped_key_json(
         && len > max as u64
     {
         return Err(FederationClientError::Http(format!(
-            "key response too large: {len} bytes (cap {max})"
+            "response too large: {len} bytes (cap {max})"
         )));
     }
     let mut buf = Vec::new();
@@ -212,7 +217,7 @@ async fn read_capped_key_json(
     {
         if buf.len() + chunk.len() > max {
             return Err(FederationClientError::Http(format!(
-                "key response exceeds {max}-byte cap"
+                "response exceeds {max}-byte cap"
             )));
         }
         buf.extend_from_slice(&chunk);
@@ -340,7 +345,7 @@ impl FederationClient {
                 resp.status()
             )));
         }
-        read_capped_key_json(resp, MAX_KEY_RESPONSE_BYTES).await
+        read_capped_json(resp, MAX_KEY_RESPONSE_BYTES).await
     }
 
     /// Fetch `GET /_matrix/key/v2/server` from `server_name` and validate.
@@ -390,7 +395,7 @@ impl FederationClient {
             )));
         }
 
-        let body = read_capped_key_json(resp, MAX_KEY_RESPONSE_BYTES).await?;
+        let body = read_capped_json(resp, MAX_KEY_RESPONSE_BYTES).await?;
 
         let now_ms = now_ms();
         validate_key_response(&body, server_name, now_ms)
@@ -466,10 +471,7 @@ impl FederationClient {
             .map_err(|e| FederationClientError::Http(e.to_string()))?;
 
         let status = resp.status();
-        let resp_body: Value = resp
-            .json()
-            .await
-            .map_err(|e| FederationClientError::BadJson(e.to_string()))?;
+        let resp_body = read_capped_json(resp, MAX_FEDERATION_RESPONSE_BYTES).await?;
 
         if !status.is_success() {
             return Err(FederationClientError::Http(format!(
