@@ -47,6 +47,12 @@ pub struct SyncQuery {
     /// field shape.
     #[serde(rename = "use_state_after")]
     pub use_state_after: Option<bool>,
+    /// The pre-stabilisation MSC4222 spelling, still sent by current Element
+    /// builds (`org.matrix.msc4222.use_state_after`). Either name opts in;
+    /// without this, Element is silently downgraded to the legacy `state`
+    /// shape, which also mis-routes lazy-loaded member state.
+    #[serde(rename = "org.matrix.msc4222.use_state_after")]
+    pub use_state_after_unstable: Option<bool>,
 }
 
 /// GET /_matrix/client/v3/sync
@@ -162,7 +168,10 @@ pub async fn sync(
 
     let filter = resolve_filter(&state, &user, query.filter.as_deref())?;
     let full_state = query.full_state.unwrap_or(false);
-    let use_state_after = query.use_state_after.unwrap_or(false);
+    let use_state_after = query
+        .use_state_after
+        .or(query.use_state_after_unstable)
+        .unwrap_or(false);
 
     // Now check the DB — any events broadcast after our subscribe() call
     // will be caught by the spawned listener tasks.
@@ -429,6 +438,22 @@ pub(crate) fn build_sync_response_inner(
                 }
             }
         }
+        // Spec: on incremental sync, joined rooms that have no new content
+        // since `since` MUST be omitted from `rooms.join` — sending them back
+        // wastes bandwidth and confuses clients into thinking the timeline
+        // restarted. `full_state=true` overrides this; the post-clearance
+        // force-full path is also exempt.
+        //
+        // Evaluate this on the room's REAL post-filter content, BEFORE
+        // lazy-loading injects member context below. Lazy-load adds the
+        // caller's own `m.room.member` into `state`/`state_after` even when
+        // the timeline is empty; counting that as a change would make every
+        // quiet room reappear on every /sync, so `has_new_data` is always
+        // true and the long-poll busy-loops (clients fire ~10 syncs/sec).
+        if since.is_some() && !full_state && !force_full_state && room_is_unchanged(&room_data) {
+            continue;
+        }
+
         if lazy_load {
             ensure_lazy_load_member_state(
                 state,
@@ -443,17 +468,6 @@ pub(crate) fn build_sync_response_inner(
                 &user.user_id,
                 use_state_after,
             );
-        }
-
-        // Spec: on incremental sync, joined rooms that have no new content
-        // since `since` MUST be omitted from `rooms.join` — sending them
-        // back wastes bandwidth and confuses clients into thinking the
-        // room timeline restarted. `full_state=true` overrides this and
-        // forces every joined room to appear. The forced-full-state
-        // path (post-clearance) is also exempt — we want the room
-        // surfaced even when the local timeline didn't move.
-        if since.is_some() && !full_state && !force_full_state && room_is_unchanged(&room_data) {
-            continue;
         }
         // MSC3706 client signal: surface `partial_state: true` so the
         // lazy client knows the membership list is incomplete and can
@@ -2048,6 +2062,7 @@ fn room_is_unchanged(room: &Value) -> bool {
     };
     arr_empty("/timeline/events")
         && arr_empty("/state/events")
+        && arr_empty("/state_after/events")
         && arr_empty("/ephemeral/events")
         && arr_empty("/account_data/events")
 }
@@ -2724,6 +2739,98 @@ mod tests {
             resp.pointer(&format!("/rooms/join/{room_id}")).is_some(),
             "full_state=true must always include joined rooms"
         );
+    }
+
+    /// Regression for the /sync busy-loop: a quiet room must be omitted from an
+    /// incremental sync even when the client requested **lazy-loading**.
+    /// Lazy-load injects the caller's own `m.room.member` into the room state
+    /// for rendering context; that must not be counted as a change, or every
+    /// room reappears on every /sync, `has_new_data` is always true, and the
+    /// long-poll busy-loops (~10 syncs/sec).
+    #[test]
+    fn lazy_loaded_unchanged_room_omitted_from_incremental_sync() {
+        let (state, _tmp) = build_test_state();
+        let db = state.db.clone();
+
+        let room_id = "!llquiet:example.com".to_string();
+        let room_nid = db.get_or_create_nid(&room_id).unwrap();
+        let alice = "@alice:example.com";
+        let alice_nid = db.get_or_create_nid(alice).unwrap();
+        let alice_user = AuthenticatedUser {
+            user_nid: alice_nid,
+            user_id: alice.into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        };
+
+        persist_state(
+            &db,
+            200,
+            "$create",
+            room_nid,
+            &room_id,
+            "m.room.create",
+            alice_nid,
+            alice,
+            "",
+            serde_json::json!({"room_version": "12"}),
+            1,
+            1,
+            &[],
+        );
+        persist_state(
+            &db,
+            201,
+            "$alice_join",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            alice_nid,
+            alice,
+            alice,
+            serde_json::json!({"membership": "join"}),
+            2,
+            2,
+            &[200],
+        );
+        db.set_membership(room_nid, alice_nid, 1).unwrap();
+
+        let cur = db.current_stream_position();
+        let lazy_filter = serde_json::json!({"room": {"state": {"lazy_load_members": true}}});
+
+        let resp = build_sync_response_with_filter(
+            &state,
+            &alice_user,
+            &[room_nid],
+            Some(cur),
+            Some(&lazy_filter),
+            false,
+        )
+        .unwrap();
+
+        let has_room = resp
+            .pointer("/rooms/join")
+            .and_then(|v| v.as_object())
+            .is_some_and(|o| o.contains_key(&room_id));
+        assert!(
+            !has_room,
+            "lazy-loaded quiet room must be omitted on incremental sync (injected own-membership must not count as a change)"
+        );
+    }
+
+    /// The unstable MSC4222 query param spelling must opt in just like the
+    /// stable one — otherwise current Element builds are silently downgraded.
+    #[test]
+    fn unstable_msc4222_use_state_after_param_is_recognised() {
+        let q: SyncQuery =
+            serde_urlencoded::from_str("org.matrix.msc4222.use_state_after=true").unwrap();
+        assert_eq!(q.use_state_after, None);
+        assert_eq!(q.use_state_after_unstable, Some(true));
+        let merged = q
+            .use_state_after
+            .or(q.use_state_after_unstable)
+            .unwrap_or(false);
+        assert!(merged, "the unstable spelling must opt into state_after");
     }
 
     #[test]
