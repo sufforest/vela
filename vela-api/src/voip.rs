@@ -138,6 +138,37 @@ pub async fn rtc_jwt(
     })))
 }
 
+/// The matrix-rtc (MSC4143) transports this server advertises.
+///
+/// Single source of truth for BOTH `.well-known`'s
+/// `org.matrix.msc4143.rtc_foci` block and the `GET .../rtc/transports`
+/// response, so the two can't drift (the same lesson as
+/// `discovery::resolve_base_url`). Empty when no SFU is configured.
+pub fn rtc_foci_list(rtc: &crate::router::RtcConfig) -> Vec<Value> {
+    if rtc.sfu_url.is_empty() {
+        return Vec::new();
+    }
+    vec![json!({
+        "type": "livekit",
+        "livekit_service_url": rtc.sfu_url,
+    })]
+}
+
+/// GET /_matrix/client/unstable/org.matrix.msc4143/rtc/transports
+/// (and the `/v1/rtc/transports` path).
+///
+/// MSC4143 transport discovery — Element Call reads this to find the
+/// LiveKit backend, mirroring the `rtc_foci` it would otherwise read
+/// from `.well-known`. Authenticated (401 without a token, per spec).
+/// Empty list when no SFU is configured; the client then shows no
+/// group-call transport rather than erroring.
+pub async fn rtc_transports(
+    State(state): State<AppState>,
+    _user: AuthenticatedUser,
+) -> Json<Value> {
+    Json(json!({ "rtc_transports": rtc_foci_list(&state.config.rtc) }))
+}
+
 /// HMAC-SHA1 with the given key, base64-encoded — coturn's expected
 /// password format under `use-auth-secret`.
 fn hmac_sha1_base64(key: &[u8], data: &[u8]) -> String {
@@ -172,4 +203,32 @@ struct LiveKitVideoGrant {
     can_subscribe: bool,
     #[serde(rename = "canPublishData")]
     can_publish_data: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::RtcConfig;
+
+    #[test]
+    fn rtc_foci_list_empty_without_sfu() {
+        assert!(rtc_foci_list(&RtcConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn rtc_foci_list_advertises_livekit_when_configured() {
+        let rtc = RtcConfig {
+            sfu_url: "https://sfu.example.org/livekit/jwt".into(),
+            livekit_api_key: "key".into(),
+            livekit_secret: "secret".into(),
+            jwt_ttl_seconds: 3600,
+        };
+        assert_eq!(
+            rtc_foci_list(&rtc),
+            vec![json!({
+                "type": "livekit",
+                "livekit_service_url": "https://sfu.example.org/livekit/jwt",
+            })]
+        );
+    }
 }

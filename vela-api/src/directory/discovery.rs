@@ -67,14 +67,13 @@ pub async fn well_known(State(state): State<AppState>) -> Json<Value> {
     // MSC4143: advertise the matrix-rtc SFU as a "focus" clients can
     // use for group calls. Empty config → no entry; clients then
     // fall back to whatever focus another participant brings or the
-    // classic m.call.* path.
-    if !state.config.rtc.sfu_url.is_empty() {
+    // classic m.call.* path. Shares one resolver with the
+    // `GET .../rtc/transports` endpoint so the two can't drift.
+    let rtc_foci = crate::voip::rtc_foci_list(&state.config.rtc);
+    if !rtc_foci.is_empty() {
         out.insert(
             "org.matrix.msc4143.rtc_foci".to_string(),
-            json!([{
-                "type": "livekit",
-                "livekit_service_url": state.config.rtc.sfu_url,
-            }]),
+            Value::Array(rtc_foci),
         );
     }
     // MSC3861 phase 1: when OIDC delegation is configured, advertise
@@ -128,6 +127,23 @@ pub async fn well_known_support(State(state): State<AppState>) -> impl IntoRespo
         out.insert("support_page".to_string(), json!(page));
     }
     Json(Value::Object(out)).into_response()
+}
+
+/// GET /_matrix/client/v3/thirdparty/protocols
+///
+/// Third-party (bridge) protocol discovery. vela doesn't run application
+/// services (out of scope), but Element probes this on every startup —
+/// the catch-all `M_UNRECOGNIZED` then surfaces as a console error and a
+/// missing-integrations state. The spec shape for "no third-party
+/// protocols" is an empty object, so return `{}` — the same benign-stub
+/// rationale as `/account/3pid` returning `{"threepids": []}`.
+///
+/// Authenticated per spec (the extractor 401s a token-less caller); the
+/// body is constant regardless of caller, so this leaks nothing.
+pub async fn thirdparty_protocols(
+    _user: crate::middleware::auth::AuthenticatedUser,
+) -> Json<Value> {
+    Json(json!({}))
 }
 
 pub async fn versions(State(state): State<AppState>) -> Json<Value> {

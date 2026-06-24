@@ -437,7 +437,7 @@ pub fn build_router(state: AppState) -> Router {
         // MSC3861 phase 1 — clients probe this to learn whether vela
         // delegates auth to an external OIDC issuer. Returns 200 with
         // the issuer/account URLs when `[auth.oidc] enabled = true`,
-        // otherwise 404 M_NOT_FOUND (the spec way of saying "this
+        // otherwise 404 M_UNRECOGNIZED (the spec way of saying "this
         // server runs legacy auth").
         .route(
             "/_matrix/client/v1/auth_issuer",
@@ -446,6 +446,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/_matrix/client/v1/auth_metadata",
             get(discovery::auth_metadata),
+        )
+        // Third-party / bridge protocol discovery. We don't run
+        // appservices, but Element probes this on startup — return an
+        // empty `{}` (spec shape for "no protocols") instead of the
+        // catch-all M_UNRECOGNIZED. Authenticated per spec.
+        .route(
+            "/_matrix/client/v3/thirdparty/protocols",
+            get(discovery::thirdparty_protocols),
         )
         // Ops — Prometheus scrape (no auth; front with reverse proxy in prod).
         .route("/_vela/metrics", get(crate::metrics::scrape))
@@ -513,6 +521,17 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/_matrix/client/unstable/org.matrix.msc4143/rtc/{room_id}/transport",
             axum::routing::post(voip::rtc_jwt),
+        )
+        // MSC4143 transport discovery — Element Call reads the available
+        // RTC backends here (mirrors `.well-known`'s rtc_foci). Both the
+        // unstable and v1 paths; authenticated.
+        .route(
+            "/_matrix/client/unstable/org.matrix.msc4143/rtc/transports",
+            get(voip::rtc_transports),
+        )
+        .route(
+            "/_matrix/client/v1/rtc/transports",
+            get(voip::rtc_transports),
         )
         .route(
             "/_matrix/client/v3/account/password",
