@@ -215,7 +215,10 @@ pub async fn login(
         "device_id": device_id.as_str(),
         "well_known": {
             "m.homeserver": {
-                "base_url": format!("http://{}:{}", state.config.bind_host, state.config.bind_port)
+                // Same resolver as `.well-known/matrix/client`. These two
+                // URLs MUST match or Element rejects the session as
+                // "misconfigured … incorrect or duplicate entries".
+                "base_url": crate::directory::discovery::resolve_base_url(&state.config)
             }
         }
     });
@@ -394,6 +397,55 @@ mod tests {
         .expect("login succeeds");
 
         assert!(res.0["access_token"].as_str().is_some());
+    }
+
+    /// The `well_known` block in the login response MUST carry the same
+    /// homeserver base_url as `.well-known/matrix/client` discovery.
+    /// They diverged once — login hardcoded `http://{bind}:{port}` while
+    /// discovery published `https://{name}` — and Element, seeing two
+    /// conflicting homeserver URLs, refused the session as "misconfigured
+    /// … incorrect or duplicate entries". Pin both to one resolver.
+    #[tokio::test]
+    async fn login_well_known_matches_discovery_base_url() {
+        // Public name: discovery resolves to https://<name>, and the
+        // login response must say the same — not http://127.0.0.1:<port>.
+        let (state, _tmp) = crate::test_helpers::build_test_state_with_name("matrix.example.org");
+        let hash = hash_password("pw");
+        state
+            .db
+            .create_user("@alice:matrix.example.org", &hash)
+            .unwrap();
+
+        let res = login(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(LoginRequest {
+                login_type: "m.login.password".into(),
+                identifier: Some(LoginIdentifier {
+                    id_type: "m.id.user".into(),
+                    user: Some("@alice:matrix.example.org".into()),
+                }),
+                user: None,
+                password: Some("pw".into()),
+                device_id: None,
+                initial_device_display_name: None,
+                refresh_token: false,
+            }),
+        )
+        .await
+        .expect("login succeeds");
+
+        let login_base = res.0["well_known"]["m.homeserver"]["base_url"]
+            .as_str()
+            .expect("login well_known base_url");
+        // Compare against the actual discovery endpoint output, not just
+        // the shared helper — guards the whole path, not one function.
+        let disc = crate::directory::discovery::well_known(State(state.clone())).await;
+        let discovery_base = disc.0["m.homeserver"]["base_url"]
+            .as_str()
+            .expect("discovery base_url");
+        assert_eq!(login_base, discovery_base);
+        assert_eq!(login_base, "https://matrix.example.org");
     }
 
     /// Flip Phase 2 on by mutating the AppState's OidcConfig in place.
