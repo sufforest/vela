@@ -183,14 +183,19 @@ pub async fn versions(State(state): State<AppState>) -> Json<Value> {
 
 /// MSC3861 `GET /_matrix/client/v1/auth_issuer`. Returns the configured
 /// issuer (and optional account-management URL) when delegation is on,
-/// or 404 `M_NOT_FOUND` otherwise — the spec's "this homeserver runs
-/// legacy auth" signal.
+/// or 404 `M_UNRECOGNIZED` otherwise — the spec's "this homeserver runs
+/// legacy auth" signal (CS-API v1.15).
 pub async fn auth_issuer(State(state): State<AppState>) -> axum::response::Response {
     if !state.config.oidc.enabled {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({
-                "errcode": "M_NOT_FOUND",
+                // Spec (CS-API v1.15): a server that does NOT support the
+                // OAuth 2.0 API responds 404 + M_UNRECOGNIZED. Element's
+                // auth_metadata probe keys on this errcode to fall back to
+                // legacy password login; any other 404 errcode is treated
+                // as a hard discovery error ("misconfigured").
+                "errcode": "M_UNRECOGNIZED",
                 "error": "this homeserver does not delegate authentication",
             })),
         )
@@ -209,15 +214,21 @@ pub async fn auth_issuer(State(state): State<AppState>) -> axum::response::Respo
 /// endpoints, JWKS, supported scopes, …). vela doesn't hold those itself,
 /// so it relays the issuer's `/.well-known/oauth-authorization-server`;
 /// on any fetch failure it falls back to a minimal `{issuer, account}`
-/// doc so clients can at least discover the issuer. 404 when delegated
-/// auth is off. The issuer is operator-configured (not user input), so
-/// the outbound fetch is not an SSRF vector.
+/// doc so clients can at least discover the issuer. 404 `M_UNRECOGNIZED`
+/// when delegated auth is off (the spec's not-supported signal — clients
+/// then use legacy login). The issuer is operator-configured (not user
+/// input), so the outbound fetch is not an SSRF vector.
 pub async fn auth_metadata(State(state): State<AppState>) -> axum::response::Response {
     if !state.config.oidc.enabled {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({
-                "errcode": "M_NOT_FOUND",
+                // Spec (CS-API v1.15): a server that does NOT support the
+                // OAuth 2.0 API responds 404 + M_UNRECOGNIZED. Element's
+                // auth_metadata probe keys on this errcode to fall back to
+                // legacy password login; any other 404 errcode is treated
+                // as a hard discovery error ("misconfigured").
+                "errcode": "M_UNRECOGNIZED",
                 "error": "this homeserver does not delegate authentication",
             })),
         )

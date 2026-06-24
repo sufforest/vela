@@ -2,9 +2,9 @@
 //!
 //! Locks in:
 //! - `/auth_issuer` is gated entirely by `[auth.oidc] enabled` — when
-//!   off (default), the route 404s with `M_NOT_FOUND` (the spec's
-//!   "we don't delegate" signal). When on, it returns 200 with the
-//!   configured issuer URL and (optional) account-management URL.
+//!   off (default), the route 404s with `M_UNRECOGNIZED` (the spec's
+//!   "we don't delegate" signal, CS-API v1.15). When on, it returns 200
+//!   with the configured issuer URL and (optional) account-management URL.
 //! - `/_matrix/client/versions` advertises `org.matrix.msc3861 = true`
 //!   in `unstable_features` ONLY when delegation is on. A bare `true`
 //!   would mislead clients into attempting an OAuth flow against a
@@ -25,7 +25,7 @@ use common::{ConfigOverrides, Harness, read_json};
 // --- disabled (default) ---------------------------------------------------
 
 #[tokio::test]
-async fn auth_issuer_disabled_returns_404_m_not_found() {
+async fn auth_issuer_disabled_returns_404_m_unrecognized() {
     let harness = Harness::new(); // default: oidc.enabled = false
     let resp = harness
         .request(
@@ -36,7 +36,10 @@ async fn auth_issuer_disabled_returns_404_m_not_found() {
         .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = read_json(resp).await;
-    assert_eq!(body["errcode"], "M_NOT_FOUND");
+    // Spec (CS-API v1.15): not-supported → M_UNRECOGNIZED, the errcode
+    // Element keys on to fall back to legacy login. Any other 404
+    // errcode is treated as a hard discovery error ("misconfigured").
+    assert_eq!(body["errcode"], "M_UNRECOGNIZED");
 }
 
 #[tokio::test]

@@ -35,8 +35,12 @@ async fn auth_metadata(harness: &Harness) -> (StatusCode, serde_json::Value) {
 #[tokio::test]
 async fn auth_metadata_404_when_oidc_disabled() {
     let harness = Harness::new();
-    let (status, _) = auth_metadata(&harness).await;
+    let (status, body) = auth_metadata(&harness).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    // Spec (CS-API v1.15): not-supported → M_UNRECOGNIZED. Element keys
+    // on this errcode to fall back to legacy login; a different 404
+    // errcode here surfaces as "your Element is misconfigured".
+    assert_eq!(body["errcode"], "M_UNRECOGNIZED");
 }
 
 #[tokio::test]
