@@ -47,6 +47,12 @@ pub struct SyncQuery {
     /// field shape.
     #[serde(rename = "use_state_after")]
     pub use_state_after: Option<bool>,
+    /// The pre-stabilisation MSC4222 spelling, still sent by current Element
+    /// builds (`org.matrix.msc4222.use_state_after`). Either name opts in;
+    /// without this, Element is silently downgraded to the legacy `state`
+    /// shape, which also mis-routes lazy-loaded member state.
+    #[serde(rename = "org.matrix.msc4222.use_state_after")]
+    pub use_state_after_unstable: Option<bool>,
 }
 
 /// GET /_matrix/client/v3/sync
@@ -162,7 +168,10 @@ pub async fn sync(
 
     let filter = resolve_filter(&state, &user, query.filter.as_deref())?;
     let full_state = query.full_state.unwrap_or(false);
-    let use_state_after = query.use_state_after.unwrap_or(false);
+    let use_state_after = query
+        .use_state_after
+        .or(query.use_state_after_unstable)
+        .unwrap_or(false);
 
     // Now check the DB — any events broadcast after our subscribe() call
     // will be caught by the spawned listener tasks.
@@ -429,6 +438,27 @@ pub(crate) fn build_sync_response_inner(
                 }
             }
         }
+        // Spec: on incremental sync, joined rooms that have no new content
+        // since `since` MUST be omitted from `rooms.join` — sending them back
+        // wastes bandwidth and confuses clients into thinking the timeline
+        // restarted. `full_state=true` overrides this; the post-clearance
+        // force-full path is also exempt.
+        //
+        // ── INVARIANT (do not break) ────────────────────────────────────────
+        // This decision MUST be made on the room's real, `since`-bounded
+        // CHANGES only. Anything that is *presentation* — lazy-loaded member
+        // state, summary/heroes, the partial_state marker, the next such field
+        // — MUST be applied AFTER this gate, never before it. Injecting
+        // presentation into a checked section (timeline/state/state_after/
+        // ephemeral/account_data) of a quiet room makes every room reappear on
+        // every /sync, so the long-poll never sleeps and clients busy-loop at
+        // ~10 syncs/sec. This has bitten receipts, typing, and lazy-load.
+        // `quiet_incremental_sync_omits_rooms_across_options` guards it.
+        // ────────────────────────────────────────────────────────────────────
+        if since.is_some() && !full_state && !force_full_state && room_is_unchanged(&room_data) {
+            continue;
+        }
+
         if lazy_load {
             ensure_lazy_load_member_state(
                 state,
@@ -443,17 +473,6 @@ pub(crate) fn build_sync_response_inner(
                 &user.user_id,
                 use_state_after,
             );
-        }
-
-        // Spec: on incremental sync, joined rooms that have no new content
-        // since `since` MUST be omitted from `rooms.join` — sending them
-        // back wastes bandwidth and confuses clients into thinking the
-        // room timeline restarted. `full_state=true` overrides this and
-        // forces every joined room to appear. The forced-full-state
-        // path (post-clearance) is also exempt — we want the room
-        // surfaced even when the local timeline didn't move.
-        if since.is_some() && !full_state && !force_full_state && room_is_unchanged(&room_data) {
-            continue;
         }
         // MSC3706 client signal: surface `partial_state: true` so the
         // lazy client knows the membership list is incomplete and can
@@ -918,22 +937,28 @@ fn ensure_lazy_load_member_state(
 ) -> Result<(), ApiError> {
     use std::collections::HashSet;
 
-    let needed: HashSet<String> = {
-        let mut s: HashSet<String> = room_data
-            .pointer("/timeline/events")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|e| e.get("sender").and_then(|x| x.as_str()).map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        s.insert(user.user_id.clone());
-        s
-    };
+    // Lazy-loading supplies membership context for the SENDERS of the timeline
+    // events being delivered, so clients can render them. With no timeline
+    // events there is nothing to contextualise — inject NOTHING. Injecting on a
+    // quiet sync (e.g. the caller's own membership) would make an otherwise-
+    // unchanged room look changed, so `room_is_unchanged` keeps returning it on
+    // every /sync and the long-poll busy-loops. That is the root cause of the
+    // hammer; `quiet_incremental_sync_omits_rooms_across_options` guards it.
+    let mut needed: HashSet<String> = room_data
+        .pointer("/timeline/events")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e.get("sender").and_then(|x| x.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
     if needed.is_empty() {
         return Ok(());
     }
+    // The caller's own membership goes alongside the senders — clients expect
+    // their own member event in a room they're actively receiving events in.
+    needed.insert(user.user_id.clone());
     let state_pointer = if use_state_after {
         "/state_after/events"
     } else {
@@ -2048,6 +2073,7 @@ fn room_is_unchanged(room: &Value) -> bool {
     };
     arr_empty("/timeline/events")
         && arr_empty("/state/events")
+        && arr_empty("/state_after/events")
         && arr_empty("/ephemeral/events")
         && arr_empty("/account_data/events")
 }
@@ -2724,6 +2750,300 @@ mod tests {
             resp.pointer(&format!("/rooms/join/{room_id}")).is_some(),
             "full_state=true must always include joined rooms"
         );
+    }
+
+    /// Regression for the /sync busy-loop: a quiet room must be omitted from an
+    /// incremental sync even when the client requested **lazy-loading**.
+    /// Lazy-load injects the caller's own `m.room.member` into the room state
+    /// for rendering context; that must not be counted as a change, or every
+    /// room reappears on every /sync, `has_new_data` is always true, and the
+    /// long-poll busy-loops (~10 syncs/sec).
+    #[test]
+    fn lazy_loaded_unchanged_room_omitted_from_incremental_sync() {
+        let (state, _tmp) = build_test_state();
+        let db = state.db.clone();
+
+        let room_id = "!llquiet:example.com".to_string();
+        let room_nid = db.get_or_create_nid(&room_id).unwrap();
+        let alice = "@alice:example.com";
+        let alice_nid = db.get_or_create_nid(alice).unwrap();
+        let alice_user = AuthenticatedUser {
+            user_nid: alice_nid,
+            user_id: alice.into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        };
+
+        persist_state(
+            &db,
+            200,
+            "$create",
+            room_nid,
+            &room_id,
+            "m.room.create",
+            alice_nid,
+            alice,
+            "",
+            serde_json::json!({"room_version": "12"}),
+            1,
+            1,
+            &[],
+        );
+        persist_state(
+            &db,
+            201,
+            "$alice_join",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            alice_nid,
+            alice,
+            alice,
+            serde_json::json!({"membership": "join"}),
+            2,
+            2,
+            &[200],
+        );
+        db.set_membership(room_nid, alice_nid, 1).unwrap();
+
+        let cur = db.current_stream_position();
+        let lazy_filter = serde_json::json!({"room": {"state": {"lazy_load_members": true}}});
+
+        let resp = build_sync_response_with_filter(
+            &state,
+            &alice_user,
+            &[room_nid],
+            Some(cur),
+            Some(&lazy_filter),
+            false,
+        )
+        .unwrap();
+
+        let has_room = resp
+            .pointer("/rooms/join")
+            .and_then(|v| v.as_object())
+            .is_some_and(|o| o.contains_key(&room_id));
+        assert!(
+            !has_room,
+            "lazy-loaded quiet room must be omitted on incremental sync (injected own-membership must not count as a change)"
+        );
+    }
+
+    /// Class-level invariant guard against the /sync busy-loop: a *quiet*
+    /// incremental sync — nothing changed since `since` — must omit every
+    /// joined room, for EVERY combination of sync options. Phrasing it as a
+    /// property (not per-source) means a future content source that injects
+    /// unconditionally fails this test regardless of which source it is or
+    /// which option combination triggers it — the per-source tests catch the
+    /// sources we thought of; this catches the ones we didn't.
+    #[test]
+    fn quiet_incremental_sync_omits_rooms_across_options() {
+        let (state, _tmp) = build_test_state();
+        let db = state.db.clone();
+
+        let room_id = "!quietmatrix:example.com".to_string();
+        let room_nid = db.get_or_create_nid(&room_id).unwrap();
+        let alice = "@alice:example.com";
+        let alice_nid = db.get_or_create_nid(alice).unwrap();
+        let alice_user = AuthenticatedUser {
+            user_nid: alice_nid,
+            user_id: alice.into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        };
+        persist_state(
+            &db,
+            200,
+            "$create",
+            room_nid,
+            &room_id,
+            "m.room.create",
+            alice_nid,
+            alice,
+            "",
+            serde_json::json!({"room_version": "12"}),
+            1,
+            1,
+            &[],
+        );
+        persist_state(
+            &db,
+            201,
+            "$alice_join",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            alice_nid,
+            alice,
+            alice,
+            serde_json::json!({"membership": "join"}),
+            2,
+            2,
+            &[200],
+        );
+        db.set_membership(room_nid, alice_nid, 1).unwrap();
+
+        let cur = db.current_stream_position();
+        let lazy = serde_json::json!({"room": {"state": {"lazy_load_members": true}}});
+        let timeline = serde_json::json!({"room": {"timeline": {"limit": 20}}});
+
+        for (label, filter) in [
+            ("no filter", None),
+            ("lazy-load", Some(&lazy)),
+            ("timeline filter", Some(&timeline)),
+        ] {
+            for &use_state_after in &[false, true] {
+                let resp = build_sync_response_inner(
+                    &state,
+                    &alice_user,
+                    &[room_nid],
+                    Some(cur),
+                    filter,
+                    false,
+                    use_state_after,
+                )
+                .unwrap();
+                let empty = resp
+                    .pointer("/rooms/join")
+                    .and_then(|v| v.as_object())
+                    .is_none_or(|o| o.is_empty());
+                assert!(
+                    empty,
+                    "quiet incremental sync must omit all rooms [{label}, use_state_after={use_state_after}], got {:?}",
+                    resp.pointer("/rooms/join")
+                );
+            }
+        }
+    }
+
+    /// The converse — the lost-update guard. A room with a *real* change MUST
+    /// still appear on an incremental lazy-load sync, carrying the timeline
+    /// sender's membership. Pairs with the omit invariant so a future
+    /// over-eager gate that dropped genuine updates is caught too.
+    #[test]
+    fn changed_room_appears_with_lazy_load_on_incremental_sync() {
+        let (state, _tmp) = build_test_state();
+        let db = state.db.clone();
+
+        let room_id = "!llchanged:example.com".to_string();
+        let room_nid = db.get_or_create_nid(&room_id).unwrap();
+        let alice = "@alice:example.com";
+        let alice_nid = db.get_or_create_nid(alice).unwrap();
+        let bob = "@bob:example.com";
+        let bob_nid = db.get_or_create_nid(bob).unwrap();
+        let alice_user = AuthenticatedUser {
+            user_nid: alice_nid,
+            user_id: alice.into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        };
+        persist_state(
+            &db,
+            200,
+            "$create",
+            room_nid,
+            &room_id,
+            "m.room.create",
+            alice_nid,
+            alice,
+            "",
+            serde_json::json!({"room_version": "12"}),
+            1,
+            1,
+            &[],
+        );
+        persist_state(
+            &db,
+            201,
+            "$alice_join",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            alice_nid,
+            alice,
+            alice,
+            serde_json::json!({"membership": "join"}),
+            2,
+            2,
+            &[200],
+        );
+        persist_state(
+            &db,
+            202,
+            "$bob_join",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            bob_nid,
+            bob,
+            bob,
+            serde_json::json!({"membership": "join"}),
+            3,
+            3,
+            &[201],
+        );
+        db.set_membership(room_nid, alice_nid, 1).unwrap();
+        db.set_membership(room_nid, bob_nid, 1).unwrap();
+
+        let cur = db.current_stream_position();
+        // Bob sends a message after `cur` — a genuine change.
+        persist_message(
+            &db, 203, "$bobmsg", room_nid, &room_id, bob_nid, bob, "hi", 100, 4,
+        );
+
+        let lazy = serde_json::json!({"room": {"state": {"lazy_load_members": true}}});
+        let resp = build_sync_response_inner(
+            &state,
+            &alice_user,
+            &[room_nid],
+            Some(cur),
+            Some(&lazy),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let room = resp.pointer(&format!("/rooms/join/{room_id}")).expect(
+            "a changed room must appear on an incremental lazy-load sync (lost-update guard)",
+        );
+        let timeline = room
+            .pointer("/timeline/events")
+            .and_then(|v| v.as_array())
+            .expect("timeline events");
+        assert!(
+            timeline
+                .iter()
+                .any(|e| e.get("event_id").and_then(|v| v.as_str()) == Some("$bobmsg")),
+            "the changed room's timeline must carry bob's message"
+        );
+        let state_events = room
+            .pointer("/state/events")
+            .and_then(|v| v.as_array())
+            .expect("state events");
+        assert!(
+            state_events
+                .iter()
+                .any(
+                    |e| e.get("type").and_then(|v| v.as_str()) == Some("m.room.member")
+                        && e.get("state_key").and_then(|v| v.as_str()) == Some(bob)
+                ),
+            "lazy-load must inject the timeline sender (bob)'s membership"
+        );
+    }
+
+    /// The unstable MSC4222 query param spelling must opt in just like the
+    /// stable one — otherwise current Element builds are silently downgraded.
+    #[test]
+    fn unstable_msc4222_use_state_after_param_is_recognised() {
+        let q: SyncQuery =
+            serde_urlencoded::from_str("org.matrix.msc4222.use_state_after=true").unwrap();
+        assert_eq!(q.use_state_after, None);
+        assert_eq!(q.use_state_after_unstable, Some(true));
+        let merged = q
+            .use_state_after
+            .or(q.use_state_after_unstable)
+            .unwrap_or(false);
+        assert!(merged, "the unstable spelling must opt into state_after");
     }
 
     #[test]

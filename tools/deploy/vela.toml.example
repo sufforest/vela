@@ -21,6 +21,19 @@ name = "vela.example.com"
 bind = "127.0.0.1"
 port = 8008
 
+# The base URL clients should reach this server at — advertised verbatim in
+# `.well-known/matrix/client` so apps like Element know where to send API
+# calls. Leave it unset and vela uses `https://{name}`, which is correct for
+# the reverse-proxy setup above (identity domain == API host).
+#
+# Set it explicitly when that assumption doesn't hold, or `.well-known` falls
+# back to the bind address (`http://127.0.0.1:8008`) and fresh client logins
+# fail to reach the server:
+#   - API host differs from the identity domain (matrix.example.com for example.com)
+#   - a non-standard port, or vela reachable only over plain HTTP
+#   - `name` is a bare IP / localhost (LAN or laptop deployments)
+# public_base_url = "https://matrix.example.com"
+
 [database]
 # Persistent volume mount-point.
 path = "/var/lib/vela"
