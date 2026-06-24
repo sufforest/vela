@@ -9,8 +9,8 @@ use crate::router::AppState;
 /// Heuristic: is this server_name a development placeholder rather
 /// than a real public domain? `localhost` is unambiguous; bare IP
 /// literals catch container-only setups; anything else (e.g.
-/// `pwd.wiki`, `matrix.example.com`) is treated as public so that
-/// well-known publishes `https://<name>` by default.
+/// `chat.example.org`, `matrix.example.com`) is treated as public so
+/// that well-known publishes `https://<name>` by default.
 fn is_local_server_name(name: &str) -> bool {
     if name == "localhost" || name.starts_with("localhost:") {
         return true;
@@ -25,32 +25,45 @@ fn is_local_server_name(name: &str) -> bool {
     false
 }
 
+/// Resolve the public base URL clients reach this homeserver at.
+///
+/// Single source of truth for that URL, used by BOTH
+/// `.well-known/matrix/client` (discovery, before login) AND the
+/// `well_known` block of the `/login` response (after login). The two
+/// MUST agree: Element validates the post-login URL against the
+/// discovered one and, on a mismatch, refuses the session with "… is
+/// misconfigured … incorrect or duplicate entries". Sharing this
+/// resolver is what keeps the two call sites in lockstep — they diverged
+/// once (login hardcoded `http://{bind}:{port}`) and that is exactly the
+/// "duplicate entries" failure this prevents.
+///
+/// Resolution order:
+///   1. operator-set `[server] public_base_url` (explicit override)
+///   2. https://{server_name} (the common case: API host == identity)
+///   3. http://{bind_host}:{bind_port} (dev fallback for localhost
+///      or other non-public server_name values)
+///
+/// Without (2), every reverse-proxied deploy (Caddy / Cloudflare /
+/// nginx — i.e. almost all real ones) saw "http://127.0.0.1:8008" and
+/// Element fell to the laptop's loopback. (2) covers "API host ==
+/// identity domain" (95% of personal homeservers); (1) is only needed
+/// when the API runs at a different host or non-default port.
+pub fn resolve_base_url(config: &crate::router::ServerConfig) -> String {
+    if let Some(url) = &config.public_base_url {
+        url.clone()
+    } else if !is_local_server_name(&config.server_name) {
+        format!("https://{}", config.server_name)
+    } else {
+        format!("http://{}:{}", config.bind_host, config.bind_port)
+    }
+}
+
 pub async fn well_known(State(state): State<AppState>) -> Json<Value> {
     let mut out = serde_json::Map::new();
-    // Resolution order:
-    //   1. operator-set [server] public_base_url (explicit override)
-    //   2. https://{server_name} (the common case: API host == identity)
-    //   3. http://{bind_host}:{bind_port} (dev fallback for localhost
-    //      or other non-public server_name values)
-    //
-    // Without (2), every reverse-proxied deploy (Caddy / Cloudflare /
-    // nginx — i.e. almost all real ones) saw "http://127.0.0.1:8008"
-    // in well-known and Element fell to the laptop's loopback. (2)
-    // covers the "API is at https://<identity-domain>" case which is
-    // 95% of personal-homeserver setups; (1) is only needed when the
-    // API runs at a different host (e.g. matrix.example.com proxying
-    // for identity domain example.com) or non-default port.
-    let base_url = if let Some(url) = &state.config.public_base_url {
-        url.clone()
-    } else if !is_local_server_name(&state.config.server_name) {
-        format!("https://{}", state.config.server_name)
-    } else {
-        format!(
-            "http://{}:{}",
-            state.config.bind_host, state.config.bind_port
-        )
-    };
-    out.insert("m.homeserver".to_string(), json!({"base_url": base_url}));
+    out.insert(
+        "m.homeserver".to_string(),
+        json!({"base_url": resolve_base_url(&state.config)}),
+    );
     // MSC4143: advertise the matrix-rtc SFU as a "focus" clients can
     // use for group calls. Empty config → no entry; clients then
     // fall back to whatever focus another participant brings or the
@@ -245,4 +258,55 @@ async fn fetch_idp_metadata(url: &str) -> Option<Value> {
         return None;
     }
     resp.json::<Value>().await.ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::build_test_state_with_name;
+    use std::sync::Arc;
+
+    #[test]
+    fn is_local_server_name_classifies_dev_vs_public() {
+        // Dev placeholders → local (well-known falls back to bind addr).
+        assert!(is_local_server_name("localhost"));
+        assert!(is_local_server_name("localhost:8008"));
+        assert!(is_local_server_name("127.0.0.1"));
+        assert!(is_local_server_name("10.0.0.5:8448"));
+        assert!(is_local_server_name("192.168.1.20"));
+        // Real public names → not local (well-known publishes https://).
+        assert!(!is_local_server_name("chat.example.net"));
+        assert!(!is_local_server_name("matrix.example.com"));
+        assert!(!is_local_server_name("example.com"));
+        // Not a bare IPv4 (too many octets / out of u8 range) → a name.
+        assert!(!is_local_server_name("1.2.3.4.5"));
+        assert!(!is_local_server_name("999.1.1.1"));
+    }
+
+    #[tokio::test]
+    async fn resolve_base_url_prefers_https_name_over_bind_addr() {
+        // A real public server_name resolves to https://<name>, NOT the
+        // loopback bind address — the bug that sent Element to 127.0.0.1.
+        let (state, _tmp) = build_test_state_with_name("matrix.example.org");
+        assert_eq!(
+            resolve_base_url(&state.config),
+            "https://matrix.example.org"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_base_url_falls_back_to_bind_for_localhost() {
+        // bind_host=127.0.0.1, bind_port=0 in the test fixture.
+        let (state, _tmp) = build_test_state_with_name("localhost");
+        assert_eq!(resolve_base_url(&state.config), "http://127.0.0.1:0");
+    }
+
+    #[tokio::test]
+    async fn resolve_base_url_honours_explicit_public_base_url() {
+        // Explicit override wins even over a public server_name.
+        let (mut state, _tmp) = build_test_state_with_name("matrix.example.org");
+        Arc::make_mut(&mut state.config).public_base_url =
+            Some("https://api.example.org".to_string());
+        assert_eq!(resolve_base_url(&state.config), "https://api.example.org");
+    }
 }
