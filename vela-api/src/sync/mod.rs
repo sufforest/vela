@@ -444,12 +444,17 @@ pub(crate) fn build_sync_response_inner(
         // restarted. `full_state=true` overrides this; the post-clearance
         // force-full path is also exempt.
         //
-        // Evaluate this on the room's REAL post-filter content, BEFORE
-        // lazy-loading injects member context below. Lazy-load adds the
-        // caller's own `m.room.member` into `state`/`state_after` even when
-        // the timeline is empty; counting that as a change would make every
-        // quiet room reappear on every /sync, so `has_new_data` is always
-        // true and the long-poll busy-loops (clients fire ~10 syncs/sec).
+        // ── INVARIANT (do not break) ────────────────────────────────────────
+        // This decision MUST be made on the room's real, `since`-bounded
+        // CHANGES only. Anything that is *presentation* — lazy-loaded member
+        // state, summary/heroes, the partial_state marker, the next such field
+        // — MUST be applied AFTER this gate, never before it. Injecting
+        // presentation into a checked section (timeline/state/state_after/
+        // ephemeral/account_data) of a quiet room makes every room reappear on
+        // every /sync, so the long-poll never sleeps and clients busy-loop at
+        // ~10 syncs/sec. This has bitten receipts, typing, and lazy-load.
+        // `quiet_incremental_sync_omits_rooms_across_options` guards it.
+        // ────────────────────────────────────────────────────────────────────
         if since.is_some() && !full_state && !force_full_state && room_is_unchanged(&room_data) {
             continue;
         }
@@ -932,22 +937,28 @@ fn ensure_lazy_load_member_state(
 ) -> Result<(), ApiError> {
     use std::collections::HashSet;
 
-    let needed: HashSet<String> = {
-        let mut s: HashSet<String> = room_data
-            .pointer("/timeline/events")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|e| e.get("sender").and_then(|x| x.as_str()).map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        s.insert(user.user_id.clone());
-        s
-    };
+    // Lazy-loading supplies membership context for the SENDERS of the timeline
+    // events being delivered, so clients can render them. With no timeline
+    // events there is nothing to contextualise — inject NOTHING. Injecting on a
+    // quiet sync (e.g. the caller's own membership) would make an otherwise-
+    // unchanged room look changed, so `room_is_unchanged` keeps returning it on
+    // every /sync and the long-poll busy-loops. That is the root cause of the
+    // hammer; `quiet_incremental_sync_omits_rooms_across_options` guards it.
+    let mut needed: HashSet<String> = room_data
+        .pointer("/timeline/events")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e.get("sender").and_then(|x| x.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
     if needed.is_empty() {
         return Ok(());
     }
+    // The caller's own membership goes alongside the senders — clients expect
+    // their own member event in a room they're actively receiving events in.
+    needed.insert(user.user_id.clone());
     let state_pointer = if use_state_after {
         "/state_after/events"
     } else {
@@ -2816,6 +2827,93 @@ mod tests {
             !has_room,
             "lazy-loaded quiet room must be omitted on incremental sync (injected own-membership must not count as a change)"
         );
+    }
+
+    /// Class-level invariant guard against the /sync busy-loop: a *quiet*
+    /// incremental sync — nothing changed since `since` — must omit every
+    /// joined room, for EVERY combination of sync options. Phrasing it as a
+    /// property (not per-source) means a future content source that injects
+    /// unconditionally fails this test regardless of which source it is or
+    /// which option combination triggers it — the per-source tests catch the
+    /// sources we thought of; this catches the ones we didn't.
+    #[test]
+    fn quiet_incremental_sync_omits_rooms_across_options() {
+        let (state, _tmp) = build_test_state();
+        let db = state.db.clone();
+
+        let room_id = "!quietmatrix:example.com".to_string();
+        let room_nid = db.get_or_create_nid(&room_id).unwrap();
+        let alice = "@alice:example.com";
+        let alice_nid = db.get_or_create_nid(alice).unwrap();
+        let alice_user = AuthenticatedUser {
+            user_nid: alice_nid,
+            user_id: alice.into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        };
+        persist_state(
+            &db,
+            200,
+            "$create",
+            room_nid,
+            &room_id,
+            "m.room.create",
+            alice_nid,
+            alice,
+            "",
+            serde_json::json!({"room_version": "12"}),
+            1,
+            1,
+            &[],
+        );
+        persist_state(
+            &db,
+            201,
+            "$alice_join",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            alice_nid,
+            alice,
+            alice,
+            serde_json::json!({"membership": "join"}),
+            2,
+            2,
+            &[200],
+        );
+        db.set_membership(room_nid, alice_nid, 1).unwrap();
+
+        let cur = db.current_stream_position();
+        let lazy = serde_json::json!({"room": {"state": {"lazy_load_members": true}}});
+        let timeline = serde_json::json!({"room": {"timeline": {"limit": 20}}});
+
+        for (label, filter) in [
+            ("no filter", None),
+            ("lazy-load", Some(&lazy)),
+            ("timeline filter", Some(&timeline)),
+        ] {
+            for &use_state_after in &[false, true] {
+                let resp = build_sync_response_inner(
+                    &state,
+                    &alice_user,
+                    &[room_nid],
+                    Some(cur),
+                    filter,
+                    false,
+                    use_state_after,
+                )
+                .unwrap();
+                let empty = resp
+                    .pointer("/rooms/join")
+                    .and_then(|v| v.as_object())
+                    .is_none_or(|o| o.is_empty());
+                assert!(
+                    empty,
+                    "quiet incremental sync must omit all rooms [{label}, use_state_after={use_state_after}], got {:?}",
+                    resp.pointer("/rooms/join")
+                );
+            }
+        }
     }
 
     /// The unstable MSC4222 query param spelling must opt in just like the
