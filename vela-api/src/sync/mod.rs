@@ -2916,6 +2916,121 @@ mod tests {
         }
     }
 
+    /// The converse — the lost-update guard. A room with a *real* change MUST
+    /// still appear on an incremental lazy-load sync, carrying the timeline
+    /// sender's membership. Pairs with the omit invariant so a future
+    /// over-eager gate that dropped genuine updates is caught too.
+    #[test]
+    fn changed_room_appears_with_lazy_load_on_incremental_sync() {
+        let (state, _tmp) = build_test_state();
+        let db = state.db.clone();
+
+        let room_id = "!llchanged:example.com".to_string();
+        let room_nid = db.get_or_create_nid(&room_id).unwrap();
+        let alice = "@alice:example.com";
+        let alice_nid = db.get_or_create_nid(alice).unwrap();
+        let bob = "@bob:example.com";
+        let bob_nid = db.get_or_create_nid(bob).unwrap();
+        let alice_user = AuthenticatedUser {
+            user_nid: alice_nid,
+            user_id: alice.into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        };
+        persist_state(
+            &db,
+            200,
+            "$create",
+            room_nid,
+            &room_id,
+            "m.room.create",
+            alice_nid,
+            alice,
+            "",
+            serde_json::json!({"room_version": "12"}),
+            1,
+            1,
+            &[],
+        );
+        persist_state(
+            &db,
+            201,
+            "$alice_join",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            alice_nid,
+            alice,
+            alice,
+            serde_json::json!({"membership": "join"}),
+            2,
+            2,
+            &[200],
+        );
+        persist_state(
+            &db,
+            202,
+            "$bob_join",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            bob_nid,
+            bob,
+            bob,
+            serde_json::json!({"membership": "join"}),
+            3,
+            3,
+            &[201],
+        );
+        db.set_membership(room_nid, alice_nid, 1).unwrap();
+        db.set_membership(room_nid, bob_nid, 1).unwrap();
+
+        let cur = db.current_stream_position();
+        // Bob sends a message after `cur` — a genuine change.
+        persist_message(
+            &db, 203, "$bobmsg", room_nid, &room_id, bob_nid, bob, "hi", 100, 4,
+        );
+
+        let lazy = serde_json::json!({"room": {"state": {"lazy_load_members": true}}});
+        let resp = build_sync_response_inner(
+            &state,
+            &alice_user,
+            &[room_nid],
+            Some(cur),
+            Some(&lazy),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let room = resp.pointer(&format!("/rooms/join/{room_id}")).expect(
+            "a changed room must appear on an incremental lazy-load sync (lost-update guard)",
+        );
+        let timeline = room
+            .pointer("/timeline/events")
+            .and_then(|v| v.as_array())
+            .expect("timeline events");
+        assert!(
+            timeline
+                .iter()
+                .any(|e| e.get("event_id").and_then(|v| v.as_str()) == Some("$bobmsg")),
+            "the changed room's timeline must carry bob's message"
+        );
+        let state_events = room
+            .pointer("/state/events")
+            .and_then(|v| v.as_array())
+            .expect("state events");
+        assert!(
+            state_events
+                .iter()
+                .any(
+                    |e| e.get("type").and_then(|v| v.as_str()) == Some("m.room.member")
+                        && e.get("state_key").and_then(|v| v.as_str()) == Some(bob)
+                ),
+            "lazy-load must inject the timeline sender (bob)'s membership"
+        );
+    }
+
     /// The unstable MSC4222 query param spelling must opt in just like the
     /// stable one — otherwise current Element builds are silently downgraded.
     #[test]
