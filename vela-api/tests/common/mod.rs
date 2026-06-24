@@ -43,6 +43,7 @@ pub struct ConfigOverrides {
     pub oidc: vela_api::router::OidcConfig,
     pub public_base_url: Option<String>,
     pub support: vela_api::router::SupportConfig,
+    pub rtc: vela_api::router::RtcConfig,
 }
 
 impl Default for ConfigOverrides {
@@ -57,6 +58,7 @@ impl Default for ConfigOverrides {
             oidc: vela_api::router::OidcConfig::default(),
             public_base_url: None,
             support: vela_api::router::SupportConfig::default(),
+            rtc: vela_api::router::RtcConfig::default(),
         }
     }
 }
@@ -159,7 +161,7 @@ impl Harness {
                 user_directory_federate: false,
                 minimum_room_version: vela_core::events::room_version::RoomVersion::V6,
                 voip: vela_api::router::VoipConfig::default(),
-                rtc: vela_api::router::RtcConfig::default(),
+                rtc: overrides.rtc,
                 oidc: overrides.oidc,
                 admin_bot_localpart: vela_api::admin::DEFAULT_BOT_LOCALPART.to_string(),
                 presence: vela_api::router::PresenceConfig::default(),
