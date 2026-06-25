@@ -3748,7 +3748,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vela-admin"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3759,7 +3759,7 @@ dependencies = [
 
 [[package]]
 name = "vela-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -3807,7 +3807,7 @@ dependencies = [
 
 [[package]]
 name = "vela-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -3821,7 +3821,7 @@ dependencies = [
 
 [[package]]
 name = "vela-extensions"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3832,7 +3832,7 @@ dependencies = [
 
 [[package]]
 name = "vela-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3864,7 +3864,7 @@ dependencies = [
 
 [[package]]
 name = "vela-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "async-trait",
