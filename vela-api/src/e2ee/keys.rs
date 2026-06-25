@@ -108,7 +108,7 @@ pub struct KeysQueryRequest {
 /// from each branch.
 pub async fn query_keys(
     State(state): State<AppState>,
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, ApiError> {
     // Manual parse so deserialize errors surface as 400 M_BAD_JSON
@@ -212,6 +212,15 @@ pub async fn query_keys(
             }
         }
     }
+
+    // Spec: `user_signing_keys` is returned ONLY for the requesting user,
+    // and only when they queried their own keys. Master + self_signing are
+    // public (returned for every queried user); the user-signing key is
+    // not. Leaking another user's user-signing key also breaks clients:
+    // matrix-rust-sdk builds OTHER users' identities with master +
+    // self_signing only, so an unexpected user-signing key corrupts that
+    // identity's processing and a verified user is shown as untrusted.
+    user_signing_keys.retain(|uid, _| uid == &user.user_id);
 
     Ok(Json(json!({
         "device_keys": device_keys_response,
