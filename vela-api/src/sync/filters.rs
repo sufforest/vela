@@ -447,6 +447,18 @@ pub fn apply_lazy_load_state(room: &mut Value, user_id: &str, use_state_after: b
         .unwrap_or_default();
     keep.insert(user_id.to_string());
 
+    // Lazy-loading MUST also retain the room heroes' membership events: the
+    // client renders an unnamed room's name/avatar (e.g. a DM) from them.
+    // Without this, a room with no recent timeline message from the other
+    // member loses that member event and shows up as "Empty room" after a
+    // fresh login (the client has nothing cached to fall back on). The
+    // heroes were computed into `summary.m.heroes` upstream.
+    if let Some(heroes) = room.pointer("/summary/m.heroes").and_then(|v| v.as_array()) {
+        for hero in heroes.iter().filter_map(|v| v.as_str()) {
+            keep.insert(hero.to_string());
+        }
+    }
+
     // MSC4222 puts the state list under `state_after.events` instead of
     // the legacy `state.events`. Same filtering shape either way.
     let pointer = if use_state_after {
@@ -549,6 +561,74 @@ mod tests {
         assert!(kinds.contains(&("m.room.member", "@charlie:s")));
         assert!(kinds.contains(&("m.room.member", "@alice:s")));
         assert!(!kinds.contains(&("m.room.member", "@bob:s")));
+    }
+
+    #[test]
+    fn lazy_load_keeps_heroes_member_for_unnamed_room() {
+        // A DM with no recent timeline messages: @bob is the room hero
+        // (used to derive the room name). Lazy-load must keep @bob's member
+        // event even though he isn't a timeline sender — otherwise the
+        // client has no member to name the room and renders "Empty room".
+        let mut room = json!({
+            "summary": {"m.heroes": ["@bob:s"]},
+            "state": {"events": [
+                {"type": "m.room.member", "state_key": "@alice:s",
+                 "sender": "@alice:s", "content": {"membership": "join"}},
+                {"type": "m.room.member", "state_key": "@bob:s",
+                 "sender": "@bob:s", "content": {"membership": "join"}},
+            ]},
+            "timeline": {"events": []},
+        });
+        apply_lazy_load_state(&mut room, "@alice:s", false);
+        let kinds: Vec<(&str, &str)> = room["state"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap(),
+                    e["state_key"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert!(kinds.contains(&("m.room.member", "@alice:s")), "self kept");
+        assert!(
+            kinds.contains(&("m.room.member", "@bob:s")),
+            "hero member must survive lazy-load so the DM has a name; got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn lazy_load_keeps_heroes_member_under_state_after() {
+        // Same as above but on the MSC4222 `state_after` path — the one
+        // Element actually uses (`org.matrix.msc4222.use_state_after=true`),
+        // which is where the "Empty room" bug surfaced.
+        let mut room = json!({
+            "summary": {"m.heroes": ["@bob:s"]},
+            "state_after": {"events": [
+                {"type": "m.room.member", "state_key": "@alice:s",
+                 "sender": "@alice:s", "content": {"membership": "join"}},
+                {"type": "m.room.member", "state_key": "@bob:s",
+                 "sender": "@bob:s", "content": {"membership": "join"}},
+            ]},
+            "timeline": {"events": []},
+        });
+        apply_lazy_load_state(&mut room, "@alice:s", true);
+        let kinds: Vec<(&str, &str)> = room["state_after"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["type"].as_str().unwrap(),
+                    e["state_key"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert!(
+            kinds.contains(&("m.room.member", "@bob:s")),
+            "hero member must survive lazy-load under state_after; got {kinds:?}"
+        );
     }
 
     #[test]
