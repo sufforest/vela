@@ -172,10 +172,26 @@ pub async fn sync(
         .use_state_after
         .or(query.use_state_after_unstable)
         .unwrap_or(false);
+    // MSC4222: the response state field must use the SAME spelling the client
+    // opted in with — the stable `state_after` for `use_state_after`, the
+    // unstable `org.matrix.msc4222.state_after` for the unstable param. We
+    // build under the stable name internally and rename to this on the way out.
+    // (sync.yaml: a client detects support from the presence of `state_after`;
+    // if its key is missing it MUST behave as if it never opted in. So a client
+    // sending the unstable param and reading the unstable key never finds a
+    // stable-keyed response, falls back to the timeline, and a room whose create
+    // event has scrolled past the timeline window then renders as "version 1".)
+    let state_after_key = if query.use_state_after == Some(true) {
+        "state_after"
+    } else if query.use_state_after_unstable == Some(true) {
+        "org.matrix.msc4222.state_after"
+    } else {
+        "state_after"
+    };
 
     // Now check the DB — any events broadcast after our subscribe() call
     // will be caught by the spawned listener tasks.
-    let response = build_sync_response_inner(
+    let mut response = build_sync_response_inner(
         &state,
         &user,
         &joined_room_nids,
@@ -184,6 +200,7 @@ pub async fn sync(
         full_state,
         use_state_after,
     )?;
+    rename_state_after_for_client(&mut response, state_after_key);
 
     // A joined room appears in `rooms.join` only when it has new
     // content (timeline / state / ephemeral / account_data) per the
@@ -261,7 +278,7 @@ pub async fn sync(
         .get_user_joined_rooms(user.user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
-    let response = build_sync_response_inner(
+    let mut response = build_sync_response_inner(
         &state,
         &user,
         &joined_room_nids,
@@ -270,7 +287,37 @@ pub async fn sync(
         full_state,
         use_state_after,
     )?;
+    rename_state_after_for_client(&mut response, state_after_key);
     Ok(Json(response))
+}
+
+/// MSC4222: rename the canonical `state_after` field in `rooms.join.*` to the
+/// key spelling the client opted in with. The unstable param
+/// `org.matrix.msc4222.use_state_after` pairs with the unstable response key
+/// `org.matrix.msc4222.state_after`; the stable `use_state_after` uses
+/// `state_after`. (Unstable-prefix is the Matrix convention for a feature still
+/// on an MSC; the stable names are spec since v1.16.) We build under the stable
+/// name internally and rename here, so the field name matches what the client
+/// looks for — a client reading the unstable key never finds a stable-keyed
+/// response and, per the spec, behaves as if it never opted in. No-op for the
+/// stable spelling.
+fn rename_state_after_for_client(response: &mut Value, key: &str) {
+    if key == "state_after" {
+        return;
+    }
+    let Some(join) = response
+        .pointer_mut("/rooms/join")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return;
+    };
+    for room_data in join.values_mut() {
+        if let Some(obj) = room_data.as_object_mut()
+            && let Some(state_after) = obj.remove("state_after")
+        {
+            obj.insert(key.to_string(), state_after);
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -2826,6 +2873,52 @@ mod tests {
         assert!(
             !has_room,
             "lazy-loaded quiet room must be omitted on incremental sync (injected own-membership must not count as a change)"
+        );
+    }
+
+    /// MSC4222: when a client opts in with the UNSTABLE param
+    /// (`org.matrix.msc4222.use_state_after`), the response's state field must
+    /// be renamed from the canonical `state_after` to the unstable key the
+    /// client reads (`org.matrix.msc4222.state_after`). vela emitted the stable
+    /// key for the unstable param, so Element never found it, treated
+    /// `state_after` as absent (per spec) and fell back to the timeline — long
+    /// rooms then rendered as "version 1" with no name.
+    #[test]
+    fn rename_state_after_uses_unstable_key_for_unstable_param() {
+        let mut resp = serde_json::json!({
+            "rooms": {"join": {"!r:s": {
+                "state_after": {"events": [
+                    {"type": "m.room.create", "content": {"room_version": "12"}}
+                ]},
+                "timeline": {"events": []}
+            }}}
+        });
+        rename_state_after_for_client(&mut resp, "org.matrix.msc4222.state_after");
+        let room = resp
+            .pointer("/rooms/join/!r:s")
+            .and_then(|v| v.as_object())
+            .unwrap();
+        assert!(
+            !room.contains_key("state_after"),
+            "the stable `state_after` key must be gone (spec: client reads its own spelling)"
+        );
+        assert!(
+            room.contains_key("org.matrix.msc4222.state_after"),
+            "state must move under the unstable key the unstable-param client reads"
+        );
+    }
+
+    /// The stable spelling (`use_state_after` → `state_after`) is a no-op:
+    /// the canonical field stays under `state_after`.
+    #[test]
+    fn rename_state_after_noop_for_stable_key() {
+        let mut resp = serde_json::json!({
+            "rooms": {"join": {"!r:s": {"state_after": {"events": []}}}}
+        });
+        rename_state_after_for_client(&mut resp, "state_after");
+        assert!(
+            resp.pointer("/rooms/join/!r:s/state_after").is_some(),
+            "stable spelling must leave `state_after` in place"
         );
     }
 
