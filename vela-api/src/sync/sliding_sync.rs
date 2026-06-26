@@ -256,7 +256,7 @@ pub struct RoomSubscription {
 #[derive(Deserialize, Default)]
 pub struct ExtensionsRequest {
     #[serde(default)]
-    pub to_device: Option<ExtEnabled>,
+    pub to_device: Option<ToDeviceExt>,
     #[serde(default)]
     pub e2ee: Option<ExtEnabled>,
     #[serde(default)]
@@ -278,12 +278,68 @@ pub struct ExtEnabled {
     pub enabled: bool,
 }
 
+/// MSC4186 `to_device` extension request. Unlike the other extensions it
+/// carries its own `since` cursor (the previous response's `next_batch`),
+/// which the server uses to ACK delivery: everything ≤ `since` has been
+/// received and can be dropped; everything newer is (re)delivered. Without
+/// honouring `since`, to-device would be delete-on-read and a dropped
+/// response would lose `m.key.verification.*` for good.
+#[derive(Deserialize, Default)]
+pub struct ToDeviceExt {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
 // --- Query params (Element X sends pos in query string) ---
 
 #[derive(Deserialize, Default)]
 pub struct SlidingSyncQuery {
     pub pos: Option<String>,
     pub timeout: Option<u64>,
+}
+
+/// Build the MSC4186 `to_device` extension response: ACK everything the
+/// client already received (≤ its `since`), then return the (since,
+/// safe_pos] window. Delete-on-ACK — a message persists until the client
+/// syncs past it, so a dropped response can't lose `m.key.verification.*`.
+/// `safe_pos` is the gap-free committed watermark, so the `next_batch` the
+/// client echoes back as `since` never strands an in-flight position.
+///
+/// Unlike classic `/sync`, the to_device cursor (`since`) is SEPARATE from
+/// the sliding-sync connection `pos`. We rely on the client echoing this
+/// extension's `next_batch` back as `since` on the next request — exactly
+/// as classic /sync relies on a client advancing its single `since`. A
+/// client that advances `pos` but never the extension `since` would keep
+/// seeing a non-empty window and re-request without long-polling; the
+/// delete-on-delete cascade still bounds the queue. Conformant clients
+/// (Element X) echo it, so this isn't the #180-class unconditional-inject
+/// hammer — the window only stays non-empty while a message is genuinely
+/// unacked.
+fn build_to_device_extension(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    ext: &ToDeviceExt,
+) -> Result<Value, ApiError> {
+    let since = ext
+        .since
+        .as_deref()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let safe_pos = state.db.safe_stream_position();
+    state
+        .db
+        .ack_to_device_messages(user.user_nid, &user.device_id, since)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let events = state
+        .db
+        .get_to_device_messages_window(user.user_nid, &user.device_id, since, safe_pos)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    Ok(json!({
+        "next_batch": safe_pos.to_string(),
+        "events": events,
+    }))
 }
 
 /// POST /_matrix/client/unstable/org.matrix.simplified_msc3575/sync
@@ -525,36 +581,10 @@ pub async fn sliding_sync(
     let mut extensions: Map<String, Value> = Map::new();
 
     // to_device extension
-    if body
-        .extensions
-        .to_device
-        .as_ref()
-        .is_some_and(|e| e.enabled)
-    {
-        let (events, keys) = {
-            let msgs = state
-                .db
-                .get_to_device_messages(user.user_nid, &user.device_id)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-            let events: Vec<Value> = msgs.iter().map(|(_, v)| v.clone()).collect();
-            let db_keys: Vec<Vec<u8>> = msgs.into_iter().map(|(k, _)| k).collect();
-            (events, db_keys)
-        };
-        if !keys.is_empty() {
-            state
-                .db
-                .delete_to_device_messages(&keys)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-        }
+    if let Some(ext) = body.extensions.to_device.as_ref().filter(|e| e.enabled) {
         extensions.insert(
             "to_device".to_string(),
-            json!({
-                // Use the gap-free committed watermark so the next sliding
-                // sync's `since` can't strand an in-flight pos. See
-                // db::safe_stream_position docs.
-                "next_batch": state.db.safe_stream_position().to_string(),
-                "events": events,
-            }),
+            build_to_device_extension(&state, &user, ext)?,
         );
     }
 
@@ -761,30 +791,10 @@ pub async fn sliding_sync(
         rooms_response = new_rooms;
 
         // Rebuild to_device (may have arrived during long-poll)
-        if body
-            .extensions
-            .to_device
-            .as_ref()
-            .is_some_and(|e| e.enabled)
-        {
-            let msgs = state
-                .db
-                .get_to_device_messages(user.user_nid, &user.device_id)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-            let events: Vec<Value> = msgs.iter().map(|(_, v)| v.clone()).collect();
-            let db_keys: Vec<Vec<u8>> = msgs.into_iter().map(|(k, _)| k).collect();
-            if !db_keys.is_empty() {
-                state
-                    .db
-                    .delete_to_device_messages(&db_keys)
-                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-            }
+        if let Some(ext) = body.extensions.to_device.as_ref().filter(|e| e.enabled) {
             extensions.insert(
                 "to_device".to_string(),
-                json!({
-                    "next_batch": state.db.safe_stream_position().to_string(),
-                    "events": events,
-                }),
+                build_to_device_extension(&state, &user, ext)?,
             );
         }
 
@@ -1568,5 +1578,54 @@ mod tests {
         for a in &arcs[1..] {
             assert!(Arc::ptr_eq(&arcs[0], a));
         }
+    }
+
+    /// MSC4186 to_device must be delete-on-ACK: held until the client
+    /// echoes a `since` past it. The old delete-on-read dropped it after
+    /// one response, losing `m.key.verification.*` on any retry.
+    #[test]
+    fn sliding_to_device_extension_is_delete_on_ack() {
+        let (state, _tmp) = crate::test_helpers::build_test_state();
+        let user_nid = state.db.get_or_create_nid("@bob:example.com").unwrap();
+        let user = AuthenticatedUser {
+            user_nid,
+            user_id: "@bob:example.com".to_string(),
+            device_id: "DEV".to_string(),
+            appservice_nid: None,
+        };
+        state
+            .db
+            .queue_to_device(
+                user_nid,
+                "DEV",
+                "m.key.verification.request",
+                "@bob:example.com",
+                &json!({"transaction_id": "t1"}),
+            )
+            .unwrap();
+
+        let n_events = |v: &Value| v["events"].as_array().map(|a| a.len()).unwrap_or(0);
+
+        // First request (no since) delivers it.
+        let enabled = ToDeviceExt {
+            enabled: true,
+            since: None,
+        };
+        let resp = build_to_device_extension(&state, &user, &enabled).unwrap();
+        assert_eq!(n_events(&resp), 1, "must deliver the queued message");
+        let next_batch = resp["next_batch"].as_str().unwrap().to_string();
+
+        // A retry that did not advance `since` still sees it (delete-on-read
+        // would have dropped it).
+        let resp2 = build_to_device_extension(&state, &user, &enabled).unwrap();
+        assert_eq!(n_events(&resp2), 1, "must redeliver until acked");
+
+        // Echoing next_batch as `since` acks and clears it.
+        let acked = ToDeviceExt {
+            enabled: true,
+            since: Some(next_batch),
+        };
+        let resp3 = build_to_device_extension(&state, &user, &acked).unwrap();
+        assert_eq!(n_events(&resp3), 0, "acked message must not reappear");
     }
 }

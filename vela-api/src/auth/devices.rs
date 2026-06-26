@@ -200,6 +200,18 @@ pub(crate) fn purge_device(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     let _ = state.db.delete_device(user_nid, device_id);
     crate::auth::logout::purge_msc3890_local_notification_settings_pub(state, user_nid, device_id);
+    // Notify local observers (the user's own other devices + room-mates)
+    // that the device set changed, so their next /sync carries the owner in
+    // `device_lists.changed` and they re-query /keys/query and drop the
+    // deleted device. Without this the deleted device lingers in every other
+    // client's session/device list and E2EE keeps targeting it. Mirrors
+    // `rename_device`; the federated update below only reaches remote servers.
+    // Kept here (rather than hoisted out of the batch/logout-all loops) so no
+    // delete path can ever skip it; `get_device_key_changes` dedups the
+    // owner to a single entry on read, so the per-device fan-out on bulk
+    // deletes is wasteful-but-correct, and bulk delete is rare.
+    let _ = state.db.record_device_key_change(user_nid);
+    crate::router::notify_user(state, user_nid);
     // Federate the removal so remote servers drop this device from their
     // `/keys/query` view — an `m.device_list_update` with `deleted: true`.
     // Matches the local key reclaim in `Database::delete_device`.
@@ -279,4 +291,36 @@ pub async fn delete_devices(
     }
 
     Ok(Json(json!({})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::build_test_state;
+
+    /// Deleting a device must record a device-list change for the owner so
+    /// local observers (the owner's other devices + room-mates) see it in
+    /// `device_lists.changed` and drop the device from their list / E2EE
+    /// targeting. Without this the deleted session lingers in every other
+    /// client's device list. (Rename already does this; delete didn't.)
+    #[test]
+    fn purge_device_records_local_device_list_change() {
+        let (state, _tmp) = build_test_state();
+        let user_nid = state.db.get_or_create_nid("@alice:example.com").unwrap();
+        state.db.create_device(user_nid, "DEAD").unwrap();
+
+        let before = state.db.safe_stream_position();
+        purge_device(&state, user_nid, "DEAD").unwrap();
+
+        // The owner now appears in her own device-key-change window, so her
+        // next /sync emits her in device_lists.changed.
+        let changed = state
+            .db
+            .get_device_key_changes(user_nid, before, state.db.safe_stream_position() + 1)
+            .unwrap();
+        assert!(
+            changed.contains(&user_nid),
+            "device delete must record a device-list change for the owner: {changed:?}"
+        );
+    }
 }
