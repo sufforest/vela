@@ -60,17 +60,29 @@ pub async fn upload_keys(
             }
         }
 
+        // Preserve cross-signing signatures a re-upload would otherwise
+        // drop. The device only ever signs itself; the self_signing-key
+        // signature that marks it verified was added separately via
+        // /keys/signatures/upload and lives only in the stored copy.
+        let mut device_keys = device_keys.clone();
+        let existing = state
+            .db
+            .get_device_keys(user.user_nid, &user.device_id)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        preserve_existing_signatures(existing.as_ref(), &mut device_keys);
+
         state
             .db
-            .set_device_keys(user.user_nid, &user.device_id, device_keys)
+            .set_device_keys(user.user_nid, &user.device_id, &device_keys)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
         // Tell our observers (self + joined room-mates) to re-query.
         let _ = state.db.record_device_key_change(user.user_nid);
         crate::router::notify_user(&state, user.user_nid);
         // Federate the change to remote servers sharing a room with
         // this user. Spec: m.device_list_update EDU per destination
-        // with a per-user monotonic stream_id.
-        federate_device_list_update(&state, &user, device_keys.clone(), /* deleted */ false);
+        // with a per-user monotonic stream_id. Moves the merged keys —
+        // this is their last use.
+        federate_device_list_update(&state, &user, device_keys, /* deleted */ false);
     }
 
     if let Some(otks) = &body.one_time_keys
@@ -705,19 +717,28 @@ pub async fn upload_signing_keys(
         .filter(|v| !v.is_null())
         .cloned();
 
-    if let Some(key) = master_key {
+    // Preserve signatures across an idempotent re-upload (same key
+    // material): a device's signature on the master key, or the
+    // self_signing signature, was added via /keys/signatures/upload and
+    // lives only in the stored copy — re-uploading the bare key would drop
+    // it and break verification. `existing` was fetched above for the UIA
+    // gate.
+    if let Some(mut key) = master_key {
+        preserve_existing_signatures(existing.get("master_key"), &mut key);
         state
             .db
             .set_cross_signing_keys(user.user_nid, "master_key", &key)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     }
-    if let Some(key) = self_signing_key {
+    if let Some(mut key) = self_signing_key {
+        preserve_existing_signatures(existing.get("self_signing_key"), &mut key);
         state
             .db
             .set_cross_signing_keys(user.user_nid, "self_signing_key", &key)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     }
-    if let Some(key) = user_signing_key {
+    if let Some(mut key) = user_signing_key {
+        preserve_existing_signatures(existing.get("user_signing_key"), &mut key);
         state
             .db
             .set_cross_signing_keys(user.user_nid, "user_signing_key", &key)
@@ -927,6 +948,72 @@ fn merge_signatures(existing: &mut Value, new_body: &Value) {
         };
         for (key_id, sig) in new_keys {
             entry_obj.insert(key_id.clone(), sig.clone());
+        }
+    }
+}
+
+/// A key object reduced to exactly the bytes its signatures cover: the
+/// whole object minus `signatures` and `unsigned`. Two keys with equal
+/// `signed_content` are signed over identical material (`user_id`,
+/// `device_id`, `algorithms`, `keys`, `usage`, …); a stored signature is
+/// valid against one iff it's valid against the other.
+fn signed_content(key: &Value) -> Value {
+    let mut c = key.clone();
+    if let Some(obj) = c.as_object_mut() {
+        obj.remove("signatures");
+        obj.remove("unsigned");
+    }
+    c
+}
+
+/// Fold the signatures from a previously stored key into a fresh upload of
+/// the SAME key. A client re-uploading a device key or cross-signing key
+/// carries only its own signature(s); signatures added by other signers —
+/// the self_signing key cross-signing a device, or a device signing the
+/// master key, via `/keys/signatures/upload` — live only in the stored
+/// copy. Without folding them back in, a re-upload silently drops them and
+/// the key reverts to "unverified" across every client.
+///
+/// Preserved ONLY when the full SIGNED CONTENT is byte-identical: a stored
+/// signature is valid over exactly the bytes it signed, so any change to a
+/// signed field (not just `keys` — also `algorithms`/`usage`) invalidates
+/// it, and a stale signature carried onto changed content would just fail
+/// client verification (still "unverified"). The fresh upload's OWN
+/// signatures always win; stored signatures are folded in only for
+/// `(signer, key_id)` pairs the upload doesn't already carry — so a
+/// re-signed self-signature is never clobbered by the stored one.
+fn preserve_existing_signatures(existing: Option<&Value>, new_key: &mut Value) {
+    let Some(old) = existing else {
+        return;
+    };
+    if signed_content(old) != signed_content(new_key) {
+        return;
+    }
+    let Some(old_sigs) = old.get("signatures").and_then(|v| v.as_object()) else {
+        return;
+    };
+    let Some(new_obj) = new_key.as_object_mut() else {
+        return;
+    };
+    let new_sigs = new_obj
+        .entry("signatures".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(new_sigs) = new_sigs.as_object_mut() else {
+        return;
+    };
+    for (signer, key_map) in old_sigs {
+        let Some(old_keys) = key_map.as_object() else {
+            continue;
+        };
+        let entry = new_sigs.entry(signer.clone()).or_insert_with(|| json!({}));
+        let Some(entry_obj) = entry.as_object_mut() else {
+            continue;
+        };
+        for (key_id, sig) in old_keys {
+            // new-wins: only fill in signatures the fresh upload lacks.
+            entry_obj
+                .entry(key_id.clone())
+                .or_insert_with(|| sig.clone());
         }
     }
 }
@@ -1459,4 +1546,158 @@ pub async fn federation_claim_keys(
     }
 
     Ok(Json(json!({ "one_time_keys": result })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::build_test_state;
+
+    fn device_key(keys: Value, sigs: Value) -> Value {
+        json!({
+            "user_id": "@alice:example.com",
+            "device_id": "DEV",
+            "algorithms": ["m.olm.v1.curve25519-aes-sha2", "m.megolm.v1.aes-sha2"],
+            "keys": keys,
+            "signatures": sigs,
+        })
+    }
+
+    /// Same key material → existing signatures from other signers are
+    /// folded into the fresh upload (so a verified device stays verified).
+    #[test]
+    fn preserve_keeps_cross_signing_sig_when_keys_unchanged() {
+        let keys = json!({"curve25519:DEV": "C", "ed25519:DEV": "E"});
+        let stored = device_key(
+            keys.clone(),
+            json!({"@alice:example.com": {"ed25519:DEV": "self", "ed25519:SSK": "cross"}}),
+        );
+        // A re-upload carries only the device's own self-signature.
+        let mut fresh = device_key(keys, json!({"@alice:example.com": {"ed25519:DEV": "self"}}));
+        preserve_existing_signatures(Some(&stored), &mut fresh);
+        let sigs = &fresh["signatures"]["@alice:example.com"];
+        assert_eq!(sigs["ed25519:DEV"], "self");
+        assert_eq!(
+            sigs["ed25519:SSK"], "cross",
+            "cross-signing sig must survive"
+        );
+    }
+
+    /// Different key material → prior signatures are over a different key
+    /// and MUST NOT be carried onto the new one.
+    #[test]
+    fn preserve_drops_sigs_when_key_material_changes() {
+        let stored = device_key(
+            json!({"ed25519:DEV": "OLD"}),
+            json!({"@alice:example.com": {"ed25519:SSK": "cross"}}),
+        );
+        let mut fresh = device_key(
+            json!({"ed25519:DEV": "NEW"}),
+            json!({"@alice:example.com": {"ed25519:DEV": "self"}}),
+        );
+        preserve_existing_signatures(Some(&stored), &mut fresh);
+        let sigs = &fresh["signatures"]["@alice:example.com"];
+        assert!(
+            sigs.get("ed25519:SSK").is_none(),
+            "stale sig must be dropped"
+        );
+        assert_eq!(sigs["ed25519:DEV"], "self");
+    }
+
+    /// Same `keys` but a different signed field (`algorithms`) → the stored
+    /// signatures are over different bytes and would fail client
+    /// verification, so they MUST be dropped, not carried over.
+    #[test]
+    fn preserve_drops_sigs_when_algorithms_change() {
+        let keys = json!({"ed25519:DEV": "E"});
+        let mut stored = device_key(
+            keys.clone(),
+            json!({"@alice:example.com": {"ed25519:SSK": "cross"}}),
+        );
+        stored["algorithms"] = json!(["m.megolm.v1.aes-sha2"]); // differs from device_key default
+        let mut fresh = device_key(keys, json!({"@alice:example.com": {"ed25519:DEV": "self"}}));
+        preserve_existing_signatures(Some(&stored), &mut fresh);
+        let sigs = &fresh["signatures"]["@alice:example.com"];
+        assert!(
+            sigs.get("ed25519:SSK").is_none(),
+            "sig over different algorithms must be dropped"
+        );
+    }
+
+    /// On a `(signer, key_id)` collision the fresh upload's signature wins —
+    /// a freshly re-signed self-signature is never clobbered by the stored
+    /// one; only foreign signatures the upload lacks are folded in.
+    #[test]
+    fn preserve_new_signature_wins_on_collision() {
+        let keys = json!({"ed25519:DEV": "E"});
+        let stored = device_key(
+            keys.clone(),
+            json!({"@alice:example.com": {"ed25519:DEV": "OLD", "ed25519:SSK": "cross"}}),
+        );
+        let mut fresh = device_key(keys, json!({"@alice:example.com": {"ed25519:DEV": "NEW"}}));
+        preserve_existing_signatures(Some(&stored), &mut fresh);
+        let sigs = &fresh["signatures"]["@alice:example.com"];
+        assert_eq!(sigs["ed25519:DEV"], "NEW", "fresh self-sig must win");
+        assert_eq!(sigs["ed25519:SSK"], "cross", "foreign sig folded in");
+    }
+
+    /// No stored key (first upload) → nothing to merge, left as-is.
+    #[test]
+    fn preserve_noop_when_nothing_stored() {
+        let mut fresh = device_key(
+            json!({"ed25519:DEV": "E"}),
+            json!({"@alice:example.com": {"ed25519:DEV": "self"}}),
+        );
+        let before = fresh.clone();
+        preserve_existing_signatures(None, &mut fresh);
+        assert_eq!(fresh, before);
+    }
+
+    /// End to end through the handler: a device re-uploading its keys (the
+    /// bare self-signed object a client regenerates) must not strip the
+    /// self_signing-key signature that marked it verified.
+    #[tokio::test]
+    async fn reupload_via_handler_preserves_verification_signature() {
+        let (state, _tmp) = build_test_state();
+        let user_nid = state.db.get_or_create_nid("@alice:example.com").unwrap();
+        let user = AuthenticatedUser {
+            user_nid,
+            user_id: "@alice:example.com".to_string(),
+            device_id: "DEV".to_string(),
+            appservice_nid: None,
+        };
+        let keys = json!({"curve25519:DEV": "C", "ed25519:DEV": "E"});
+
+        // Verified state: device key carries both its self-sig and the
+        // self_signing-key cross-signature (as /keys/signatures/upload left it).
+        state
+            .db
+            .set_device_keys(
+                user_nid,
+                "DEV",
+                &device_key(
+                    keys.clone(),
+                    json!({"@alice:example.com": {"ed25519:DEV": "self", "ed25519:SSK": "cross"}}),
+                ),
+            )
+            .unwrap();
+
+        // Client re-uploads the bare, self-signed key.
+        let body = KeysUploadRequest {
+            device_keys: Some(device_key(
+                keys,
+                json!({"@alice:example.com": {"ed25519:DEV": "self"}}),
+            )),
+            one_time_keys: None,
+        };
+        upload_keys(State(state.clone()), user, Json(body))
+            .await
+            .expect("upload ok");
+
+        let stored = state.db.get_device_keys(user_nid, "DEV").unwrap().unwrap();
+        assert_eq!(
+            stored["signatures"]["@alice:example.com"]["ed25519:SSK"], "cross",
+            "re-upload must not strip the cross-signing signature"
+        );
+    }
 }
