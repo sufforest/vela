@@ -46,6 +46,16 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
                 .resolve_nid(user_nid)
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
                 .ok_or(ApiError(VelaError::UnknownToken))?;
+            // Best-effort: record this device's activity for GET /devices.
+            // Throttled in the store (one write/device/minute), so the cost
+            // on the hot path is a small point lookup + parse of the
+            // last-seen row, with an actual write only past the throttle.
+            // Never fatal — a failure here must not block an otherwise-
+            // authenticated request.
+            let ip = crate::auth::client_ip::client_ip_from_headers(&parts.headers);
+            let _ = state
+                .db
+                .touch_device_seen(user_nid, &device_id, now_unix_ms(), ip.as_deref());
             return Ok(AuthenticatedUser {
                 user_nid,
                 user_id,
@@ -230,6 +240,13 @@ fn hex(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn extract_token(parts: &Parts) -> Option<String> {

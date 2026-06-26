@@ -659,24 +659,22 @@ pub(crate) fn build_sync_response_inner(
         }));
     }
 
-    // To-device messages
-    let (to_device_events, to_device_keys) = {
-        let msgs = state
-            .db
-            .get_to_device_messages(user.user_nid, &user.device_id)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-        let events: Vec<Value> = msgs.iter().map(|(_, v)| v.clone()).collect();
-        let db_keys: Vec<Vec<u8>> = msgs.into_iter().map(|(k, _)| k).collect();
-        (events, db_keys)
-    };
-
-    // Delete consumed to-device messages
-    if !to_device_keys.is_empty() {
-        state
-            .db
-            .delete_to_device_messages(&to_device_keys)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    }
+    // To-device messages are delivered delete-on-ACK, not delete-on-read:
+    // the client acknowledges a message by syncing past it (presenting a
+    // `since` at or beyond its stream id). Drop everything ≤ `since` now
+    // (the client has seen it), then return the (since, safe_pos] window —
+    // each message stays in the store until a later `since` acks it. A
+    // dropped or failed sync response therefore can't permanently lose an
+    // `m.key.verification.*` event the way the old delete-on-read did.
+    let since_pos = since.unwrap_or(0);
+    state
+        .db
+        .ack_to_device_messages(user.user_nid, &user.device_id, since_pos)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let to_device_events = state
+        .db
+        .get_to_device_messages_window(user.user_nid, &user.device_id, since_pos, safe_pos)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     // E2EE key counts for this device
     let otk_counts = state
@@ -2347,6 +2345,63 @@ mod tests {
             device_id: "DEV".into(),
             appservice_nid: None,
         }
+    }
+
+    /// To-device messages must be redelivered until the client syncs past
+    /// them (delete-on-ACK), not dropped the moment they're first returned.
+    /// Guards the verification-request-lost regression end to end through
+    /// the sync handler (ack `since`, then return the (since, safe_pos]
+    /// window).
+    #[test]
+    fn to_device_redelivered_until_synced_past() {
+        let (state, _tmp) = build_test_state();
+        let user = fake_user(&state, "@bob:example.com");
+        state
+            .db
+            .queue_to_device(
+                user.user_nid,
+                "DEV",
+                "m.key.verification.request",
+                "@bob:example.com",
+                &json!({"transaction_id": "t1"}),
+            )
+            .unwrap();
+
+        let td = |resp: &Value| -> usize {
+            resp.pointer("/to_device/events")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0)
+        };
+
+        // Initial sync delivers it.
+        let resp = build_sync_response(&state, &user, &[], None).unwrap();
+        assert_eq!(td(&resp), 1, "verification to-device must be delivered");
+        let pos: u64 = resp["next_batch"]
+            .as_str()
+            .unwrap()
+            .strip_prefix('s')
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        // A client that did not advance its token still sees it — the old
+        // delete-on-read would have dropped it after the first response.
+        let resp2 = build_sync_response(&state, &user, &[], None).unwrap();
+        assert_eq!(td(&resp2), 1, "must redeliver until acked");
+
+        // Syncing past it (since = next_batch) acks and clears it.
+        let resp3 = build_sync_response(&state, &user, &[], Some(pos)).unwrap();
+        assert_eq!(td(&resp3), 0, "acked message must not reappear");
+
+        // And it's actually gone from the store, not just filtered out.
+        assert!(
+            state
+                .db
+                .get_to_device_messages_window(user.user_nid, "DEV", 0, pos)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

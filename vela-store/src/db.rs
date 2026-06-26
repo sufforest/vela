@@ -106,6 +106,14 @@ mod b_meta {
 pub const SCHEMA_VERSION: &str = "1";
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
+/// Minimum gap between `last_seen` writes for a device. The per-request
+/// auth path calls [`Database::touch_device_seen`] on every authenticated
+/// request; throttling at this granularity keeps that to at most one
+/// write per device per minute while staying fresh enough for the
+/// "last active" column clients display. (Synapse uses 120s; 60s here
+/// trades a little more write traffic for a fresher value.)
+pub const LAST_SEEN_GRANULARITY_MS: u64 = 60_000;
+
 /// How `persist_event_kind` should treat an event with respect to the
 /// timeline, current state, and forward extremities. Use this for new
 /// callers that need the in-between behaviours the bool form of
@@ -1000,6 +1008,75 @@ impl Database {
         self.db.put_cf(&cf, &key, rec.to_string().as_bytes())
     }
 
+    /// Record device activity (`last_seen` ts + ip) so `GET /devices` can
+    /// report a real "last active" instead of null (clients render a null
+    /// timestamp as "Dec 31, 1969"). Stored in the dedicated
+    /// `device_last_seen` CF — NOT in the device record — so this
+    /// per-request write never read-modify-writes the device row (which
+    /// would race `delete_device` into a zombie and clobber a concurrent
+    /// rename). An entry written for an already-deleted device is an inert
+    /// orphan: `GET /devices` iterates the `devices` CF, so it never
+    /// surfaces, and `delete_device` cascades it away.
+    ///
+    /// Throttled: a no-op when the stored ts is within
+    /// [`LAST_SEEN_GRANULARITY_MS`] of `now_ms`, so the hot path's cost is
+    /// one small point lookup + parse, and an actual write happens at most
+    /// once per device per minute. `ip` is the raw client IP (first
+    /// `X-Forwarded-For` hop); `None` preserves the previously stored IP.
+    pub fn touch_device_seen(
+        &self,
+        user_nid: u64,
+        device_id: &str,
+        now_ms: u64,
+        ip: Option<&str>,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("device_last_seen").unwrap();
+        let key = keys::encode_u64_bytes(user_nid, device_id.as_bytes());
+        let prior: Option<Value> = self
+            .db
+            .get_cf(&cf, key.as_slice())?
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        if let Some(last) = prior
+            .as_ref()
+            .and_then(|p| p.get("ts").and_then(|v| v.as_u64()))
+            && now_ms.saturating_sub(last) < LAST_SEEN_GRANULARITY_MS
+        {
+            return Ok(());
+        }
+        let ip = ip.map(str::to_string).or_else(|| {
+            prior
+                .as_ref()
+                .and_then(|p| p.get("ip").and_then(|v| v.as_str()).map(str::to_string))
+        });
+        let mut rec = serde_json::Map::new();
+        rec.insert("ts".to_string(), Value::from(now_ms));
+        if let Some(ip) = ip {
+            rec.insert("ip".to_string(), Value::String(ip));
+        }
+        self.db
+            .put_cf(&cf, &key, Value::Object(rec).to_string().as_bytes())
+    }
+
+    /// Read a device's `last_seen` as `(ts_ms, ip)` for `GET /devices`.
+    /// Either field is `None` when never recorded.
+    pub fn get_device_last_seen(
+        &self,
+        user_nid: u64,
+        device_id: &str,
+    ) -> Result<(Option<u64>, Option<String>), rocksdb::Error> {
+        let cf = self.db.cf_handle("device_last_seen").unwrap();
+        let key = keys::encode_u64_bytes(user_nid, device_id.as_bytes());
+        match self.db.get_cf(&cf, key.as_slice())? {
+            Some(b) => {
+                let v: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+                let ts = v.get("ts").and_then(|x| x.as_u64());
+                let ip = v.get("ip").and_then(|x| x.as_str()).map(str::to_string);
+                Ok((ts, ip))
+            }
+            None => Ok((None, None)),
+        }
+    }
+
     /// Delete a device and reclaim the key material bound to it: the device
     /// record, its identity (device) keys, and all of its one-time keys.
     /// Without the key/OTK cascade, every logout / device delete / dehydrated
@@ -1038,6 +1115,26 @@ impl Database {
             }
             batch.delete_cf(&otk, &k);
         }
+
+        // Undelivered to-device messages: same `(user_nid || len || device)`
+        // prefix as OTKs (msg_id is the 8-byte suffix). Now that delivery is
+        // delete-on-ACK, a logged-out device would otherwise leak its queue
+        // forever — nothing will ever sync it to drain them.
+        let to_device = self.db.cf_handle("to_device_messages").unwrap();
+        for item in self.db.prefix_iterator_cf(&to_device, &prefix) {
+            let (k, _) = item?;
+            if k.len() < prefix.len() || k[..prefix.len()] != prefix[..] {
+                break;
+            }
+            batch.delete_cf(&to_device, &k);
+        }
+
+        // Per-device last-seen activity row.
+        let last_seen = self.db.cf_handle("device_last_seen").unwrap();
+        batch.delete_cf(
+            &last_seen,
+            keys::encode_u64_bytes(user_nid, device_id.as_bytes()),
+        );
 
         self.db.write(batch)
     }
@@ -5389,6 +5486,84 @@ impl Database {
         Ok((messages, cursor))
     }
 
+    /// Return to-device messages for `device_id` with `since` < stream id
+    /// ≤ `up_to`, in stream order. The lower bound is exclusive — the
+    /// client has already seen everything ≤ `since` (those are dropped by
+    /// `ack_to_device_messages`). The upper bound is the sync's `safe_pos`
+    /// so next_batch never lands below a returned message. Messages are
+    /// NOT deleted here: this is the read half of delete-on-ACK delivery,
+    /// so a message survives until the client syncs past it.
+    pub fn get_to_device_messages_window(
+        &self,
+        user_nid: u64,
+        device_id: &str,
+        since: u64,
+        up_to: u64,
+    ) -> Result<Vec<Value>, rocksdb::Error> {
+        let cf = self.db.cf_handle("to_device_messages").unwrap();
+        let device_bytes = device_id.as_bytes();
+        let len = device_bytes.len() as u16;
+        let mut prefix = Vec::with_capacity(8 + 2 + device_bytes.len());
+        prefix.extend_from_slice(&keys::encode_u64(user_nid));
+        prefix.extend_from_slice(&len.to_be_bytes());
+        prefix.extend_from_slice(device_bytes);
+
+        let mut messages = Vec::new();
+        for item in self.db.prefix_iterator_cf(&cf, &prefix) {
+            let (key, val) = item?;
+            if key.len() != prefix.len() + 8 || key[..prefix.len()] != prefix[..] {
+                if key.len() <= prefix.len() || key[..prefix.len()] != prefix[..] {
+                    break;
+                }
+                continue;
+            }
+            let msg_id = u64::from_be_bytes(key[prefix.len()..].try_into().unwrap());
+            if msg_id <= since || msg_id > up_to {
+                continue;
+            }
+            let msg: Value = serde_json::from_slice(&val).unwrap_or(Value::Null);
+            messages.push(msg);
+        }
+        Ok(messages)
+    }
+
+    /// Delete to-device messages for `device_id` with stream id ≤ `up_to`.
+    /// Called at the start of each /sync to drop the messages the client
+    /// acknowledged by presenting `since`. This is the delete-on-ACK half
+    /// of at-least-once to-device delivery: a message is redelivered until
+    /// the client syncs past it, so a dropped sync response can't lose an
+    /// `m.key.verification.*` event.
+    pub fn ack_to_device_messages(
+        &self,
+        user_nid: u64,
+        device_id: &str,
+        up_to: u64,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("to_device_messages").unwrap();
+        let device_bytes = device_id.as_bytes();
+        let len = device_bytes.len() as u16;
+        let mut prefix = Vec::with_capacity(8 + 2 + device_bytes.len());
+        prefix.extend_from_slice(&keys::encode_u64(user_nid));
+        prefix.extend_from_slice(&len.to_be_bytes());
+        prefix.extend_from_slice(device_bytes);
+
+        let mut batch = WriteBatch::default();
+        for item in self.db.prefix_iterator_cf(&cf, &prefix) {
+            let (key, _) = item?;
+            if key.len() != prefix.len() + 8 || key[..prefix.len()] != prefix[..] {
+                if key.len() <= prefix.len() || key[..prefix.len()] != prefix[..] {
+                    break;
+                }
+                continue;
+            }
+            let msg_id = u64::from_be_bytes(key[prefix.len()..].try_into().unwrap());
+            if msg_id <= up_to {
+                batch.delete_cf(&cf, key.as_ref());
+            }
+        }
+        self.db.write(batch)
+    }
+
     // --- MSC3814: Dehydrated devices ---
 
     /// Fetch the user's current dehydrated device, if any, as
@@ -7934,6 +8109,236 @@ mod stream_recovery_tests {
         assert!(db.get_device(user, "ABC").unwrap().is_some());
         assert!(db.get_device_keys(user, "ABC").unwrap().is_some());
         assert!(!db.count_one_time_keys(user, "ABC").unwrap().is_empty());
+    }
+
+    /// `touch_device_seen` records last-seen ts/ip in the dedicated CF (so
+    /// /devices stops reporting null → "Dec 31, 1969"), throttles writes to
+    /// one per `LAST_SEEN_GRANULARITY_MS`, and never writes the `devices`
+    /// record (so it can't resurrect a deleted device).
+    #[test]
+    fn touch_device_seen_records_and_throttles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        let user = db.get_or_create_nid("@alice:example.com").unwrap();
+        db.create_device(user, "DEV").unwrap();
+
+        // First touch records ts + ip.
+        db.touch_device_seen(user, "DEV", 1_000, Some("1.2.3.4"))
+            .unwrap();
+        assert_eq!(
+            db.get_device_last_seen(user, "DEV").unwrap(),
+            (Some(1_000), Some("1.2.3.4".to_string()))
+        );
+
+        // Within the granularity window: throttled, no change (neither ts
+        // nor ip move even though a newer ip was supplied).
+        db.touch_device_seen(
+            user,
+            "DEV",
+            1_000 + LAST_SEEN_GRANULARITY_MS - 1,
+            Some("9.9.9.9"),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_device_last_seen(user, "DEV").unwrap(),
+            (Some(1_000), Some("1.2.3.4".to_string()))
+        );
+
+        // Past the window: updates both.
+        db.touch_device_seen(
+            user,
+            "DEV",
+            1_000 + LAST_SEEN_GRANULARITY_MS,
+            Some("9.9.9.9"),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_device_last_seen(user, "DEV").unwrap(),
+            (
+                Some(1_000 + LAST_SEEN_GRANULARITY_MS),
+                Some("9.9.9.9".to_string())
+            )
+        );
+
+        // A missing IP preserves the stored one while still advancing ts.
+        db.touch_device_seen(user, "DEV", 1_000 + 10 * LAST_SEEN_GRANULARITY_MS, None)
+            .unwrap();
+        let (ts, ip) = db.get_device_last_seen(user, "DEV").unwrap();
+        assert_eq!(ts, Some(1_000 + 10 * LAST_SEEN_GRANULARITY_MS));
+        assert_eq!(ip.as_deref(), Some("9.9.9.9"));
+
+        // Touching an id with no device record must NOT create a device row
+        // (the activity entry is an inert orphan; /devices never shows it).
+        db.touch_device_seen(user, "GHOST", 5_000, Some("1.2.3.4"))
+            .unwrap();
+        assert!(db.get_device(user, "GHOST").unwrap().is_none());
+    }
+
+    /// `delete_device` must cascade the last-seen row AND the device's
+    /// undelivered to-device queue. With delete-on-ACK delivery, a
+    /// logged-out device would otherwise leak its queue forever (nothing
+    /// will sync it to drain). A prefix-sharing sibling must survive.
+    #[test]
+    fn delete_device_cascades_last_seen_and_to_device() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        let user = db.get_or_create_nid("@alice:example.com").unwrap();
+
+        for d in ["AB", "ABC"] {
+            db.create_device(user, d).unwrap();
+            db.touch_device_seen(user, d, 1_000, Some("1.2.3.4"))
+                .unwrap();
+            db.queue_to_device(
+                user,
+                d,
+                "m.x",
+                "@alice:example.com",
+                &serde_json::json!({"k": 1}),
+            )
+            .unwrap();
+        }
+        let top = db.safe_stream_position();
+
+        db.delete_device(user, "AB").unwrap();
+
+        // "AB" fully reclaimed: record, last-seen, and to-device queue.
+        assert!(db.get_device(user, "AB").unwrap().is_none());
+        assert_eq!(db.get_device_last_seen(user, "AB").unwrap(), (None, None));
+        assert!(
+            db.get_to_device_messages_window(user, "AB", 0, top)
+                .unwrap()
+                .is_empty()
+        );
+
+        // "ABC" — the prefix sibling — is untouched on every axis.
+        assert!(db.get_device(user, "ABC").unwrap().is_some());
+        assert_eq!(
+            db.get_device_last_seen(user, "ABC").unwrap(),
+            (Some(1_000), Some("1.2.3.4".to_string()))
+        );
+        assert_eq!(
+            db.get_to_device_messages_window(user, "ABC", 0, top)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    /// To-device delivery is delete-on-ACK: a returned message survives
+    /// redelivery until the client syncs past it, and `ack_to_device_messages`
+    /// drops exactly the acknowledged prefix. The bug this guards: an
+    /// `m.key.verification.*` request lost forever when the first /sync that
+    /// carried it was dropped (the old delete-on-read).
+    #[test]
+    fn to_device_window_redelivers_until_acked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        let user = db.get_or_create_nid("@alice:example.com").unwrap();
+
+        let content = |i: u64| serde_json::json!({ "i": i });
+        db.queue_to_device(
+            user,
+            "DEV",
+            "m.key.verification.request",
+            "@alice:example.com",
+            &content(1),
+        )
+        .unwrap();
+        let p1 = db.safe_stream_position();
+        db.queue_to_device(
+            user,
+            "DEV",
+            "m.key.verification.request",
+            "@alice:example.com",
+            &content(2),
+        )
+        .unwrap();
+        db.queue_to_device(
+            user,
+            "DEV",
+            "m.key.verification.request",
+            "@alice:example.com",
+            &content(3),
+        )
+        .unwrap();
+        let top = db.safe_stream_position();
+
+        let ids = |msgs: &[Value]| {
+            let mut v: Vec<u64> = msgs
+                .iter()
+                .filter_map(|m| m["content"]["i"].as_u64())
+                .collect();
+            v.sort_unstable();
+            v
+        };
+
+        // Full window returns all three, in stream order.
+        let all = db
+            .get_to_device_messages_window(user, "DEV", 0, top)
+            .unwrap();
+        assert_eq!(ids(&all), vec![1, 2, 3]);
+
+        // Reading does NOT delete — a re-read returns the same set (this is
+        // the property the old delete-on-read violated).
+        let again = db
+            .get_to_device_messages_window(user, "DEV", 0, top)
+            .unwrap();
+        assert_eq!(ids(&again), vec![1, 2, 3]);
+
+        // Lower bound is exclusive: a since at the top yields nothing newer.
+        assert!(
+            db.get_to_device_messages_window(user, "DEV", top, top)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Ack everything up to p1 → only the first message is dropped; the
+        // rest are still pending and still in the (p1, top] window.
+        db.ack_to_device_messages(user, "DEV", p1).unwrap();
+        let remaining = db
+            .get_to_device_messages_window(user, "DEV", 0, top)
+            .unwrap();
+        assert_eq!(ids(&remaining), vec![2, 3]);
+
+        // Ack the rest → queue drains.
+        db.ack_to_device_messages(user, "DEV", top).unwrap();
+        assert!(
+            db.get_to_device_messages_window(user, "DEV", 0, top)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A device id that is a byte-prefix of another must not have its
+    /// to-device queue acked/read through the shorter id (the length
+    /// prefix in the key keeps the ranges distinct).
+    #[test]
+    fn to_device_window_no_prefix_bleed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        let user = db.get_or_create_nid("@alice:example.com").unwrap();
+
+        let c = serde_json::json!({"k": "v"});
+        db.queue_to_device(user, "AB", "m.x", "@alice:example.com", &c)
+            .unwrap();
+        db.queue_to_device(user, "ABC", "m.x", "@alice:example.com", &c)
+            .unwrap();
+        let top = db.safe_stream_position();
+
+        // Acking "AB" must not touch "ABC".
+        db.ack_to_device_messages(user, "AB", top).unwrap();
+        assert!(
+            db.get_to_device_messages_window(user, "AB", 0, top)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.get_to_device_messages_window(user, "ABC", 0, top)
+                .unwrap()
+                .len(),
+            1,
+            "ABC's queue must survive an AB ack"
+        );
     }
 
     /// `set_receipt` MUST bump the room's max-receipt stream position
