@@ -18,10 +18,27 @@ pub async fn list_devices(
     State(state): State<AppState>,
     user: AuthenticatedUser,
 ) -> Result<Json<Value>, ApiError> {
-    let devices = state
+    let raw = state
         .db
         .list_devices(user.user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let mut devices = Vec::with_capacity(raw.len());
+    for d in &raw {
+        let device_id = d
+            .get("device_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let (ts, ip) = state
+            .db
+            .get_device_last_seen(user.user_nid, device_id)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        devices.push(json!({
+            "device_id": device_id,
+            "display_name": d.get("display_name").cloned().unwrap_or(Value::Null),
+            "last_seen_ts": ts.map(Value::from).unwrap_or(Value::Null),
+            "last_seen_ip": ip.map(Value::String).unwrap_or(Value::Null),
+        }));
+    }
     Ok(Json(json!({"devices": devices})))
 }
 
@@ -40,11 +57,15 @@ pub async fn get_device(
         .get_device(user.user_nid, &device_id)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         .ok_or_else(|| ApiError(VelaError::NotFound("device not found".into())))?;
+    let (ts, ip) = state
+        .db
+        .get_device_last_seen(user.user_nid, &device_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     Ok(Json(json!({
         "device_id": device.get("device_id").cloned().unwrap_or_else(|| Value::String(device_id.clone())),
         "display_name": device.get("display_name").cloned().unwrap_or(Value::Null),
-        "last_seen_ip": device.get("last_seen_ip").cloned().unwrap_or(Value::Null),
-        "last_seen_ts": device.get("last_seen_ts").cloned().unwrap_or(Value::Null),
+        "last_seen_ip": ip.map(Value::String).unwrap_or(Value::Null),
+        "last_seen_ts": ts.map(Value::from).unwrap_or(Value::Null),
     })))
 }
 

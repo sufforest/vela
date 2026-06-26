@@ -30,6 +30,12 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     "tokens",
     "refresh_tokens",
     "devices",
+    // Per-device activity for GET /devices: `[user_nid_be:8] | device_id`
+    // -> `{ts, ip}`. Kept out of the `devices` record so the per-request
+    // `last_seen` write never read-modify-writes that record — that would
+    // race device deletion (resurrecting a zombie row) and device renames
+    // (clobbering display_name). `delete_device` cascades this entry.
+    "device_last_seen",
     "sync_tokens",
     "transactions",
     "account_data",
