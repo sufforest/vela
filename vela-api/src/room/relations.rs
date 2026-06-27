@@ -103,14 +103,11 @@ async fn handle(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         .ok_or_else(|| ApiError(VelaError::NotFound("room not found".into())))?;
 
-    // Membership check — match the rest of the read path.
-    let membership = state
-        .db
-        .get_membership(room_nid, user.user_nid)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    if membership.is_none() || membership == Some(0) {
-        return Err(VelaError::Forbidden("not a member of this room".into()).into());
-    }
+    // Membership + history-visibility gate — same rule as /messages.
+    // Rejects never-members and invite/knock-only callers (403), bounds
+    // departed (leave/ban) callers to their leave position, and filters
+    // each child by history-visibility below.
+    let gate = crate::room::messages::TimelineReadGate::resolve(&state, room_nid, user.user_nid)?;
 
     let parent_nid = state
         .db
@@ -176,9 +173,23 @@ async fn handle(
                 break;
             }
         }
+        // Advance the cursor over every scanned entry, even ones the gate
+        // hides, so a page that's entirely filtered still yields a
+        // next_batch and the client keeps paginating instead of stalling.
+        last_pos = Some(sp);
+        // Gate on the child's timeline position, not the relation-index `sp`:
+        // MSC2836-backfilled relations record `origin_server_ts` as their
+        // index pos, a different coordinate from the leave-cap, so reusing
+        // `sp` would wrongly hide them from a departed caller.
+        let child_pos = state
+            .db
+            .event_timeline_pos_of(child_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        if !gate.permits(&state, room_nid, user.user_nid, child_nid, child_pos)? {
+            continue;
+        }
         if let Some(ev) = load_client_event(&state, child_nid, &room_id)? {
             chunk.push(ev);
-            last_pos = Some(sp);
         }
     }
 
@@ -222,13 +233,7 @@ pub async fn threads_list(
         .get_nid(&room_id)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         .ok_or_else(|| ApiError(VelaError::NotFound("room not found".into())))?;
-    let membership = state
-        .db
-        .get_membership(room_nid, user.user_nid)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    if membership.is_none() || membership == Some(0) {
-        return Err(VelaError::Forbidden("not a member of this room".into()).into());
-    }
+    let gate = crate::room::messages::TimelineReadGate::resolve(&state, room_nid, user.user_nid)?;
 
     let limit = q.limit.unwrap_or(20).clamp(1, 100);
     let from = parse_stream_token(q.from.as_deref()).unwrap_or(u64::MAX);
@@ -269,6 +274,15 @@ pub async fn threads_list(
 
     let mut chunk = Vec::with_capacity(candidates.len());
     for (_latest_sp, root_nid) in candidates {
+        // Gate each thread root by history-visibility / leave-cap, keyed
+        // on the root's own timeline position.
+        let root_pos = state
+            .db
+            .event_timeline_pos_of(root_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        if !gate.permits(&state, room_nid, user.user_nid, root_nid, root_pos)? {
+            continue;
+        }
         if let Some(ev) = crate::room::messages::load_client_event_with_relations(
             &state,
             root_nid,
@@ -774,6 +788,97 @@ mod tests {
         .await
         .expect_err("non-member rejected");
         assert!(matches!(err, ApiError(VelaError::Forbidden(_))));
+    }
+
+    /// An invited (not joined) user must not read a room's relations —
+    /// matches /messages, which 403s invite/knock-only callers.
+    #[tokio::test]
+    async fn relations_rejects_invited_user() {
+        let (state, _tmp, room_id, room_nid, _alice_nid, parent_eid) = setup_room();
+        let bob_nid = state.db.get_or_create_nid("@bob:example.com").unwrap();
+        state.db.set_membership(room_nid, bob_nid, 2).unwrap(); // invite
+
+        let err = relations_with_query(
+            State(state.clone()),
+            AuthenticatedUser {
+                user_nid: bob_nid,
+                user_id: "@bob:example.com".into(),
+                device_id: "DEV".into(),
+                appservice_nid: None,
+            },
+            Path((room_id, parent_eid)),
+            Query(RelationsQuery::default()),
+        )
+        .await
+        .expect_err("invited user rejected");
+        assert!(matches!(err, ApiError(VelaError::Forbidden(_))));
+    }
+
+    /// A departed user (left/ban) may read relations posted while they
+    /// were a member, but NOT ones added after they left — the leave-cap.
+    #[tokio::test]
+    async fn relations_caps_departed_user_at_leave() {
+        let (state, _tmp, room_id, room_nid, alice_nid, parent_eid) = setup_room();
+        let bob_nid = state.db.get_or_create_nid("@bob:example.com").unwrap();
+        state.db.set_membership(room_nid, bob_nid, 1).unwrap(); // bob joins
+
+        persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            301,
+            "$c_before",
+            "m.annotation",
+            &parent_eid,
+        );
+
+        // bob leaves — set_membership records the leave stream position.
+        state.db.set_membership(room_nid, bob_nid, 0).unwrap();
+
+        persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            302,
+            "$c_after",
+            "m.annotation",
+            &parent_eid,
+        );
+
+        let resp = relations_with_query(
+            State(state.clone()),
+            AuthenticatedUser {
+                user_nid: bob_nid,
+                user_id: "@bob:example.com".into(),
+                device_id: "DEV".into(),
+                appservice_nid: None,
+            },
+            Path((room_id, parent_eid)),
+            Query(RelationsQuery::default()),
+        )
+        .await
+        .expect("departed user may read pre-leave relations");
+        let ids: Vec<&str> = resp
+            .0
+            .get("chunk")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.get("event_id").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            ids.contains(&"$c_before"),
+            "pre-leave relation must be visible: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"$c_after"),
+            "post-leave relation must be hidden: {ids:?}"
+        );
     }
 
     #[tokio::test]

@@ -764,15 +764,12 @@ pub async fn event_relationships_cs(
         return Err(VelaError::NotFound("event not found".into()).into());
     };
 
-    let membership = state
-        .db
-        .get_membership(room_nid, user.user_nid)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    if membership.is_none() || membership == Some(0) {
-        // Spec privacy rule: don't distinguish "room doesn't exist"
-        // from "not a member" — both 403, matching MSC2675.
-        return Err(VelaError::Forbidden("not a member of this room".into()).into());
-    }
+    // Membership + history-visibility gate (same rule as /messages).
+    // Rejects never-members and invite/knock-only callers (the spec
+    // privacy rule: a non-member and a missing room both surface as 403,
+    // matching MSC2675), and bounds departed callers — applied per event
+    // to the walk result below.
+    let gate = crate::room::messages::TimelineReadGate::resolve(&state, room_nid, user.user_nid)?;
 
     // If the start event isn't on disk, federation-backfill it now.
     // The peer's response carries the whole reachable subtree, so a
@@ -804,6 +801,37 @@ pub async fn event_relationships_cs(
         }
         result = walk(&state, &room_id, start_nid, &body)?;
     }
+
+    // Drop events the caller may not see (history-visibility + leave-cap),
+    // keeping `events` and `event_ids` index-aligned for bundle_unsigned.
+    // Filtering after the walk is intentional: traversal still passes
+    // through hidden nodes to reach visible descendants, we just omit the
+    // hidden ones from the response.
+    let mut kept_events = Vec::with_capacity(result.events.len());
+    let mut kept_ids = Vec::with_capacity(result.event_ids.len());
+    for (ev, eid) in result.events.into_iter().zip(result.event_ids) {
+        let visible = if eid.is_empty() {
+            false
+        } else if let Some(nid) = state
+            .db
+            .get_event_nid_by_id(&eid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        {
+            let sp = state
+                .db
+                .event_timeline_pos_of(nid)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+            gate.permits(&state, room_nid, user.user_nid, nid, sp)?
+        } else {
+            false
+        };
+        if visible {
+            kept_events.push(ev);
+            kept_ids.push(eid);
+        }
+    }
+    result.events = kept_events;
+    result.event_ids = kept_ids;
 
     bundle_unsigned(&state, &mut result.events, &result.event_ids)?;
     Ok(Json(json!({
@@ -1066,6 +1094,101 @@ mod tests {
         .unwrap();
 
         (room_nid, root_nid)
+    }
+
+    /// The CS handler bounds a departed (leave/ban) caller to their leave
+    /// position: they read children posted while they were a member, but
+    /// not ones added after they left. Exercises the post-walk gate.
+    #[tokio::test]
+    async fn event_relationships_caps_departed_user_at_leave() {
+        let (state, _tmp) = build_test_state();
+        let db = state.db.clone();
+        let room_id = "!er_cap:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        let bob_nid = db.get_or_create_nid("@bob:example.com").unwrap();
+        let type_msg = db.get_or_create_nid("m.room.message").unwrap();
+        let rel = db.get_or_create_nid("io.example.child").unwrap();
+
+        let persist = |eid: &str, nid: u64, parent: Option<&str>| -> u64 {
+            let mut content = serde_json::Map::new();
+            content.insert("body".into(), json!("x"));
+            if let Some(p) = parent {
+                content.insert(
+                    "m.relates_to".into(),
+                    json!({"rel_type": "io.example.child", "event_id": p}),
+                );
+            }
+            let body = json!({
+                "type": "m.room.message", "sender": "@alice:example.com",
+                "room_id": room_id, "content": Value::Object(content),
+                "origin_server_ts": nid, "depth": nid,
+                "prev_events": [], "auth_events": [],
+            });
+            db.persist_event(
+                nid,
+                eid,
+                room_nid,
+                type_msg,
+                alice_nid,
+                0,
+                nid,
+                nid,
+                &serde_json::to_vec(&body).unwrap(),
+                &[],
+                &[],
+                false,
+                false,
+            )
+            .unwrap()
+        };
+
+        db.set_membership(room_nid, bob_nid, 1).unwrap(); // bob joins
+        persist("$er_root", 10, None);
+        let before_pos = persist("$er_before", 11, Some("$er_root"));
+        db.record_relation(
+            10, before_pos, 11, rel, type_msg, room_nid, alice_nid, false, true,
+        )
+        .unwrap();
+        // bob leaves — records the leave stream position between the two children.
+        db.set_membership(room_nid, bob_nid, 0).unwrap();
+        let after_pos = persist("$er_after", 12, Some("$er_root"));
+        db.record_relation(
+            10, after_pos, 12, rel, type_msg, room_nid, alice_nid, false, true,
+        )
+        .unwrap();
+
+        let user = AuthenticatedUser {
+            user_nid: bob_nid,
+            user_id: "@bob:example.com".into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        };
+        let body = EventRelationshipsRequest {
+            event_id: "$er_root".into(),
+            ..Default::default()
+        };
+        let resp = event_relationships_cs(State(state.clone()), user, Json(body))
+            .await
+            .expect("departed user reads pre-leave subtree");
+        let ids: Vec<&str> = resp
+            .0
+            .get("events")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.get("event_id").and_then(|v| v.as_str()))
+            .collect();
+        assert!(ids.contains(&"$er_root"), "root visible: {ids:?}");
+        assert!(
+            ids.contains(&"$er_before"),
+            "pre-leave child visible: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"$er_after"),
+            "post-leave child must be hidden: {ids:?}"
+        );
     }
 
     /// Default down-walk from the root returns root + both children
