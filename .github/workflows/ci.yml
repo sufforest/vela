@@ -67,10 +67,18 @@ jobs:
         run: cargo test --workspace --all-targets --locked
 
   msrv:
-    # Verifies the project still compiles under the declared minimum
-    # supported Rust version (rust-version in Cargo.toml). Drift here is
+    # Verifies the SHIPPED code still compiles under the declared minimum
+    # supported Rust version (rust-version in Cargo.toml), which must stay
+    # <= the rust:1.93 base both Dockerfiles build on — otherwise a dep
+    # bump that raises the floor breaks the image build. Drift here is
     # silent without this job. Uses `cargo build` (not `check`) so codegen
     # errors surface, not just type errors.
+    #
+    # Deliberately NOT `--all-targets`: that additionally links the ~40
+    # integration-test binaries, which (a) are never shipped, so their
+    # 1.93 compat is irrelevant, and (b) under that link storm rust-lld
+    # crashes intermittently on the runner. Building lib + binaries is
+    # what the Docker image actually does, and is the floor that matters.
     name: cargo build (MSRV 1.93)
     runs-on: ubuntu-latest
     steps:
@@ -87,8 +95,8 @@ jobs:
         with:
           shared-key: workspace-msrv
 
-      - name: cargo build --workspace --all-targets
-        run: cargo build --workspace --all-targets --locked
+      - name: cargo build --workspace
+        run: cargo build --workspace --locked
 
   lint:
     name: cargo clippy + rustfmt
