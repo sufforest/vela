@@ -648,7 +648,7 @@ async fn thumbnail_inner(
     //   - alpha channel preserved (some chat clients render PNGs for
     //     stickers and emoji),
     //   - decoders are universally available.
-    let img = image::load_from_memory(&buf)
+    let img = decode_image_limited(&buf)
         .map_err(|e| ApiError(VelaError::Unknown(format!("decode image: {e}"))))?;
     let resized = match method {
         "crop" => crop_to(&img, req_w, req_h),
@@ -683,7 +683,7 @@ pub(crate) fn resize_to_png_thumbnail(
 ) -> Result<Vec<u8>, image::ImageError> {
     let w = width.clamp(1, 1600);
     let h = height.clamp(1, 1600);
-    let img = image::load_from_memory(bytes)?;
+    let img = decode_image_limited(bytes)?;
     let resized = match method {
         "crop" => crop_to(&img, w, h),
         _ => img.thumbnail(w, h),
@@ -691,6 +691,22 @@ pub(crate) fn resize_to_png_thumbnail(
     let mut out = Vec::new();
     resized.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
     Ok(out)
+}
+
+/// Decode an image with explicit resource limits. A "decompression bomb" is
+/// a tiny compressed file that expands into an enormous bitmap; the decoder
+/// default caps allocation at 512 MiB and places NO ceiling on dimensions,
+/// so we tighten both. Bounds the worst-case memory per thumbnail request.
+fn decode_image_limited(bytes: &[u8]) -> Result<image::DynamicImage, image::ImageError> {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(image::ImageError::IoError)?;
+    reader.limits(limits);
+    reader.decode()
 }
 
 /// `method=crop` returns an image of exactly the requested

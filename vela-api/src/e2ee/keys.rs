@@ -197,16 +197,26 @@ pub async fn query_keys(
     // Persist the per-user pieces of each response into the cache so
     // the next /keys/query for the same user short-circuits above.
     if !by_remote.is_empty() {
-        let mut futures = Vec::with_capacity(by_remote.len());
-        for (server, device_keys_for_server) in by_remote {
-            let body = json!({"device_keys": device_keys_for_server});
-            let client = state.federation_client.clone();
-            futures.push(async move {
-                let resp = client.query_user_keys(&server, body).await;
-                (server, resp)
-            });
-        }
-        for (server, resp) in futures::future::join_all(futures).await {
+        use futures::StreamExt;
+        // Bound the outbound fan-out. A single client request can name users
+        // on arbitrarily many remote servers; firing one federation call per
+        // server concurrently turns one request into a connection/DNS
+        // amplifier. Cap how many run at once.
+        const MAX_CONCURRENT_REMOTE_KEY_QUERIES: usize = 16;
+        let results = futures::stream::iter(by_remote.into_iter().map(
+            |(server, device_keys_for_server)| {
+                let body = json!({ "device_keys": device_keys_for_server });
+                let client = state.federation_client.clone();
+                async move {
+                    let resp = client.query_user_keys(&server, body).await;
+                    (server, resp)
+                }
+            },
+        ))
+        .buffer_unordered(MAX_CONCURRENT_REMOTE_KEY_QUERIES)
+        .collect::<Vec<_>>()
+        .await;
+        for (server, resp) in results {
             match resp {
                 Ok(v) => {
                     persist_remote_keys_response_to_cache(&state, &v);
@@ -502,18 +512,25 @@ pub async fn claim_keys(
         }
     }
 
-    // One federation call per remote server, fan out concurrently.
+    // One federation call per remote server. Bound the concurrency for the
+    // same reason as /keys/query: a client request can name users on many
+    // servers, and unbounded fan-out is a connection/DNS amplifier.
     if !by_remote.is_empty() {
-        let mut futures = Vec::with_capacity(by_remote.len());
-        for (server, otks_for_server) in by_remote {
-            let body = json!({"one_time_keys": otks_for_server});
-            let client = state.federation_client.clone();
-            futures.push(async move {
-                let resp = client.claim_user_keys(&server, body).await;
-                (server, resp)
-            });
-        }
-        for (server, resp) in futures::future::join_all(futures).await {
+        use futures::StreamExt;
+        const MAX_CONCURRENT_REMOTE_KEY_CLAIMS: usize = 16;
+        let results =
+            futures::stream::iter(by_remote.into_iter().map(|(server, otks_for_server)| {
+                let body = json!({ "one_time_keys": otks_for_server });
+                let client = state.federation_client.clone();
+                async move {
+                    let resp = client.claim_user_keys(&server, body).await;
+                    (server, resp)
+                }
+            }))
+            .buffer_unordered(MAX_CONCURRENT_REMOTE_KEY_CLAIMS)
+            .collect::<Vec<_>>()
+            .await;
+        for (server, resp) in results {
             match resp {
                 Ok(v) => merge_remote_claim_response(v, &mut result),
                 Err(e) => {
@@ -709,6 +726,7 @@ pub async fn upload_signing_keys(
             }
         });
     if !existing.is_empty() && any_change {
+        crate::auth::uia::require_uia_identifier_matches(&state, &body, &user.user_id)?;
         crate::auth::uia::require_password_auth(&state, &body)?;
     }
 
