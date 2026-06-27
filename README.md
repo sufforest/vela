@@ -6,13 +6,17 @@ A self-hostable Matrix homeserver written in Rust.
 
 ## What it is
 
-A Matrix homeserver targeting Room Version 12. Single binary,
-embedded storage.
+A Matrix homeserver targeting Room Version 12 — single binary, embedded
+storage (RocksDB). Federation, end-to-end encryption (cross-signing, key
+backup, dehydrated devices), both `/sync` and sliding sync, and a sandboxed
+WebAssembly extension system for policy and bot plugins. See
+[`CHANGELOG.md`](CHANGELOG.md) for the feature detail per release.
 
 ## Status
 
-0.1.1. See [`CHANGELOG.md`](CHANGELOG.md) for what's in this release
-and what's known to be missing.
+Actively developed. The [releases](https://github.com/sufforest/vela/releases)
+and [`CHANGELOG.md`](CHANGELOG.md) are the source of truth for what's shipped
+in each version and what's known to be missing.
 
 ## Quickstart (Docker)
 

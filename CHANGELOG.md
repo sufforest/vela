@@ -8,6 +8,61 @@ minor versions.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-06-27
+
+A sandboxed WebAssembly extension platform, plus a round of federation,
+end-to-end-encryption, and client-compatibility hardening.
+
+### Added
+
+- **Extension platform.** Sandboxed WebAssembly plugins (wasmtime + the
+  Component Model) hook the server at well-defined points without forking it.
+  Decision points — `check_registration`, `check_login`, `check_media_upload`,
+  `check_profile_update`, `check_room_create` — allow / deny / modify a
+  request; `on_event` observes events asynchronously; `filter_sync_event`
+  shapes what a client sees in `/sync`; inbound federated events can be
+  soft-failed by a plugin. Plugins get three capabilities — structured
+  logging, an `emit-event` bot channel, and per-plugin key/value state — all
+  behind a manifest whose grants are reconciled against the component's actual
+  imports before it loads. Per-plugin fuel, memory, and wall-clock limits;
+  hot-reload on SIGHUP. Ships an SDK and example plugins.
+- **Third-party protocols + matrix-rtc transports.** `GET
+  /_matrix/client/v3/thirdparty/protocols` and the MSC4143 `rtc/transports`
+  discovery endpoint.
+
+### Security
+
+- **`/keys/query` no longer leaks other users' `user_signing_keys`** — they
+  are returned only for a self-query, per spec. (Cross-user leakage corrupted
+  the client trust model and showed verified users as untrusted.)
+- **`/preview_url` SSRF guard.** The URL-preview fetch refuses targets that
+  resolve to private/internal addresses, re-validates each redirect hop, pins
+  the connection to the validated address, and caps the response body.
+  Operators with internal preview targets opt out via
+  `[media] url_preview_allow_private_ips`.
+- **Cross-signing signature uploads are scoped to the caller** — a client can
+  no longer fold signatures attributed to another user, or into another user's
+  device/signing keys (cross-user signing is limited to the master key). The
+  cross-signing-key UIA gate keys off key material, not signatures.
+- Cap federation response bodies (key server 256 KiB, general 100 MiB).
+
+### Fixed
+
+- **Federation signing keys.** Refetch a remote server's keys when a signature
+  references an unknown key id instead of serving a stale cached key; accept
+  events signed with a server's rotated-out keys within their validity window.
+- **E2EE / devices.** Preserve cross-signing signatures across a key re-upload
+  (a verified device no longer reverts to unverified); track device
+  `last_seen`; deliver to-device messages delete-on-ack on both `/sync` and
+  sliding sync (a dropped sync can't lose a verification request); notify a
+  user's other devices and room-mates when a device is deleted.
+- **Client compatibility.** Stop a `/sync` busy-loop on lazy-loaded
+  incremental syncs; emit the MSC4222 `state_after` under the key matching the
+  client's opt-in param (rooms no longer render as "v1"/empty in Element);
+  keep room heroes' membership through lazy-load (fixes "Empty room" on fresh
+  login); align the `/login` `well_known` base URL with discovery; return
+  `M_UNRECOGNIZED` for auth-metadata when delegated auth is off.
+
 ## [0.2.0] — 2026-06-13
 
 Spec-maturity milestone: faster joins (MSC3706/MSC3902), delegated auth
