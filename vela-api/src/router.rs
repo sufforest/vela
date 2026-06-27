@@ -66,6 +66,14 @@ pub struct ServerConfig {
     /// Maximum upload size in bytes. Enforced both at the global body
     /// limit layer and inside the media upload handler. Default 50 MiB.
     pub max_upload_size: u64,
+    /// When false (default), `/preview_url` refuses to fetch URLs that
+    /// resolve to non-public addresses (loopback, RFC1918, link-local —
+    /// including the `169.254.169.254` cloud-metadata endpoint), closing
+    /// the SSRF vector where a client makes the server fetch internal
+    /// services. Operators whose legitimate preview targets live on an
+    /// internal network (docker/k8s/intranet) can set this true to opt
+    /// out of the guard. Secure by default.
+    pub url_preview_allow_private_ips: bool,
     /// When `/createRoom` is called without `m.room.encryption` in
     /// `initial_state`, vela may auto-inject it for some presets per
     /// this policy. Spec-clean: clients that explicitly include

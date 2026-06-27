@@ -578,7 +578,7 @@ fn host_only(server_name: &str) -> &str {
 /// - IPv6 loopback (::1), link-local (fe80::/10), ULA (fc00::/7),
 ///   unspecified (::), multicast (ff00::/8), IPv4-mapped/-compatible
 ///   ranges that wrap any of the above.
-fn is_blocked_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_blocked_v4(v4),
         IpAddr::V6(v6) => {

@@ -156,6 +156,7 @@ impl Harness {
                 registration_enabled: overrides.registration_enabled,
                 registration_token: overrides.registration_token,
                 max_upload_size: overrides.max_upload_size,
+                url_preview_allow_private_ips: false,
                 encrypt_by_default: overrides.encrypt_by_default,
                 allow_public_rooms_over_federation: false,
                 user_directory_federate: false,

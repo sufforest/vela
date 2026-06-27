@@ -743,29 +743,20 @@ pub async fn preview_url(
         .url
         .ok_or_else(|| ApiError(VelaError::BadJson("missing `url` query parameter".into())))?;
 
-    // Conservative HTTP client: short timeout, no redirects across
-    // hosts beyond a hard cap, refuse non-HTTP(S) URLs. Don't surface
-    // any internal addresses (no SSRF guard here yet — leave that to
-    // the operator's network policy).
-    let client = preview_http_client()
-        .map_err(|e| ApiError(VelaError::Unknown(format!("http client: {e}"))))?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| ApiError(VelaError::Unknown(format!("fetching {url} failed: {e}"))))?;
-    let final_url = resp.url().to_string();
-    let content_type = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let bytes = resp.bytes().await.map_err(|e| {
-        ApiError(VelaError::Unknown(format!(
-            "reading body of {url} failed: {e}"
-        )))
-    })?;
+    // SSRF-guarded fetch: refuses non-public targets (loopback / RFC1918 /
+    // link-local incl. 169.254.169.254 cloud-metadata), pins the connection
+    // to the validated IPs, re-validates each redirect hop, and caps the
+    // body. The client-supplied `url` must never make the server reach into
+    // its own network. Returns a uniform error so we don't leak whether an
+    // internal host exists.
+    let allow_private = state.config.url_preview_allow_private_ips;
+    let (final_url, content_type, bytes) =
+        fetch_preview(&url, allow_private).await.map_err(|e| {
+            tracing::debug!(%url, error = %e, "url preview fetch refused");
+            ApiError(VelaError::Unknown(
+                "could not fetch the requested URL".into(),
+            ))
+        })?;
 
     // If the URL points directly at an image, the spec wants us to
     // upload it and return the size + dimensions under the og:* keys
@@ -799,13 +790,7 @@ pub async fn preview_url(
     // mxc://.
     if let Some(raw_img) = metas.get("og:image")
         && let Some(img_url) = resolve_relative(&final_url, raw_img)
-        && let Ok(img_resp) = client.get(&img_url).send().await
-        && let Some(img_ct) = img_resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-        && let Ok(img_bytes) = img_resp.bytes().await
+        && let Ok((_img_final, img_ct, img_bytes)) = fetch_preview(&img_url, allow_private).await
         && let Ok((mxc, size, w, h)) = ingest_remote_image(&state, &user, &img_bytes, &img_ct).await
     {
         out.insert("og:image".into(), json!(mxc));
@@ -828,12 +813,131 @@ pub struct PreviewUrlQuery {
     pub ts: Option<u64>,
 }
 
-fn preview_http_client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent("vela-preview/0.1")
-        .build()
+/// Max bytes vela will read from a preview target (HTML page or image).
+const PREVIEW_MAX_BYTES: usize = 10 * 1024 * 1024;
+/// Max redirect hops followed during a preview fetch.
+const PREVIEW_MAX_REDIRECTS: usize = 5;
+
+/// Fetch a URL for link preview with SSRF protection and a hard body cap.
+///
+/// For the initial request and every redirect hop: refuse non-http(s),
+/// resolve the host and require all addresses be public (unless
+/// `allow_private`), and pin the connection to those validated addresses so
+/// a DNS-rebinding race can't swap in an internal address between the check
+/// and the connect. Follows at most `PREVIEW_MAX_REDIRECTS` and reads at
+/// most `PREVIEW_MAX_BYTES`. Returns `(final_url, content_type, body)`.
+async fn fetch_preview(url: &str, allow_private: bool) -> Result<(String, String, Bytes), String> {
+    let mut current = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    for _ in 0..=PREVIEW_MAX_REDIRECTS {
+        if current.scheme() != "http" && current.scheme() != "https" {
+            return Err(format!("scheme `{}` not allowed", current.scheme()));
+        }
+        let host = current
+            .host_str()
+            .ok_or_else(|| "URL has no host".to_string())?
+            .to_string();
+        let port = current.port_or_known_default().unwrap_or(443);
+        let addrs = resolve_public_or_reject(&host, port, allow_private).await?;
+
+        // Pin to the validated addresses (reqwest won't re-resolve) and
+        // disable automatic redirects so we can re-validate each hop.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent("vela-preview/0.1")
+            .resolve_to_addrs(&host, &addrs)
+            .build()
+            .map_err(|e| format!("http client: {e}"))?;
+
+        let resp = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
+
+        if resp.status().is_redirection() {
+            let loc = resp
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| "redirect without Location".to_string())?;
+            current = current
+                .join(loc)
+                .map_err(|e| format!("bad redirect target: {e}"))?;
+            continue;
+        }
+
+        let final_url = resp.url().to_string();
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = read_body_capped(resp, PREVIEW_MAX_BYTES).await?;
+        return Ok((final_url, content_type, body));
+    }
+    Err("too many redirects".to_string())
+}
+
+/// Resolve `host:port` and require every resolved address be public unless
+/// `allow_private`. Returns the socket addresses (for connection pinning).
+/// Fails CLOSED: an empty resolution or any non-public address is rejected.
+async fn resolve_public_or_reject(
+    host: &str,
+    port: u16,
+    allow_private: bool,
+) -> Result<Vec<std::net::SocketAddr>, String> {
+    // `Url::host_str()` brackets IPv6 literals (`[::1]`); strip them so the
+    // literal parses and the unbracketed form is handed to the resolver.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        if !allow_private && crate::federation::federation_resolver::is_blocked_ip(ip) {
+            return Err(format!("host `{host}` is not a public address"));
+        }
+        return Ok(vec![std::net::SocketAddr::new(ip, port)]);
+    }
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((bare, port))
+        .await
+        .map_err(|e| format!("DNS lookup failed: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("host `{host}` did not resolve"));
+    }
+    if !allow_private {
+        for sa in &addrs {
+            if crate::federation::federation_resolver::is_blocked_ip(sa.ip()) {
+                return Err(format!("host `{host}` resolves to a non-public address"));
+            }
+        }
+    }
+    Ok(addrs)
+}
+
+/// Read a response body, failing if it exceeds `cap` bytes — checks the
+/// advertised Content-Length first, then enforces during streaming so a
+/// lying or chunked body can't blow past the cap.
+async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> Result<Bytes, String> {
+    if let Some(len) = resp.content_length()
+        && len as usize > cap
+    {
+        return Err(format!("response too large: {len} > {cap}"));
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("read failed: {e}"))?
+    {
+        if buf.len() + chunk.len() > cap {
+            return Err("response exceeded size cap".to_string());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buf))
 }
 
 /// Parse the bytes as an image, save it via the regular media store,
@@ -1114,5 +1218,116 @@ mod media_extension_tests {
         .await
         .expect("clean upload allowed");
         assert!(ok.0.get("content_uri").is_some());
+    }
+}
+
+#[cfg(test)]
+mod preview_ssrf_tests {
+    use super::*;
+
+    /// The SSRF guard refuses every flavour of internal/reserved address.
+    #[tokio::test]
+    async fn rejects_internal_ip_literals() {
+        for bad in [
+            "127.0.0.1",       // loopback
+            "169.254.169.254", // link-local / cloud metadata
+            "10.0.0.5",        // RFC1918
+            "192.168.1.1",     // RFC1918
+            "100.64.0.1",      // CGNAT
+            "0.0.0.0",         // unspecified
+            "[::1]",           // v6 loopback (bracketed, as host_str yields)
+            "[fe80::1]",       // v6 link-local (bracketed)
+            "[::ffff:7f00:1]", // v4-mapped loopback (bracketed)
+        ] {
+            assert!(
+                resolve_public_or_reject(bad, 80, false).await.is_err(),
+                "{bad} must be rejected by the SSRF guard"
+            );
+        }
+    }
+
+    /// A public literal passes (v4 and bracketed v6); the operator opt-out
+    /// re-permits internal.
+    #[tokio::test]
+    async fn allows_public_and_honours_optout() {
+        assert!(
+            resolve_public_or_reject("8.8.8.8", 443, false)
+                .await
+                .is_ok()
+        );
+        assert!(
+            resolve_public_or_reject("[2606:4700::1111]", 443, false)
+                .await
+                .is_ok(),
+            "a public IPv6 literal must be accepted"
+        );
+        assert!(
+            resolve_public_or_reject("127.0.0.1", 80, true)
+                .await
+                .is_ok(),
+            "allow_private must re-permit internal targets"
+        );
+    }
+
+    /// Non-http(s) schemes are refused before any connection.
+    #[tokio::test]
+    async fn rejects_non_http_scheme() {
+        assert!(fetch_preview("file:///etc/passwd", false).await.is_err());
+        assert!(fetch_preview("gopher://example.com/", false).await.is_err());
+    }
+
+    /// End to end: a loopback target (wiremock binds 127.0.0.1) is blocked
+    /// by default and fetched only when the operator opts in.
+    #[tokio::test]
+    async fn blocks_loopback_target_unless_opted_in() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("<html>ok</html>", "text/html"))
+            .mount(&server)
+            .await;
+        let url = server.uri();
+
+        assert!(
+            fetch_preview(&url, false).await.is_err(),
+            "loopback target must be blocked by default"
+        );
+        let (_final, ct, body) = fetch_preview(&url, true)
+            .await
+            .expect("allowed with opt-in");
+        assert!(ct.starts_with("text/html"), "unexpected content-type: {ct}");
+        assert_eq!(&body[..], b"<html>ok</html>");
+    }
+
+    /// Redirects are followed manually and each hop is re-validated; the
+    /// final body comes back.
+    #[tokio::test]
+    async fn follows_validated_redirect() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/a"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/b"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/b"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_string("final"),
+            )
+            .mount(&server)
+            .await;
+
+        let (final_url, _ct, body) = fetch_preview(&format!("{}/a", server.uri()), true)
+            .await
+            .expect("redirect followed");
+        assert!(final_url.ends_with("/b"));
+        assert_eq!(&body[..], b"final");
     }
 }

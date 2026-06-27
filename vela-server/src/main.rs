@@ -506,6 +506,10 @@ struct MediaSection {
     backend: String,
     /// S3 configuration. Only consulted when `backend = "s3"`.
     s3: Option<S3MediaSection>,
+    /// Allow `/preview_url` to fetch URLs resolving to private/internal
+    /// addresses. Default false (SSRF guard on). Set true only on
+    /// docker/k8s/intranet deployments whose preview targets are internal.
+    url_preview_allow_private_ips: bool,
 }
 
 impl Default for MediaSection {
@@ -514,6 +518,7 @@ impl Default for MediaSection {
             max_upload_size: "50MB".to_string(),
             backend: "fs".to_string(),
             s3: None,
+            url_preview_allow_private_ips: false,
         }
     }
 }
@@ -1482,6 +1487,7 @@ fn main() -> anyhow::Result<()> {
                 registration_enabled: config.registration.enabled,
                 registration_token: config.registration.token.clone(),
                 max_upload_size: parse_size(&config.media.max_upload_size)?,
+                url_preview_allow_private_ips: config.media.url_preview_allow_private_ips,
                 encrypt_by_default: parse_encrypt_policy(&config.room_defaults.encrypt_by_default)?,
                 allow_public_rooms_over_federation: config
                     .directory
