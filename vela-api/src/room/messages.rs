@@ -1531,6 +1531,92 @@ pub(crate) fn current_history_visibility(
         .to_string())
 }
 
+/// Read-gate for a room's timeline events, shared by the per-event read
+/// paths (`/relations`, `/event_relationships`, …). Mirrors what
+/// `get_messages` does inline: reject callers not entitled to the room's
+/// timeline, bound departed (leave/ban) callers to their leave position,
+/// and apply the history-visibility per-event check. Centralising it
+/// keeps every read endpoint enforcing the same rule.
+pub(crate) struct TimelineReadGate {
+    membership: Option<u8>,
+    /// Departed callers (leave/ban) only see events at or before this
+    /// stream position; `None` for currently-joined callers (no cap).
+    leave_cap: Option<u64>,
+    visibility: String,
+    needs_hv_filter: bool,
+}
+
+impl TimelineReadGate {
+    /// Resolve the caller's gate, or `Err(Forbidden)` when they may not
+    /// read the room's timeline at all — never a member, or invite/knock
+    /// only (same rule as `/messages`; encoding 1=join, 0=leave, 2=invite,
+    /// 3=ban).
+    pub(crate) fn resolve(
+        state: &AppState,
+        room_nid: u64,
+        user_nid: u64,
+    ) -> Result<Self, ApiError> {
+        let membership = state
+            .db
+            .get_membership(room_nid, user_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        let leave_cap: Option<u64> = match membership {
+            Some(1) => None,
+            Some(0) | Some(3) => state
+                .db
+                .get_user_room_membership_pos(user_nid, room_nid)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?,
+            _ => return Err(VelaError::Forbidden("not a member of this room".into()).into()),
+        };
+        let visibility = current_history_visibility(state, room_nid)?;
+        let needs_hv_filter = match visibility.as_str() {
+            "world_readable" => false,
+            "joined" | "invited" => true,
+            _ => !matches!(membership, Some(0) | Some(1)),
+        };
+        Ok(Self {
+            membership,
+            leave_cap,
+            visibility,
+            needs_hv_filter,
+        })
+    }
+
+    /// Whether `user_nid` may read `event_nid`. `stream_pos` is the
+    /// event's timeline position, used to enforce the leave-cap for
+    /// departed callers; a capped caller is denied when it's `None`
+    /// (an event with no timeline position is post-membership noise we
+    /// fail closed on).
+    pub(crate) fn permits(
+        &self,
+        state: &AppState,
+        room_nid: u64,
+        user_nid: u64,
+        event_nid: u64,
+        stream_pos: Option<u64>,
+    ) -> Result<bool, ApiError> {
+        if let Some(cap) = self.leave_cap {
+            match stream_pos {
+                Some(sp) if sp <= cap => {}
+                _ => return Ok(false),
+            }
+        }
+        if self.needs_hv_filter
+            && !history_visibility_permits(
+                state,
+                room_nid,
+                user_nid,
+                self.membership,
+                &self.visibility,
+                event_nid,
+            )?
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
 /// Returns true if the caller is permitted to read `event_nid` under
 /// the given history-visibility setting. Implements the four spec
 /// modes; a user with no membership at all is denied for everything
