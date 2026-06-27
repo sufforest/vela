@@ -888,13 +888,19 @@ async fn resolve_public_or_reject(
     port: u16,
     allow_private: bool,
 ) -> Result<Vec<std::net::SocketAddr>, String> {
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+    // `Url::host_str()` brackets IPv6 literals (`[::1]`); strip them so the
+    // literal parses and the unbracketed form is handed to the resolver.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
         if !allow_private && crate::federation::federation_resolver::is_blocked_ip(ip) {
             return Err(format!("host `{host}` is not a public address"));
         }
         return Ok(vec![std::net::SocketAddr::new(ip, port)]);
     }
-    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((bare, port))
         .await
         .map_err(|e| format!("DNS lookup failed: {e}"))?
         .collect();
@@ -1229,8 +1235,9 @@ mod preview_ssrf_tests {
             "192.168.1.1",     // RFC1918
             "100.64.0.1",      // CGNAT
             "0.0.0.0",         // unspecified
-            "::1",             // v6 loopback
-            "fe80::1",         // v6 link-local
+            "[::1]",           // v6 loopback (bracketed, as host_str yields)
+            "[fe80::1]",       // v6 link-local (bracketed)
+            "[::ffff:7f00:1]", // v4-mapped loopback (bracketed)
         ] {
             assert!(
                 resolve_public_or_reject(bad, 80, false).await.is_err(),
@@ -1239,13 +1246,20 @@ mod preview_ssrf_tests {
         }
     }
 
-    /// A public literal passes; the operator opt-out re-permits internal.
+    /// A public literal passes (v4 and bracketed v6); the operator opt-out
+    /// re-permits internal.
     #[tokio::test]
     async fn allows_public_and_honours_optout() {
         assert!(
             resolve_public_or_reject("8.8.8.8", 443, false)
                 .await
                 .is_ok()
+        );
+        assert!(
+            resolve_public_or_reject("[2606:4700::1111]", 443, false)
+                .await
+                .is_ok(),
+            "a public IPv6 literal must be accepted"
         );
         assert!(
             resolve_public_or_reject("127.0.0.1", 80, true)

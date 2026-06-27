@@ -80,6 +80,12 @@ enabled = false
 [federation]
 private_ip_block = false
 
+# TestUrlPreview serves the preview target from an internal Docker
+# address; the default /preview_url SSRF guard would refuse it. Same
+# reasoning as private_ip_block above.
+[media]
+url_preview_allow_private_ips = true
+
 # Complement drops one YAML per test-defined Application Service at
 # this path before starting the container. Loading them at boot is
 # how Synapse/Dendrite pick up the same registrations.
