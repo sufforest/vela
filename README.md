@@ -6,11 +6,13 @@ A self-hostable Matrix homeserver written in Rust.
 
 ## What it is
 
-A Matrix homeserver targeting Room Version 12 — single binary, embedded
-storage (RocksDB). Federation, end-to-end encryption (cross-signing, key
-backup, dehydrated devices), both `/sync` and sliding sync, and a sandboxed
-WebAssembly extension system for policy and bot plugins. See
-[`CHANGELOG.md`](CHANGELOG.md) for the feature detail per release.
+A Matrix homeserver written in Rust, targeting Room Version 12. Single
+binary, embedded storage (RocksDB) — no external database to run.
+
+Its one unusual feature is a sandboxed WebAssembly extension system: policy
+and bot plugins hook the server (registration, events, sync, media, …)
+without forking it. Otherwise it's a normal homeserver — see
+[`CHANGELOG.md`](CHANGELOG.md) for what's implemented.
 
 ## Status
 
