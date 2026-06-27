@@ -89,11 +89,12 @@ fn challenge_body(session: &str, completed: Option<&[&str]>) -> Value {
 /// for *some* local user. Returns `Ok(())` when the password matches; a
 /// `UiaError` otherwise (which the caller converts to an HTTP 401).
 ///
-/// We deliberately do *not* require the authenticated session's user to
-/// match the identifier supplied in `auth.identifier` — UIA proves the
-/// password holder is *someone* the server trusts. Endpoints that need
-/// stronger ownership guarantees should additionally compare against
-/// their `AuthenticatedUser` extractor.
+/// This proves the password holder is someone the server trusts, but NOT
+/// that it's the authenticated caller. Every endpoint that uses UIA for
+/// step-up auth (the point of which is to contain a stolen token) MUST also
+/// call [`require_uia_identifier_matches`] so a stolen token + the
+/// attacker's own password can't authorise an action on the victim's
+/// account.
 pub fn require_password_auth(state: &AppState, body: &Value) -> Result<(), UiaError> {
     let auth = match body.get("auth") {
         Some(a) if !a.is_null() => a,
@@ -171,6 +172,43 @@ pub fn require_password_auth(state: &AppState, body: &Value) -> Result<(), UiaEr
         });
     }
 
+    Ok(())
+}
+
+/// Require the UIA `auth.identifier` to resolve to the authenticated caller.
+/// 403 on mismatch — so a stolen token plus the attacker's own (valid)
+/// password can't authorise a step-up action on the victim's account.
+///
+/// Call this BEFORE [`require_password_auth`]: checking the identifier first
+/// means a mismatch is rejected without ever testing the named account's
+/// password, which closes a cross-user password oracle (otherwise a wrong
+/// password gives 401 and a right one gives 403, distinguishing them). When
+/// no `auth` block is present this is a no-op so `require_password_auth` can
+/// still issue the 401 challenge.
+pub fn require_uia_identifier_matches(
+    state: &AppState,
+    body: &Value,
+    caller_user_id: &str,
+) -> Result<(), ApiError> {
+    // No auth block yet → defer to require_password_auth's challenge.
+    if body.get("auth").is_none_or(|a| a.is_null()) {
+        return Ok(());
+    }
+    let auth_user = body
+        .pointer("/auth/identifier/user")
+        .and_then(|v| v.as_str())
+        .or_else(|| body.pointer("/auth/user").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let auth_user_id = if auth_user.starts_with('@') {
+        auth_user.to_lowercase()
+    } else {
+        format!("@{}:{}", auth_user.to_lowercase(), state.config.server_name)
+    };
+    if auth_user_id != caller_user_id {
+        return Err(ApiError(VelaError::Forbidden(
+            "UIA identifier does not match the caller".into(),
+        )));
+    }
     Ok(())
 }
 
@@ -303,5 +341,37 @@ mod tests {
         });
         let err = require_password_auth(&state, &body).expect_err("failed");
         assert!(matches!(err, UiaError::Failed { .. }));
+    }
+
+    /// The UIA must be completed AS the caller: an identifier for a DIFFERENT
+    /// account (even with that account's correct password) is refused by
+    /// `require_uia_identifier_matches`. Localpart and full-MXID identifiers
+    /// both resolve before comparison.
+    #[test]
+    fn identifier_must_match_caller() {
+        let (state, _tmp) = build_test_state();
+        let body = json!({
+            "auth": {
+                "type": "m.login.password",
+                "identifier": {"type": "m.id.user", "user": "@attacker:example.com"},
+                "password": "pw",
+            }
+        });
+        // Caller is the victim → mismatch → forbidden.
+        require_uia_identifier_matches(&state, &body, "@victim:example.com")
+            .expect_err("cross-account UIA must be refused");
+        // Caller is the attacker (own account) → allowed.
+        require_uia_identifier_matches(&state, &body, "@attacker:example.com")
+            .expect("matching identifier ok");
+        // Localpart identifier resolves to the full MXID before comparison.
+        let local = json!({
+            "auth": {
+                "type": "m.login.password",
+                "identifier": {"type": "m.id.user", "user": "bob"},
+                "password": "pw",
+            }
+        });
+        require_uia_identifier_matches(&state, &local, "@bob:example.com")
+            .expect("localpart matches full mxid");
     }
 }

@@ -399,7 +399,9 @@ pub async fn receive_transaction(
     Extension(origin): Extension<XMatrixOrigin>,
     Extension(VerifiedBody(body)): Extension<VerifiedBody>,
 ) -> Json<Value> {
-    use crate::federation::federation_receive::{MAX_PDUS_PER_TRANSACTION, process_pdu};
+    use crate::federation::federation_receive::{
+        MAX_EDUS_PER_TRANSACTION, MAX_PDUS_PER_TRANSACTION, process_pdu,
+    };
 
     // Body is Some(Value) for PUT transactions; a missing body would be a
     // malformed federation call (empty-body PUT would fail the middleware's
@@ -533,7 +535,10 @@ pub async fn receive_transaction(
     // PDU) see consistent state. Conduwuit + Dendrite use the same
     // two-phase order.
     if let Some(edus) = body.get("edus").and_then(|p| p.as_array()) {
-        for edu in edus {
+        // Cap EDUs per transaction (spec: <=100). Each dispatched EDU does
+        // amplified writes (per-device to-device rows, per-room-mate
+        // device-list fan-out), so an uncapped loop is a remote write-DoS.
+        for edu in edus.iter().take(MAX_EDUS_PER_TRANSACTION) {
             dispatch_edu(&state, &origin.0, edu).await;
         }
     }

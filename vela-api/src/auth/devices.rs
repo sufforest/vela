@@ -150,23 +150,10 @@ pub async fn delete_device(
         })?
     };
 
+    // Identifier-match before the password check (closes a cross-user
+    // password oracle), then verify the caller's password.
+    uia::require_uia_identifier_matches(&state, &body, &user.user_id)?;
     uia::require_password_auth(&state, &body)?;
-
-    let auth_user = body
-        .pointer("/auth/identifier/user")
-        .and_then(|v| v.as_str())
-        .or_else(|| body.pointer("/auth/user").and_then(|v| v.as_str()))
-        .unwrap_or("");
-    let auth_user_id = if auth_user.starts_with('@') {
-        auth_user.to_lowercase()
-    } else {
-        format!("@{}:{}", auth_user.to_lowercase(), state.config.server_name)
-    };
-    if auth_user_id != user.user_id {
-        return Err(ApiError(VelaError::Forbidden(
-            "UIA identifier does not match the caller".into(),
-        )));
-    }
 
     if state
         .db
@@ -251,23 +238,10 @@ pub async fn delete_devices(
         })?
     };
 
+    // Identifier-match before the password check (closes a cross-user
+    // password oracle), then verify the caller's password.
+    uia::require_uia_identifier_matches(&state, &body, &user.user_id)?;
     uia::require_password_auth(&state, &body)?;
-
-    let auth_user = body
-        .pointer("/auth/identifier/user")
-        .and_then(|v| v.as_str())
-        .or_else(|| body.pointer("/auth/user").and_then(|v| v.as_str()))
-        .unwrap_or("");
-    let auth_user_id = if auth_user.starts_with('@') {
-        auth_user.to_lowercase()
-    } else {
-        format!("@{}:{}", auth_user.to_lowercase(), state.config.server_name)
-    };
-    if auth_user_id != user.user_id {
-        return Err(ApiError(VelaError::Forbidden(
-            "UIA identifier does not match the caller".into(),
-        )));
-    }
 
     let devices = body
         .get("devices")

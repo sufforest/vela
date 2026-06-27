@@ -9,7 +9,6 @@
 
 use crate::middleware::json::Json;
 use axum::extract::State;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use vela_core::error::VelaError;
 
@@ -18,22 +17,11 @@ use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::error::ApiError;
 use crate::router::AppState;
 
-#[derive(Debug, Deserialize)]
-pub struct PasswordChangeBody {
-    pub new_password: String,
-    #[serde(default = "default_logout_devices")]
-    pub logout_devices: bool,
-}
-
-fn default_logout_devices() -> bool {
-    true
-}
-
 /// POST /_matrix/client/v3/account/password
 pub async fn change_password(
     State(state): State<AppState>,
     user: AuthenticatedUser,
-    Json(body): Json<PasswordChangeBody>,
+    Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     // MSC3861 Phase 2: passwords live at the IdP. Refuse with
     // M_UNRECOGNIZED + an issuer hint so an unaware client doesn't
@@ -52,17 +40,33 @@ pub async fn change_password(
         }));
     }
 
-    if body.new_password.is_empty() {
+    // Spec mandates user-interactive auth here. Changing the password is an
+    // account-takeover primitive, so a valid access token alone must not be
+    // enough — require the caller to re-enter their password (bound to the
+    // caller, so a stolen token + someone else's password won't do).
+    uia::require_uia_identifier_matches(&state, &body, &user.user_id)?;
+    uia::require_password_auth(&state, &body)?;
+
+    let new_password = body
+        .get("new_password")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if new_password.is_empty() {
         return Err(VelaError::BadJson("new_password is required".into()).into());
     }
+    // Spec default: log out other devices unless the client opts out.
+    let logout_devices = body
+        .get("logout_devices")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
-    let hash = hash_password(&body.new_password);
+    let hash = hash_password(new_password);
     state
         .db
         .update_user_password(user.user_nid, &hash)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
-    if body.logout_devices {
+    if logout_devices {
         // Keep the caller's current device alive; spec: "The homeserver SHOULD
         // NOT revoke the access token provided in the request."
         state
@@ -133,6 +137,7 @@ pub async fn deactivate(
         }));
     }
 
+    uia::require_uia_identifier_matches(&state, &body, &user.user_id)?;
     uia::require_password_auth(&state, &body)?;
 
     let erase = body.get("erase").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -343,9 +348,11 @@ mod tests {
                 device_id: device_id.clone(),
                 appservice_nid: None,
             },
-            Json(PasswordChangeBody {
-                new_password: "new_secret".into(),
-                logout_devices: true,
+            Json({
+                let mut b = pw_auth("@alice:example.com", "old");
+                b["new_password"] = json!("new_secret");
+                b["logout_devices"] = json!(true);
+                b
             }),
         )
         .await
@@ -381,9 +388,11 @@ mod tests {
                 device_id,
                 appservice_nid: None,
             },
-            Json(PasswordChangeBody {
-                new_password: "new".into(),
-                logout_devices: false,
+            Json({
+                let mut b = pw_auth("@alice:example.com", "old");
+                b["new_password"] = json!("new");
+                b["logout_devices"] = json!(false);
+                b
             }),
         )
         .await
@@ -405,14 +414,81 @@ mod tests {
                 device_id,
                 appservice_nid: None,
             },
-            Json(PasswordChangeBody {
-                new_password: String::new(),
-                logout_devices: true,
+            Json({
+                let mut b = pw_auth("@alice:example.com", "old");
+                b["new_password"] = json!("");
+                b
             }),
         )
         .await
         .expect_err("empty rejected");
         assert!(matches!(err, ApiError(VelaError::BadJson(_))));
+    }
+
+    #[tokio::test]
+    async fn change_password_requires_uia() {
+        let (state, _tmp) = build_test_state();
+        let (user_nid, device_id) = register_test_user(&state, "@alice:example.com", "old");
+        // No `auth` block → must be challenged, not silently accepted (a
+        // stolen token alone must not be able to set a new password).
+        let err = change_password(
+            State(state.clone()),
+            AuthenticatedUser {
+                user_nid,
+                user_id: "@alice:example.com".into(),
+                device_id,
+                appservice_nid: None,
+            },
+            Json(json!({ "new_password": "new_secret" })),
+        )
+        .await
+        .expect_err("UIA required");
+        assert!(matches!(err, ApiError(VelaError::Uia { .. })));
+    }
+
+    #[tokio::test]
+    async fn change_password_rejects_cross_account_uia() {
+        let (state, _tmp) = build_test_state();
+        let (alice_nid, alice_dev) = register_test_user(&state, "@alice:example.com", "alicepw");
+        register_test_user(&state, "@bob:example.com", "bobpw");
+        // Caller is alice, but UIA completed as bob with bob's CORRECT
+        // password — must be refused (403), and bob's password must not even
+        // be consulted (no cross-account oracle).
+        let mut body = pw_auth("@bob:example.com", "bobpw");
+        body["new_password"] = json!("attacker_set");
+        let err = change_password(
+            State(state.clone()),
+            AuthenticatedUser {
+                user_nid: alice_nid,
+                user_id: "@alice:example.com".into(),
+                device_id: alice_dev,
+                appservice_nid: None,
+            },
+            Json(body),
+        )
+        .await
+        .expect_err("cross-account UIA must be refused");
+        assert!(matches!(err, ApiError(VelaError::Forbidden(_))));
+    }
+
+    #[tokio::test]
+    async fn deactivate_rejects_cross_account_uia() {
+        let (state, _tmp) = build_test_state();
+        let (alice_nid, alice_dev) = register_test_user(&state, "@alice:example.com", "alicepw");
+        register_test_user(&state, "@bob:example.com", "bobpw");
+        let err = deactivate(
+            State(state.clone()),
+            AuthenticatedUser {
+                user_nid: alice_nid,
+                user_id: "@alice:example.com".into(),
+                device_id: alice_dev,
+                appservice_nid: None,
+            },
+            Json(pw_auth("@bob:example.com", "bobpw")),
+        )
+        .await
+        .expect_err("cross-account UIA must be refused");
+        assert!(matches!(err, ApiError(VelaError::Forbidden(_))));
     }
 
     #[tokio::test]
@@ -736,10 +812,7 @@ mod tests {
                 device_id: "DEV".into(),
                 appservice_nid: None,
             },
-            Json(PasswordChangeBody {
-                new_password: "anything".into(),
-                logout_devices: true,
-            }),
+            Json(json!({ "new_password": "anything" })),
         )
         .await
         .expect_err("password change must be refused under Phase 2");
