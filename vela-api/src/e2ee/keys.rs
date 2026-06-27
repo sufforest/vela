@@ -697,7 +697,13 @@ pub async fn upload_signing_keys(
             let new = body.get(*slot).filter(|v| !v.is_null());
             let old = existing.get(*slot);
             match (new, old) {
-                (Some(n), Some(o)) => n != o,
+                // Compare SIGNED CONTENT, not the whole object: a stored key
+                // accumulates device signatures (via /keys/signatures/upload)
+                // that a bare re-upload doesn't carry, and a signature-only
+                // difference is not a key-material change — gating it behind
+                // UIA spuriously prompts for a password on an idempotent
+                // re-upload. UIA still fires when the key material changes.
+                (Some(n), Some(o)) => signed_content(n) != signed_content(o),
                 (Some(_), None) => true,
                 _ => false,
             }
@@ -847,52 +853,65 @@ fn federate_signing_key_update(
 /// POST /_matrix/client/v3/keys/signatures/upload
 pub async fn upload_signatures(
     State(state): State<AppState>,
-    _user: AuthenticatedUser,
+    user: AuthenticatedUser,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     let Some(users) = body.as_object() else {
         return Ok(Json(json!({"failures": {}})));
     };
     let mut changed_users: Vec<u64> = Vec::new();
-    for (user_id, devs) in users {
+    for (target_user_id, devs) in users {
         let Some(dev_map) = devs.as_object() else {
             continue;
         };
-        let Some(user_nid) = state
+        let Some(target_nid) = state
             .db
-            .get_nid(user_id)
+            .get_nid(target_user_id)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         else {
             continue;
         };
-        if !changed_users.contains(&user_nid) {
-            changed_users.push(user_nid);
-        }
+        // A user may only upload signatures THEY produced: self-signatures on
+        // their own devices and master key, or their user_signing-key
+        // signature on ANOTHER user's master key. So cross-user uploads are
+        // limited to the target's master key; signing another user's device
+        // is never allowed.
+        let is_self = target_user_id == &user.user_id;
+        let mut touched = false;
         for (dev_or_key_id, new_body) in dev_map {
-            // Try device keys first (typical case for self-signatures),
-            // fall back to cross-signing keys (e.g. master key signed by
-            // user-signing key).
-            if let Some(mut existing) = state
-                .db
-                .get_device_keys(user_nid, dev_or_key_id)
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            // Accept only the signatures attributed to the caller — a client
+            // can't forge a signature in another user's name.
+            let Some(filtered) = caller_signatures_only(new_body, &user.user_id) else {
+                continue;
+            };
+            // Own device keys (typical self-signature). Cross-user device
+            // signing is refused by gating on `is_self`.
+            if is_self
+                && let Some(mut existing) = state
+                    .db
+                    .get_device_keys(target_nid, dev_or_key_id)
+                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
             {
-                merge_signatures(&mut existing, new_body);
+                merge_signatures(&mut existing, &filtered);
                 state
                     .db
-                    .set_device_keys(user_nid, dev_or_key_id, &existing)
+                    .set_device_keys(target_nid, dev_or_key_id, &existing)
                     .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+                touched = true;
                 continue;
             }
-            // Cross-signing keys are addressed in the input by their
-            // public key id (not a device id), so we scan all stored
-            // cross-signing records for this user and fold signatures
-            // into whichever one owns the supplied key id.
+            // Cross-signing keys are addressed by their public key id, so we
+            // scan the target's stored cross-signing records and fold into
+            // whichever one owns the supplied key id. For a cross-user upload
+            // only the master key is eligible.
             let all_xs = state
                 .db
-                .get_cross_signing_keys(user_nid)
+                .get_cross_signing_keys(target_nid)
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
             for (xs_type, mut existing) in all_xs {
+                if !is_self && xs_type != "master_key" {
+                    continue;
+                }
                 let matches = existing
                     .get("keys")
                     .and_then(|k| k.as_object())
@@ -902,14 +921,18 @@ pub async fn upload_signatures(
                     })
                     .unwrap_or(false);
                 if matches {
-                    merge_signatures(&mut existing, new_body);
+                    merge_signatures(&mut existing, &filtered);
                     state
                         .db
-                        .set_cross_signing_keys(user_nid, &xs_type, &existing)
+                        .set_cross_signing_keys(target_nid, &xs_type, &existing)
                         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+                    touched = true;
                     break;
                 }
             }
+        }
+        if touched && !changed_users.contains(&target_nid) {
+            changed_users.push(target_nid);
         }
     }
     // Record changes for each affected user so their next /sync carries
@@ -919,6 +942,21 @@ pub async fn upload_signatures(
         crate::router::notify_user(&state, nid);
     }
     Ok(Json(json!({"failures": {}})))
+}
+
+/// Reduce an uploaded `{…, signatures}` object to ONLY the signatures the
+/// authenticated caller produced (`signatures[caller]`). Returns `None` when
+/// the caller contributed nothing — a client may upload only its own
+/// signatures (self-signing its devices/master, or user-signing another
+/// user's master), never one attributed to a different user.
+fn caller_signatures_only(new_body: &Value, caller: &str) -> Option<Value> {
+    let mine = new_body
+        .get("signatures")
+        .and_then(|v| v.as_object())
+        .and_then(|sigs| sigs.get(caller))?;
+    let mut signer = Map::new();
+    signer.insert(caller.to_string(), mine.clone());
+    Some(json!({ "signatures": Value::Object(signer) }))
 }
 
 /// Fold `new_body.signatures.*` into `existing.signatures.*`. Preserves
@@ -1698,6 +1736,190 @@ mod tests {
         assert_eq!(
             stored["signatures"]["@alice:example.com"]["ed25519:SSK"], "cross",
             "re-upload must not strip the cross-signing signature"
+        );
+    }
+
+    fn auth_user(state: &AppState, user_id: &str) -> AuthenticatedUser {
+        AuthenticatedUser {
+            user_nid: state.db.get_or_create_nid(user_id).unwrap(),
+            user_id: user_id.to_string(),
+            device_id: "DEV".to_string(),
+            appservice_nid: None,
+        }
+    }
+
+    /// `caller_signatures_only` keeps only the caller's signatures and drops
+    /// any attributed to another user (forgery guard).
+    #[test]
+    fn caller_signatures_only_drops_foreign_signers() {
+        let body = json!({"signatures": {
+            "@alice:example.com": {"ed25519:SSK": "alice"},
+            "@mallory:example.com": {"ed25519:EVIL": "forged"},
+        }});
+        let f = caller_signatures_only(&body, "@alice:example.com").unwrap();
+        assert_eq!(
+            f["signatures"]["@alice:example.com"]["ed25519:SSK"],
+            "alice"
+        );
+        assert!(f["signatures"].get("@mallory:example.com").is_none());
+        // Caller contributed nothing → None.
+        assert!(caller_signatures_only(&body, "@bob:example.com").is_none());
+    }
+
+    /// `/keys/signatures/upload` must (a) drop a signature forged in another
+    /// user's name and (b) refuse to sign another user's DEVICE.
+    #[tokio::test]
+    async fn upload_signatures_rejects_forged_and_cross_user_device() {
+        let (state, _tmp) = build_test_state();
+        let alice = state.db.get_or_create_nid("@alice:example.com").unwrap();
+        let bob = state.db.get_or_create_nid("@bob:example.com").unwrap();
+        state
+            .db
+            .set_device_keys(
+                alice,
+                "ADEV",
+                &json!({"signatures": {"@alice:example.com": {"ed25519:ADEV": "self"}}}),
+            )
+            .unwrap();
+        state
+            .db
+            .set_device_keys(
+                bob,
+                "BDEV",
+                &json!({"signatures": {"@bob:example.com": {"ed25519:BDEV": "self"}}}),
+            )
+            .unwrap();
+
+        let body = json!({
+            "@alice:example.com": {"ADEV": {"signatures": {
+                "@alice:example.com": {"ed25519:ASSK": "ok"},
+                "@bob:example.com": {"ed25519:FORGE": "forged"},
+            }}},
+            "@bob:example.com": {"BDEV": {"signatures": {
+                "@alice:example.com": {"ed25519:ASSK": "should-not-land"},
+            }}},
+        });
+        upload_signatures(
+            State(state.clone()),
+            auth_user(&state, "@alice:example.com"),
+            Json(body),
+        )
+        .await
+        .unwrap();
+
+        let adev = state.db.get_device_keys(alice, "ADEV").unwrap().unwrap();
+        assert_eq!(
+            adev["signatures"]["@alice:example.com"]["ed25519:ASSK"],
+            "ok"
+        );
+        assert!(
+            adev["signatures"].get("@bob:example.com").is_none(),
+            "forged foreign-signer signature must be dropped"
+        );
+        let bdev = state.db.get_device_keys(bob, "BDEV").unwrap().unwrap();
+        assert!(
+            bdev["signatures"]["@alice:example.com"]
+                .get("ed25519:ASSK")
+                .is_none(),
+            "signing another user's device must be refused"
+        );
+    }
+
+    /// Cross-user signing of another user's MASTER key (the legitimate
+    /// user_signing flow) is allowed.
+    #[tokio::test]
+    async fn upload_signatures_allows_cross_user_master() {
+        let (state, _tmp) = build_test_state();
+        let bob = state.db.get_or_create_nid("@bob:example.com").unwrap();
+        state
+            .db
+            .set_cross_signing_keys(
+                bob,
+                "master_key",
+                &json!({"user_id": "@bob:example.com", "usage": ["master"], "keys": {"ed25519:BMASTER": "BMASTER"}, "signatures": {}}),
+            )
+            .unwrap();
+
+        let body = json!({"@bob:example.com": {"ed25519:BMASTER": {"signatures": {
+            "@alice:example.com": {"ed25519:AUSK": "alice-usk-sig"},
+        }}}});
+        upload_signatures(
+            State(state.clone()),
+            auth_user(&state, "@alice:example.com"),
+            Json(body),
+        )
+        .await
+        .unwrap();
+
+        let master = state.db.get_cross_signing_keys(bob).unwrap();
+        assert_eq!(
+            master["master_key"]["signatures"]["@alice:example.com"]["ed25519:AUSK"],
+            "alice-usk-sig",
+            "cross-user master signature must be stored"
+        );
+    }
+
+    /// Item 1: an idempotent cross-signing re-upload (same key material, but
+    /// the stored copy has since gained a device signature) must NOT demand
+    /// UIA — the gate keys off signed content, not signatures.
+    #[tokio::test]
+    async fn idempotent_cross_signing_reupload_skips_uia() {
+        let (state, _tmp) = build_test_state();
+        let alice = state.db.get_or_create_nid("@alice:example.com").unwrap();
+        // Stored master carries a device signature, as /keys/signatures/upload
+        // would have left it after the user verified.
+        state
+            .db
+            .set_cross_signing_keys(
+                alice,
+                "master_key",
+                &json!({"user_id": "@alice:example.com", "usage": ["master"], "keys": {"ed25519:M": "M"}, "signatures": {"@alice:example.com": {"ed25519:DEV": "sig"}}}),
+            )
+            .unwrap();
+
+        // Client re-uploads the bare master (same material, no signatures, no
+        // `auth`). Old gate compared whole objects → UIA challenge (Err);
+        // new gate compares signed content → no change → Ok.
+        let bare = json!({"master_key": {"user_id": "@alice:example.com", "usage": ["master"], "keys": {"ed25519:M": "M"}, "signatures": {}}});
+        let res = upload_signing_keys(
+            State(state.clone()),
+            auth_user(&state, "@alice:example.com"),
+            Json(bare),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "idempotent re-upload of unchanged key material must not require UIA: {:?}",
+            res.err().map(|e| e.0)
+        );
+    }
+
+    /// Item 1 (bound-fire): swapping in DIFFERENT key material still requires
+    /// UIA — the gate must reject the change when no `auth` is supplied.
+    #[tokio::test]
+    async fn cross_signing_material_change_requires_uia() {
+        let (state, _tmp) = build_test_state();
+        let alice = state.db.get_or_create_nid("@alice:example.com").unwrap();
+        state
+            .db
+            .set_cross_signing_keys(
+                alice,
+                "master_key",
+                &json!({"user_id": "@alice:example.com", "usage": ["master"], "keys": {"ed25519:OLD": "OLD"}, "signatures": {}}),
+            )
+            .unwrap();
+
+        // Replace the master key material, no `auth` in the body.
+        let changed = json!({"master_key": {"user_id": "@alice:example.com", "usage": ["master"], "keys": {"ed25519:NEW": "NEW"}, "signatures": {}}});
+        let res = upload_signing_keys(
+            State(state.clone()),
+            auth_user(&state, "@alice:example.com"),
+            Json(changed),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "changing master key material without auth must still require UIA"
         );
     }
 }
