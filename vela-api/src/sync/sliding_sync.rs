@@ -1216,11 +1216,22 @@ fn build_sliding_room(
 
     let limited = timeline_entries.len() >= timeline_limit;
 
+    // Same history-visibility gate as v3 /sync: a user joining a
+    // `joined`/`invited` room must not receive pre-join events in the
+    // sliding-sync timeline. No-op for world_readable/shared rooms.
+    let hv_gate = if timeline_entries.is_empty() {
+        None
+    } else {
+        super::hv_timeline_gate(state, room_nid, Some(user_nid))?
+    };
     let mut timeline = Vec::new();
     let mut prev_batch = None;
     for (i, (pos, enid)) in timeline_entries.iter().enumerate() {
         if i == 0 {
             prev_batch = Some(format!("{pos}"));
+        }
+        if super::hv_hides_event(state, room_nid, &hv_gate, *enid)? {
+            continue;
         }
         if let Some(ev) = load_client_event(state, *enid, room_id)? {
             timeline.push(ev);
@@ -1627,5 +1638,223 @@ mod tests {
         };
         let resp3 = build_to_device_extension(&state, &user, &acked).unwrap();
         assert_eq!(n_events(&resp3), 0, "acked message must not reappear");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hv_state(
+        db: &vela_store::db::Database,
+        nid: u64,
+        eid: &str,
+        room_nid: u64,
+        room_id: &str,
+        type_name: &str,
+        sender_nid: u64,
+        sender_id: &str,
+        state_key: &str,
+        content: Value,
+        depth: u64,
+        prev: &[u64],
+    ) -> u64 {
+        let type_nid = db.get_or_create_nid(type_name).unwrap();
+        let skey_nid = db.get_or_create_nid(state_key).unwrap();
+        let body = json!({
+            "type": type_name, "sender": sender_id, "state_key": state_key,
+            "room_id": room_id, "content": content,
+            "origin_server_ts": depth, "depth": depth,
+            "prev_events": [], "auth_events": [],
+        });
+        let pos = db
+            .persist_event(
+                nid,
+                eid,
+                room_nid,
+                type_nid,
+                sender_nid,
+                skey_nid,
+                depth,
+                depth,
+                &serde_json::to_vec(&body).unwrap(),
+                prev,
+                &[],
+                true,
+                false,
+            )
+            .unwrap();
+        db.promote_state_event(room_nid, nid, type_nid, skey_nid)
+            .unwrap();
+        pos
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hv_msg(
+        db: &vela_store::db::Database,
+        nid: u64,
+        eid: &str,
+        room_nid: u64,
+        room_id: &str,
+        sender_nid: u64,
+        sender_id: &str,
+        body: &str,
+        depth: u64,
+        prev: &[u64],
+    ) -> u64 {
+        let type_nid = db.get_or_create_nid("m.room.message").unwrap();
+        let event = json!({
+            "event_id": eid, "type": "m.room.message", "sender": sender_id,
+            "room_id": room_id, "content": {"msgtype": "m.text", "body": body},
+            "origin_server_ts": depth, "depth": depth,
+            "prev_events": [], "auth_events": [],
+        });
+        db.persist_event(
+            nid,
+            eid,
+            room_nid,
+            type_nid,
+            sender_nid,
+            0,
+            depth,
+            depth,
+            &serde_json::to_vec(&event).unwrap(),
+            prev,
+            &[],
+            false,
+            false,
+        )
+        .unwrap()
+    }
+
+    /// Sliding sync must apply the same history-visibility gate as v3
+    /// /sync: a user joining a `joined`-visibility room gets post-join
+    /// messages and their own join, never the pre-join history.
+    #[test]
+    fn sliding_room_hides_prejoin_under_joined_visibility() {
+        let (state, _tmp) = crate::test_helpers::build_test_state();
+        let db = state.db.clone();
+        let room_id = "!slidehv:example.com".to_string();
+        let room_nid = db.get_or_create_nid(&room_id).unwrap();
+        let alice = "@alice:example.com";
+        let alice_nid = db.get_or_create_nid(alice).unwrap();
+        let bob = "@bob:example.com";
+        let bob_nid = db.get_or_create_nid(bob).unwrap();
+
+        hv_state(
+            &db,
+            400,
+            "$c",
+            room_nid,
+            &room_id,
+            "m.room.create",
+            alice_nid,
+            alice,
+            "",
+            json!({"room_version": "12"}),
+            1,
+            &[],
+        );
+        hv_state(
+            &db,
+            401,
+            "$aj",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            alice_nid,
+            alice,
+            alice,
+            json!({"membership": "join"}),
+            2,
+            &[400],
+        );
+        db.set_membership(room_nid, alice_nid, 1).unwrap();
+        hv_state(
+            &db,
+            402,
+            "$vis",
+            room_nid,
+            &room_id,
+            "m.room.history_visibility",
+            alice_nid,
+            alice,
+            "",
+            json!({"history_visibility": "joined"}),
+            3,
+            &[401],
+        );
+        hv_msg(
+            &db,
+            403,
+            "$pre",
+            room_nid,
+            &room_id,
+            alice_nid,
+            alice,
+            "pre-join-secret",
+            4,
+            &[402],
+        );
+        hv_state(
+            &db,
+            404,
+            "$bj",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            bob_nid,
+            bob,
+            bob,
+            json!({"membership": "join"}),
+            5,
+            &[403],
+        );
+        db.set_membership(room_nid, bob_nid, 1).unwrap();
+        hv_msg(
+            &db,
+            405,
+            "$post",
+            room_nid,
+            &room_id,
+            alice_nid,
+            alice,
+            "post-join-visible",
+            6,
+            &[404],
+        );
+
+        let info = RoomInfo {
+            room_nid,
+            room_id: room_id.clone(),
+            bump_ts: 0,
+            name: None,
+            membership: "join".to_string(),
+            is_dm: false,
+            is_encrypted: false,
+            room_type: None,
+        };
+        let room = build_sliding_room(&state, &info, 10, &[], None, bob_nid).unwrap();
+        let timeline = room
+            .pointer("/timeline")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        let bodies: Vec<&str> = timeline
+            .iter()
+            .filter_map(|e| e.pointer("/content/body").and_then(|b| b.as_str()))
+            .collect();
+        let ids: Vec<&str> = timeline
+            .iter()
+            .filter_map(|e| e.get("event_id").and_then(|v| v.as_str()))
+            .collect();
+
+        assert!(
+            !bodies.contains(&"pre-join-secret"),
+            "pre-join message leaked into sliding sync: {bodies:?}"
+        );
+        assert!(
+            bodies.contains(&"post-join-visible"),
+            "post-join message missing from sliding sync: {bodies:?}"
+        );
+        assert!(
+            ids.contains(&"$bj"),
+            "bob's own join must be visible: {ids:?}"
+        );
     }
 }

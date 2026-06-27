@@ -1103,6 +1103,64 @@ fn sync_filter_shows(
     })
 }
 
+/// History-visibility gate for /sync timelines.
+///
+/// `/messages`, `/event` and `/context` gate every event through
+/// `history_visibility_permits`, but the sync timeline builders used to
+/// return raw `get_timeline_latest` / `get_timeline_range` slices, so a
+/// user who joined a `history_visibility: joined` (or `invited`) room
+/// could read pre-join messages on their first sync. This applies the
+/// same per-event check.
+///
+/// Returns `Some((user_nid, visibility))` only when filtering is
+/// required, i.e. the room is `joined`/`invited`. The sync timeline
+/// builders are invoked for rooms the caller is (or was) a member of,
+/// and a member sees the full history under `world_readable` (rule 1)
+/// and `shared` (rule 3), so those return `None` — keeping the common
+/// case (and the unchanged-room long-poll path) free of any per-event
+/// work. `None` when there's no authenticated viewer (fail-open: we
+/// can't run a per-viewer check without a viewer, and the event is
+/// still gated by /messages).
+fn hv_timeline_gate(
+    state: &AppState,
+    room_nid: u64,
+    user_nid: Option<u64>,
+) -> Result<Option<(u64, String)>, ApiError> {
+    let Some(uid) = user_nid else {
+        return Ok(None);
+    };
+    let visibility = crate::room::messages::current_history_visibility(state, room_nid)?;
+    Ok(matches!(visibility.as_str(), "joined" | "invited").then_some((uid, visibility)))
+}
+
+/// True iff `event_nid` is hidden from `user_nid` under the room's
+/// history-visibility, given a precomputed [`hv_timeline_gate`] result.
+/// `None` gate (world_readable / shared / no viewer) never hides.
+///
+/// The `membership` passed to `history_visibility_permits` is fixed to
+/// `join`: the gate only fires for `joined`/`invited` visibility, and
+/// neither of those branches consults the membership argument (they key
+/// off the membership *at the event*), so the nominal value is correct
+/// for every caller (join, leave and ban sections alike).
+fn hv_hides_event(
+    state: &AppState,
+    room_nid: u64,
+    gate: &Option<(u64, String)>,
+    event_nid: u64,
+) -> Result<bool, ApiError> {
+    let Some((uid, visibility)) = gate else {
+        return Ok(false);
+    };
+    Ok(!crate::room::messages::history_visibility_permits(
+        state,
+        room_nid,
+        *uid,
+        Some(1),
+        visibility,
+        event_nid,
+    )?)
+}
+
 fn build_room_sync_for_user(
     state: &AppState,
     room_nid: u64,
@@ -1150,8 +1208,16 @@ fn build_room_sync_for_user(
                 .get_timeline_latest(room_nid, timeline_limit)
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
+            let hv_gate = if timeline_entries.is_empty() {
+                None
+            } else {
+                hv_timeline_gate(state, room_nid, user_nid)?
+            };
             let mut timeline_events = Vec::new();
             for (_, enid) in &timeline_entries {
+                if hv_hides_event(state, room_nid, &hv_gate, *enid)? {
+                    continue;
+                }
                 if let Some(ev) = load_timeline_event(state, *enid, room_id, user_nid, device_id)?
                     && sync_filter_shows(&sync_rt, sync_viewer.as_deref(), room_id, &ev)
                 {
@@ -1206,11 +1272,19 @@ fn build_room_sync_for_user(
                     .db
                     .get_timeline_latest(room_nid, timeline_limit)
                     .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+                let hv_gate = if timeline_entries.is_empty() {
+                    None
+                } else {
+                    hv_timeline_gate(state, room_nid, user_nid)?
+                };
                 let mut timeline_events = Vec::new();
                 let mut first_pos = None;
                 for (pos, enid) in &timeline_entries {
                     if first_pos.is_none() {
                         first_pos = Some(*pos);
+                    }
+                    if hv_hides_event(state, room_nid, &hv_gate, *enid)? {
+                        continue;
                     }
                     if let Some(ev) =
                         load_timeline_event(state, *enid, room_id, user_nid, device_id)?
@@ -1289,11 +1363,19 @@ fn build_room_sync_for_user(
                 };
                 let limited = timeline_entries.len() >= timeline_limit || since_pos < gap_fill_pos;
 
+                let hv_gate = if timeline_entries.is_empty() {
+                    None
+                } else {
+                    hv_timeline_gate(state, room_nid, user_nid)?
+                };
                 let mut timeline_events = Vec::new();
                 let mut first_pos = None;
                 for (pos, enid) in &timeline_entries {
                     if first_pos.is_none() {
                         first_pos = Some(*pos);
+                    }
+                    if hv_hides_event(state, room_nid, &hv_gate, *enid)? {
+                        continue;
                     }
                     if let Some(ev) =
                         load_timeline_event(state, *enid, room_id, user_nid, device_id)?
@@ -2288,14 +2370,24 @@ fn build_leave_sync(
         }
     }
 
+    // History-visibility also bounds the *start* of an archived view:
+    // under `joined`/`invited`, a user who joined then left must not see
+    // events from before they joined (the leave-cap above only bounds the
+    // recent end). Same per-event gate as /messages and the live sync.
+    let hv_gate = if timeline_newest_first.is_empty() {
+        None
+    } else {
+        hv_timeline_gate(state, room_nid, Some(user_nid))?
+    };
     let mut timeline_events = Vec::new();
     for (_, enid) in timeline_newest_first.iter().rev() {
+        if hv_hides_event(state, room_nid, &hv_gate, *enid)? {
+            continue;
+        }
         if let Some(ev) = load_client_event(state, *enid, room_id)? {
             timeline_events.push(ev);
         }
     }
-
-    let _ = user_nid;
 
     Ok(json!({
         "state": {"events": state_events},
@@ -2493,6 +2585,371 @@ mod tests {
         db.promote_state_event(room_nid, nid, type_nid, skey_nid)
             .unwrap();
         pos
+    }
+
+    /// Like `persist_message` but with explicit `prev_events`, so the
+    /// message inherits a per-event state snapshot. History-visibility
+    /// keys off `get_state_at_event`, which is populated by snapshot
+    /// inheritance through `prev_events` — `persist_message` passes none,
+    /// so it can't exercise the gate. Returns the stream position.
+    #[allow(clippy::too_many_arguments)]
+    fn persist_msg_prev(
+        db: &vela_store::db::Database,
+        nid: u64,
+        eid: &str,
+        room_nid: u64,
+        room_id: &str,
+        sender_nid: u64,
+        sender_id: &str,
+        body: &str,
+        ts: u64,
+        depth: u64,
+        prev: &[u64],
+    ) -> u64 {
+        let type_nid = db.get_or_create_nid("m.room.message").unwrap();
+        let event = serde_json::json!({
+            "event_id": eid,
+            "type": "m.room.message",
+            "sender": sender_id,
+            "room_id": room_id,
+            "content": {"msgtype": "m.text", "body": body},
+            "origin_server_ts": ts, "depth": depth,
+            "prev_events": [], "auth_events": [],
+        });
+        db.persist_event(
+            nid,
+            eid,
+            room_nid,
+            type_nid,
+            sender_nid,
+            0,
+            ts,
+            depth,
+            &serde_json::to_vec(&event).unwrap(),
+            prev,
+            &[],
+            false,
+            false,
+        )
+        .unwrap()
+    }
+
+    /// Build a room with a given `m.room.history_visibility`, a message
+    /// sent BEFORE bob joins, bob's join, and a message sent AFTER. All
+    /// events are prev-chained so per-event state snapshots resolve (what
+    /// the history-visibility gate reads). bob ends up joined. Returns
+    /// `(state, tmp, bob, room_id, pre_join_pos, bob_membership_pos)`:
+    /// `pre_join_pos` is a `since` that falls before bob's join (triggers
+    /// the fresh-join branch), `bob_membership_pos` is bob's join
+    /// transition pos (a `since` for steady-state incremental).
+    fn build_hv_scenario(
+        visibility: &str,
+    ) -> (
+        AppState,
+        tempfile::TempDir,
+        AuthenticatedUser,
+        String,
+        u64,
+        u64,
+    ) {
+        let (state, tmp) = build_test_state();
+        let db = state.db.clone();
+
+        let room_id = "!hvroom:example.com".to_string();
+        let room_nid = db.get_or_create_nid(&room_id).unwrap();
+        let alice = "@alice:example.com";
+        let alice_nid = db.get_or_create_nid(alice).unwrap();
+        let bob = fake_user(&state, "@bob:example.com");
+
+        persist_state(
+            &db,
+            300,
+            "$hv_create",
+            room_nid,
+            &room_id,
+            "m.room.create",
+            alice_nid,
+            alice,
+            "",
+            serde_json::json!({"room_version": "12"}),
+            1,
+            1,
+            &[],
+        );
+        persist_state(
+            &db,
+            301,
+            "$hv_alice_join",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            alice_nid,
+            alice,
+            alice,
+            serde_json::json!({"membership": "join"}),
+            2,
+            2,
+            &[300],
+        );
+        db.set_membership(room_nid, alice_nid, 1).unwrap();
+        persist_state(
+            &db,
+            302,
+            "$hv_vis",
+            room_nid,
+            &room_id,
+            "m.room.history_visibility",
+            alice_nid,
+            alice,
+            "",
+            serde_json::json!({ "history_visibility": visibility }),
+            3,
+            3,
+            &[301],
+        );
+        // Pre-join message: bob has no member event in the snapshot here.
+        let pre_join_pos = persist_msg_prev(
+            &db,
+            303,
+            "$hv_pre",
+            room_nid,
+            &room_id,
+            alice_nid,
+            alice,
+            "pre-join-secret",
+            4,
+            4,
+            &[302],
+        );
+        persist_state(
+            &db,
+            304,
+            "$hv_bob_join",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            bob.user_nid,
+            "@bob:example.com",
+            "@bob:example.com",
+            serde_json::json!({"membership": "join"}),
+            5,
+            5,
+            &[303],
+        );
+        // set_membership burns a fresh pos AFTER the join event; calling it
+        // here (before the post message) keeps bob's membership_pos below
+        // the post message's pos, so a steady-state incremental sync from
+        // `bob_membership_pos` still surfaces the post-join message.
+        db.set_membership(room_nid, bob.user_nid, 1).unwrap();
+        let bob_membership_pos = db
+            .get_user_room_membership_pos(bob.user_nid, room_nid)
+            .unwrap()
+            .expect("bob join transition recorded");
+        // Post-join message: snapshot includes bob's join.
+        persist_msg_prev(
+            &db,
+            305,
+            "$hv_post",
+            room_nid,
+            &room_id,
+            alice_nid,
+            alice,
+            "post-join-visible",
+            6,
+            6,
+            &[304],
+        );
+
+        (state, tmp, bob, room_id, pre_join_pos, bob_membership_pos)
+    }
+
+    /// Collect the `body` strings of every timeline message in bob's
+    /// `rooms.join.<room>` section of a /sync response.
+    fn join_timeline_bodies(resp: &Value, room_id: &str) -> Vec<String> {
+        resp.pointer(&format!("/rooms/join/{room_id}/timeline/events"))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| {
+                        e.pointer("/content/body")
+                            .and_then(|b| b.as_str())
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `joined` history-visibility: a user's initial /sync MUST NOT leak
+    /// messages sent before they joined, but MUST show post-join messages
+    /// and their own join. Regression guard for the /sync timeline build
+    /// ignoring `m.room.history_visibility` (which /messages enforces).
+    #[test]
+    fn sync_initial_hides_prejoin_under_joined_visibility() {
+        let (state, _tmp, bob, room_id, _pre, _mp) = build_hv_scenario("joined");
+        let room_nid = state.db.get_nid(&room_id).unwrap().unwrap();
+        let resp = build_sync_response(&state, &bob, &[room_nid], None).unwrap();
+
+        let bodies = join_timeline_bodies(&resp, &room_id);
+        assert!(
+            !bodies.iter().any(|b| b == "pre-join-secret"),
+            "pre-join message leaked into initial sync: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|b| b == "post-join-visible"),
+            "post-join message missing from initial sync: {bodies:?}"
+        );
+        // bob's own join event is always visible.
+        let ids: Vec<String> = resp
+            .pointer(&format!("/rooms/join/{room_id}/timeline/events"))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.get("event_id").and_then(|v| v.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            ids.iter().any(|i| i == "$hv_bob_join"),
+            "bob's own join must be visible: {ids:?}"
+        );
+    }
+
+    /// Fresh-join branch (incremental sync whose `since` predates the
+    /// join): same gate as initial sync — no pre-join leak.
+    #[test]
+    fn sync_fresh_join_hides_prejoin_under_joined_visibility() {
+        let (state, _tmp, bob, room_id, pre_join_pos, _mp) = build_hv_scenario("joined");
+        let room_nid = state.db.get_nid(&room_id).unwrap().unwrap();
+        let resp = build_sync_response(&state, &bob, &[room_nid], Some(pre_join_pos)).unwrap();
+
+        let bodies = join_timeline_bodies(&resp, &room_id);
+        assert!(
+            !bodies.iter().any(|b| b == "pre-join-secret"),
+            "pre-join message leaked into fresh-join sync: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|b| b == "post-join-visible"),
+            "post-join message missing from fresh-join sync: {bodies:?}"
+        );
+    }
+
+    /// Steady-state incremental sync after the join: a post-join message
+    /// must still come through — the gate must not over-filter events the
+    /// member is entitled to.
+    #[test]
+    fn sync_incremental_shows_postjoin_under_joined_visibility() {
+        let (state, _tmp, bob, room_id, _pre, bob_membership_pos) = build_hv_scenario("joined");
+        let room_nid = state.db.get_nid(&room_id).unwrap().unwrap();
+        let resp =
+            build_sync_response(&state, &bob, &[room_nid], Some(bob_membership_pos)).unwrap();
+
+        let bodies = join_timeline_bodies(&resp, &room_id);
+        assert_eq!(
+            bodies,
+            vec!["post-join-visible".to_string()],
+            "incremental sync should carry exactly the post-join message: {bodies:?}"
+        );
+    }
+
+    /// `shared` (the spec default): a joined member sees the WHOLE
+    /// history, including events from before they joined (rule 3). The
+    /// gate must be a no-op here — otherwise the common case regresses.
+    #[test]
+    fn sync_initial_shows_prejoin_under_shared_visibility() {
+        let (state, _tmp, bob, room_id, _pre, _mp) = build_hv_scenario("shared");
+        let room_nid = state.db.get_nid(&room_id).unwrap().unwrap();
+        let resp = build_sync_response(&state, &bob, &[room_nid], None).unwrap();
+
+        let bodies = join_timeline_bodies(&resp, &room_id);
+        assert!(
+            bodies.iter().any(|b| b == "pre-join-secret"),
+            "shared visibility must show pre-join history: {bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|b| b == "post-join-visible"),
+            "post-join message missing: {bodies:?}"
+        );
+    }
+
+    /// `world_readable`: everything is visible regardless of membership.
+    #[test]
+    fn sync_initial_shows_prejoin_under_world_readable() {
+        let (state, _tmp, bob, room_id, _pre, _mp) = build_hv_scenario("world_readable");
+        let room_nid = state.db.get_nid(&room_id).unwrap().unwrap();
+        let resp = build_sync_response(&state, &bob, &[room_nid], None).unwrap();
+
+        let bodies = join_timeline_bodies(&resp, &room_id);
+        assert!(
+            bodies.iter().any(|b| b == "pre-join-secret"),
+            "world_readable must show pre-join history: {bodies:?}"
+        );
+    }
+
+    /// The archived (rooms.leave) view is bounded at BOTH ends under
+    /// `joined` visibility: the leave-cap hides post-leave events, and the
+    /// history-visibility gate hides pre-join events. The user still sees
+    /// the messages from while they were joined plus their own
+    /// join/leave.
+    #[test]
+    fn leave_sync_hides_prejoin_under_joined_visibility() {
+        let (state, _tmp, bob, room_id, _pre, _mp) = build_hv_scenario("joined");
+        let db = state.db.clone();
+        let room_nid = db.get_nid(&room_id).unwrap().unwrap();
+
+        // bob leaves after the post-join message.
+        persist_state(
+            &db,
+            306,
+            "$hv_bob_leave",
+            room_nid,
+            &room_id,
+            "m.room.member",
+            bob.user_nid,
+            "@bob:example.com",
+            "@bob:example.com",
+            serde_json::json!({"membership": "leave"}),
+            7,
+            7,
+            &[305],
+        );
+        db.set_membership(room_nid, bob.user_nid, 0).unwrap();
+
+        let leave = build_leave_sync(
+            &state,
+            room_nid,
+            &room_id,
+            bob.user_nid,
+            &bob.user_id,
+            None,
+            10,
+        )
+        .unwrap();
+        let events = leave
+            .pointer("/timeline/events")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        let bodies: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e.pointer("/content/body").and_then(|b| b.as_str()))
+            .collect();
+        let ids: Vec<&str> = events
+            .iter()
+            .filter_map(|e| e.get("event_id").and_then(|v| v.as_str()))
+            .collect();
+
+        assert!(
+            !bodies.contains(&"pre-join-secret"),
+            "pre-join message leaked into archived view: {bodies:?}"
+        );
+        assert!(
+            bodies.contains(&"post-join-visible"),
+            "while-joined message missing from archived view: {bodies:?}"
+        );
+        assert!(
+            ids.contains(&"$hv_bob_leave"),
+            "bob's own leave must appear: {ids:?}"
+        );
     }
 
     /// Setup that mirrors the Complement TestArchivedRoomsHistory shape:

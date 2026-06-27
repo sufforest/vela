@@ -1517,7 +1517,10 @@ async fn try_fetch_event_from_federation(
 
 /// Read the current `m.room.history_visibility` value, defaulting to
 /// `"shared"` when the state event isn't present (matches spec default).
-fn current_history_visibility(state: &AppState, room_nid: u64) -> Result<String, ApiError> {
+pub(crate) fn current_history_visibility(
+    state: &AppState,
+    room_nid: u64,
+) -> Result<String, ApiError> {
     let v =
         crate::membership::read_state_value_pub(state, room_nid, "m.room.history_visibility", "")?;
     Ok(v.as_ref()
@@ -1550,7 +1553,7 @@ fn current_history_visibility(state: &AppState, room_nid: u64) -> Result<String,
 /// Matches the per-event-state approach used by Synapse,
 /// Continuwuity (`user_was_joined(shortstatehash)`), and Dendrite
 /// (`membershipAtEvent`).
-fn history_visibility_permits(
+pub(crate) fn history_visibility_permits(
     state: &AppState,
     room_nid: u64,
     user_nid: u64,
