@@ -379,6 +379,64 @@ impl FederationResolver {
         }
     }
 
+    /// Are the resolved IPs of a `.well-known` host acceptable to connect to?
+    /// Mirrors `check_resolved_ips`: under `private_ip_block`, reject any
+    /// non-public address — with the self-loop loopback exception when the
+    /// host is our own server_name. An empty set is rejected (we can't
+    /// validate what we couldn't resolve). With the guard off, anything goes.
+    fn well_known_ips_permitted(&self, hostname: &str, ips: &[IpAddr]) -> bool {
+        if !self.policy.private_ip_block {
+            return true;
+        }
+        if ips.is_empty() {
+            return false;
+        }
+        let is_self = !self.policy.our_server_name.is_empty()
+            && host_only(hostname) == host_only(&self.policy.our_server_name);
+        !ips.iter()
+            .any(|ip| is_blocked_ip(*ip) && !(is_self && ip.is_loopback()))
+    }
+
+    /// HTTP client for a `.well-known` fetch. The well-known GET is the first,
+    /// attacker-influenced network touch when resolving a destination, so
+    /// under `private_ip_block` we resolve the host ourselves, refuse
+    /// non-public targets, and PIN the connection to the validated IPs (so a
+    /// DNS rebind can't swap in an internal address) with redirects disabled
+    /// (so a redirect can't escape the pin to an unvalidated host). Returns
+    /// `None` to refuse the fetch. With the guard off, reuses the shared
+    /// client unchanged.
+    ///
+    /// Deliberate spec deviation: the spec SAYS well-known SHOULD follow 30x
+    /// redirects (a SHOULD, not a MUST). Under the guard we don't, because a
+    /// redirect target wouldn't be covered by the IP pin — following it would
+    /// reopen the SSRF hole. A server that serves its well-known via a
+    /// redirect loses delegation here; serving it directly (the common case)
+    /// is unaffected.
+    async fn well_known_client(&self, hostname: &str) -> Option<reqwest::Client> {
+        if !self.policy.private_ip_block {
+            return Some(self.http.clone());
+        }
+        let ips = self.lookup_host_ips(hostname).await;
+        if !self.well_known_ips_permitted(hostname, &ips) {
+            warn!(%hostname, "well-known fetch refused — host unresolvable or resolves to a private/loopback IP");
+            return None;
+        }
+        // Pin to ALL validated IPs at once (`resolve_to_addrs` keeps the set;
+        // a per-IP `.resolve` loop would overwrite down to the last one). The
+        // connection can only land on an address we already checked.
+        let pinned: Vec<std::net::SocketAddr> = ips
+            .iter()
+            .map(|ip| std::net::SocketAddr::new(*ip, 443))
+            .collect();
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .user_agent(concat!("vela/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(hostname, &pinned)
+            .build()
+            .ok()
+    }
+
     /// Fetch and cache `.well-known/matrix/server`. Returns the delegated target
     /// (a server_name, possibly with port) or `None` if the lookup failed or
     /// the server has no well-known (both are cached negatively for 1h).
@@ -394,9 +452,23 @@ impl FederationResolver {
             self.well_known.remove(hostname);
         }
 
-        // Fetch
+        // Fetch through the SSRF-guarded client (refuses/pins non-public
+        // targets under private_ip_block; a None client means "refused").
         let url = format!("https://{hostname}/.well-known/matrix/server");
-        let result = self.http.get(&url).send().await;
+        let result = match self.well_known_client(hostname).await {
+            Some(client) => client.get(&url).send().await,
+            None => {
+                // Cache the refusal negatively so we don't re-resolve every call.
+                self.well_known.insert(
+                    hostname.to_string(),
+                    CachedWellKnown {
+                        delegated: None,
+                        expires_at_ms: now + WELL_KNOWN_NEG_TTL_MS,
+                    },
+                );
+                return None;
+            }
+        };
         let (delegated, ttl_ms) = match result {
             Ok(resp) if resp.status().is_success() => {
                 // Compute cache TTL from Cache-Control: max-age, clamped to 48h.
@@ -1015,5 +1087,37 @@ mod tests {
         assert_eq!(host_only("1.2.3.4:8448"), "1.2.3.4");
         assert_eq!(host_only("[::1]:8448"), "[::1]");
         assert_eq!(host_only("[::1]"), "[::1]");
+    }
+
+    #[test]
+    fn well_known_guard_refuses_private_and_unresolvable() {
+        let r = FederationResolver::with_policy(FederationPolicy::strict("our.example".into()))
+            .unwrap();
+        assert!(r.well_known_ips_permitted("evil.example", &[ip("1.1.1.1")]));
+        assert!(!r.well_known_ips_permitted("evil.example", &[ip("127.0.0.1")]));
+        assert!(!r.well_known_ips_permitted("evil.example", &[ip("10.0.0.5")]));
+        assert!(!r.well_known_ips_permitted("evil.example", &[ip("169.254.169.254")]));
+        // Any blocked address in the set refuses the whole host.
+        assert!(!r.well_known_ips_permitted("evil.example", &[ip("1.1.1.1"), ip("127.0.0.1")]));
+        // Unresolvable (empty) refuses — we can't validate what we can't resolve.
+        assert!(!r.well_known_ips_permitted("evil.example", &[]));
+    }
+
+    #[test]
+    fn well_known_guard_allows_self_loopback_only() {
+        let r = FederationResolver::with_policy(FederationPolicy::strict("our.example".into()))
+            .unwrap();
+        // Our own server_name may point at loopback (single-host eval).
+        assert!(r.well_known_ips_permitted("our.example", &[ip("127.0.0.1")]));
+        // But a non-loopback private IP for self is still refused.
+        assert!(!r.well_known_ips_permitted("our.example", &[ip("10.0.0.5")]));
+    }
+
+    #[test]
+    fn well_known_guard_off_permits_everything() {
+        // private_ip_block off (e.g. Complement's Docker network).
+        let r = FederationResolver::with_policy(FederationPolicy::permissive()).unwrap();
+        assert!(r.well_known_ips_permitted("anything", &[ip("127.0.0.1")]));
+        assert!(r.well_known_ips_permitted("anything", &[]));
     }
 }
