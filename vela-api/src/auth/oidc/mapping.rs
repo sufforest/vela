@@ -39,6 +39,8 @@ pub enum MappingError {
     MissingDeviceId,
     #[error("derived localpart is invalid: {0}")]
     InvalidLocalpart(String),
+    #[error("a local account already exists for {0}; refusing to adopt it via OIDC")]
+    LocalpartTaken(String),
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -86,6 +88,21 @@ pub fn lookup_or_provision(
             // create the user row, persist the mapping.
             let mxid = derive_mxid(&introspection.sub, &introspection.username, server_name);
             validate_localpart_from_mxid(&mxid)?;
+            // Refuse to adopt a pre-existing local account. We only reach
+            // this branch when THIS (provider, sub) has no mapping, so if a
+            // user row already exists for the derived MXID it belongs to
+            // someone else (a password registration, or a different OIDC
+            // subject). `create_user` would resolve that existing nid and
+            // OVERWRITE its row with an empty password — handing the
+            // attacker the account and wiping the victim's password. Fail
+            // closed instead; an operator who genuinely wants to migrate an
+            // account onto OIDC must seed the external-id mapping out of band.
+            if db
+                .user_exists(&mxid)
+                .map_err(|e| MappingError::Storage(e.to_string()))?
+            {
+                return Err(MappingError::LocalpartTaken(mxid));
+            }
             let nid = db
                 .create_user(&mxid, "")
                 .map_err(|e| MappingError::Storage(e.to_string()))?;
@@ -234,25 +251,74 @@ mod tests {
     }
 
     #[test]
-    fn distinct_providers_isolate_users() {
+    fn oidc_refuses_to_adopt_password_account() {
+        let (state, _tmp) = build_test_state();
+        // Alice registered locally with a password.
+        let alice_nid = state
+            .db
+            .create_user("@alice:example.com", "argon2-hash")
+            .unwrap();
+
+        // An OIDC subject whose username derives @alice tries to first-touch.
+        let r = introspection("attacker-sub", Some("alice"), Some("DEV"));
+        let err = lookup_or_provision(&state.db, "oauth-delegated", "example.com", &r).unwrap_err();
+        assert!(
+            matches!(err, MappingError::LocalpartTaken(_)),
+            "OIDC must not adopt an existing password account: {err:?}"
+        );
+
+        // The password account is untouched — hash intact, no OIDC mapping
+        // written, so the attacker can't log in and Alice isn't locked out.
+        let rec = state.db.get_user(alice_nid).unwrap().unwrap();
+        assert_eq!(
+            rec.get("password_hash").and_then(|v| v.as_str()),
+            Some("argon2-hash"),
+            "the victim's password must not be wiped"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_external_id_mapping("oauth-delegated", "attacker-sub")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn second_provider_cannot_adopt_existing_localpart() {
         let (state, _tmp) = build_test_state();
         let r = introspection("shared", Some("bob"), Some("DEV"));
+        // idp-a provisions @bob fresh.
         let m1 = lookup_or_provision(&state.db, "idp-a", "example.com", &r).unwrap();
-        // Same sub under a different provider must mint a different
-        // mapping. The MXIDs collide because they share the localpart;
-        // create_user is idempotent on the existing nid, so the second
-        // call resolves the SAME user_nid but writes its OWN mapping
-        // entry under provider="idp-b".
-        let m2 = lookup_or_provision(&state.db, "idp-b", "example.com", &r).unwrap();
-        // Both providers now have their own mapping rows pointing at
-        // the same user — operator-intended migration scenario.
+        assert_eq!(m1.user_id, "@bob:example.com");
+
+        // A different provider asserting the same localpart must NOT adopt
+        // the account idp-a created — that's a cross-provider takeover.
+        let err = lookup_or_provision(&state.db, "idp-b", "example.com", &r).unwrap_err();
+        assert!(
+            matches!(err, MappingError::LocalpartTaken(_)),
+            "second provider must not adopt an existing localpart: {err:?}"
+        );
+        // idp-b got no mapping; idp-a's mapping is untouched.
+        assert_eq!(
+            state.db.get_external_id_mapping("idp-b", "shared").unwrap(),
+            None
+        );
         assert_eq!(
             state.db.get_external_id_mapping("idp-a", "shared").unwrap(),
             Some(m1.user_nid)
         );
-        assert_eq!(
-            state.db.get_external_id_mapping("idp-b", "shared").unwrap(),
-            Some(m2.user_nid)
-        );
+    }
+
+    #[test]
+    fn returning_subject_still_logs_in() {
+        // The guard must not break the normal returning-user fast path: the
+        // same (provider, sub) logs into the account it created.
+        let (state, _tmp) = build_test_state();
+        let r = introspection("sub-9", Some("carol"), Some("DEV"));
+        let first = lookup_or_provision(&state.db, "idp-a", "example.com", &r).unwrap();
+        let again = lookup_or_provision(&state.db, "idp-a", "example.com", &r).unwrap();
+        assert_eq!(first.user_nid, again.user_nid);
+        assert!(!again.first_touch_user, "second login is not a first touch");
     }
 }
