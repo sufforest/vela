@@ -68,6 +68,7 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
             bind_host: "127.0.0.1".to_string(),
             bind_port: 0,
             public_base_url: None,
+            real_ip_header: None,
             search_all_users: false,
             federation_enabled: true,
             registration_enabled: true,

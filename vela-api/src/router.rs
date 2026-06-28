@@ -45,6 +45,15 @@ pub struct ServerConfig {
     /// (e.g. `"https://matrix.example.com"`) or clients will follow
     /// the well-known to localhost and fail.
     pub public_base_url: Option<String>,
+    /// Request header to read the real client IP from when vela sits behind
+    /// a reverse proxy / CDN. `None` (default) → use the TCP peer, which
+    /// behind a proxy is the PROXY's IP, so the per-IP login/register
+    /// limiter lumps every real client together. `Some("CF-Connecting-IP")`
+    /// (Cloudflare) or `Some("X-Forwarded-For")` (nginx/Caddy) makes the
+    /// limiter key on the real client. Only safe when the origin EXCLUSIVELY
+    /// accepts traffic through that proxy — otherwise a direct client could
+    /// spoof the header to dodge limits or forge a victim's IP.
+    pub real_ip_header: Option<String>,
     /// When true, `/user_directory/search` may return users the caller
     /// doesn't share a room with. Default is `false`: unrestricted user
     /// enumeration is a privacy leak and an abuse vector (spam, targeted
@@ -1118,16 +1127,63 @@ async fn rate_limit_middleware(
         _ => None,
     };
     if let Some(endpoint) = endpoint {
-        let ip = req
-            .extensions()
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .map(|c| c.0.ip().to_string())
-            .unwrap_or_else(|| "0.0.0.0".to_string());
+        let ip = real_client_ip(&state, &req);
         if let Err(retry_ms) = state.rate_limiter.check(endpoint, &ip) {
             return limit_exceeded_response(retry_ms);
         }
     }
     next.run(req).await
+}
+
+/// The client IP to rate-limit on. When `real_ip_header` is configured
+/// (vela behind a trusted proxy / CDN), read the first IP from that header;
+/// otherwise — and on a missing or malformed value — fall back to the TCP
+/// peer. The first comma-separated entry is the originating client for
+/// `X-Forwarded-For`, and the sole value for `CF-Connecting-IP`. Parsing it
+/// as an `IpAddr` rejects a junk/spoofed non-IP so it can't become a bogus
+/// limiter key. Only trustworthy when the origin exclusively accepts
+/// traffic from that proxy — see [`ServerConfig::real_ip_header`].
+fn real_client_ip(state: &AppState, req: &axum::extract::Request) -> String {
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip());
+    pick_client_ip(state.config.real_ip_header.as_deref(), req.headers(), peer)
+}
+
+/// Pure IP-selection logic behind [`real_client_ip`], split out so it can be
+/// unit-tested without a live request. When `real_ip_header` names a header
+/// present with a parseable IP, use it; otherwise fall back to the TCP
+/// `peer` (or `0.0.0.0` when even that is absent, e.g. in tests).
+///
+/// For a multi-value header (`X-Forwarded-For`) we take the LAST entry, not
+/// the first. Each proxy APPENDS the address it saw, so the rightmost entry
+/// is the one our immediate trusted upstream added; the leftmost entries are
+/// whatever the client sent and are fully spoofable. Taking the last hop is
+/// spoof-resistant behind a single trusted proxy (a `CF-Connecting-IP` carries
+/// one value, so first == last). With more than one proxy in front, the last
+/// hop is an upstream proxy's IP — wrong but still not client-controlled, so
+/// it degrades to "ineffective", never to "bypassable". This only holds when
+/// the origin exclusively accepts traffic from that proxy — a directly
+/// reachable origin lets a client forge the header outright (lock the origin
+/// firewall to the proxy / CDN IP ranges).
+fn pick_client_ip(
+    real_ip_header: Option<&str>,
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::IpAddr>,
+) -> String {
+    if let Some(name) = real_ip_header
+        && let Some(val) = headers.get(name)
+        && let Ok(s) = val.to_str()
+        && let Some(ip) = s
+            .split(',')
+            .next_back()
+            .and_then(|h| h.trim().parse::<std::net::IpAddr>().ok())
+    {
+        return ip.to_string();
+    }
+    peer.map(|p| p.to_string())
+        .unwrap_or_else(|| "0.0.0.0".to_string())
 }
 
 /// Build a Matrix-spec `M_LIMIT_EXCEEDED` response carrying the
@@ -1350,4 +1406,85 @@ fn federation_authed_routes(state: AppState) -> Router<AppState> {
             put(crate::membership::federation_knock::send_knock_v1),
         )
         .layer(axum::middleware::from_fn_with_state(state, federation_auth))
+}
+
+#[cfg(test)]
+mod client_ip_tests {
+    use super::pick_client_ip;
+    use axum::http::HeaderMap;
+    use std::net::IpAddr;
+
+    fn peer() -> Option<IpAddr> {
+        Some("203.0.113.7".parse().unwrap())
+    }
+
+    fn headers(name: &str, value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value.parse().unwrap(),
+        );
+        h
+    }
+
+    #[test]
+    fn no_header_config_uses_tcp_peer() {
+        assert_eq!(
+            pick_client_ip(None, &headers("CF-Connecting-IP", "198.51.100.9"), peer()),
+            "203.0.113.7",
+            "without config the proxy header is ignored"
+        );
+    }
+
+    #[test]
+    fn configured_header_overrides_peer() {
+        assert_eq!(
+            pick_client_ip(
+                Some("CF-Connecting-IP"),
+                &headers("CF-Connecting-IP", "198.51.100.9"),
+                peer()
+            ),
+            "198.51.100.9"
+        );
+    }
+
+    #[test]
+    fn xff_uses_last_hop_not_client_supplied() {
+        // The proxy APPENDS the address it saw, so the rightmost entry is the
+        // trusted one. The leftmost entries are client-supplied and spoofable:
+        // an attacker sending `X-Forwarded-For: 1.2.3.4` must NOT be able to
+        // pick the limiter key — the proxy's appended real IP wins.
+        assert_eq!(
+            pick_client_ip(
+                Some("X-Forwarded-For"),
+                &headers("X-Forwarded-For", "1.2.3.4, 70.0.0.1, 198.51.100.9"),
+                peer()
+            ),
+            "198.51.100.9",
+            "must take the proxy-appended last hop, not the spoofable first"
+        );
+    }
+
+    #[test]
+    fn missing_or_malformed_header_falls_back_to_peer() {
+        // Configured header absent from the request.
+        assert_eq!(
+            pick_client_ip(Some("CF-Connecting-IP"), &HeaderMap::new(), peer()),
+            "203.0.113.7"
+        );
+        // Present but not an IP — never becomes a bogus limiter key.
+        assert_eq!(
+            pick_client_ip(
+                Some("CF-Connecting-IP"),
+                &headers("CF-Connecting-IP", "not-an-ip"),
+                peer()
+            ),
+            "203.0.113.7"
+        );
+    }
+
+    #[test]
+    fn no_header_and_no_peer_is_sentinel() {
+        assert_eq!(pick_client_ip(None, &HeaderMap::new(), None), "0.0.0.0");
+    }
 }
