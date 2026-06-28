@@ -1301,28 +1301,32 @@ pub async fn get_event(
         return Err(VelaError::NotFound("event not found".into()).into());
     }
 
-    let visibility = current_history_visibility(&state, room_nid)?;
-    let membership = state
+    // The caller's read gate. `resolve_reader` is the non-403 variant:
+    // /event serves invited and world-readable non-member callers, so
+    // entry is decided here by `permits`, not by the gate refusing to
+    // build. A departed (leave/ban) caller is still bounded to their
+    // leave position — without the leave-cap, a `shared`-visibility room
+    // would let them read post-departure events directly. A denied caller
+    // gets 404, the same existence-hiding response as before.
+    let gate = TimelineReadGate::resolve_reader(&state, room_nid, user.user_nid)?;
+    let pivot_pos = state
         .db
-        .get_membership(room_nid, user.user_nid)
+        .event_timeline_pos_of(event_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-
-    if !history_visibility_permits(
-        &state,
-        room_nid,
-        user.user_nid,
-        membership,
-        &visibility,
-        event_nid,
-    )? {
+    if !gate.permits(&state, room_nid, user.user_nid, event_nid, pivot_pos)? {
         return Err(VelaError::NotFound("event not found".into()).into());
     }
 
-    let event = load_client_event_with_relations(
+    // Gated loader so the bundled `unsigned.m.relations` (latest reply,
+    // latest edit, reactions) only includes children this caller may
+    // see — a departed reader must not learn post-leave reply/edit
+    // content through the aggregation.
+    let event = load_client_event_with_relations_gated(
         &state,
         event_nid,
         &room_id_str,
         Some((user.user_nid, &user.device_id)),
+        Some(&gate),
     )?
     .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
 
@@ -1374,15 +1378,18 @@ pub async fn get_event_context(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
 
-    let visibility = current_history_visibility(&state, room_nid)?;
-    if !history_visibility_permits(
-        &state,
-        room_nid,
-        user.user_nid,
-        membership,
-        &visibility,
-        event_nid,
-    )? {
+    // Read gate for the pivot, the flanking events, and their bundles.
+    // The membership check above already rejected invite/knock/none with
+    // 403 (existence-hiding, same as /messages), so the gate only ever
+    // sees join/leave/ban here; it adds the leave-cap and per-event
+    // history-visibility filter that bound a departed caller to their
+    // leave position and a member to their post-join history.
+    let gate = TimelineReadGate::resolve_reader(&state, room_nid, user.user_nid)?;
+    let pivot_gate_pos = state
+        .db
+        .event_timeline_pos_of(event_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if !gate.permits(&state, room_nid, user.user_nid, event_nid, pivot_gate_pos)? {
         return Err(VelaError::NotFound("event not found".into()).into());
     }
 
@@ -1392,11 +1399,12 @@ pub async fn get_event_context(
     let limit = query.limit.unwrap_or(10).clamp(1, 100);
     let half = limit.div_ceil(2);
 
-    let pivot = load_client_event_with_relations(
+    let pivot = load_client_event_with_relations_gated(
         &state,
         event_nid,
         &room_id_str,
         Some((user.user_nid, &user.device_id)),
+        Some(&gate),
     )?
     .ok_or_else(|| ApiError(VelaError::NotFound("event not found".into())))?;
 
@@ -1437,11 +1445,20 @@ pub async fn get_event_context(
         let mut e = before_entries;
         e.reverse();
         for (pos, enid) in &e {
-            if let Some(ev) = load_client_event_with_relations(
+            // Per-event gate: a departed caller's leave-cap and the
+            // history-visibility filter bound which flanking events are
+            // visible — without it /context would leak post-leave (shared)
+            // or pre-join (joined/invited) events the timeline scan picked
+            // up. The token still only advances over events actually shown.
+            if !gate.permits(&state, room_nid, user.user_nid, *enid, Some(*pos))? {
+                continue;
+            }
+            if let Some(ev) = load_client_event_with_relations_gated(
                 &state,
                 *enid,
                 &room_id_str,
                 Some((user.user_nid, &user.device_id)),
+                Some(&gate),
             )? {
                 before.push(ev);
                 start_token = format!("s{pos}");
@@ -1460,11 +1477,19 @@ pub async fn get_event_context(
         // we offset by +1.
         let mut end_token = format!("s{}", pp.saturating_add(1));
         for (pos, enid) in &after_entries {
-            if let Some(ev) = load_client_event_with_relations(
+            // Same per-event gate as events_before: bound a departed
+            // caller to their leave position so post-leave events_after
+            // don't leak. The token only advances over shown events, so a
+            // capped caller's `end` stops at their last visible event.
+            if !gate.permits(&state, room_nid, user.user_nid, *enid, Some(*pos))? {
+                continue;
+            }
+            if let Some(ev) = load_client_event_with_relations_gated(
                 &state,
                 *enid,
                 &room_id_str,
                 Some((user.user_nid, &user.device_id)),
+                Some(&gate),
             )? {
                 after.push(ev);
                 end_token = format!("s{}", pos.saturating_add(1));
@@ -1630,17 +1655,39 @@ impl TimelineReadGate {
         room_nid: u64,
         user_nid: u64,
     ) -> Result<Self, ApiError> {
+        let gate = Self::resolve_reader(state, room_nid, user_nid)?;
+        // /messages-class endpoints reject callers not entitled to the
+        // timeline at all: never a member (None), or invite/knock only.
+        // Join (1), leave (0) and ban (3) read under the per-event gate.
+        match gate.membership {
+            Some(0) | Some(1) | Some(3) => Ok(gate),
+            _ => Err(VelaError::Forbidden("not a member of this room".into()).into()),
+        }
+    }
+
+    /// Resolve the caller's gate for an endpoint that makes its own entry
+    /// decision and also serves invited / world-readable non-member
+    /// callers (`/event`, `/context`). Unlike [`resolve`], this never 403s
+    /// on membership — it reflects the caller's actual membership so the
+    /// leave-cap and history-visibility filters still apply, while the
+    /// handler keeps ownership of the entry response. Departed (leave/ban)
+    /// callers get a leave-cap; everyone else (join/invite/knock/none) has
+    /// no cap and relies on the per-event history-visibility filter.
+    pub(crate) fn resolve_reader(
+        state: &AppState,
+        room_nid: u64,
+        user_nid: u64,
+    ) -> Result<Self, ApiError> {
         let membership = state
             .db
             .get_membership(room_nid, user_nid)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
         let leave_cap: Option<u64> = match membership {
-            Some(1) => None,
             Some(0) | Some(3) => state
                 .db
                 .get_user_room_membership_pos(user_nid, room_nid)
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?,
-            _ => return Err(VelaError::Forbidden("not a member of this room".into()).into()),
+            _ => None,
         };
         let visibility = current_history_visibility(state, room_nid)?;
         let needs_hv_filter = match visibility.as_str() {
