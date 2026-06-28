@@ -405,10 +405,11 @@ impl FederationClient {
         validate_key_response(&body, server_name, now_ms)
     }
 
-    /// Send a signed federation request and return the parsed JSON response.
-    ///
-    /// Used by the outbound transaction sender and (later) by the outbound
-    /// fetch path in `federation_receive`.
+    /// Resolve, sign, and send a federation request, returning the raw
+    /// response. Shared by [`signed_request`](Self::signed_request) (which
+    /// then parses the body) and [`send_transaction`](Self::send_transaction)
+    /// (which only cares about the status). Splitting here lets `/send` treat
+    /// a 2xx as delivered even when its response body can't be read.
     #[tracing::instrument(
         name = "federation.signed_request",
         skip(self, body),
@@ -419,13 +420,13 @@ impl FederationClient {
             http.target = %path_and_query,
         )
     )]
-    pub async fn signed_request(
+    async fn send_signed(
         &self,
         method: reqwest::Method,
         destination: &str,
         path_and_query: &str,
         body: Option<Value>,
-    ) -> Result<Value, FederationClientError> {
+    ) -> Result<reqwest::Response, FederationClientError> {
         if !self.enabled {
             return Err(FederationClientError::FederationDisabled);
         }
@@ -469,11 +470,26 @@ impl FederationClient {
             req = req.json(b);
         }
 
-        let resp = req
-            .send()
+        req.send()
             .await
-            .map_err(|e| FederationClientError::Http(e.to_string()))?;
+            .map_err(|e| FederationClientError::Http(e.to_string()))
+    }
 
+    /// Send a signed federation request and return the parsed JSON response.
+    ///
+    /// Used by the outbound fetch path and any caller that needs the
+    /// response body. For `/send` (where the body is informational), use
+    /// [`send_transaction`](Self::send_transaction) instead.
+    pub async fn signed_request(
+        &self,
+        method: reqwest::Method,
+        destination: &str,
+        path_and_query: &str,
+        body: Option<Value>,
+    ) -> Result<Value, FederationClientError> {
+        let resp = self
+            .send_signed(method, destination, path_and_query, body)
+            .await?;
         let status = resp.status();
         let resp_body = read_capped_json(resp, MAX_FEDERATION_RESPONSE_BYTES).await?;
 
@@ -496,8 +512,35 @@ impl FederationClient {
         body: Value,
     ) -> Result<Value, FederationClientError> {
         let path = format!("/_matrix/federation/v1/send/{txn_id}");
-        self.signed_request(reqwest::Method::PUT, destination, &path, Some(body))
+        let resp = self
+            .send_signed(reqwest::Method::PUT, destination, &path, Some(body))
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            // A 2xx means the peer ACCEPTED the transaction. The /send
+            // response body is per-PDU results the sender doesn't use, so a
+            // body that can't be read or parsed (e.g. the connection drops
+            // mid-body under load) MUST NOT be treated as a delivery failure
+            // — doing so re-sends and backs off a transaction the peer
+            // already processed, which stalls the per-room outbox behind a
+            // phantom failure and delays later events (the msc3902
+            // leave-delivery flake).
+            //
+            // Still drain the body best-effort: reqwest only returns a
+            // connection to the keep-alive pool once its body is read to
+            // EOF, so for the common case (a small, readable response)
+            // this preserves connection reuse instead of forcing a fresh
+            // TLS handshake on the next transaction. An unreadable body
+            // just errors here and is ignored — delivery still succeeded.
+            let _ = read_capped_json(resp, MAX_FEDERATION_RESPONSE_BYTES).await;
+            return Ok(Value::Null);
+        }
+        let resp_body = read_capped_json(resp, MAX_FEDERATION_RESPONSE_BYTES)
             .await
+            .unwrap_or(Value::Null);
+        Err(FederationClientError::Http(format!(
+            "status {status}: {resp_body}"
+        )))
     }
 
     /// `GET /_matrix/federation/v1/make_join/{roomId}/{userId}?ver=X`
