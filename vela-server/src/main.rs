@@ -1630,6 +1630,11 @@ fn main() -> anyhow::Result<()> {
         // presence survives forever, which is the bug this fixes).
         let _presence_sweeper_handle = vela_api::presence::presence_sweeper::spawn(state.clone());
 
+        // Periodic pruner for the unbounded dedup caches (client txn
+        // idempotency + inbound to-device dedup). Always on — these
+        // grow for the life of the server otherwise.
+        let _dedup_pruner_handle = vela_api::maintenance::dedup_pruner::spawn(state.clone());
+
         // Extension async observation worker. Drains the durable observation
         // queue and runs every `on_event`-bound plugin off the request path.
         // Always running (cheap when idle), so a SIGHUP that adds an on_event

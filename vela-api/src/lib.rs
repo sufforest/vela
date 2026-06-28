@@ -15,6 +15,7 @@ pub mod extensions;
 pub mod federation;
 pub mod health;
 pub mod invite_filter;
+pub mod maintenance;
 pub mod media;
 pub mod membership;
 pub mod metrics;

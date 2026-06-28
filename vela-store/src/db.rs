@@ -1967,8 +1967,37 @@ impl Database {
         if self.db.get_cf(&cf, key.as_slice())?.is_some() {
             return Ok(true);
         }
-        self.db.put_cf(&cf, &key, [1u8])?;
+        // Value is the receive time (ms, big-endian) so the pruner can
+        // age these out; the seen-check above only cares about presence.
+        self.db.put_cf(&cf, &key, now_ms().to_be_bytes())?;
         Ok(false)
+    }
+
+    /// Delete inbound to-device dedup markers older than `cutoff_ms`.
+    /// Like `prune_transactions`: re-accepting a long-since-seen
+    /// message_id is harmless (the to-device delivery path dedupes
+    /// again downstream), so an over-aggressive cutoff only costs a
+    /// little rework. Legacy 1-byte markers (pre-timestamp) are left
+    /// alone. Returns the count removed.
+    pub fn prune_to_device_seen(&self, cutoff_ms: u64) -> Result<usize, rocksdb::Error> {
+        let cf = self.db.cf_handle("to_device_seen_message_ids").unwrap();
+        let mut batch = WriteBatch::default();
+        let mut removed = 0usize;
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+        for item in iter {
+            let (key, val) = item?;
+            if val.len() >= 8 {
+                let ts = u64::from_be_bytes(val[..8].try_into().unwrap_or([0u8; 8]));
+                if ts < cutoff_ms {
+                    batch.delete_cf(&cf, &key);
+                    removed += 1;
+                }
+            }
+        }
+        if removed > 0 {
+            self.db.write(batch)?;
+        }
+        Ok(removed)
     }
 
     /// Scan `presence_stream` strictly after `cursor`, returning up to
@@ -4139,7 +4168,7 @@ impl Database {
         let cf = self.db.cf_handle("transactions").unwrap();
         let key = transaction_key(user_nid, device_id, scope, txn_id);
         match self.db.get_cf(&cf, key.as_slice())? {
-            Some(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).to_string())),
+            Some(bytes) => Ok(Some(decode_transaction_value(&bytes))),
             None => Ok(None),
         }
     }
@@ -4154,7 +4183,39 @@ impl Database {
     ) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("transactions").unwrap();
         let key = transaction_key(user_nid, device_id, scope, txn_id);
-        self.db.put_cf(&cf, &key, event_id.as_bytes())
+        self.db
+            .put_cf(&cf, &key, encode_transaction_value(event_id))
+    }
+
+    /// Delete client-transaction idempotency entries older than
+    /// `cutoff_ms` (write time < cutoff). Returns the count removed.
+    ///
+    /// The `transactions` CF only needs to remember a (user, device,
+    /// scope, txn_id) → event_id mapping for the client's retry window;
+    /// without pruning it grows for the life of the server. Entries
+    /// written before timestamps were stamped (legacy, untagged) are
+    /// left alone — they have no parseable time, and deleting one that
+    /// happened to be recent could re-mint a duplicate event on retry.
+    /// Full scan: the keys aren't time-ordered, so if this ever becomes
+    /// hot the upgrade is a time-ordered index CF.
+    pub fn prune_transactions(&self, cutoff_ms: u64) -> Result<usize, rocksdb::Error> {
+        let cf = self.db.cf_handle("transactions").unwrap();
+        let mut batch = WriteBatch::default();
+        let mut removed = 0usize;
+        let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+        for item in iter {
+            let (key, val) = item?;
+            if let Some(ts) = transaction_value_ts(&val)
+                && ts < cutoff_ms
+            {
+                batch.delete_cf(&cf, &key);
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            self.db.write(batch)?;
+        }
+        Ok(removed)
     }
 
     // --- Profile operations ---
@@ -7653,6 +7714,40 @@ fn to_device_outbound_key(destination: &str, stream_pos: u64) -> Vec<u8> {
 /// <scope> 0xff <txn_id>`. The two-byte separators keep variable-
 /// length fields unambiguous so a `device_id` containing the
 /// "scope/txn" delimiter can't collide with a different request.
+/// Tag byte marking the timestamped `transactions` value format
+/// `[TXN_V1][8-byte big-endian write-time ms][event_id]`. Unambiguous
+/// against legacy values, which are bare event_ids starting with the
+/// `$` sigil (0x24).
+const TXN_V1: u8 = 0x01;
+
+fn encode_transaction_value(event_id: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + 8 + event_id.len());
+    v.push(TXN_V1);
+    v.extend_from_slice(&now_ms().to_be_bytes());
+    v.extend_from_slice(event_id.as_bytes());
+    v
+}
+
+/// Extract the event_id from a stored `transactions` value, handling
+/// both the timestamped format and legacy bare-event_id values.
+fn decode_transaction_value(bytes: &[u8]) -> String {
+    if bytes.first() == Some(&TXN_V1) && bytes.len() >= 9 {
+        String::from_utf8_lossy(&bytes[9..]).to_string()
+    } else {
+        String::from_utf8_lossy(bytes).to_string()
+    }
+}
+
+/// Write-time (ms) of a `transactions` value, or `None` for a legacy
+/// untagged value (which the pruner then leaves in place).
+fn transaction_value_ts(bytes: &[u8]) -> Option<u64> {
+    if bytes.first() == Some(&TXN_V1) && bytes.len() >= 9 {
+        Some(u64::from_be_bytes(bytes[1..9].try_into().ok()?))
+    } else {
+        None
+    }
+}
+
 fn transaction_key(user_nid: u64, device_id: &str, scope: &str, txn_id: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(8 + 1 + device_id.len() + 1 + scope.len() + 1 + txn_id.len());
     k.extend_from_slice(&keys::encode_u64(user_nid));
@@ -9953,5 +10048,105 @@ mod kv_tests {
         // A sweep with nothing expired still recomputes the gauge authoritatively.
         assert_eq!(db.kv_sweep_plugin(7, 1_000).unwrap(), 0);
         assert_eq!(db.kv_quota_get(7).unwrap(), (b"a".len() + 5) as u64);
+    }
+
+    #[test]
+    fn transactions_roundtrip_and_prune_by_age() {
+        let (db, _t) = db();
+        let cf = db.db.cf_handle("transactions").unwrap();
+
+        // Round-trips through the timestamped value format.
+        db.set_transaction(1, "DEV", "send", "txn-new", "$evt_new")
+            .unwrap();
+        assert_eq!(
+            db.get_transaction(1, "DEV", "send", "txn-new")
+                .unwrap()
+                .as_deref(),
+            Some("$evt_new")
+        );
+
+        // A legacy bare-event_id value (pre-timestamp) still reads.
+        let legacy_key = transaction_key(1, "DEV", "send", "txn-legacy");
+        db.db.put_cf(&cf, &legacy_key, b"$evt_legacy").unwrap();
+        assert_eq!(
+            db.get_transaction(1, "DEV", "send", "txn-legacy")
+                .unwrap()
+                .as_deref(),
+            Some("$evt_legacy")
+        );
+
+        // A crafted OLD timestamped entry (write-time 1000ms).
+        let old_key = transaction_key(1, "DEV", "send", "txn-old");
+        let mut old_val = vec![TXN_V1];
+        old_val.extend_from_slice(&1000u64.to_be_bytes());
+        old_val.extend_from_slice(b"$evt_old");
+        db.db.put_cf(&cf, &old_key, &old_val).unwrap();
+
+        // Cutoff above the old entry but below "now": only the old
+        // timestamped entry is pruned; recent + legacy survive.
+        let removed = db.prune_transactions(1_000_000).unwrap();
+        assert_eq!(removed, 1);
+        assert!(
+            db.get_transaction(1, "DEV", "send", "txn-old")
+                .unwrap()
+                .is_none(),
+            "old entry pruned"
+        );
+        assert_eq!(
+            db.get_transaction(1, "DEV", "send", "txn-new")
+                .unwrap()
+                .as_deref(),
+            Some("$evt_new"),
+            "recent entry kept"
+        );
+        assert_eq!(
+            db.get_transaction(1, "DEV", "send", "txn-legacy")
+                .unwrap()
+                .as_deref(),
+            Some("$evt_legacy"),
+            "legacy untagged entry kept"
+        );
+    }
+
+    #[test]
+    fn to_device_seen_dedup_and_prune_by_age() {
+        let (db, _t) = db();
+
+        // Dedup: first sighting false (new), second true (seen).
+        assert!(
+            !db.check_and_record_to_device_message_id("remote.example", "msg1")
+                .unwrap()
+        );
+        assert!(
+            db.check_and_record_to_device_message_id("remote.example", "msg1")
+                .unwrap()
+        );
+
+        let cf = db.db.cf_handle("to_device_seen_message_ids").unwrap();
+        let mk = |mid: &str| {
+            let mut k = b"remote.example".to_vec();
+            k.push(0xff);
+            k.extend_from_slice(mid.as_bytes());
+            k
+        };
+        // Old timestamped entry + a legacy 1-byte marker.
+        db.db
+            .put_cf(&cf, mk("msg-old"), 1000u64.to_be_bytes())
+            .unwrap();
+        db.db.put_cf(&cf, mk("msg-legacy"), [1u8]).unwrap();
+
+        let removed = db.prune_to_device_seen(1_000_000).unwrap();
+        assert_eq!(removed, 1, "only the old timestamped marker pruned");
+        // The recent marker and the legacy marker both remain (seen == true).
+        assert!(
+            db.check_and_record_to_device_message_id("remote.example", "msg1")
+                .unwrap(),
+            "recent marker kept"
+        );
+        assert!(
+            db.check_and_record_to_device_message_id("remote.example", "msg-legacy")
+                .unwrap(),
+            "legacy marker kept"
+        );
     }
 }
