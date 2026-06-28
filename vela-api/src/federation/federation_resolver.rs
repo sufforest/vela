@@ -194,11 +194,32 @@ impl FederationResolver {
 
     /// Construct a resolver bound to a specific safety policy.
     pub fn with_policy(policy: FederationPolicy) -> Result<Self, ResolveError> {
-        let mut builder = TokioResolver::builder_with_config(
-            ResolverConfig::default(),
-            TokioRuntimeProvider::default(),
-        );
-        *builder.options_mut() = ResolverOpts::default();
+        // Build the DNS resolver from system config (/etc/resolv.conf) so it
+        // has real upstream nameservers. hickory's `ResolverConfig::default()`
+        // is EMPTY — building from it means the resolver resolves nothing for
+        // real hostnames, so outbound resolution silently falls through to the
+        // HTTP client's *unchecked* system DNS and bypasses the `is_blocked_ip`
+        // SSRF vetting entirely. Reading system config is what Synapse and
+        // conduwuit do too. Fall back to an (empty) default config only when
+        // there is no system config to read: federation resolution is then
+        // unavailable until DNS is configured, but under `private_ip_block`
+        // that surfaces as a clean fail-closed error, not an unchecked-DNS
+        // bypass.
+        let builder = match TokioResolver::builder_tokio() {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "no system DNS config; federation name resolution unavailable until configured"
+                );
+                let mut b = TokioResolver::builder_with_config(
+                    ResolverConfig::default(),
+                    TokioRuntimeProvider::default(),
+                );
+                *b.options_mut() = ResolverOpts::default();
+                b
+            }
+        };
         let dns = builder
             .build()
             .map_err(|e| ResolveError::WellKnownFailure(format!("dns resolver build: {e}")))?;
@@ -350,6 +371,28 @@ impl FederationResolver {
         // when the destination's host portion exactly matches ours.
         let is_self = !self.policy.our_server_name.is_empty()
             && host_only(server_name) == host_only(&self.policy.our_server_name);
+        // Fail closed on an empty IP set. We resolve outbound destinations
+        // ourselves precisely so we can vet the IPs against `is_blocked_ip`.
+        // An empty set means our resolver found nothing — and `client_for`
+        // would then fall back to the default client's *system* DNS, which
+        // resolves the hostname again with no SSRF check (a split-horizon /
+        // DNS-rebinding bypass). Refuse instead of letting that fallthrough
+        // happen. (IP-literal destinations always carry one IP, so this only
+        // fires on a genuine lookup failure.) The self-loop is exempt: a
+        // single-host eval pointing at itself with no working resolver still
+        // reaches its own loopback via the default client, which is safe.
+        if resolved.resolved_ips.is_empty() {
+            if is_self {
+                return Ok(());
+            }
+            warn!(
+                %server_name,
+                "federation: outbound refused — destination did not resolve to any IP"
+            );
+            return Err(ResolveError::DnsFailure(format!(
+                "{server_name} resolved to no IPs"
+            )));
+        }
         for ip in &resolved.resolved_ips {
             if is_blocked_ip(*ip) {
                 if is_self && ip.is_loopback() {
@@ -1013,6 +1056,69 @@ mod tests {
             .unwrap();
         let err = r.resolve("127.0.0.1:8448").await.unwrap_err();
         assert!(matches!(err, ResolveError::PrivateIpBlocked { .. }));
+    }
+
+    #[tokio::test]
+    async fn check_resolved_ips_fails_closed_on_empty_under_private_block() {
+        // An empty IP set for a non-self destination must be refused under
+        // private_ip_block — otherwise client_for falls back to unchecked
+        // system DNS (the SSRF fail-open this guards).
+        let strict =
+            FederationResolver::with_policy(FederationPolicy::strict("our.example".into()))
+                .unwrap();
+        let empty = ResolvedServer {
+            target_host: "ghost.example".into(),
+            target_port: 8448,
+            tls_server_name: "ghost.example".into(),
+            host_header: "ghost.example".into(),
+            resolved_ips: vec![],
+        };
+        assert!(matches!(
+            strict.check_resolved_ips("ghost.example", &empty),
+            Err(ResolveError::DnsFailure(_))
+        ));
+
+        // The self-loop is exempt (single-host eval with no resolver).
+        let self_loop =
+            FederationResolver::with_policy(FederationPolicy::strict("ghost.example".into()))
+                .unwrap();
+        assert!(
+            self_loop
+                .check_resolved_ips("ghost.example", &empty)
+                .is_ok()
+        );
+
+        // With the policy off (tests / Complement) the empty set is allowed
+        // so the default-client fallback keeps working.
+        let permissive = FederationResolver::new().unwrap();
+        assert!(
+            permissive
+                .check_resolved_ips("ghost.example", &empty)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_resolver_refuses_hostname_resolving_to_loopback() {
+        // End-to-end through `resolve`: a non-self hostname that resolves to
+        // a private/loopback IP must be REFUSED, not silently served. We use
+        // "localhost" (→ 127.0.0.1 / ::1 via /etc/hosts) as a stable
+        // private-resolving name. This is the production (strict) path the
+        // empty-nameserver resolver used to skip: it returned no IPs, so the
+        // vetting loop never ran and resolution fell through to the unchecked
+        // default client. Either PrivateIpBlocked (resolved + vetted) or
+        // DnsFailure (no IPs → fail-closed) is a refusal; Ok must not happen.
+        // (Real-peer resolution via system nameservers is covered by Complement.)
+        let r = FederationResolver::with_policy(FederationPolicy::strict("our.example".into()))
+            .unwrap();
+        let res = r.resolve("localhost:8448").await;
+        assert!(
+            matches!(
+                res,
+                Err(ResolveError::PrivateIpBlocked { .. } | ResolveError::DnsFailure(_))
+            ),
+            "strict resolver must refuse a hostname resolving to loopback, got {res:?}"
+        );
     }
 
     #[tokio::test]
