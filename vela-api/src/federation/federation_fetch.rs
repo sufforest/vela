@@ -96,6 +96,14 @@ pub async fn get_event(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    // History-visibility redaction: a resident server gets the unredacted
+    // event only if it could have seen it under the room's policy at that
+    // event (e.g. it had a joined member then); otherwise a redacted copy.
+    let json = match state.db.get_event_nid_by_id(&event_id).ok().flatten() {
+        Some(nid) => redact_for_origin_if_hidden(&state, nid, &origin.0, json),
+        None => json,
+    };
+
     // Transaction-shaped response per spec.
     Ok(Json(json!({
         "origin": state.config.server_name,
@@ -276,8 +284,10 @@ pub async fn get_backfill(
     axum::extract::Extension(origin): axum::extract::Extension<XMatrixOrigin>,
 ) -> Result<Json<Value>, StatusCode> {
     // The requesting server must be in the room (see origin_in_room).
-    // /backfill returns unredacted message bodies, so this is the most
-    // sensitive of the read endpoints to leave ungated.
+    // /backfill returns message bodies, so this is the most sensitive of
+    // the read endpoints to leave ungated. Per-event history-visibility
+    // redaction (in the walk below) further trims what a resident server
+    // sees, keyed on each event's own room.
     if let Ok(Some(room_nid)) = state.db.get_nid(&room_id)
         && !origin_in_room(&state, room_nid, &origin.0)
     {
@@ -333,6 +343,7 @@ pub async fn get_backfill(
         let Some(json) = load_event_json_by_event_id(&state.db, &eid) else {
             continue;
         };
+        let json = redact_for_origin_if_hidden(&state, nid, &origin.0, json);
         pdus.push(json);
 
         if let Ok(prev) = state.db.get_prev_events(nid) {
@@ -444,14 +455,7 @@ pub async fn get_missing_events(
     // and the requesting origin's member events at that point.
     let final_out: Vec<Value> = out
         .into_iter()
-        .map(|(nid, json)| {
-            if should_redact_for_origin(&state, nid, &origin.0) {
-                let obj = json.as_object().cloned().unwrap_or_default();
-                Value::Object(vela_core::events::redact::redact_event(&obj))
-            } else {
-                json
-            }
-        })
+        .map(|(nid, json)| redact_for_origin_if_hidden(&state, nid, &origin.0, json))
         .collect();
 
     let mut final_out = final_out;
@@ -479,6 +483,44 @@ fn should_redact_for_origin(state: &AppState, event_nid: u64, origin: &str) -> b
         // Unknown/missing → spec default "shared".
         _ => false,
     }
+}
+
+/// History-visibility redaction for the event-serving endpoints (`/event`,
+/// `/backfill`, `/get_missing_events`): when the requesting `origin`
+/// couldn't see `event_nid` under the room's policy at that event, return
+/// a redacted copy; otherwise the event unchanged.
+///
+/// Redaction uses the *event's own* room version — read from the event's
+/// `room_id`, NOT a caller-supplied path room — so the served event's
+/// signature still validates on the receiver (signatures are computed over
+/// the redacted form) and a cross-room seed can't be stripped under the
+/// wrong room's rules. Falls back to v12 when the version can't be
+/// resolved: redacting under a possibly-wrong version is still strictly
+/// safer than leaking the event in full, so redaction is unconditional
+/// once `should_redact_for_origin` says hide.
+///
+/// `/state` and `/state_ids` deliberately do NOT call this: a resident
+/// peer needs the full resolved state for state-resolution and auth, and
+/// Synapse likewise filters only the timeline-serving endpoints.
+fn redact_for_origin_if_hidden(
+    state: &AppState,
+    event_nid: u64,
+    origin: &str,
+    json: Value,
+) -> Value {
+    if !should_redact_for_origin(state, event_nid, origin) {
+        return json;
+    }
+    let version = json
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .and_then(|rid| state.db.get_nid(rid).ok().flatten())
+        .and_then(|rn| state.db.get_room_version_typed(rn).ok())
+        .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
+    let obj = json.as_object().cloned().unwrap_or_default();
+    Value::Object(vela_core::events::redact::redact_event_for_version(
+        &obj, version,
+    ))
 }
 
 /// Read `m.room.history_visibility/""` from a state snapshot. Returns
@@ -1003,5 +1045,308 @@ mod residency_tests {
         )
         .await;
         assert!(ok.is_ok(), "resident server must pass the residency gate");
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    //! History-visibility redaction on the event-serving endpoints: a
+    //! server that is *currently* resident (passes `origin_in_room`) but
+    //! had no qualifying member at an event must receive that event
+    //! REDACTED, not in full. Mirrors Synapse's `filter_events_for_server`
+    //! on `/event`, `/backfill`, `/get_missing_events`. `/state` is
+    //! deliberately NOT filtered (peers need full state for resolution).
+
+    use super::{XMatrixOrigin, get_backfill, get_event, get_missing_events};
+    use crate::middleware::federation_auth::VerifiedBody;
+    use crate::middleware::json::Json;
+    use crate::router::AppState;
+    use crate::test_helpers::build_test_state;
+    use axum::extract::{Extension, Path, RawQuery, State};
+    use serde_json::{Value, json};
+
+    const ORIGIN: &str = "remote.example";
+
+    fn xorigin(s: &str) -> Extension<XMatrixOrigin> {
+        Extension(XMatrixOrigin(s.to_string()))
+    }
+
+    /// A room with the given history `visibility` where `remote.example`
+    /// is CURRENTLY joined (so it passes the residency gate), plus a
+    /// message `$msg`. The message's per-event state snapshot holds the
+    /// history_visibility event and — only when `member_at_msg` is `Some`
+    /// — a remote member event with that membership, modelling "the remote
+    /// was already a member at the message" vs "the message predates the
+    /// remote's membership" (`None`). `version` sets the room version so
+    /// the version-aware redaction path can be exercised.
+    fn room_with_message(
+        state: &AppState,
+        visibility: &str,
+        member_at_msg: Option<&str>,
+        version: Option<&str>,
+    ) -> String {
+        let db = &state.db;
+        let room_id = "!redact:local".to_string();
+        let room_nid = db.get_or_create_nid(&room_id).unwrap();
+        if let Some(v) = version {
+            db.create_room_meta(room_nid, &room_id, v).unwrap();
+        }
+        // Current membership: remote.example is joined → resident.
+        db.set_membership(
+            room_nid,
+            db.get_or_create_nid("@r:remote.example").unwrap(),
+            1,
+        )
+        .unwrap();
+
+        let local = db.get_or_create_nid("@a:good.example").unwrap();
+        let sk_empty = db.get_or_create_nid("").unwrap();
+
+        // history_visibility state event for the snapshot.
+        let hv_nid = 2001u64;
+        let type_hv = db.get_or_create_nid("m.room.history_visibility").unwrap();
+        let hv_ev = json!({
+            "event_id": "$hv", "type": "m.room.history_visibility",
+            "state_key": "", "sender": "@a:good.example", "room_id": room_id,
+            "content": {"history_visibility": visibility},
+            "origin_server_ts": 1, "depth": 1, "prev_events": [], "auth_events": [],
+        });
+        db.persist_event(
+            hv_nid,
+            "$hv",
+            room_nid,
+            type_hv,
+            local,
+            sk_empty,
+            1,
+            1,
+            &serde_json::to_vec(&hv_ev).unwrap(),
+            &[],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+
+        let mut snapshot = vec![hv_nid];
+
+        if let Some(membership) = member_at_msg {
+            let mem_nid = 2002u64;
+            let type_mem = db.get_or_create_nid("m.room.member").unwrap();
+            let sk_remote = db.get_or_create_nid("@r:remote.example").unwrap();
+            let mem_ev = json!({
+                "event_id": "$mem", "type": "m.room.member",
+                "state_key": "@r:remote.example", "sender": "@r:remote.example", "room_id": room_id,
+                "content": {"membership": membership},
+                "origin_server_ts": 2, "depth": 2, "prev_events": [], "auth_events": [],
+            });
+            db.persist_event(
+                mem_nid,
+                "$mem",
+                room_nid,
+                type_mem,
+                sk_remote,
+                sk_remote,
+                2,
+                2,
+                &serde_json::to_vec(&mem_ev).unwrap(),
+                &[],
+                &[],
+                true,
+                false,
+            )
+            .unwrap();
+            snapshot.push(mem_nid);
+        }
+
+        // The message whose snapshot we control.
+        let msg_nid = 2000u64;
+        let type_msg = db.get_or_create_nid("m.room.message").unwrap();
+        let msg_ev = json!({
+            "event_id": "$msg", "type": "m.room.message",
+            "sender": "@a:good.example", "room_id": room_id,
+            "content": {"msgtype": "m.text", "body": "secret"},
+            "origin_server_ts": 3, "depth": 3, "prev_events": [], "auth_events": [],
+        });
+        db.persist_event(
+            msg_nid,
+            "$msg",
+            room_nid,
+            type_msg,
+            local,
+            0,
+            3,
+            3,
+            &serde_json::to_vec(&msg_ev).unwrap(),
+            &[],
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+
+        db.persist_state_snapshot(room_nid, msg_nid, &snapshot)
+            .unwrap();
+        room_id
+    }
+
+    fn pdu0_body(resp: &Value) -> Option<String> {
+        resp.pointer("/pdus/0/content/body")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    }
+
+    #[tokio::test]
+    async fn event_redacted_when_message_predates_origin_membership() {
+        let (state, _tmp) = build_test_state();
+        room_with_message(&state, "joined", None, None);
+        let Json(resp) = get_event(
+            State(state.clone()),
+            Path("$msg".to_string()),
+            xorigin(ORIGIN),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pdu0_body(&resp),
+            None,
+            "an event predating the origin's membership must be redacted under joined visibility"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_not_redacted_when_origin_was_member_at_event() {
+        let (state, _tmp) = build_test_state();
+        room_with_message(&state, "joined", Some("join"), None);
+        let Json(resp) = get_event(
+            State(state.clone()),
+            Path("$msg".to_string()),
+            xorigin(ORIGIN),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pdu0_body(&resp).as_deref(),
+            Some("secret"),
+            "an origin that was a member at the event must receive it in full"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_visibility_serves_full_event() {
+        let (state, _tmp) = build_test_state();
+        room_with_message(&state, "shared", None, None);
+        let Json(resp) = get_event(
+            State(state.clone()),
+            Path("$msg".to_string()),
+            xorigin(ORIGIN),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pdu0_body(&resp).as_deref(),
+            Some("secret"),
+            "shared visibility never redacts on read"
+        );
+    }
+
+    #[tokio::test]
+    async fn redaction_applies_for_non_v12_room_version() {
+        let (state, _tmp) = build_test_state();
+        room_with_message(&state, "joined", None, Some("10"));
+        let Json(resp) = get_event(
+            State(state.clone()),
+            Path("$msg".to_string()),
+            xorigin(ORIGIN),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pdu0_body(&resp),
+            None,
+            "redaction must apply regardless of room version"
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_redacts_pre_membership_event() {
+        let (state, _tmp) = build_test_state();
+        let room_id = room_with_message(&state, "joined", None, None);
+        let Json(resp) = get_backfill(
+            State(state.clone()),
+            Path(room_id),
+            RawQuery(Some("v=$msg&limit=10".to_string())),
+            xorigin(ORIGIN),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pdu0_body(&resp),
+            None,
+            "backfill must redact events predating the origin's membership"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_missing_events_redacts_pre_membership_event() {
+        let (state, _tmp) = build_test_state();
+        let room_id = room_with_message(&state, "joined", None, None);
+        // A child whose prev_events points at $msg, used as the walk seed.
+        // The seed is excluded from output; $msg is what comes back.
+        let db = &state.db;
+        let room_nid = db.get_nid(&room_id).unwrap().unwrap();
+        let type_msg = db.get_or_create_nid("m.room.message").unwrap();
+        let local = db.get_or_create_nid("@a:good.example").unwrap();
+        let child = json!({
+            "event_id": "$child", "type": "m.room.message",
+            "sender": "@a:good.example", "room_id": room_id,
+            "content": {"msgtype": "m.text", "body": "child"},
+            "origin_server_ts": 4, "depth": 4, "prev_events": ["$msg"], "auth_events": [],
+        });
+        db.persist_event(
+            2003,
+            "$child",
+            room_nid,
+            type_msg,
+            local,
+            0,
+            4,
+            4,
+            &serde_json::to_vec(&child).unwrap(),
+            &[2000],
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+
+        let body = VerifiedBody(Some(json!({
+            "earliest_events": [],
+            "latest_events": ["$child"],
+        })));
+        let Json(resp) = get_missing_events(
+            State(state.clone()),
+            Path(room_id),
+            xorigin(ORIGIN),
+            Extension(body),
+        )
+        .await
+        .unwrap();
+        // Only $msg is in the gap — the seed $child is excluded from the
+        // response. (Redaction strips the top-level event_id, which in v3+
+        // is a computed reference hash, not a signed field, so we assert on
+        // the lone output rather than matching by id.)
+        let events = resp.get("events").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "only the gap event $msg should be returned: {events:?}"
+        );
+        assert_eq!(
+            events[0].pointer("/content/body"),
+            None,
+            "get_missing_events must redact events predating the origin's membership: {:?}",
+            events[0]
+        );
     }
 }
