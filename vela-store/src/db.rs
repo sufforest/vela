@@ -3518,10 +3518,10 @@ impl Database {
         stream_pos: u64,
     ) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("device_key_changes").unwrap();
+        let val = device_list_value(changed_user_nid, now_ms());
         let mut batch = WriteBatch::default();
         for &observer_nid in observer_nids {
             let key = keys::encode_u64_pair(observer_nid, stream_pos);
-            let val = keys::encode_u64(changed_user_nid);
             batch.put_cf(&cf, key, val);
         }
         self.db.write(batch)
@@ -5999,7 +5999,7 @@ impl Database {
         let cf = self.db.cf_handle("device_key_changes").unwrap();
         let pos = self.next_stream_position();
         let _stream_guard = StreamApplyOnDrop::new(self, pos.as_u64());
-        let val = keys::encode_u64(changed_user_nid);
+        let val = device_list_value(changed_user_nid, now_ms());
 
         // Collect observers: always self, plus every joined room-mate.
         let mut observers = std::collections::HashSet::new();
@@ -6061,7 +6061,7 @@ impl Database {
         stream_pos: u64,
     ) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("device_list_left").unwrap();
-        let val = keys::encode_u64(departed_nid);
+        let val = device_list_value(departed_nid, now_ms());
         let mut batch = WriteBatch::default();
         for &obs in observer_nids {
             if obs == departed_nid {
@@ -6101,6 +6101,80 @@ impl Database {
             }
         }
         Ok(left_users)
+    }
+
+    /// Remove `device_key_changes` / `device_list_left` entries written
+    /// before `cutoff_ms`, and advance the prune horizon to the highest
+    /// stream position removed. Returns `(entries_removed, horizon)`.
+    ///
+    /// The horizon lets the `/sync` + `/keys/changes` read paths detect a
+    /// caller whose `since` token predates the retained window: any entry
+    /// at or below the horizon may be gone, so that caller's change list
+    /// would be incomplete and they must full-resync (see
+    /// [`users_sharing_room_with`](Self::users_sharing_room_with)). Legacy
+    /// values without a timestamp are treated as ancient and removed.
+    pub fn prune_device_lists(&self, cutoff_ms: u64) -> Result<(usize, u64), rocksdb::Error> {
+        let mut batch = WriteBatch::default();
+        let mut removed = 0usize;
+        let mut horizon = self.device_list_prune_horizon();
+
+        for cf_name in ["device_key_changes", "device_list_left"] {
+            let cf = self.db.cf_handle(cf_name).unwrap();
+            let iter = self.db.iterator_cf(&cf, IteratorMode::Start);
+            for item in iter {
+                let (key, val) = item?;
+                if key.len() < 16 {
+                    continue;
+                }
+                // Absent timestamp (legacy 8-byte value) = ancient → prune.
+                if device_list_value_ts(&val).unwrap_or(0) < cutoff_ms {
+                    let (_obs, pos) = keys::decode_u64_pair(&key);
+                    horizon = horizon.max(pos);
+                    batch.delete_cf(&cf, &key);
+                    removed += 1;
+                }
+            }
+        }
+
+        if removed > 0 {
+            let cf_meta = self.db.cf_handle("meta").unwrap();
+            batch.put_cf(
+                &cf_meta,
+                "device_list_prune_horizon".as_bytes(),
+                horizon.to_be_bytes(),
+            );
+            self.db.write(batch)?;
+        }
+        Ok((removed, horizon))
+    }
+
+    /// The highest stream position whose device-list entries have been
+    /// pruned. A reader whose `from` is `<=` this value can't trust an
+    /// incremental change list and must full-resync. Defaults to 0.
+    pub fn device_list_prune_horizon(&self) -> u64 {
+        self.get_meta("device_list_prune_horizon")
+            .ok()
+            .flatten()
+            .filter(|b| b.len() >= 8)
+            .map(|b| u64::from_be_bytes(b[..8].try_into().unwrap_or([0u8; 8])))
+            .unwrap_or(0)
+    }
+
+    /// Every user who shares a joined room with `user_nid` (excluding the
+    /// user themselves). Used as the over-report set when a caller's
+    /// device-list token predates the prune horizon: re-reporting all of
+    /// them as `changed` forces a full `/keys/query`, which is safe (an
+    /// extra refetch) whereas under-reporting leaves stale device keys.
+    pub fn users_sharing_room_with(&self, user_nid: u64) -> Result<Vec<u64>, rocksdb::Error> {
+        let mut set = std::collections::HashSet::new();
+        for room_nid in self.get_user_joined_rooms(user_nid)? {
+            for m in self.get_room_members(room_nid)? {
+                if m != user_nid {
+                    set.insert(m);
+                }
+            }
+        }
+        Ok(set.into_iter().collect())
     }
 
     /// Return the prev_events (as NIDs) recorded for an event.
@@ -7775,6 +7849,31 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Encode a `device_key_changes` / `device_list_left` value: the
+/// changed/departed `user_nid` (first 8 bytes — all readers `decode_u64`
+/// only these) followed by the wall-clock write time in ms (next 8 bytes),
+/// so the retention pruner can age entries out by time. Legacy 8-byte
+/// values stay readable; the pruner treats their absent timestamp as 0
+/// (ancient), so they age out on the first pass.
+fn device_list_value(nid: u64, ts_ms: u64) -> [u8; 16] {
+    let mut v = [0u8; 16];
+    v[0..8].copy_from_slice(&nid.to_be_bytes());
+    v[8..16].copy_from_slice(&ts_ms.to_be_bytes());
+    v
+}
+
+/// Read the write-time ms from a device-list value (`None` for a legacy
+/// 8-byte value with no timestamp).
+fn device_list_value_ts(val: &[u8]) -> Option<u64> {
+    if val.len() >= 16 {
+        Some(u64::from_be_bytes(
+            val[8..16].try_into().unwrap_or([0u8; 8]),
+        ))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -10148,5 +10247,78 @@ mod kv_tests {
                 .unwrap(),
             "legacy marker kept"
         );
+    }
+}
+
+#[cfg(test)]
+mod device_list_retention_tests {
+    use super::*;
+
+    fn db() -> (Database, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        (Database::open(tmp.path()).unwrap(), tmp)
+    }
+
+    /// The change value now carries a trailing timestamp (16 bytes), but
+    /// readers only decode the first 8 — so the changed nid must still read
+    /// back. Guards the retention format change against breaking the E2EE
+    /// device-tracking read path.
+    #[test]
+    fn record_then_read_roundtrips_with_timestamped_value() {
+        let (db, _t) = db();
+        // No rooms → the only observer is the user themselves.
+        db.record_device_key_change(42).unwrap();
+        let changed = db.get_device_key_changes(42, 0, u64::MAX).unwrap();
+        assert_eq!(changed, vec![42], "16-byte value must still decode the nid");
+    }
+
+    /// A cutoff past every entry's write time removes them all and advances
+    /// the horizon to the highest removed stream position.
+    #[test]
+    fn prune_removes_old_and_advances_horizon() {
+        let (db, _t) = db();
+        db.record_device_key_change(42).unwrap();
+        assert_eq!(db.device_list_prune_horizon(), 0, "nothing pruned yet");
+
+        // u64::MAX cutoff: every entry's timestamp is < cutoff → all go.
+        let (removed, horizon) = db.prune_device_lists(u64::MAX).unwrap();
+        assert_eq!(removed, 1);
+        assert!(horizon > 0, "horizon advances to the pruned entry's pos");
+        assert_eq!(db.device_list_prune_horizon(), horizon, "horizon persisted");
+        assert!(
+            db.get_device_key_changes(42, 0, u64::MAX)
+                .unwrap()
+                .is_empty(),
+            "pruned entry is gone"
+        );
+    }
+
+    /// A zero cutoff (nothing is older than the epoch) keeps every entry
+    /// and leaves the horizon untouched.
+    #[test]
+    fn prune_with_zero_cutoff_keeps_recent() {
+        let (db, _t) = db();
+        db.record_device_key_change(42).unwrap();
+        let (removed, horizon) = db.prune_device_lists(0).unwrap();
+        assert_eq!((removed, horizon), (0, 0));
+        assert_eq!(
+            db.get_device_key_changes(42, 0, u64::MAX).unwrap(),
+            vec![42]
+        );
+    }
+
+    /// The over-report set is every joined room-mate, excluding the user.
+    #[test]
+    fn users_sharing_room_with_returns_room_mates() {
+        let (db, _t) = db();
+        let room = db.get_or_create_nid("!r:local").unwrap();
+        let a = db.get_or_create_nid("@a:local").unwrap();
+        let b = db.get_or_create_nid("@b:local").unwrap();
+        db.set_membership(room, a, 1).unwrap();
+        db.set_membership(room, b, 1).unwrap();
+
+        let mut shared = db.users_sharing_room_with(a).unwrap();
+        shared.sort_unstable();
+        assert_eq!(shared, vec![b], "self excluded, room-mate included");
     }
 }

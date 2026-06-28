@@ -1635,6 +1635,12 @@ fn main() -> anyhow::Result<()> {
         // grow for the life of the server otherwise.
         let _dedup_pruner_handle = vela_api::maintenance::dedup_pruner::spawn(state.clone());
 
+        // Retention pruner for the device-list change CFs (E2EE device
+        // tracking). Bounds their growth with a 30-day window; clients that
+        // fall behind it full-resync via the horizon guard in /sync.
+        let _device_list_pruner_handle =
+            vela_api::maintenance::device_list_pruner::spawn(state.clone());
+
         // Extension async observation worker. Drains the durable observation
         // queue and runs every `on_event`-bound plugin off the request path.
         // Always running (cheap when idle), so a SIGHUP that adds an on_event

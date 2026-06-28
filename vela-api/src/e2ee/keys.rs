@@ -612,6 +612,47 @@ pub struct KeyChangesQuery {
     pub to: String,
 }
 
+/// Device-list `changed` user-nids for an incremental window `[from, to)`,
+/// with the fall-behind guard shared by `/sync` and `/keys/changes`.
+///
+/// If `from` predates the device-list prune horizon, the retained change
+/// entries for that window are incomplete (the retention pruner removed
+/// them), so we over-report every user the caller shares a room with —
+/// forcing a full `/keys/query`. Over-reporting is safe (an extra
+/// refetch); under-reporting would silently leave stale device keys after
+/// a long absence. `from == 0` (initial sync / no prior token) is never
+/// guarded: the spec only populates `device_lists` for incremental syncs.
+pub(crate) fn device_list_changed_nids(
+    state: &AppState,
+    user_nid: u64,
+    from: u64,
+    to: u64,
+) -> Result<Vec<u64>, ApiError> {
+    // Read the precise list FIRST, then the horizon. The pruner commits its
+    // deletes and the new horizon in one atomic batch, so a horizon read
+    // that happens-after the change read is guaranteed to reflect any prune
+    // that could have dropped an entry from the window we just read. Reading
+    // the horizon first would leave a race where a concurrent prune slips a
+    // gap past the guard and the client permanently misses a change.
+    let precise = state
+        .db
+        .get_device_key_changes(user_nid, from, to)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if from > 0 && from <= state.db.device_list_prune_horizon() {
+        // Fell behind the retained window → over-report. The precise path
+        // always reports the caller's OWN changes too (the user is always
+        // their own observer), so self must be in the over-report set or a
+        // client whose own device list changed wouldn't re-query itself.
+        let mut nids = state
+            .db
+            .users_sharing_room_with(user_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        nids.push(user_nid);
+        return Ok(nids);
+    }
+    Ok(precise)
+}
+
 /// GET /_matrix/client/v3/keys/changes
 pub async fn key_changes(
     State(state): State<AppState>,
@@ -621,10 +662,7 @@ pub async fn key_changes(
     let from: u64 = query.from.parse().unwrap_or(0);
     let to: u64 = query.to.parse().unwrap_or(u64::MAX);
 
-    let changed_nids = state
-        .db
-        .get_device_key_changes(user.user_nid, from, to)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let changed_nids = device_list_changed_nids(&state, user.user_nid, from, to)?;
 
     // `left`: users with whom the caller no longer shares ANY room
     // within the [from, to) window. Mirrors /sync's device_lists.left
@@ -1617,6 +1655,62 @@ mod tests {
             "keys": keys,
             "signatures": sigs,
         })
+    }
+
+    /// Fall-behind guard: a caller whose device-list token predates the
+    /// prune horizon over-reports all shared-room users (forcing a full
+    /// resync), a caller within the window gets the precise pruned-aware
+    /// list, and an initial sync (from == 0) is never over-reported.
+    #[test]
+    fn device_list_changed_nids_over_reports_below_horizon() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room = db.get_or_create_nid("!r:local").unwrap();
+        let a = db.get_or_create_nid("@a:local").unwrap();
+        let b = db.get_or_create_nid("@b:local").unwrap();
+        db.set_membership(room, a, 1).unwrap();
+        db.set_membership(room, b, 1).unwrap();
+
+        // B's keys change; A (a room-mate) observes it precisely.
+        db.record_device_key_change(b).unwrap();
+        assert_eq!(
+            device_list_changed_nids(&state, a, 1, u64::MAX).unwrap(),
+            vec![b],
+            "within window: precise change list"
+        );
+
+        // Prune everything → the horizon advances past the change.
+        let (_removed, horizon) = db.prune_device_lists(u64::MAX).unwrap();
+        assert!(horizon > 0);
+
+        // A's token predates the horizon → over-report all shared-room
+        // users, even though the precise entry was pruned. Self (A) MUST be
+        // included: the precise path always reports the caller's own
+        // changes, so the over-report must too or A wouldn't re-query its
+        // own devices after falling behind.
+        let mut behind = device_list_changed_nids(&state, a, 1, u64::MAX).unwrap();
+        behind.sort_unstable();
+        assert_eq!(
+            behind,
+            vec![a, b],
+            "fell behind → full-resync over-report incl. self"
+        );
+
+        // A token after the horizon trusts the (now empty) precise list.
+        assert!(
+            device_list_changed_nids(&state, a, horizon + 1, u64::MAX)
+                .unwrap()
+                .is_empty(),
+            "within window after prune: nothing changed"
+        );
+
+        // Initial sync (from == 0) is never over-reported.
+        assert!(
+            device_list_changed_nids(&state, a, 0, u64::MAX)
+                .unwrap()
+                .is_empty(),
+            "initial sync must not trigger the over-report"
+        );
     }
 
     /// Same key material → existing signatures from other signers are

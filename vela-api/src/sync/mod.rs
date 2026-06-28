@@ -708,10 +708,15 @@ pub(crate) fn build_sync_response_inner(
     // re-serves a change that was already in the prior response.
     let dl_from = since.map(|s| s.saturating_add(1)).unwrap_or(0);
     let device_lists_changed: Vec<String> = {
-        let nids = state
-            .db
-            .get_device_key_changes(user.user_nid, dl_from, safe_pos + 1)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        // Shared fall-behind guard: when `dl_from` predates the retained
+        // device-list window, this over-reports all shared-room users so
+        // the client re-queries everyone rather than missing pruned changes.
+        let nids = crate::e2ee::keys::device_list_changed_nids(
+            state,
+            user.user_nid,
+            dl_from,
+            safe_pos + 1,
+        )?;
         let mut out = Vec::new();
         for nid in nids {
             if let Some(uid) = state
