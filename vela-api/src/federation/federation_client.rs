@@ -272,8 +272,12 @@ impl FederationClient {
         &self,
         resolved: &crate::federation::federation_resolver::ResolvedServer,
     ) -> reqwest::Client {
-        // If no resolved IPs (shouldn't happen for valid hostnames post-3c.1,
-        // but defensive), fall back to the default client which does its own DNS.
+        // No resolved IPs → fall back to the default client, which does its
+        // own (system) DNS. Under `private_ip_block` this branch is now
+        // unreachable: `FederationResolver::check_resolved_ips` fails closed
+        // on an empty IP set, so `resolve` errors before we get here. It only
+        // fires when the SSRF policy is off (tests / Complement), where
+        // reaching loopback/private targets is intended.
         if resolved.resolved_ips.is_empty() {
             return self.default_http.clone();
         }
