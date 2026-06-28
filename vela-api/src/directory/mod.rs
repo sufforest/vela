@@ -411,6 +411,26 @@ pub async fn put_room_visibility(
     if membership != Some(1) {
         return Err(VelaError::Forbidden("user not joined to room".into()).into());
     }
+    // Power-level gate. Publishing/unpublishing a room to the public
+    // directory exposes its existence and metadata, so require the same
+    // power needed to change room state (`state_default`, spec default 50)
+    // rather than letting any joined member do it. Room creators have
+    // effectively infinite power (handled by `user_power`).
+    let user_pl = crate::membership::user_power(&state, room_nid, &user.user_id)?;
+    let state_default =
+        crate::membership::read_state_value_pub(&state, room_nid, "m.room.power_levels", "")?
+            .and_then(|pl| {
+                pl.get("content")
+                    .and_then(|c| c.get("state_default"))
+                    .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)))
+            })
+            .unwrap_or(50);
+    if user_pl < state_default {
+        return Err(VelaError::Forbidden(
+            "insufficient power level to change directory visibility".into(),
+        )
+        .into());
+    }
     state
         .db
         .set_room_directory_visibility(room_nid, public)

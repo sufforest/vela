@@ -1924,13 +1924,15 @@ impl Database {
         room_nid: u64,
         public: bool,
     ) -> Result<(), rocksdb::Error> {
+        // Persist `private` explicitly as `0` rather than deleting the key.
+        // Deleting would leave `get_room_directory_visibility` returning
+        // `None`, which callers treat as "fall back to join_rule == public"
+        // — so a publicly-joinable room could never actually be marked
+        // unlisted (createRoom visibility:private, or un-listing via the
+        // directory API, would silently stay listed).
         let cf = self.db.cf_handle("room_directory").unwrap();
         let key = keys::encode_u64(room_nid);
-        if public {
-            self.db.put_cf(&cf, key, [1u8])
-        } else {
-            self.db.delete_cf(&cf, key)
-        }
+        self.db.put_cf(&cf, key, [u8::from(public)])
     }
 
     /// Read directory visibility. `None` means "never set" — caller
