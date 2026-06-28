@@ -181,6 +181,10 @@ async fn resolve_oidc_token(
         mapping::MappingError::MissingDeviceId | mapping::MappingError::InvalidLocalpart(_) => {
             ApiError(VelaError::UnknownToken)
         }
+        // A would-be account adoption: the localpart belongs to an existing
+        // local account this OIDC subject doesn't own. Forbid, don't 401 —
+        // the token is valid, the bind is what's refused.
+        mapping::MappingError::LocalpartTaken(msg) => ApiError(VelaError::Forbidden(msg)),
         mapping::MappingError::Storage(msg) => ApiError(VelaError::Store(msg)),
     })?;
 
