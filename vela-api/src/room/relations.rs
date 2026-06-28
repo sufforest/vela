@@ -283,11 +283,12 @@ pub async fn threads_list(
         if !gate.permits(&state, room_nid, user.user_nid, root_nid, root_pos)? {
             continue;
         }
-        if let Some(ev) = crate::room::messages::load_client_event_with_relations(
+        if let Some(ev) = crate::room::messages::load_client_event_with_relations_gated(
             &state,
             root_nid,
             &room_id,
             Some((user.user_nid, &user.device_id)),
+            Some(&gate),
         )? {
             chunk.push(ev);
         }
@@ -878,6 +879,87 @@ mod tests {
         assert!(
             !ids.contains(&"$c_after"),
             "post-leave relation must be hidden: {ids:?}"
+        );
+    }
+
+    /// The bundled `m.thread.latest_event` on a thread root must reflect
+    /// the latest reply the caller could SEE, not the absolute latest. A
+    /// departed user gets the pre-leave reply; a current member gets the
+    /// real latest (the gate is a no-op for them).
+    #[tokio::test]
+    async fn threads_bundle_latest_event_respects_leave_cap() {
+        let (state, _tmp, room_id, room_nid, alice_nid, parent_eid) = setup_room();
+        let bob_nid = state.db.get_or_create_nid("@bob:example.com").unwrap();
+        state.db.set_membership(room_nid, bob_nid, 1).unwrap(); // bob joins
+
+        persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            310,
+            "$reply_before",
+            "m.thread",
+            &parent_eid,
+        );
+        state.db.set_membership(room_nid, bob_nid, 0).unwrap(); // bob leaves
+        persist_child(
+            &state,
+            &room_id,
+            room_nid,
+            alice_nid,
+            "@alice:example.com",
+            311,
+            "$reply_after",
+            "m.thread",
+            &parent_eid,
+        );
+
+        let latest_for = |resp: &Json<Value>| -> Option<String> {
+            resp.0
+                .get("chunk")?
+                .as_array()?
+                .iter()
+                .find(|e| e.get("event_id").and_then(|v| v.as_str()) == Some(parent_eid.as_str()))?
+                .pointer("/unsigned/m.relations/m.thread/latest_event/event_id")?
+                .as_str()
+                .map(String::from)
+        };
+
+        // Departed bob: bundle latest must be the pre-leave reply.
+        let bob_resp = threads_list(
+            State(state.clone()),
+            AuthenticatedUser {
+                user_nid: bob_nid,
+                user_id: "@bob:example.com".into(),
+                device_id: "DEV".into(),
+                appservice_nid: None,
+            },
+            Path(room_id.clone()),
+            Query(ThreadsQuery::default()),
+        )
+        .await
+        .expect("departed user reads pre-leave thread roots");
+        assert_eq!(
+            latest_for(&bob_resp).as_deref(),
+            Some("$reply_before"),
+            "departed user's bundle latest_event must be the pre-leave reply"
+        );
+
+        // Current member alice: gate is a no-op, real latest comes through.
+        let alice_resp = threads_list(
+            State(state.clone()),
+            alice_user(&state),
+            Path(room_id),
+            Query(ThreadsQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            latest_for(&alice_resp).as_deref(),
+            Some("$reply_after"),
+            "a current member must still see the real latest reply"
         );
     }
 

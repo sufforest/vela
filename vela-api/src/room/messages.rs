@@ -187,6 +187,13 @@ pub async fn get_messages(
     let mut start_token = String::new();
     let mut end_token = String::new();
 
+    // Same gate as the per-event filter above, reused to restrict the
+    // bundled relations (latest thread reply, latest edit, reactions) to
+    // children this caller may see — so a departed reader doesn't learn
+    // post-leave reply/edit content via the aggregations.
+    let bundle_gate =
+        TimelineReadGate::from_parts(membership, leave_cap, visibility.clone(), needs_hv_filter);
+
     for (i, (stream_pos, event_nid)) in events.iter().enumerate() {
         // Tokens advance over every *scanned* position (not just included
         // events) so pagination keeps making progress when the gate drops
@@ -210,11 +217,12 @@ pub async fn get_messages(
             continue;
         }
 
-        if let Some(client_event) = load_client_event_with_relations(
+        if let Some(client_event) = load_client_event_with_relations_gated(
             &state,
             *event_nid,
             &room_id_str,
             Some((user.user_nid, &user.device_id)),
+            Some(&bundle_gate),
         )? {
             chunk.push(client_event);
         }
@@ -793,6 +801,25 @@ pub fn load_client_event_with_relations(
     room_id: &str,
     caller: Option<(u64, &str)>,
 ) -> Result<Option<Value>, ApiError> {
+    load_client_event_with_relations_gated(state, event_nid, room_id, caller, None)
+}
+
+/// As [`load_client_event_with_relations`] but with an optional
+/// [`TimelineReadGate`]: when present, the bundled `unsigned.m.relations`
+/// aggregations (latest thread reply, latest edit, reaction set,
+/// references) are restricted to child events the caller may see — so a
+/// departed (leave/ban) reader doesn't learn the content of replies/edits
+/// posted after they left, and a pre-join reader under joined/invited
+/// visibility doesn't see pre-join children. `None` (and an unrestricted
+/// gate) bundles everything, as before. The hot /sync path passes `None`
+/// because its callers are current members who see the whole bundle.
+pub(crate) fn load_client_event_with_relations_gated(
+    state: &AppState,
+    event_nid: u64,
+    room_id: &str,
+    caller: Option<(u64, &str)>,
+    gate: Option<&TimelineReadGate>,
+) -> Result<Option<Value>, ApiError> {
     let mut ev = match load_client_event(state, event_nid, room_id)? {
         Some(v) => v,
         None => return Ok(None),
@@ -802,7 +829,7 @@ pub fn load_client_event_with_relations(
     // aggregations in one pass. Element renders reactions and edits
     // from `unsigned.m.relations`, so skipping this makes a chat
     // look like a feed of raw events.
-    if let Some(relations) = compute_bundled_relations(state, event_nid, room_id, user_nid)? {
+    if let Some(relations) = compute_bundled_relations(state, event_nid, room_id, user_nid, gate)? {
         let unsigned = ev
             .as_object_mut()
             .unwrap()
@@ -862,17 +889,58 @@ fn compute_bundled_relations(
     event_nid: u64,
     room_id: &str,
     user_nid: Option<u64>,
+    gate: Option<&TimelineReadGate>,
 ) -> Result<Option<serde_json::Map<String, Value>>, ApiError> {
     // One prefix scan of `event_relations` covers every relation type.
     // Anything heavier (large reaction sets) is bounded by the 1000-row
     // cap; clients that need more paginate via /relations.
-    let entries = state
+    let mut entries = state
         .db
         .list_relations(event_nid, None, None, u64::MAX, true, 1000)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     if entries.is_empty() {
         return Ok(None);
     }
+
+    // Restrict the aggregations to children the caller may see. Only a
+    // restricted gate (a departed caller, or joined/invited visibility)
+    // does any work — a current member in a shared room short-circuits,
+    // so the common path (and /sync, which passes no gate) is untouched.
+    // Each child is gated on its own timeline position so the leave-cap
+    // applies; children with no position fail closed for capped callers.
+    let restricted = match (gate, user_nid) {
+        (Some(g), Some(uid)) if !g.is_unrestricted() => {
+            // Fail closed if the room id can't be resolved: a restricted
+            // caller must never get an unfiltered bundle, so emit none.
+            let Some(room_nid) = state
+                .db
+                .get_nid(room_id)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            else {
+                return Ok(None);
+            };
+            let mut kept = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let (_sp, child_nid, _rt, _ct) = entry;
+                // Gate on the child's TIMELINE position (not the relation
+                // index `_sp`, which is origin_server_ts for MSC2836
+                // backfill) so the leave-cap compares like with like.
+                let pos = state
+                    .db
+                    .event_timeline_pos_of(child_nid)
+                    .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+                if g.permits(state, room_nid, uid, child_nid, pos)? {
+                    kept.push(entry);
+                }
+            }
+            entries = kept;
+            if entries.is_empty() {
+                return Ok(None);
+            }
+            true
+        }
+        _ => false,
+    };
 
     let mut annotations: Vec<(u64, u64, u64)> = Vec::new(); // (child_nid, rel_nid, child_type_nid)
     let mut replaces: Vec<(u64, u64, u64)> = Vec::new();
@@ -900,7 +968,13 @@ fn compute_bundled_relations(
     // relation tail don't pay a per-render full-prefix scan to
     // confirm "no threads / no edits" — if the bundle wasn't
     // truncated, an empty `threads` / `replaces` is authoritative.
-    let bundle_truncated = entries.len() >= 1000;
+    // Skip the probe for a restricted caller: it fetches the absolute
+    // latest thread/replace child ungated (a single newest-first row), so
+    // for a departed reader that row is likely one they shouldn't see and
+    // a limit-1 scan can't find an older visible one. Dropping the probe
+    // only costs completeness for callers with >1000 visible relations on
+    // one event (still reachable via /relations + /threads), never a leak.
+    let bundle_truncated = entries.len() >= 1000 && !restricted;
     if bundle_truncated
         && threads.is_empty()
         && let Ok(Some(thread_nid)) = state.db.get_nid("m.thread")
@@ -1580,6 +1654,33 @@ impl TimelineReadGate {
             visibility,
             needs_hv_filter,
         })
+    }
+
+    /// Build a gate from already-resolved parts. For handlers like
+    /// `get_messages` that compute membership / leave-cap / visibility
+    /// inline for their direct-event filtering and want the same gate for
+    /// bundle filtering without re-reading the store.
+    pub(crate) fn from_parts(
+        membership: Option<u8>,
+        leave_cap: Option<u64>,
+        visibility: String,
+        needs_hv_filter: bool,
+    ) -> Self {
+        Self {
+            membership,
+            leave_cap,
+            visibility,
+            needs_hv_filter,
+        }
+    }
+
+    /// True when the gate imposes no per-event constraints — a
+    /// currently-joined caller (no leave-cap) in a room whose
+    /// visibility needs no filtering (world_readable, or shared/unknown
+    /// for a member). Lets the bundle filter skip all per-child work for
+    /// the common case.
+    pub(crate) fn is_unrestricted(&self) -> bool {
+        self.leave_cap.is_none() && !self.needs_hv_filter
     }
 
     /// Whether `user_nid` may read `event_nid`. `stream_pos` is the
