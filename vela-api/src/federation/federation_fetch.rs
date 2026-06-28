@@ -6,10 +6,11 @@
 //! - `GET /_matrix/federation/v1/event_auth/{roomId}/{eventId}`
 //! - `POST /_matrix/federation/v1/get_missing_events/{roomId}`
 //!
-//! All behind the existing `federation_auth` middleware. Handlers take
-//! `Extension<XMatrixOrigin>` so we can log/audit who's asking (not yet used
-//! for access control — a server that can sign the request and is in the
-//! same rooms as us is authorised per spec).
+//! All behind the existing `federation_auth` middleware, which verifies
+//! the X-Matrix signature and injects `Extension<XMatrixOrigin>` (the
+//! requesting server). Each handler then enforces `origin_in_room` — the
+//! signature proves identity, but a server still has to be in the room to
+//! read its events (spec's "server is in the room" rule).
 
 use std::collections::{HashSet, VecDeque};
 
@@ -31,6 +32,31 @@ use crate::router::AppState;
 const DEFAULT_MISSING_LIMIT: u32 = 10;
 const MAX_MISSING_LIMIT: u32 = 100;
 
+/// The spec's "server is in the room" check (Synapse's
+/// `assert_host_in_room`): `origin` must have at least one *joined*
+/// member in the room. The X-Matrix signature only proves *which* server
+/// is asking — without this, any server on the federation could read any
+/// room's state and (via /backfill, /event) its message bodies given just
+/// a room id and one event id. Join-only on purpose: a server with only
+/// invited/knocking users has no claim to the room's history. Mirrors the
+/// origin-in-room gate already on `event_relationships_fed`.
+fn origin_in_room(state: &AppState, room_nid: u64, origin: &str) -> bool {
+    let Ok(members) = state.db.get_room_members(room_nid) else {
+        return false;
+    };
+    for nid in members {
+        if let Ok(Some(mxid)) = state.db.resolve_nid(nid)
+            && mxid
+                .split_once(':')
+                .map(|(_, d)| d == origin)
+                .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// GET /_matrix/federation/v1/event/{eventId}
 pub async fn get_event(
     State(state): State<AppState>,
@@ -40,6 +66,35 @@ pub async fn get_event(
     debug!(%event_id, origin = %origin.0, "federation /event request");
 
     let json = load_event_json_by_event_id(&state.db, &event_id).ok_or(StatusCode::NOT_FOUND)?;
+
+    // The requesting server must be in the event's room. Resolve the room
+    // from the event itself (this endpoint takes no room id) and 404 a
+    // non-resident server — same code as "event not found", so it can't
+    // probe which events we hold for rooms it isn't in.
+    let room_id = json
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| {
+            // v12 (MSC4291) `m.room.create` events carry no `room_id`; the
+            // room id is the create event id with the sigil swapped
+            // ($X -> !X) — the reverse of get_event_auth's derivation.
+            if json.get("type").and_then(|v| v.as_str()) == Some("m.room.create") {
+                event_id.strip_prefix('$').map(|rest| format!("!{rest}"))
+            } else {
+                None
+            }
+        })
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let room_nid = state
+        .db
+        .get_nid(&room_id)
+        .ok()
+        .flatten()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if !origin_in_room(&state, room_nid, &origin.0) {
+        return Err(StatusCode::NOT_FOUND);
+    }
 
     // Transaction-shaped response per spec.
     Ok(Json(json!({
@@ -63,17 +118,21 @@ pub async fn get_state(
 ) -> Result<Json<Value>, StatusCode> {
     debug!(event_id = %q.event_id, origin = %origin.0, "federation /state request");
 
-    // MSC3902: while the room is partial-state we don't have the full
-    // membership at any post-join event. Refuse rather than return a
-    // confidently-wrong incomplete state — the caller (typically a
-    // joining server's filler) will retry or fall back to another
-    // peer. Mirrors how Complement's MSC3902 mocks behave from the
-    // remote side; spec test
-    // TestPartialStateJoin/CanReceiveEvents*PartialStateJoin.
-    if let Ok(Some(room_nid)) = state.db.get_nid(&room_id)
-        && let Ok((true, _)) = state.db.get_partial_state_info(room_nid)
-    {
-        return Err(StatusCode::FORBIDDEN);
+    if let Ok(Some(room_nid)) = state.db.get_nid(&room_id) {
+        // The requesting server must be in the room (see origin_in_room).
+        if !origin_in_room(&state, room_nid, &origin.0) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        // MSC3902: while the room is partial-state we don't have the full
+        // membership at any post-join event. Refuse rather than return a
+        // confidently-wrong incomplete state — the caller (typically a
+        // joining server's filler) will retry or fall back to another
+        // peer. Mirrors how Complement's MSC3902 mocks behave from the
+        // remote side; spec test
+        // TestPartialStateJoin/CanReceiveEvents*PartialStateJoin.
+        if let Ok((true, _)) = state.db.get_partial_state_info(room_nid) {
+            return Err(StatusCode::FORBIDDEN);
+        }
     }
 
     // state_before_event runs state_res which is CPU-bound — isolate from
@@ -119,12 +178,16 @@ pub async fn get_state_ids(
 ) -> Result<Json<Value>, StatusCode> {
     debug!(event_id = %q.event_id, origin = %origin.0, "federation /state_ids request");
 
-    // MSC3902: refuse while the room is partial-state (see get_state
-    // for the rationale). Same condition, same response.
-    if let Ok(Some(room_nid)) = state.db.get_nid(&room_id)
-        && let Ok((true, _)) = state.db.get_partial_state_info(room_nid)
-    {
-        return Err(StatusCode::FORBIDDEN);
+    if let Ok(Some(room_nid)) = state.db.get_nid(&room_id) {
+        // The requesting server must be in the room (see origin_in_room).
+        if !origin_in_room(&state, room_nid, &origin.0) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        // MSC3902: refuse while the room is partial-state (see get_state
+        // for the rationale). Same condition, same response.
+        if let Ok((true, _)) = state.db.get_partial_state_info(room_nid) {
+            return Err(StatusCode::FORBIDDEN);
+        }
     }
 
     // CPU isolation as in get_state.
@@ -158,6 +221,13 @@ pub async fn get_event_auth(
     axum::extract::Extension(origin): axum::extract::Extension<XMatrixOrigin>,
 ) -> Result<Json<Value>, StatusCode> {
     debug!(%event_id, origin = %origin.0, "federation /event_auth request");
+
+    // The requesting server must be in the room (see origin_in_room).
+    if let Ok(Some(room_nid)) = state.db.get_nid(&room_id)
+        && !origin_in_room(&state, room_nid, &origin.0)
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     let mut chain = auth_chain_pdu_json(&state.db, &event_id).map_err(|_| StatusCode::NOT_FOUND)?;
 
@@ -201,10 +271,19 @@ pub struct MissingEventsRequest {
 /// from /messages backfill.
 pub async fn get_backfill(
     State(state): State<AppState>,
-    Path(_room_id): Path<String>,
+    Path(room_id): Path<String>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     axum::extract::Extension(origin): axum::extract::Extension<XMatrixOrigin>,
 ) -> Result<Json<Value>, StatusCode> {
+    // The requesting server must be in the room (see origin_in_room).
+    // /backfill returns unredacted message bodies, so this is the most
+    // sensitive of the read endpoints to leave ungated.
+    if let Ok(Some(room_nid)) = state.db.get_nid(&room_id)
+        && !origin_in_room(&state, room_nid, &origin.0)
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     let mut v_params: Vec<String> = Vec::new();
     let mut limit_param: Option<u32> = None;
     if let Some(qs) = raw_query.as_deref() {
@@ -284,6 +363,15 @@ pub async fn get_missing_events(
     let body = body.ok_or(StatusCode::BAD_REQUEST)?;
     let req: MissingEventsRequest =
         serde_json::from_value(body).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    // The requesting server must be in the room (see origin_in_room).
+    // Per-event history-visibility redaction below further trims what a
+    // resident server sees; this gate keeps non-residents out entirely.
+    if let Ok(Some(room_nid)) = state.db.get_nid(&room_id)
+        && !origin_in_room(&state, room_nid, &origin.0)
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     let limit = req
         .limit
@@ -730,5 +818,190 @@ mod tests {
         assert!(!is_valid_server_name("[1234:5678::abcd"));
         // Garbage after IPv6 closing bracket without colon prefix.
         assert!(!is_valid_server_name("[1234::abcd]xyz"));
+    }
+}
+
+#[cfg(test)]
+mod residency_tests {
+    use super::{XMatrixOrigin, get_backfill, get_event, origin_in_room};
+    use crate::middleware::json::Json;
+    use crate::router::AppState;
+    use crate::test_helpers::build_test_state;
+    use axum::extract::{Extension, Path, RawQuery, State};
+    use axum::http::StatusCode;
+    use serde_json::{Value, json};
+
+    fn xorigin(s: &str) -> Extension<XMatrixOrigin> {
+        Extension(XMatrixOrigin(s.to_string()))
+    }
+
+    /// A room with a joined member at `@a:good.example` and a persisted
+    /// message event `$e1` in it.
+    fn room_with_member(state: &AppState) -> String {
+        let db = &state.db;
+        let room_id = "!residency:local".to_string();
+        let room_nid = db.get_or_create_nid(&room_id).unwrap();
+        let sender = db.get_or_create_nid("@a:good.example").unwrap();
+        db.set_membership(room_nid, sender, 1).unwrap();
+        let type_msg = db.get_or_create_nid("m.room.message").unwrap();
+        let event = json!({
+            "event_id": "$e1", "type": "m.room.message",
+            "sender": "@a:good.example", "room_id": room_id,
+            "content": {"msgtype": "m.text", "body": "hi"},
+            "origin_server_ts": 1, "depth": 1, "prev_events": [], "auth_events": [],
+        });
+        db.persist_event(
+            500,
+            "$e1",
+            room_nid,
+            type_msg,
+            sender,
+            0,
+            1,
+            1,
+            &serde_json::to_vec(&event).unwrap(),
+            &[],
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+        room_id
+    }
+
+    #[test]
+    fn origin_in_room_matches_joined_member_domain_only() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_nid = db.get_or_create_nid("!r:local").unwrap();
+        db.set_membership(
+            room_nid,
+            db.get_or_create_nid("@bob:good.example").unwrap(),
+            1,
+        )
+        .unwrap();
+        // A LEFT member's server must not count as resident.
+        db.set_membership(
+            room_nid,
+            db.get_or_create_nid("@carol:left.example").unwrap(),
+            0,
+        )
+        .unwrap();
+
+        assert!(origin_in_room(&state, room_nid, "good.example"));
+        assert!(!origin_in_room(&state, room_nid, "evil.example"));
+        assert!(!origin_in_room(&state, room_nid, "left.example"));
+    }
+
+    #[tokio::test]
+    async fn event_not_found_for_non_resident_server() {
+        let (state, _tmp) = build_test_state();
+        let _room_id = room_with_member(&state);
+
+        // Non-resident server gets 404 — same as "no such event", so it
+        // can't probe which events we hold for rooms it isn't in.
+        let err = get_event(
+            State(state.clone()),
+            Path("$e1".to_string()),
+            xorigin("evil.example"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::NOT_FOUND);
+
+        // Resident server can fetch it.
+        let ok: Result<Json<Value>, StatusCode> = get_event(
+            State(state.clone()),
+            Path("$e1".to_string()),
+            xorigin("good.example"),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "resident server must be able to fetch the event"
+        );
+    }
+
+    /// v12 (MSC4291) `m.room.create` events carry no `room_id`. `/event`
+    /// must still resolve the room (from the create event's own id) and
+    /// serve it to a resident server — not 404 it.
+    #[tokio::test]
+    async fn event_resolves_v12_create_without_room_id() {
+        let (state, _tmp) = build_test_state();
+        let db = &state.db;
+        let room_id = "!cr8:local";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let sender = db.get_or_create_nid("@a:good.example").unwrap();
+        db.set_membership(room_nid, sender, 1).unwrap();
+        let type_create = db.get_or_create_nid("m.room.create").unwrap();
+        let skey = db.get_or_create_nid("").unwrap();
+        // v12 create event: deliberately NO `room_id` field.
+        let create = json!({
+            "event_id": "$cr8:local", "type": "m.room.create",
+            "sender": "@a:good.example", "content": {"room_version": "12"},
+            "origin_server_ts": 1, "depth": 1, "prev_events": [], "auth_events": [],
+        });
+        db.persist_event(
+            600,
+            "$cr8:local",
+            room_nid,
+            type_create,
+            sender,
+            skey,
+            1,
+            1,
+            &serde_json::to_vec(&create).unwrap(),
+            &[],
+            &[],
+            true,
+            false,
+        )
+        .unwrap();
+
+        let ok: Result<Json<Value>, StatusCode> = get_event(
+            State(state.clone()),
+            Path("$cr8:local".to_string()),
+            xorigin("good.example"),
+        )
+        .await;
+        assert!(
+            ok.is_ok(),
+            "resident server must be able to fetch a v12 create event with no room_id"
+        );
+        let err = get_event(
+            State(state.clone()),
+            Path("$cr8:local".to_string()),
+            xorigin("evil.example"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::NOT_FOUND, "non-resident still 404");
+    }
+
+    #[tokio::test]
+    async fn backfill_forbidden_for_non_resident_server() {
+        let (state, _tmp) = build_test_state();
+        let room_id = room_with_member(&state);
+
+        // Non-resident → 403 before any walk.
+        let err = get_backfill(
+            State(state.clone()),
+            Path(room_id.clone()),
+            RawQuery(Some("v=$e1&limit=10".to_string())),
+            xorigin("evil.example"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StatusCode::FORBIDDEN);
+
+        // Resident → passes the gate (walk succeeds, 200).
+        let ok = get_backfill(
+            State(state.clone()),
+            Path(room_id),
+            RawQuery(Some("v=$e1&limit=10".to_string())),
+            xorigin("good.example"),
+        )
+        .await;
+        assert!(ok.is_ok(), "resident server must pass the residency gate");
     }
 }
