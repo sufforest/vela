@@ -44,7 +44,10 @@ pub async fn get_all_state(
         .db
         .get_nid(&room_id)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        .ok_or_else(|| ApiError(VelaError::NotFound("room not found".into())))?;
+        // Unknown room and known-room-non-member both surface as 403 (the
+        // membership gate below also 403s) so a 404-vs-403 difference can't
+        // be used to probe which rooms exist — same posture as /messages.
+        .ok_or_else(|| ApiError(VelaError::Forbidden("not a member of this room".into())))?;
 
     let view = pick_state_view(&state, room_nid, user.user_nid)?;
     let state_nids = view.all_state_nids(&state, room_nid)?;
@@ -72,7 +75,10 @@ pub async fn get_state_event(
         .db
         .get_nid(&room_id)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        .ok_or_else(|| ApiError(VelaError::NotFound("room not found".into())))?;
+        // Unknown room and known-room-non-member both surface as 403 (the
+        // membership gate below also 403s) so a 404-vs-403 difference can't
+        // be used to probe which rooms exist — same posture as /messages.
+        .ok_or_else(|| ApiError(VelaError::Forbidden("not a member of this room".into())))?;
 
     let view = pick_state_view(&state, room_nid, user.user_nid)?;
 

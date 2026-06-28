@@ -724,6 +724,19 @@ pub async fn create_room(
         .update_room_bump(room_nid, now, 0)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
+    // Persist the public-directory listing per the request's `visibility`
+    // (spec default "private" → not listed). This is INDEPENDENT of
+    // join_rules: a publicly-joinable room may be unlisted, and an
+    // invite-only room may be listed. Without persisting it the directory
+    // falls back to join_rule == "public" (see collect_public_rooms), which
+    // leaks a room the creator wanted unlisted into /publicRooms whenever
+    // its join_rule happens to be public.
+    let publish_to_directory = body.visibility.as_deref() == Some("public");
+    state
+        .db
+        .set_room_directory_visibility(room_nid, publish_to_directory)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
     if let Some(sender) = state.room_senders.get(&Nid(room_nid)) {
         let _ = sender.send(last_stream_pos);
     }
