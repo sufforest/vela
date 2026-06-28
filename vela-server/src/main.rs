@@ -790,6 +790,19 @@ struct ServerSection {
     /// directly-internet-reachable vela, wrong for any reverse-proxied
     /// deploy.
     public_base_url: Option<String>,
+    /// Header to read the real client IP from when vela is behind a reverse
+    /// proxy / CDN. Unset (default) → vela uses the TCP peer, which behind a
+    /// proxy is the PROXY's IP, so the per-IP login/register limiter lumps
+    /// every real client together. Set to the header your proxy populates —
+    /// `"CF-Connecting-IP"` for Cloudflare (recommended — a single value
+    /// that Cloudflare sets and a client can't append to), or
+    /// `"X-Forwarded-For"` for nginx/Caddy (the LAST hop is used — the
+    /// proxy-appended IP; the leftmost XFF entries are client-spoofable).
+    /// Only enable when the origin ONLY accepts traffic through that proxy;
+    /// a directly reachable origin lets a client forge the header outright,
+    /// so lock the origin firewall to the proxy's / CDN's IP ranges.
+    #[serde(default)]
+    real_ip_header: Option<String>,
     /// Optional TLS listener. When present, Vela additionally serves HTTPS on
     /// `tls.port` using the provided cert/key files. Absent → plain HTTP only
     /// (development and unit-test default).
@@ -823,6 +836,7 @@ impl Default for ServerSection {
             bind: "0.0.0.0".to_string(),
             port: 8008,
             public_base_url: None,
+            real_ip_header: None,
             tls: None,
             extra_ca_certs: Vec::new(),
             minimum_room_version: "6".to_string(),
@@ -1482,6 +1496,7 @@ fn main() -> anyhow::Result<()> {
                 bind_host: config.server.bind.clone(),
                 bind_port: config.server.port,
                 public_base_url: config.server.public_base_url.clone(),
+                real_ip_header: config.server.real_ip_header.clone(),
                 search_all_users: config.user_directory.search_all_users,
                 federation_enabled: config.federation.enabled,
                 registration_enabled: config.registration.enabled,

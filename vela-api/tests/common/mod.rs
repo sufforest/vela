@@ -151,6 +151,7 @@ impl Harness {
                 bind_host: "127.0.0.1".into(),
                 bind_port: 0,
                 public_base_url: overrides.public_base_url.clone(),
+                real_ip_header: None,
                 search_all_users: overrides.search_all_users,
                 federation_enabled: overrides.federation_enabled,
                 registration_enabled: overrides.registration_enabled,
