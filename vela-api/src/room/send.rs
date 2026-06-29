@@ -775,6 +775,26 @@ pub(crate) async fn send_state_inner(
         .promote_state_event(room_nid, event_nid, type_nid, state_key_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
+    // A member event sent through the generic /state path must also maintain
+    // the membership index + E2EE/sync side effects — promote_state_event
+    // only updates room state, but every read gate keys off the index, so
+    // without this a ban/leave via /state would leave the removed user with
+    // read + sync access.
+    if event_type == "m.room.member"
+        && let Some(membership) = event
+            .get("content")
+            .and_then(|c| c.get("membership"))
+            .and_then(|m| m.as_str())
+    {
+        crate::membership::apply_member_event_side_effects(
+            &state,
+            room_nid,
+            state_key_nid,
+            membership,
+            stream_pos,
+        )?;
+    }
+
     state.federation_sender.broadcast(room_nid, event_nid);
 
     // Observe (async): hand the persisted state event to any on_event plugins.

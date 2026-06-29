@@ -1600,6 +1600,51 @@ fn membership_u8(membership: &str) -> u8 {
     }
 }
 
+/// Maintain the membership INDEX and the E2EE / sync side effects for a
+/// just-persisted `m.room.member` event. Every read gate (`/sync`,
+/// `/messages`, `/members`, restricted-join qualification) keys off the
+/// `memberships` index via `get_membership` — NOT room state — so any path
+/// that persists a member event MUST call this, or the index desyncs and a
+/// banned/left user keeps read + sync access (a confidentiality leak).
+///
+/// Shared by the dedicated membership endpoints and the generic
+/// `PUT /state/m.room.member` write path. Call AFTER the event is persisted;
+/// `stream_pos` is that event's stream position.
+pub(crate) fn apply_member_event_side_effects(
+    state: &AppState,
+    room_nid: u64,
+    target_user_nid: u64,
+    membership: &str,
+    stream_pos: u64,
+) -> Result<(), ApiError> {
+    // device_lists.left: capture the observer set BEFORE the index update so
+    // a leaving/banned user's departure still reaches local observers.
+    let was_joined = state
+        .db
+        .get_membership(room_nid, target_user_nid)
+        .ok()
+        .flatten()
+        == Some(1);
+    if was_joined && matches!(membership, "leave" | "ban") {
+        crate::e2ee::keys::record_device_changes_on_leave(state, target_user_nid, room_nid);
+    }
+    state
+        .db
+        .set_membership(room_nid, target_user_nid, membership_u8(membership))
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    // Wake the target's pending /sync so the change lands promptly.
+    crate::router::notify_user(state, target_user_nid);
+    // E2EE: tell room members the target's device keys may have changed so
+    // clients re-fetch and avoid "unable to decrypt".
+    if matches!(membership, "join" | "leave" | "ban") {
+        let members = state.db.get_room_members(room_nid).unwrap_or_default();
+        let _ = state
+            .db
+            .notify_device_key_change(target_user_nid, &members, stream_pos);
+    }
+    Ok(())
+}
+
 /// Emit a membership event where the sender is also the target (join, leave).
 async fn emit_membership_event(
     state: &AppState,
@@ -2160,43 +2205,16 @@ async fn emit_membership_event_for_target(
         )
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
-    // For leave/kick/ban (target was joined and is now no longer):
-    // surface the departure to local observers via the device_list_left
-    // CF so /sync's `device_lists.left` reflects the new "no longer
-    // shared" relationships. Run BEFORE the membership update so
-    // `get_room_members` still includes the observer set.
-    let was_joined = state
-        .db
-        .get_membership(room_nid, target_user_nid)
-        .ok()
-        .flatten()
-        == Some(1);
-    let now_left = matches!(membership, "leave" | "ban");
-    if was_joined && now_left {
-        crate::e2ee::keys::record_device_changes_on_leave(state, target_user_nid, room_nid);
-    }
-    // Update membership
-    state
-        .db
-        .set_membership(room_nid, target_user_nid, membership_u8(membership))
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    // Wake the target's pending /sync so invites/joins/kicks appear
-    // instantly instead of after the long-poll timeout.
-    crate::router::notify_user(state, target_user_nid);
+    // Maintain the membership index + device-list / sync side effects for
+    // the member event (the shared helper, so the generic /state member path
+    // stays consistent with this one). promote_state_event below updates the
+    // room STATE; the index every read gate uses lives in the helper.
+    apply_member_event_side_effects(state, room_nid, target_user_nid, membership, stream_pos)?;
 
     state
         .db
         .promote_state_event(room_nid, event_nid, type_nid, skey_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-
-    // E2EE hook: notify all room members that target user's device keys may have changed.
-    // This triggers clients to re-fetch keys, preventing "Unable to decrypt" errors.
-    if matches!(membership, "join" | "leave" | "ban") {
-        let current_members = state.db.get_room_members(room_nid).unwrap_or_default();
-        let _ = state
-            .db
-            .notify_device_key_change(target_user_nid, &current_members, stream_pos);
-    }
 
     // Wake local /sync long-pollers as soon as state is durable. The
     // federated invite POST below is awaited inline and can hang for
