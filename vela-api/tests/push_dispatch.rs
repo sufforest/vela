@@ -169,3 +169,82 @@ async fn sender_does_not_receive_push_for_own_message() {
         "sender should not receive push for own message"
     );
 }
+
+/// A pusher registered with `format: "event_id_only"` (Push Gateway API)
+/// must receive only routing fields — never the event `type`, `sender`, or
+/// message `content`. Privacy: the plaintext never reaches the gateway.
+#[tokio::test]
+async fn event_id_only_pusher_omits_event_content() {
+    let harness = Harness::new();
+    let (_alice, alice_tok) = harness.register("alice", "pw").await;
+    let (bob, bob_tok) = harness.register("bob", "pw").await;
+
+    let gateway = MockServer::start().await;
+    let notify_url = format!("{}/_matrix/push/v1/notify", gateway.uri());
+    Mock::given(method("POST"))
+        .and(path("/_matrix/push/v1/notify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"rejected": []})))
+        .mount(&gateway)
+        .await;
+
+    // Bob registers an event_id_only pusher.
+    let resp = harness
+        .request(
+            Request::post("/_matrix/client/v3/pushers/set")
+                .header("authorization", format!("Bearer {bob_tok}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "app_id": "com.example.app",
+                        "pushkey": "pk-bob-1",
+                        "kind": "http",
+                        "app_display_name": "App",
+                        "device_display_name": "Dev",
+                        "lang": "en",
+                        "data": {"url": notify_url, "format": "event_id_only"},
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let room_id = harness
+        .create_room(
+            &alice_tok,
+            json!({"preset": "trusted_private_chat", "invite": [bob]}),
+        )
+        .await;
+    harness.join(&bob_tok, &room_id).await;
+    let event_id = harness
+        .send_message(&alice_tok, &room_id, "secret-plaintext")
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let received = gateway.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1, "expected one POST to the gateway");
+    let raw = &received[0].body;
+    let body: Value = serde_json::from_slice(raw).expect("json body");
+    let notif = &body["notification"];
+
+    // Routing fields present.
+    assert_eq!(notif["event_id"], event_id);
+    assert_eq!(notif["room_id"], room_id);
+    assert!(
+        notif["devices"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|x| x["pushkey"] == "pk-bob-1")),
+        "the recipient's device must be present"
+    );
+
+    // Privacy: no event content / type / sender.
+    assert!(notif.get("content").is_none(), "must not send content");
+    assert!(notif.get("type").is_none(), "must not send type");
+    assert!(notif.get("sender").is_none(), "must not send sender");
+    assert!(
+        !String::from_utf8_lossy(raw).contains("secret-plaintext"),
+        "the message plaintext must not reach the gateway"
+    );
+}

@@ -188,7 +188,20 @@ async fn dispatch_inner(
             for (k, v) in &action.tweaks {
                 tweaks.insert(k.clone(), v.clone());
             }
-            let mut notification = notification_base.clone();
+            // Honor the pusher's `event_id_only` format (Push Gateway API):
+            // the client opted out of receiving event content at the gateway,
+            // so send only the routing fields — never the event `type`,
+            // `sender`, or message `content`.
+            let event_id_only = pusher
+                .get("data")
+                .and_then(|d| d.get("format"))
+                .and_then(|f| f.as_str())
+                == Some("event_id_only");
+            let mut notification = if event_id_only {
+                json!({"event_id": event_id, "room_id": room_id})
+            } else {
+                notification_base.clone()
+            };
             if let Some(obj) = notification.as_object_mut() {
                 obj.insert(
                     "devices".into(),

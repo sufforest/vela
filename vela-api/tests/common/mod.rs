@@ -303,7 +303,7 @@ impl Harness {
             "app_display_name": "test",
             "device_display_name": "test-device",
             "lang": "en",
-            "data": {"url": url, "format": "event_id_only"},
+            "data": {"url": url},
         });
         let resp = self
             .request(
