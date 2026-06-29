@@ -915,7 +915,12 @@ async fn fetch_preview(url: &str, allow_private: bool) -> Result<(String, String
 /// Resolve `host:port` and require every resolved address be public unless
 /// `allow_private`. Returns the socket addresses (for connection pinning).
 /// Fails CLOSED: an empty resolution or any non-public address is rejected.
-async fn resolve_public_or_reject(
+///
+/// Shared with push delivery: resolving once here and pinning the resulting
+/// addresses onto the client (`resolve_to_addrs`) is what closes the
+/// DNS-rebinding TOCTOU — the connect uses these checked addresses, not a
+/// fresh re-resolution.
+pub(crate) async fn resolve_public_or_reject(
     host: &str,
     port: u16,
     allow_private: bool,
