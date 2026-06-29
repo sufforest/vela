@@ -915,6 +915,10 @@ pub async fn upload_signatures(
     let Some(users) = body.as_object() else {
         return Ok(Json(json!({"failures": {}})));
     };
+    // The caller may only contribute signatures made by keys they've
+    // published; anything else is dropped before it's folded into a target's
+    // key record (see retain_published_signatures).
+    let allowed = caller_published_key_ids(&state, user.user_nid)?;
     let mut changed_users: Vec<u64> = Vec::new();
     for (target_user_id, devs) in users {
         let Some(dev_map) = devs.as_object() else {
@@ -938,6 +942,11 @@ pub async fn upload_signatures(
             // Accept only the signatures attributed to the caller — a client
             // can't forge a signature in another user's name.
             let Some(filtered) = caller_signatures_only(new_body, &user.user_id) else {
+                continue;
+            };
+            // Keep only signatures from the caller's own published keys.
+            let Some(filtered) = retain_published_signatures(filtered, &user.user_id, &allowed)
+            else {
                 continue;
             };
             // Own device keys (typical self-signature). Cross-user device
@@ -972,8 +981,14 @@ pub async fn upload_signatures(
                     .get("keys")
                     .and_then(|k| k.as_object())
                     .map(|m| {
-                        m.keys()
-                            .any(|k| k == dev_or_key_id || k.ends_with(dev_or_key_id))
+                        // Match the stored key id exactly, or by bare-pubkey
+                        // suffix when the client omitted the `ed25519:` prefix.
+                        // Guard the empty id: `"".ends_with("")` is true, which
+                        // would otherwise match the master key unconditionally.
+                        m.keys().any(|k| {
+                            k == dev_or_key_id
+                                || (!dev_or_key_id.is_empty() && k.ends_with(dev_or_key_id))
+                        })
                     })
                     .unwrap_or(false);
                 if matches {
@@ -1012,6 +1027,68 @@ fn caller_signatures_only(new_body: &Value, caller: &str) -> Option<Value> {
         .and_then(|sigs| sigs.get(caller))?;
     let mut signer = Map::new();
     signer.insert(caller.to_string(), mine.clone());
+    Some(json!({ "signatures": Value::Object(signer) }))
+}
+
+/// The set of ed25519 signing key ids the user has PUBLISHED: their device
+/// keys plus their cross-signing (master / self_signing / user_signing)
+/// public keys. A client only ever signs with a key it has published, so
+/// this is exactly the set of key ids a legitimate `signatures/upload` can
+/// carry.
+fn caller_published_key_ids(
+    state: &AppState,
+    caller_nid: u64,
+) -> Result<std::collections::HashSet<String>, ApiError> {
+    let mut ids = std::collections::HashSet::new();
+    for (_device, dk) in state
+        .db
+        .get_all_device_keys(caller_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    {
+        if let Some(keys) = dk.get("keys").and_then(|k| k.as_object()) {
+            ids.extend(keys.keys().filter(|k| k.starts_with("ed25519:")).cloned());
+        }
+    }
+    for (_ty, xs) in state
+        .db
+        .get_cross_signing_keys(caller_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    {
+        if let Some(keys) = xs.get("keys").and_then(|k| k.as_object()) {
+            ids.extend(keys.keys().filter(|k| k.starts_with("ed25519:")).cloned());
+        }
+    }
+    Ok(ids)
+}
+
+/// Drop any signature whose signing key id is NOT one of the caller's
+/// published keys. A client signs only with keys it has published, so this
+/// never drops a legitimate signature — but it stops a caller from folding
+/// arbitrary, unbounded `(key_id -> blob)` entries under fake key ids into
+/// ANOTHER user's published key record (a cross-user write / storage
+/// amplification). Returns `None` when nothing the caller is entitled to
+/// remains. (Cryptographic verification of the signature bytes is left to
+/// clients, which already reject invalid signatures.)
+fn retain_published_signatures(
+    filtered: Value,
+    caller: &str,
+    allowed: &std::collections::HashSet<String>,
+) -> Option<Value> {
+    let mine = filtered
+        .get("signatures")
+        .and_then(|v| v.as_object())
+        .and_then(|s| s.get(caller))
+        .and_then(|v| v.as_object())?;
+    let kept: Map<String, Value> = mine
+        .iter()
+        .filter(|(kid, _)| allowed.contains(kid.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let mut signer = Map::new();
+    signer.insert(caller.to_string(), Value::Object(kept));
     Some(json!({ "signatures": Value::Object(signer) }))
 }
 
@@ -1901,6 +1978,16 @@ mod tests {
                 &json!({"signatures": {"@bob:example.com": {"ed25519:BDEV": "self"}}}),
             )
             .unwrap();
+        // Alice publishes her self-signing key, so signing her device with
+        // `ed25519:ASSK` is from a key she actually owns.
+        state
+            .db
+            .set_cross_signing_keys(
+                alice,
+                "self_signing",
+                &json!({"user_id": "@alice:example.com", "usage": ["self_signing"], "keys": {"ed25519:ASSK": "ASSK"}}),
+            )
+            .unwrap();
 
         let body = json!({
             "@alice:example.com": {"ADEV": {"signatures": {
@@ -1942,6 +2029,7 @@ mod tests {
     #[tokio::test]
     async fn upload_signatures_allows_cross_user_master() {
         let (state, _tmp) = build_test_state();
+        let alice = state.db.get_or_create_nid("@alice:example.com").unwrap();
         let bob = state.db.get_or_create_nid("@bob:example.com").unwrap();
         state
             .db
@@ -1949,6 +2037,16 @@ mod tests {
                 bob,
                 "master_key",
                 &json!({"user_id": "@bob:example.com", "usage": ["master"], "keys": {"ed25519:BMASTER": "BMASTER"}, "signatures": {}}),
+            )
+            .unwrap();
+        // Alice publishes her user-signing key — the key the user_signing
+        // flow uses to sign another user's master.
+        state
+            .db
+            .set_cross_signing_keys(
+                alice,
+                "user_signing",
+                &json!({"user_id": "@alice:example.com", "usage": ["user_signing"], "keys": {"ed25519:AUSK": "AUSK"}}),
             )
             .unwrap();
 
@@ -1968,6 +2066,45 @@ mod tests {
             master["master_key"]["signatures"]["@alice:example.com"]["ed25519:AUSK"],
             "alice-usk-sig",
             "cross-user master signature must be stored"
+        );
+    }
+
+    /// A caller can only fold signatures made by keys they've PUBLISHED. A
+    /// signature attributed to an unpublished (fake) key id must be dropped,
+    /// not written into another user's master key — this bounds a cross-user
+    /// write / storage-amplification abuse.
+    #[tokio::test]
+    async fn upload_signatures_drops_unpublished_key_ids() {
+        let (state, _tmp) = build_test_state();
+        let _alice = state.db.get_or_create_nid("@alice:example.com").unwrap();
+        let bob = state.db.get_or_create_nid("@bob:example.com").unwrap();
+        state
+            .db
+            .set_cross_signing_keys(
+                bob,
+                "master_key",
+                &json!({"user_id": "@bob:example.com", "usage": ["master"], "keys": {"ed25519:BMASTER": "BMASTER"}, "signatures": {}}),
+            )
+            .unwrap();
+
+        // Alice has published NO keys, so `ed25519:FAKE` is not hers.
+        let body = json!({"@bob:example.com": {"ed25519:BMASTER": {"signatures": {
+            "@alice:example.com": {"ed25519:FAKE": "garbage-blob"},
+        }}}});
+        upload_signatures(
+            State(state.clone()),
+            auth_user(&state, "@alice:example.com"),
+            Json(body),
+        )
+        .await
+        .unwrap();
+
+        let master = state.db.get_cross_signing_keys(bob).unwrap();
+        assert!(
+            master["master_key"]["signatures"]
+                .get("@alice:example.com")
+                .is_none(),
+            "a signature from an unpublished key id must not land on another user's master key"
         );
     }
 
