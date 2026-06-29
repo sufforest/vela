@@ -225,6 +225,37 @@ async fn read_capped_json(
     serde_json::from_slice(&buf).map_err(|e| FederationClientError::BadJson(e.to_string()))
 }
 
+/// As [`read_capped_json`] but returns the raw bytes — used for the
+/// federated media fetch, where a hostile peer's `/media/download` response
+/// must not be buffered unbounded into memory (an unauthenticated client can
+/// drive this fetch via the legacy download endpoint).
+async fn read_capped_bytes(
+    mut resp: reqwest::Response,
+    max: usize,
+) -> Result<Vec<u8>, FederationClientError> {
+    if let Some(len) = resp.content_length()
+        && len > max as u64
+    {
+        return Err(FederationClientError::Http(format!(
+            "media too large: {len} bytes (cap {max})"
+        )));
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| FederationClientError::Http(e.to_string()))?
+    {
+        if buf.len() + chunk.len() > max {
+            return Err(FederationClientError::Http(format!(
+                "media exceeds {max}-byte cap"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 impl FederationClient {
     pub fn new(
         signing_key: Arc<ServerSigningKey>,
@@ -939,6 +970,7 @@ impl FederationClient {
         &self,
         destination: &str,
         media_id: &str,
+        max_bytes: usize,
     ) -> Result<MediaResponse, FederationClientError> {
         if !self.enabled {
             return Err(FederationClientError::FederationDisabled);
@@ -999,10 +1031,11 @@ impl FederationClient {
             .get(reqwest::header::CONTENT_DISPOSITION)
             .and_then(|v| v.to_str().ok())
             .and_then(parse_filename_from_content_disposition);
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| FederationClientError::Http(format!("read body: {e}")))?;
+        // Bounded read: a hostile peer must not be able to OOM us with an
+        // unbounded (or chunked, length-less) body. Capped at our media size
+        // limit — like Synapse, we don't cache remote media bigger than we'd
+        // accept locally.
+        let body = read_capped_bytes(resp, max_bytes).await?;
 
         // Spec-compliant peers reply with multipart/mixed (MSC3916).
         // Compatibility carve-out: some servers and Complement mocks
@@ -1016,7 +1049,7 @@ impl FederationClient {
             Ok(MediaResponse {
                 content_type: response_ct,
                 filename: top_level_filename,
-                bytes: body.to_vec(),
+                bytes: body,
             })
         }
     }

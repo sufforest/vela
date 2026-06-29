@@ -457,6 +457,24 @@ pub async fn download_legacy_with_filename(
     download_inner(state, Path((server, media, Some(filename)))).await
 }
 
+/// Apply the spec-recommended media security headers (content-repository
+/// §security). The sandboxing `Content-Security-Policy` + `nosniff` stop a
+/// blob served with an attacker-chosen `Content-Type` (e.g. `text/html`, or
+/// `image/svg+xml` carrying `<script>`) from executing as active content in
+/// the media origin; the v1.4 `Cross-Origin-Resource-Policy: cross-origin`
+/// keeps media embeddable by web clients. Applied on every media response.
+fn with_media_security_headers(
+    builder: axum::http::response::Builder,
+) -> axum::http::response::Builder {
+    builder
+        .header(
+            "Content-Security-Policy",
+            "sandbox; default-src 'none'; script-src 'none'; plugin-types application/pdf; style-src 'unsafe-inline'; object-src 'self';",
+        )
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Cross-Origin-Resource-Policy", "cross-origin")
+}
+
 async fn download_inner(
     State(state): State<AppState>,
     Path((server_name, media_id, filename_override)): Path<(String, String, Option<String>)>,
@@ -515,8 +533,7 @@ async fn download_inner(
 
     let size = state.media_store.size(&media_id).await.ok().flatten();
 
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
+    let mut builder = with_media_security_headers(Response::builder().status(StatusCode::OK))
         .header(header::CONTENT_TYPE, content_type);
     if let Some(s) = size {
         builder = builder.header(header::CONTENT_LENGTH, s.to_string());
@@ -663,8 +680,7 @@ async fn thumbnail_inner(
         .map_err(|e| ApiError(VelaError::Unknown(format!("encode thumbnail: {e}"))))?;
 
     let body = Body::from(out_bytes.clone());
-    Response::builder()
-        .status(StatusCode::OK)
+    with_media_security_headers(Response::builder().status(StatusCode::OK))
         .header(header::CONTENT_TYPE, "image/png")
         .header(header::CONTENT_LENGTH, out_bytes.len().to_string())
         .body(body)
@@ -1133,7 +1149,7 @@ async fn download_remote(
 ) -> Result<Response, ApiError> {
     let media = state
         .federation_client
-        .fetch_media(server_name, media_id)
+        .fetch_media(server_name, media_id, state.config.max_upload_size as usize)
         .await
         .map_err(|e| {
             tracing::debug!(remote = %server_name, %media_id, error = %e, "federation media fetch failed");
@@ -1141,8 +1157,7 @@ async fn download_remote(
         })?;
 
     let len = media.bytes.len();
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
+    let mut builder = with_media_security_headers(Response::builder().status(StatusCode::OK))
         .header(header::CONTENT_TYPE, media.content_type)
         .header(header::CONTENT_LENGTH, len.to_string());
     // Propagate the original filename from the peer so clients see the
