@@ -1390,14 +1390,22 @@ fn build_room_sync_for_user(
                     }
                 }
 
-                // State delta: events with state_key that changed in
-                // the range (since_pos, first_pos). Per spec, /sync's
-                // `state` field is the delta between the client's last
-                // sync and the start of the timeline. Without this,
-                // power-level changes, room name updates, etc. that
-                // happened while the client was offline never reach
-                // the client until they do a full sync.
-                let delta_upper = first_pos.unwrap_or(safe_pos + 1);
+                // State delta. The legacy `state` field is the delta between
+                // the client's last sync and the START of the timeline
+                // (first_pos): state events IN the timeline are carried by
+                // the timeline itself and must not be duplicated here.
+                //
+                // MSC4222 `state_after` is instead the room state at the END
+                // of the timeline, so its delta extends to the sync point
+                // (safe_pos) and DOES include state events in the batch.
+                // Without this split a state event that's the only new event
+                // sits in the timeline and never reaches `state_after` — the
+                // msc4140 delayed-state-event regression.
+                let delta_upper = if use_state_after {
+                    safe_pos + 1
+                } else {
+                    first_pos.unwrap_or(safe_pos + 1)
+                };
                 let state_events = compute_state_delta(
                     state,
                     room_nid,
