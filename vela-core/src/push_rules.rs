@@ -222,41 +222,44 @@ fn split_unescaped_dots(key: &str) -> Vec<String> {
 
 /// Matrix glob: `*` matches any substring, `?` any single character.
 /// Case-insensitive per spec.
+///
+/// Iterative two-pointer matcher with single-star backtracking — O(pattern ×
+/// input) worst case, no recursion. The previous recursive backtracker was
+/// EXPONENTIAL on patterns like `*a*a*…*z` (stars separated by literals)
+/// against a long non-matching input. The pattern is attacker-controlled (a
+/// client-set `content` / `event_match` push rule) and the input is a message
+/// body, and `evaluate` runs synchronously on the `/sync` hot path — so a
+/// crafted rule plus a long message could pin a worker core and DoS the
+/// server. This form is bounded regardless of pattern shape.
 pub fn glob_match(pattern: &str, input: &str) -> bool {
-    // Push-rules / MSC4155 glob shape: `*` matches zero or more chars,
-    // `?` matches exactly one. Case-insensitive. Backtracking matcher
-    // — pushrules patterns are short, so the O(p*i) worst case is fine.
     let pat: Vec<char> = pattern.to_lowercase().chars().collect();
     let inp: Vec<char> = input.to_lowercase().chars().collect();
-    glob_match_inner(&pat, 0, &inp, 0)
-}
-
-fn glob_match_inner(pat: &[char], pi: usize, inp: &[char], ii: usize) -> bool {
-    if pi == pat.len() {
-        return ii == inp.len();
-    }
-    match pat[pi] {
-        '*' => {
-            // Collapse runs of `*` so we don't blow up on `**`-style
-            // patterns.
-            let mut next = pi + 1;
-            while next < pat.len() && pat[next] == '*' {
-                next += 1;
-            }
-            // `*` at end matches the rest of the input outright.
-            if next == pat.len() {
-                return true;
-            }
-            for skip in ii..=inp.len() {
-                if glob_match_inner(pat, next, inp, skip) {
-                    return true;
-                }
-            }
-            false
+    let (mut pi, mut ii) = (0usize, 0usize);
+    // The last `*` seen, and the input index to resume from if a later
+    // literal/`?` mismatch forces that `*` to consume one more char.
+    let mut star_pi: Option<usize> = None;
+    let mut star_ii = 0usize;
+    while ii < inp.len() {
+        if pi < pat.len() && (pat[pi] == '?' || pat[pi] == inp[ii]) {
+            pi += 1;
+            ii += 1;
+        } else if pi < pat.len() && pat[pi] == '*' {
+            star_pi = Some(pi);
+            star_ii = ii;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ii += 1;
+            ii = star_ii;
+        } else {
+            return false;
         }
-        '?' => ii < inp.len() && glob_match_inner(pat, pi + 1, inp, ii + 1),
-        c => ii < inp.len() && inp[ii] == c && glob_match_inner(pat, pi + 1, inp, ii + 1),
     }
+    // Trailing `*`s match the empty remainder.
+    while pi < pat.len() && pat[pi] == '*' {
+        pi += 1;
+    }
+    pi == pat.len()
 }
 
 /// Word-boundary contains check for `contains_display_name`. A display
@@ -777,6 +780,27 @@ mod tests {
         assert!(glob_match("a**b", "axxxxxxxxb"));
         assert!(glob_match("**", ""));
         assert!(glob_match("**", "anything"));
+    }
+
+    /// Regression: many stars separated by literals against a long
+    /// non-matching input made the old recursive backtracker exponential —
+    /// a ReDoS, since the pattern is an attacker-set push rule evaluated on
+    /// the /sync hot path. The iterative matcher is O(pattern × input):
+    /// this test completing at all is the proof, and the results must stay
+    /// correct.
+    #[test]
+    fn glob_match_pathological_pattern_is_bounded() {
+        let pattern = "*a*a*a*a*a*a*a*a*a*a*a*a*z";
+        let no_match = "a".repeat(200); // no trailing 'z'
+        assert!(
+            !glob_match(pattern, &no_match),
+            "long non-matching input must fail fast, not hang"
+        );
+        let does_match = format!("{}z", "a".repeat(200));
+        assert!(
+            glob_match(pattern, &does_match),
+            "the matching variant must still match"
+        );
     }
 
     #[test]

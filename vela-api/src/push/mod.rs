@@ -239,6 +239,12 @@ fn push_http_client() -> Arc<reqwest::Client> {
     Arc::new(
         reqwest::Client::builder()
             .timeout(PUSH_PER_ATTEMPT_TIMEOUT)
+            // Don't follow redirects. The SSRF guard validates the pusher
+            // URL's resolved IP up front, but a malicious gateway could
+            // 30x-redirect to an internal address (loopback / RFC1918 /
+            // 169.254.169.254) and reqwest would follow it straight past the
+            // guard. Push gateways have no legitimate need to redirect.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client"),
     )
