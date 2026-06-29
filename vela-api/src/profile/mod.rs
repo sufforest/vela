@@ -14,6 +14,11 @@ use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::error::ApiError;
 use crate::router::AppState;
 
+/// Upper bound on a profile field (displayname / avatar_url). Generous — far
+/// above any real value — but bounds a client from setting a huge field that
+/// then propagates into a member event in every room they're in.
+const MAX_PROFILE_FIELD_BYTES: usize = 2048;
+
 /// Extract the server name from a Matrix user ID (`@local:server`).
 /// Returns `None` for malformed IDs (no `:` or no `@` prefix).
 fn user_server(user_id: &str) -> Option<&str> {
@@ -310,6 +315,19 @@ pub async fn set_displayname(
         return Err(VelaError::Forbidden("can only set own profile".into()).into());
     }
 
+    // Bound the value: a displayname propagates into an m.room.member event
+    // in every room the user is in and is shown to everyone, so an unbounded
+    // one is a cross-room storage/bandwidth amplifier. The cap is generous —
+    // far above any real name.
+    if let Some(name) = body.displayname.as_deref()
+        && name.len() > MAX_PROFILE_FIELD_BYTES
+    {
+        return Err(VelaError::InvalidParam(format!(
+            "displayname too long (max {MAX_PROFILE_FIELD_BYTES} bytes)"
+        ))
+        .into());
+    }
+
     profile_gate(
         &state,
         &user.user_id,
@@ -399,6 +417,17 @@ pub async fn set_avatar_url(
 ) -> Result<Json<Value>, ApiError> {
     if user.user_id != user_id {
         return Err(VelaError::Forbidden("can only set own profile".into()).into());
+    }
+
+    // Same bound as displayname — avatar_url is an mxc:// URI (a couple
+    // hundred bytes at most), propagated into member events room-wide.
+    if let Some(url) = body.avatar_url.as_deref()
+        && url.len() > MAX_PROFILE_FIELD_BYTES
+    {
+        return Err(VelaError::InvalidParam(format!(
+            "avatar_url too long (max {MAX_PROFILE_FIELD_BYTES} bytes)"
+        ))
+        .into());
     }
 
     profile_gate(
