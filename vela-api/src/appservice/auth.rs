@@ -67,6 +67,18 @@ pub fn resolve_masquerade(
         ),
     };
 
+    // Target MUST be homed on THIS server. An AS can only act as users it
+    // homes locally, never as a user on another homeserver — a namespace
+    // regex that isn't anchored to our domain (e.g. `^@_irc_.*`) would
+    // otherwise let it masquerade as, and impersonate, a remote user.
+    let is_local = target_user_id
+        .split_once(':')
+        .map(|(_, domain)| domain == server_name)
+        .unwrap_or(false);
+    if !is_local {
+        return Err(AsAuthError::ExclusiveViolation(target_user_id));
+    }
+
     // Target MUST be in the AS's user namespaces.
     if !appservice
         .matcher
@@ -158,6 +170,37 @@ mod tests {
         let err = resolve_masquerade(&state.db, "example.com", &live, Some("@alice:example.com"))
             .unwrap_err();
         assert!(matches!(err, AsAuthError::ExclusiveViolation(_)));
+    }
+
+    #[test]
+    fn masquerade_rejects_remote_user_even_within_loose_namespace() {
+        let (state, _tmp) = build_test_state();
+        let reg = Arc::new(AsRegistry::open(state.db.clone()).unwrap());
+        // A loosely-anchored namespace that also matches a remote domain.
+        reg.register(make_as("irc", r"^@_irc_.*", "example.com"))
+            .unwrap();
+        let live = reg.get_by_id("irc").unwrap();
+        // The regex matches, but the user is homed on ANOTHER server → refused.
+        let err = resolve_masquerade(
+            &state.db,
+            "example.com",
+            &live,
+            Some("@_irc_alice:evil.com"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AsAuthError::ExclusiveViolation(_)),
+            "an AS must not masquerade as a user on another homeserver"
+        );
+        // A LOCAL user in the same loose namespace is still allowed.
+        let (uid, _) = resolve_masquerade(
+            &state.db,
+            "example.com",
+            &live,
+            Some("@_irc_alice:example.com"),
+        )
+        .unwrap();
+        assert_eq!(uid, "@_irc_alice:example.com");
     }
 
     #[test]
