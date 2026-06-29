@@ -19,6 +19,11 @@ use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::error::ApiError;
 use crate::router::AppState;
 
+/// Upper bound on registered pushers per user. Each push dispatch fans out
+/// over every recipient's pushers, so an unbounded set is a delivery-cost
+/// amplifier (and storage). Far above any real client's needs.
+const MAX_PUSHERS_PER_USER: usize = 100;
+
 /// GET /_matrix/client/v3/pushers
 pub async fn get_pushers(
     State(state): State<AppState>,
@@ -68,6 +73,24 @@ pub async fn set_pusher(
             .delete_pusher(user.user_nid, &body.app_id, &body.pushkey)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
         return Ok(Json(json!({})));
+    }
+
+    // Cap the number of pushers per user. A re-set of an existing
+    // (app_id, pushkey) is an update (same storage key) and is always
+    // allowed; only a genuinely new pusher beyond the cap is refused.
+    let existing = state
+        .db
+        .list_pushers(user.user_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let is_update = existing.iter().any(|p| {
+        p.get("app_id").and_then(|v| v.as_str()) == Some(body.app_id.as_str())
+            && p.get("pushkey").and_then(|v| v.as_str()) == Some(body.pushkey.as_str())
+    });
+    if !is_update && existing.len() >= MAX_PUSHERS_PER_USER {
+        return Err(VelaError::InvalidParam(format!(
+            "too many pushers (max {MAX_PUSHERS_PER_USER})"
+        ))
+        .into());
     }
 
     // Record the device_id of the access token that registered this
