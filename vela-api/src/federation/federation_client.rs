@@ -194,6 +194,21 @@ fn url_query_encode(s: &str) -> String {
     out
 }
 
+/// Build the federation `query/profile` request path. BOTH `user_id` and
+/// `field` are URL-query-encoded: `field` is the client-supplied CS-API
+/// profile key, so leaving it raw would let a crafted key (`x&extra=1`)
+/// inject extra query parameters into the federation request.
+fn query_profile_path(user_id: &str, field: Option<&str>) -> String {
+    let user = url_query_encode(user_id);
+    match field {
+        Some(f) => format!(
+            "/_matrix/federation/v1/query/profile?user_id={user}&field={}",
+            url_query_encode(f)
+        ),
+        None => format!("/_matrix/federation/v1/query/profile?user_id={user}"),
+    }
+}
+
 /// Read a federation response body into JSON, capped at `max` bytes. Rejects on
 /// an advertised `Content-Length` over the cap, and streams with a hard limit
 /// as the backstop (the length header may be absent or understated), so a
@@ -733,13 +748,7 @@ impl FederationClient {
         user_id: &str,
         field: Option<&str>,
     ) -> Result<Value, FederationClientError> {
-        let encoded_user = url_query_encode(user_id);
-        let path = match field {
-            Some(f) => {
-                format!("/_matrix/federation/v1/query/profile?user_id={encoded_user}&field={f}")
-            }
-            None => format!("/_matrix/federation/v1/query/profile?user_id={encoded_user}"),
-        };
+        let path = query_profile_path(user_id, field);
         self.signed_request(reqwest::Method::GET, destination, &path, None)
             .await
     }
@@ -1755,6 +1764,20 @@ mod tests {
         // Unicode bytes encoded — `老` (U+8001) is 3 bytes in UTF-8:
         // E8 80 81. Verify those appear in order.
         assert!(encoded.contains("%E8%80%81"));
+    }
+
+    #[test]
+    fn query_profile_path_encodes_field() {
+        let p = query_profile_path("@a:b.com", Some("displayname"));
+        assert!(p.contains("field=displayname"), "{p}");
+        // A client-supplied field carrying query-control chars must be
+        // encoded, not injected as a separate parameter.
+        let p = query_profile_path("@a:b.com", Some("displayname&extra=1"));
+        assert!(
+            !p.contains("&extra=1"),
+            "field must be encoded, not injected: {p}"
+        );
+        assert!(p.contains("field=displayname%26extra%3D1"), "{p}");
     }
 
     fn now_ms_fixed() -> u64 {
