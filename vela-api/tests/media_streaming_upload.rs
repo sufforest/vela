@@ -141,3 +141,64 @@ async fn streaming_upload_at_cap_succeeds() {
         "at-cap upload must succeed: {resp:?}"
     );
 }
+
+/// A download must carry the spec's media security headers so a blob served
+/// with an attacker-chosen Content-Type can't execute as active content.
+#[tokio::test]
+async fn download_carries_security_headers() {
+    let harness = Harness::new();
+    let (_, tok) = harness.register("alice", "pw").await;
+
+    // Upload an HTML payload with a text/html content-type — the XSS shape.
+    let resp = harness
+        .request(
+            Request::post("/_matrix/media/v3/upload")
+                .header("authorization", format!("Bearer {tok}"))
+                .header("content-type", "text/html")
+                .body(Body::from("<script>alert(1)</script>"))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mxc = read_json(resp).await["content_uri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let media_id = mxc.rsplit('/').next().unwrap();
+
+    let resp = harness
+        .request(
+            Request::get(format!(
+                "/_matrix/client/v1/media/download/{}/{}",
+                harness.state.config.server_name, media_id
+            ))
+            .header("authorization", format!("Bearer {tok}"))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let headers = resp.headers();
+    let csp = headers
+        .get("content-security-policy")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        csp.contains("sandbox") && csp.contains("script-src 'none'"),
+        "download must send a sandboxing CSP, got: {csp:?}"
+    );
+    assert_eq!(
+        headers
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff"),
+        "download must send X-Content-Type-Options: nosniff"
+    );
+    assert_eq!(
+        headers
+            .get("cross-origin-resource-policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("cross-origin"),
+        "download must send Cross-Origin-Resource-Policy: cross-origin"
+    );
+}
