@@ -14,7 +14,6 @@ pub mod notifications;
 pub mod pushers;
 pub mod pushrules;
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -85,8 +84,6 @@ async fn dispatch_inner(
         "content": content,
     });
 
-    let client = push_http_client();
-
     let room_member_count = members.len() as u64;
 
     // @room mention gate (MSC3952): the sender's effective power vs the
@@ -102,6 +99,12 @@ async fn dispatch_inner(
         .get("origin_server_ts")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
+
+    // Collect (gateway URL, body) pairs during the walk, then dispatch after:
+    // one pinned client per UNIQUE URL is shared across same-gateway recipients
+    // (a big room on one push gateway reuses connections instead of opening one
+    // per recipient), while each delivery still runs on its own task.
+    let mut deliveries: Vec<(String, Value)> = Vec::new();
 
     for member_nid in members {
         if member_nid == sender_nid {
@@ -214,25 +217,50 @@ async fn dispatch_inner(
                 );
             }
             let body = json!({"notification": notification});
-            let url = url.to_string();
-            let client = client.clone();
-            let allow_private = state.config.push.allow_private_pushers;
-            // One request per pusher, spawned so a slow gateway doesn't
-            // serialise delivery across recipients. Retries with bounded
-            // exponential backoff on transient failure (5xx + network);
-            // 4xx is permanent (the gateway rejected the payload, so a
-            // retry can't help) and drops immediately.
-            tokio::spawn(async move {
-                if !allow_private && let Err(reason) = check_pusher_url_is_public(&url).await {
-                    warn!(%url, reason, "pusher URL rejected (SSRF guard)");
-                    return;
-                }
-                deliver_one_pusher(&client, &url, &body).await;
-            });
+            deliveries.push((url.to_string(), body));
         }
     }
 
+    dispatch_deliveries(deliveries, state.config.push.allow_private_pushers).await;
     Ok(())
+}
+
+/// Fan the collected deliveries out to their push gateways. Builds one
+/// validated, connection-pinned client per UNIQUE gateway URL (so a high
+/// fan-out room sharing a gateway reuses connections), then spawns one task
+/// per delivery sharing that client. Resolving + validating + pinning here —
+/// rather than a separate pre-flight check — closes the DNS-rebinding TOCTOU:
+/// the connection can only reach the addresses we checked. Runs off the send
+/// hot path (the whole dispatch is already spawned), so the per-URL resolves
+/// add no request latency.
+async fn dispatch_deliveries(deliveries: Vec<(String, Value)>, allow_private: bool) {
+    // One delivery per task so a slow gateway doesn't serialise the others.
+    // Same-URL deliveries clone a shared client (cheap; clones share the pool).
+    // Retries use bounded exponential backoff on transient failure (5xx +
+    // network); 4xx is permanent (gateway rejected the payload) and drops.
+    let mut clients: std::collections::HashMap<String, Option<reqwest::Client>> =
+        std::collections::HashMap::new();
+    for (url, body) in deliveries {
+        // Build + validate + pin once per unique URL, caching the result.
+        // A rejected URL caches `None` so its other deliveries skip silently
+        // (the rejection is warned once, when first seen).
+        if !clients.contains_key(&url) {
+            let built = match build_pinned_push_client(&url, allow_private).await {
+                Ok(c) => Some(c),
+                Err(reason) => {
+                    warn!(%url, reason, "pusher URL rejected (SSRF guard)");
+                    None
+                }
+            };
+            clients.insert(url.clone(), built);
+        }
+        let Some(client) = clients.get(&url).and_then(|c| c.clone()) else {
+            continue;
+        };
+        tokio::spawn(async move {
+            deliver_one_pusher(&client, &url, &body).await;
+        });
+    }
 }
 
 /// Look up the recipient's display name (stored on the user record so
@@ -245,22 +273,40 @@ fn recipient_display_name(state: &AppState, user_nid: u64) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn push_http_client() -> Arc<reqwest::Client> {
-    // Cheap to clone, but build once per dispatch so request-level config
-    // lives alongside the dispatch. Longer-lived reuse would require stashing
-    // a client on AppState — not worth it for the current call volume.
-    Arc::new(
-        reqwest::Client::builder()
-            .timeout(PUSH_PER_ATTEMPT_TIMEOUT)
-            // Don't follow redirects. The SSRF guard validates the pusher
-            // URL's resolved IP up front, but a malicious gateway could
-            // 30x-redirect to an internal address (loopback / RFC1918 /
-            // 169.254.169.254) and reqwest would follow it straight past the
-            // guard. Push gateways have no legitimate need to redirect.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("reqwest client"),
-    )
+/// Build a delivery client whose connection is pinned to the gateway URL's
+/// validated public address(es). Resolving + validating + pinning together
+/// (instead of a separate pre-flight check) closes the DNS-rebinding TOCTOU:
+/// a hostname that resolved to a public IP for the check can't re-resolve to
+/// an internal one at connect time, because reqwest connects to exactly the
+/// addresses we hand it. `allow_private` is the operator escape hatch for
+/// intranet gateways (docker/k8s), gated on `push.allow_private_pushers`.
+async fn build_pinned_push_client(
+    url: &str,
+    allow_private: bool,
+) -> Result<reqwest::Client, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("scheme `{scheme}` not allowed"));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?
+        .to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    // Reuses the URL-preview resolver: fails closed on empty / non-public.
+    let addrs = crate::media::resolve_public_or_reject(&host, port, allow_private).await?;
+    reqwest::Client::builder()
+        .timeout(PUSH_PER_ATTEMPT_TIMEOUT)
+        // Don't follow redirects. Pinning fixes the FIRST connection, but a
+        // malicious gateway could still 30x to an internal address and reqwest
+        // would re-resolve the redirect target past the pin. Push gateways
+        // have no legitimate need to redirect.
+        .redirect(reqwest::redirect::Policy::none())
+        // Pin: connect only to the checked addresses (no re-resolution).
+        .resolve_to_addrs(&host, &addrs)
+        .build()
+        .map_err(|e| format!("client build failed: {e}"))
 }
 
 /// Per-attempt timeout. The push spec doesn't pin a value; we mirror
@@ -381,76 +427,18 @@ mod tests {
     }
 }
 
-/// Coarse SSRF guard: refuse non-http(s) schemes and any host whose
-/// resolved addresses include a loopback / private / link-local IP.
-/// Doesn't close DNS rebinding (reqwest re-resolves at connect time);
-/// catches the common literal-IP / private-host misconfiguration.
-/// Not wired yet — a follow-up adds the config flag that lets
-/// operators with docker/k8s gateways opt out of strict mode.
-async fn check_pusher_url_is_public(url: &str) -> Result<(), String> {
-    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
-    let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(format!("scheme `{scheme}` not allowed"));
-    }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "URL has no host".to_string())?;
-    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
-        if !is_public_ip(&addr) {
-            return Err(format!("host `{host}` is not a public IP"));
-        }
-        return Ok(());
-    }
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    let mut any_public = false;
-    let resolved = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| format!("DNS lookup failed: {e}"))?;
-    for sock in resolved {
-        if !is_public_ip(&sock.ip()) {
-            return Err(format!(
-                "host `{host}` resolves to non-public address {}",
-                sock.ip()
-            ));
-        }
-        any_public = true;
-    }
-    if !any_public {
-        return Err(format!("host `{host}` has no resolved addresses"));
-    }
-    Ok(())
-}
-
-/// `is_global` would do this in one call but it's not yet stable;
-/// approximated with the stable predicates plus explicit IPv6 prefix
-/// checks (link-local fe80::/10, unique-local fc00::/7).
-fn is_public_ip(addr: &std::net::IpAddr) -> bool {
-    if addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() {
-        return false;
-    }
-    match addr {
-        std::net::IpAddr::V4(v4) => !(v4.is_private() || v4.is_link_local() || v4.is_broadcast()),
-        std::net::IpAddr::V6(v6) => {
-            let s = v6.segments();
-            if (s[0] & 0xffc0) == 0xfe80 || (s[0] & 0xfe00) == 0xfc00 {
-                return false;
-            }
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_public_ip(&std::net::IpAddr::V4(v4));
-            }
-            true
-        }
-    }
-}
-
 #[cfg(test)]
 mod ssrf_tests {
     use super::*;
 
+    // The SSRF guard now lives in `build_pinned_push_client`, which both
+    // validates (via the shared `resolve_public_or_reject`) and pins the
+    // connection — so a host that passes can't rebind to an internal address.
+    // `allow_private = false` exercises the strict default.
+
     #[tokio::test]
     async fn refuses_loopback_literal() {
-        let r = check_pusher_url_is_public("http://127.0.0.1:8000/notify").await;
+        let r = build_pinned_push_client("http://127.0.0.1:8000/notify", false).await;
         assert!(r.is_err(), "loopback must be refused");
     }
 
@@ -459,7 +447,7 @@ mod ssrf_tests {
         for addr in ["10.0.0.5", "172.16.5.1", "192.168.1.1"] {
             let url = format!("http://{addr}/notify");
             assert!(
-                check_pusher_url_is_public(&url).await.is_err(),
+                build_pinned_push_client(&url, false).await.is_err(),
                 "{addr} must be refused"
             );
         }
@@ -468,7 +456,7 @@ mod ssrf_tests {
     #[tokio::test]
     async fn refuses_link_local() {
         assert!(
-            check_pusher_url_is_public("http://169.254.169.254/")
+            build_pinned_push_client("http://169.254.169.254/", false)
                 .await
                 .is_err(),
             "AWS-metadata IP (link-local) must be refused"
@@ -478,7 +466,7 @@ mod ssrf_tests {
     #[tokio::test]
     async fn refuses_ipv6_loopback() {
         assert!(
-            check_pusher_url_is_public("http://[::1]/notify")
+            build_pinned_push_client("http://[::1]/notify", false)
                 .await
                 .is_err(),
             "IPv6 loopback must be refused"
@@ -488,7 +476,7 @@ mod ssrf_tests {
     #[tokio::test]
     async fn refuses_non_http_scheme() {
         assert!(
-            check_pusher_url_is_public("file:///etc/passwd")
+            build_pinned_push_client("file:///etc/passwd", false)
                 .await
                 .is_err(),
             "non-http scheme must be refused"
@@ -498,7 +486,7 @@ mod ssrf_tests {
     #[tokio::test]
     async fn refuses_ipv4_mapped_loopback_in_ipv6() {
         assert!(
-            check_pusher_url_is_public("http://[::ffff:127.0.0.1]/")
+            build_pinned_push_client("http://[::ffff:127.0.0.1]/", false)
                 .await
                 .is_err(),
             "IPv4-mapped loopback must be refused"
@@ -506,10 +494,18 @@ mod ssrf_tests {
     }
 
     #[tokio::test]
-    async fn accepts_public_literal() {
-        // 1.1.1.1 (Cloudflare DNS) — example of a routable public address.
-        // Note: this doesn't actually connect; we only resolve + classify.
-        let r = check_pusher_url_is_public("https://1.1.1.1/notify").await;
+    async fn accepts_public_literal_and_pins() {
+        // 1.1.1.1 (Cloudflare DNS) — a routable public address. Builds a
+        // pinned client without connecting; the literal is validated public.
+        let r = build_pinned_push_client("https://1.1.1.1/notify", false).await;
         assert!(r.is_ok(), "public IP must be accepted: {r:?}");
+    }
+
+    #[tokio::test]
+    async fn allow_private_permits_loopback() {
+        // The operator escape hatch: with allow_private the strict check is
+        // skipped (intranet gateways), so loopback builds a client.
+        let r = build_pinned_push_client("http://127.0.0.1:8000/notify", true).await;
+        assert!(r.is_ok(), "allow_private must permit loopback: {r:?}");
     }
 }

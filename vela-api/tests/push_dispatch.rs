@@ -138,6 +138,66 @@ async fn room_mention_from_powered_sender_highlights_in_push() {
     let _ = alice;
 }
 
+/// Two recipients whose pushers point at the SAME gateway URL must each
+/// receive their own notification from a single message. Guards the
+/// dispatch-time dedup: clients are now shared per unique URL, so a bug there
+/// could collapse same-gateway recipients into one delivery (or drop one).
+#[tokio::test]
+async fn two_recipients_on_same_gateway_each_get_pushed() {
+    let harness = Harness::new();
+    let (_alice, alice_tok) = harness.register("alice", "pw").await;
+    let (bob, bob_tok) = harness.register("bob", "pw").await;
+    let (carol, carol_tok) = harness.register("carol", "pw").await;
+
+    let gateway = MockServer::start().await;
+    let notify_url = format!("{}/_matrix/push/v1/notify", gateway.uri());
+    Mock::given(method("POST"))
+        .and(path("/_matrix/push/v1/notify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"rejected": []})))
+        .expect(2)
+        .mount(&gateway)
+        .await;
+
+    // Distinct pushkeys, same gateway URL — the shared-client case.
+    harness
+        .set_pusher(&bob_tok, "com.example.app", "pk-bob", &notify_url)
+        .await;
+    harness
+        .set_pusher(&carol_tok, "com.example.app", "pk-carol", &notify_url)
+        .await;
+
+    let room_id = harness
+        .create_room(
+            &alice_tok,
+            json!({"preset": "trusted_private_chat", "invite": [bob, carol]}),
+        )
+        .await;
+    harness.join(&bob_tok, &room_id).await;
+    harness.join(&carol_tok, &room_id).await;
+
+    harness.send_message(&alice_tok, &room_id, "hi both").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let received = gateway.received_requests().await.unwrap();
+    assert_eq!(
+        received.len(),
+        2,
+        "both recipients on the shared gateway push"
+    );
+    let pushkeys: Vec<String> = received
+        .iter()
+        .map(|r| {
+            let body: Value = serde_json::from_slice(&r.body).unwrap();
+            body["notification"]["devices"][0]["pushkey"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert!(pushkeys.contains(&"pk-bob".to_string()), "bob pushed");
+    assert!(pushkeys.contains(&"pk-carol".to_string()), "carol pushed");
+}
+
 #[tokio::test]
 async fn sender_does_not_receive_push_for_own_message() {
     let harness = Harness::new();
