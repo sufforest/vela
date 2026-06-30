@@ -1617,13 +1617,7 @@ fn build_room_sync_for_user(
     // points at a root with `rel_type=m.thread`. The thread root
     // itself counts toward the main timeline, not its own thread.
     let (notification_count, highlight_count, thread_counts) = match user_nid {
-        Some(uid) => compute_unread_counts(
-            state,
-            room_nid,
-            uid,
-            &timeline_events,
-            unread_thread_notifications,
-        )?,
+        Some(uid) => compute_unread_counts(state, room_nid, uid, unread_thread_notifications)?,
         None => (0, 0, std::collections::BTreeMap::new()),
     };
 
@@ -1703,45 +1697,96 @@ fn build_room_sync_for_user(
 /// joined_member_count) is built once per call; the per-event hot loop
 /// only does the evaluate.
 ///
-/// MSC3771/3773 receipt scoping: every `m.read` receipt the user has in
-/// the room is bucketed by `thread_id` — unthreaded covers all threads,
-/// `"main"` covers main-timeline events only, thread-id-keyed covers
-/// just that thread. An event is "read" if any in-scope receipt sits at
-/// or after it in batch iteration order; a receipt whose target predates
-/// the batch covers everything in the batch under its scope.
+/// Counts the room TOTAL unread since the user's read receipt — a scan over
+/// `room_timeline` from the receipt position to now, NOT a per-`/sync`-batch
+/// delta (the old batch-local count read as zero whenever the receipt sat
+/// before the delivered batch).
+///
+/// MSC3771/3773 receipt scoping: each `m.read`/`m.read.private` receipt is
+/// bucketed by `thread_id` — unthreaded covers all threads, `"main"` covers
+/// main-timeline events only, a thread id covers just that thread. An event at
+/// stream position P is "read" iff an in-scope receipt sits at a position >= P.
+/// The scan is bounded below by the unthreaded receipt (the only one that
+/// covers every scope) and the caller's membership position, and capped to the
+/// newest `UNREAD_SCAN_CAP` events above that floor.
 pub(crate) fn compute_unread_counts(
     state: &AppState,
     room_nid: u64,
     user_nid: u64,
-    timeline_events: &[Value],
     unread_thread_notifications: bool,
 ) -> Result<(u64, u64, std::collections::BTreeMap<String, (u64, u64)>), ApiError> {
     let mut thread_counts: std::collections::BTreeMap<String, (u64, u64)> =
         std::collections::BTreeMap::new();
-    let user_receipts: Vec<(Option<String>, String)> = state
+
+    // Map the user's read receipts to stream POSITIONS. An event at position P
+    // is "read" if an in-scope receipt sits at a position >= P. We count over
+    // the whole room since the receipt — not just the delivered /sync batch —
+    // so the count is the spec's room-total unread, not a per-batch delta.
+    // Both m.read and m.read.private advance the owner's own read position.
+    // thread_id: None = unthreaded (covers every scope); "main" = the main
+    // timeline only; otherwise a specific thread root.
+    let receipts: Vec<(Option<String>, u64)> = state
         .db
         .get_room_receipts(room_nid)
         .ok()
         .unwrap_or_default()
         .into_iter()
         .filter_map(|(rt, un, tid, val)| {
-            if rt != "m.read" || un != user_nid {
+            if un != user_nid || (rt != "m.read" && rt != "m.read.private") {
                 return None;
             }
-            val.get("event_id")
-                .and_then(|v| v.as_str())
-                .map(|eid| (tid, eid.to_string()))
+            let eid = val.get("event_id").and_then(|v| v.as_str())?;
+            let pos = state.db.event_stream_pos(room_nid, eid).ok().flatten()?;
+            Some((tid, pos))
         })
         .collect();
-    let receipt_idx: Vec<(Option<String>, Option<usize>)> = user_receipts
+
+    // Highest receipt position that marks `scope` (the event's thread root, or
+    // None for the main timeline) read.
+    let scope_read_pos = |scope: Option<&str>| -> u64 {
+        receipts
+            .iter()
+            .filter(|(rt, _)| match (rt.as_deref(), scope) {
+                (None, _) => true,            // unthreaded covers every scope
+                (Some("main"), None) => true, // main receipt covers main-timeline events
+                (Some(t), Some(s)) => t == s, // thread receipt covers its own thread
+                _ => false,
+            })
+            .map(|(_, p)| *p)
+            .max()
+            .unwrap_or(0)
+    };
+    // The unthreaded receipt is the only one guaranteed to cover all scopes, so
+    // it's the safe lower bound for the scan; events at/below it are all read.
+    let unthreaded_pos = receipts
         .iter()
-        .map(|(tid, eid)| {
-            let idx = timeline_events
-                .iter()
-                .position(|ev| ev.get("event_id").and_then(|v| v.as_str()) == Some(eid.as_str()));
-            (tid.clone(), idx)
-        })
-        .collect();
+        .filter(|(rt, _)| rt.is_none())
+        .map(|(_, p)| *p)
+        .max()
+        .unwrap_or(0);
+    // Don't count events from before the caller joined.
+    let join_pos = state
+        .db
+        .get_user_room_membership_pos(user_nid, room_nid)
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let scan_from = join_pos.max(unthreaded_pos);
+    let to = state.db.current_stream_position().saturating_add(1);
+    // Caught up to the safe floor → nothing to count, skip the scan entirely.
+    if scan_from.saturating_add(1) >= to {
+        return Ok((0, 0, thread_counts));
+    }
+    // Scan the NEWEST events above the floor, not the oldest: the count must
+    // reflect the freshest unread and saturate older overflow at the cap. A
+    // forward scan would, for a client with only a "main"/thread receipt (no
+    // unthreaded floor) and more than `UNREAD_SCAN_CAP` events, examine only
+    // the oldest (already-read) window and wrongly report zero.
+    let events = state
+        .db
+        .get_timeline_range_newest(room_nid, scan_from.saturating_add(1), to, UNREAD_SCAN_CAP)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
     let mut main_count = 0u64;
     let mut main_highlights = 0u64;
     let user_id_str = state
@@ -1773,24 +1818,21 @@ pub(crate) fn compute_unread_counts(
         notifications_room_level,
     };
 
-    for (idx, ev) in timeline_events.iter().enumerate() {
+    for (pos, event_nid) in events {
+        let Some((_, body)) = state.db.get_event(event_nid).ok().flatten() else {
+            continue;
+        };
+        let Ok(ev) = serde_json::from_slice::<Value>(&body) else {
+            continue;
+        };
         let ev_type = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let sender = ev.get("sender").and_then(|v| v.as_str()).unwrap_or("");
-        let is_state = ev.get("state_key").is_some();
-        if is_state || sender == user_id_str {
+        if ev.get("state_key").is_some() || sender == user_id_str {
             continue;
         }
         if !matches!(ev_type, "m.room.message" | "m.room.encrypted") {
             continue;
         }
-        push_ctx.sender_power_level =
-            crate::membership::user_power(state, room_nid, sender).unwrap_or(0);
-        let action = vela_core::push_rules::evaluate(ev, &rules, &push_ctx);
-        let highlights = action
-            .tweaks
-            .get("highlight")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
 
         let thread_root = ev
             .pointer("/content/m.relates_to")
@@ -1799,25 +1841,19 @@ pub(crate) fn compute_unread_counts(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let in_scope = |receipt_thread: Option<&str>| -> bool {
-            match receipt_thread {
-                None => true,
-                Some("main") => thread_root.is_none(),
-                Some(tid) => thread_root.as_deref() == Some(tid),
-            }
-        };
-        let covered = receipt_idx.iter().any(|(rt, ridx)| {
-            if !in_scope(rt.as_deref()) {
-                return false;
-            }
-            match ridx {
-                None => true,
-                Some(r) => idx <= *r,
-            }
-        });
-        if covered {
+        // Read if an in-scope receipt sits at or after this event's position.
+        if scope_read_pos(thread_root.as_deref()) >= pos {
             continue;
         }
+
+        push_ctx.sender_power_level =
+            crate::membership::user_power(state, room_nid, sender).unwrap_or(0);
+        let action = vela_core::push_rules::evaluate(&ev, &rules, &push_ctx);
+        let highlights = action
+            .tweaks
+            .get("highlight")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         if unread_thread_notifications && let Some(root) = thread_root {
             let entry = thread_counts.entry(root).or_insert((0, 0));
@@ -1834,6 +1870,13 @@ pub(crate) fn compute_unread_counts(
     }
     Ok((main_count, main_highlights, thread_counts))
 }
+
+/// Cap on how many room events `compute_unread_counts` scans behind the read
+/// receipt. Bounds the per-room cost for a caller far behind; the reported
+/// count saturates here (clients render large counts as "99+"). The common
+/// case — a recent unthreaded receipt — scans only the events since it, so
+/// this ceiling is rarely approached.
+const UNREAD_SCAN_CAP: usize = 1000;
 
 /// Resolve the recipient's display name for use in `contains_display_name`
 /// push-rule evaluation. Prefer the per-room `m.room.member` event (so
@@ -3958,7 +4001,7 @@ mod tests {
             &[102],
         );
 
-        let ev = persist_message(
+        let _ev = persist_message(
             &state.db,
             200,
             "$m1",
@@ -3971,8 +4014,7 @@ mod tests {
             20,
         );
 
-        let (notif, hl, _) =
-            compute_unread_counts(&state, room_nid, alice_nid, &[ev], false).unwrap();
+        let (notif, hl, _) = compute_unread_counts(&state, room_nid, alice_nid, false).unwrap();
         assert_eq!(notif, 1, "underride rule should count bob's message");
         assert_eq!(hl, 1, "displayname mention should highlight");
     }
@@ -4007,7 +4049,7 @@ mod tests {
             )
             .unwrap();
 
-        let ev = persist_message(
+        let _ev = persist_message(
             &state.db,
             201,
             "$m2",
@@ -4020,8 +4062,7 @@ mod tests {
             21,
         );
 
-        let (notif, hl, _) =
-            compute_unread_counts(&state, room_nid, alice_nid, &[ev], false).unwrap();
+        let (notif, hl, _) = compute_unread_counts(&state, room_nid, alice_nid, false).unwrap();
         assert_eq!(notif, 1);
         assert_eq!(hl, 1, "MXID mention via content rule should highlight");
     }
@@ -4034,7 +4075,7 @@ mod tests {
         let (state, _tmp) = build_test_state();
         let (room_nid, alice_nid, bob_nid, room_id, _alice, bob) = build_alice_bob_room(&state);
 
-        let ev = persist_message(
+        let _ev = persist_message(
             &state.db,
             202,
             "$m3",
@@ -4047,8 +4088,7 @@ mod tests {
             22,
         );
 
-        let (notif, hl, _) =
-            compute_unread_counts(&state, room_nid, alice_nid, &[ev], false).unwrap();
+        let (notif, hl, _) = compute_unread_counts(&state, room_nid, alice_nid, false).unwrap();
         assert_eq!(notif, 1, "plain message still notifies under defaults");
         assert_eq!(hl, 0, "no rule emits highlight → highlight_count = 0");
     }
@@ -4064,7 +4104,7 @@ mod tests {
             .update_user_profile(alice_nid, Some("Alice Profile"), None)
             .unwrap();
 
-        let ev = persist_message(
+        let _ev = persist_message(
             &state.db,
             203,
             "$m4",
@@ -4077,9 +4117,129 @@ mod tests {
             23,
         );
 
-        let (_notif, hl, _) =
-            compute_unread_counts(&state, room_nid, alice_nid, &[ev], false).unwrap();
+        let (_notif, hl, _) = compute_unread_counts(&state, room_nid, alice_nid, false).unwrap();
         assert_eq!(hl, 1, "profile displayname should still drive highlight");
+    }
+
+    #[test]
+    fn unread_count_reflects_messages_after_read_receipt() {
+        // The regression this fixes: the old per-batch count returned 0
+        // whenever the read receipt sat before the delivered timeline batch.
+        // Now we count the room total since the receipt — alice reads m1, bob
+        // sends m2 + m3, so the count is 2 regardless of any /sync batch.
+        let (state, _tmp) = build_test_state();
+        let (room_nid, alice_nid, bob_nid, room_id, _alice, bob) = build_alice_bob_room(&state);
+
+        persist_message(
+            &state.db, 200, "$u1", room_nid, room_id, bob_nid, bob, "one", 20, 20,
+        );
+        state
+            .db
+            .set_receipt(room_nid, "m.read", alice_nid, "$u1", 100, None)
+            .unwrap();
+        persist_message(
+            &state.db, 201, "$u2", room_nid, room_id, bob_nid, bob, "two", 21, 21,
+        );
+        persist_message(
+            &state.db, 202, "$u3", room_nid, room_id, bob_nid, bob, "three", 22, 22,
+        );
+
+        let (notif, _hl, _) = compute_unread_counts(&state, room_nid, alice_nid, false).unwrap();
+        assert_eq!(notif, 2, "two messages after the read receipt are unread");
+    }
+
+    #[test]
+    fn unread_count_zero_when_caught_up() {
+        let (state, _tmp) = build_test_state();
+        let (room_nid, alice_nid, bob_nid, room_id, _alice, bob) = build_alice_bob_room(&state);
+        persist_message(
+            &state.db, 200, "$c1", room_nid, room_id, bob_nid, bob, "one", 20, 20,
+        );
+        persist_message(
+            &state.db, 201, "$c2", room_nid, room_id, bob_nid, bob, "two", 21, 21,
+        );
+        state
+            .db
+            .set_receipt(room_nid, "m.read", alice_nid, "$c2", 100, None)
+            .unwrap();
+        let (notif, _, _) = compute_unread_counts(&state, room_nid, alice_nid, false).unwrap();
+        assert_eq!(notif, 0, "reading the latest event clears the count");
+    }
+
+    #[test]
+    fn private_read_receipt_advances_unread_count() {
+        // m.read.private marks events read for the owner's own unread count.
+        let (state, _tmp) = build_test_state();
+        let (room_nid, alice_nid, bob_nid, room_id, _alice, bob) = build_alice_bob_room(&state);
+        persist_message(
+            &state.db, 200, "$p1", room_nid, room_id, bob_nid, bob, "one", 20, 20,
+        );
+        state
+            .db
+            .set_receipt(room_nid, "m.read.private", alice_nid, "$p1", 100, None)
+            .unwrap();
+        let (notif, _, _) = compute_unread_counts(&state, room_nid, alice_nid, false).unwrap();
+        assert_eq!(
+            notif, 0,
+            "a private read receipt also marks the message read"
+        );
+    }
+
+    #[test]
+    fn main_receipt_does_not_clear_thread_unread() {
+        // A "main"-scoped receipt covers only the main timeline; a reply in a
+        // thread it doesn't cover stays unread under its own thread bucket.
+        let (state, _tmp) = build_test_state();
+        let (room_nid, alice_nid, bob_nid, room_id, _alice, bob) = build_alice_bob_room(&state);
+
+        persist_message(
+            &state.db, 200, "$mt1", room_nid, room_id, bob_nid, bob, "main", 20, 20,
+        );
+        state
+            .db
+            .set_receipt(room_nid, "m.read", alice_nid, "$mt1", 100, Some("main"))
+            .unwrap();
+
+        // A threaded reply (rel_type m.thread) the "main" receipt does not cover.
+        let type_nid = state.db.get_or_create_nid("m.room.message").unwrap();
+        let thread_ev = serde_json::json!({
+            "event_id": "$mt2", "type": "m.room.message", "sender": bob, "room_id": room_id,
+            "content": {
+                "msgtype": "m.text", "body": "in thread",
+                "m.relates_to": {"rel_type": "m.thread", "event_id": "$root"},
+            },
+            "origin_server_ts": 21, "depth": 21, "prev_events": [], "auth_events": [],
+        });
+        state
+            .db
+            .persist_event(
+                201,
+                "$mt2",
+                room_nid,
+                type_nid,
+                bob_nid,
+                0,
+                21,
+                21,
+                &serde_json::to_vec(&thread_ev).unwrap(),
+                &[],
+                &[],
+                false,
+                false,
+            )
+            .unwrap();
+
+        let (main_count, _hl, threads) =
+            compute_unread_counts(&state, room_nid, alice_nid, true).unwrap();
+        assert_eq!(
+            main_count, 0,
+            "main receipt clears the main-timeline message"
+        );
+        assert_eq!(
+            threads.get("$root").map(|(c, _)| *c),
+            Some(1),
+            "the thread reply stays unread under its thread bucket"
+        );
     }
 
     /// `compute_state_delta` returns the most-recent state event for

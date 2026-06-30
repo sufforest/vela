@@ -4073,6 +4073,43 @@ impl Database {
         Ok(results)
     }
 
+    /// Like `get_timeline_range`, but returns the NEWEST `limit` events in
+    /// `[from, to)` (ascending order) instead of the oldest. Walking backward
+    /// from the top lets a caller bound work to recent events and saturate on
+    /// older overflow — e.g. the unread-count scan must count the freshest
+    /// unread and cap the rest, never stop at the oldest `limit`.
+    pub fn get_timeline_range_newest(
+        &self,
+        room_nid: u64,
+        from: u64,
+        to: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, u64)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("room_timeline").unwrap();
+        let start_key = keys::encode_u64_pair(room_nid, to.saturating_sub(1));
+        let iter = self.db.iterator_cf(
+            &cf,
+            IteratorMode::From(&start_key, rocksdb::Direction::Reverse),
+        );
+        let mut results = Vec::new();
+        for item in iter {
+            let (key, val) = item?;
+            if key.len() < 16 {
+                break;
+            }
+            let (rn, sp) = keys::decode_u64_pair(&key);
+            if rn != room_nid || sp < from {
+                break;
+            }
+            results.push((sp, keys::decode_u64(&val)));
+            if results.len() >= limit {
+                break;
+            }
+        }
+        results.reverse(); // ascending (chronological)
+        Ok(results)
+    }
+
     /// Get events from room timeline going backwards from a position.
     /// If `before` is u64::MAX, starts from the latest event.
     /// Returns Vec<(stream_pos, event_nid)> in chronological order.
