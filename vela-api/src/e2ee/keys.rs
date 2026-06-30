@@ -16,6 +16,10 @@ use crate::router::AppState;
 pub struct KeysUploadRequest {
     pub device_keys: Option<Value>,
     pub one_time_keys: Option<Map<String, Value>>,
+    /// MSC2732 fallback keys. Accept both the stable `fallback_keys` field and
+    /// the unstable `org.matrix.msc2732:fallback_keys` name older clients send.
+    #[serde(default, alias = "org.matrix.msc2732:fallback_keys")]
+    pub fallback_keys: Option<Map<String, Value>>,
 }
 
 /// POST /_matrix/client/v3/keys/upload
@@ -91,6 +95,27 @@ pub async fn upload_keys(
         state
             .db
             .add_one_time_keys(user.user_nid, &user.device_id, otks)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    }
+
+    // MSC2732 fallback keys: stored one-per-algorithm, kept after claim, and
+    // handed out when the device's one-time keys are exhausted.
+    if let Some(fallback) = &body.fallback_keys
+        && !fallback.is_empty()
+    {
+        // Serialize against /keys/claim, which read-modify-writes the `used`
+        // flag under this same per-user lock. Without it, a claim landing
+        // between this upload's read and write could mark a freshly-uploaded
+        // fallback key used and keep serving the old one.
+        let lock = state
+            .user_locks
+            .entry(user.user_nid)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        state
+            .db
+            .set_fallback_keys(user.user_nid, &user.device_id, fallback)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     }
 
@@ -569,11 +594,21 @@ pub(crate) async fn claim_local_user_otks(
 
     let mut user_keys: Map<String, Value> = Map::new();
     for (device_id, algorithm) in devices {
-        if let Some((key_id, key_data)) = state
+        // Prefer a one-time key; fall back to the device's MSC2732 fallback key
+        // when the OTKs are exhausted (kept, not consumed) so the sender can
+        // still establish an Olm session instead of getting nothing.
+        let claimed = match state
             .db
             .claim_one_time_key(user_nid, device_id, algorithm)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         {
+            Some(otk) => Some(otk),
+            None => state
+                .db
+                .claim_fallback_key(user_nid, device_id, algorithm)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?,
+        };
+        if let Some((key_id, key_data)) = claimed {
             let mut device_map = Map::new();
             device_map.insert(key_id, key_data);
             user_keys.insert(device_id.clone(), Value::Object(device_map));
@@ -1916,6 +1951,7 @@ mod tests {
                 json!({"@alice:example.com": {"ed25519:DEV": "self"}}),
             )),
             one_time_keys: None,
+            fallback_keys: None,
         };
         upload_keys(State(state.clone()), user, Json(body))
             .await

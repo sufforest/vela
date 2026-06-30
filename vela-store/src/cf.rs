@@ -43,6 +43,13 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     "room_account_data",
     "device_keys",
     "one_time_keys",
+    // MSC2732 fallback keys: one per `(user_nid:8 | len:u16 | device_id |
+    // algorithm)` -> `{key_id, key, used}`. Unlike one-time keys, a fallback
+    // key is KEPT after being claimed (marked used) and only replaced by a new
+    // upload, so a device whose OTKs are exhausted can still receive an Olm
+    // session. `device_unused_fallback_key_types` in /sync lists the
+    // algorithms whose fallback key is still unused.
+    "fallback_keys",
     "cross_signing_keys",
     // MSC3814 dehydrated devices: `user_nid (8 BE) -> { device_id,
     // device_data }`. One row per user; the PUT replaces any prior

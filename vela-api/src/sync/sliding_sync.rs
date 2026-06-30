@@ -594,12 +594,16 @@ pub async fn sliding_sync(
             .db
             .count_one_time_keys(user.user_nid, &user.device_id)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        let unused_fallback_key_types = state
+            .db
+            .unused_fallback_key_algorithms(user.user_nid, &user.device_id)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
         extensions.insert(
             "e2ee".to_string(),
             json!({
                 "device_one_time_keys_count": otk_counts,
-                "device_unused_fallback_key_types": [],
+                "device_unused_fallback_key_types": unused_fallback_key_types,
             }),
         );
     }
