@@ -102,6 +102,138 @@ fn extension_soft_fails_inbound(
     }
 }
 
+/// Verify the event carries at least one valid signature from `domain`,
+/// fetching that server's keys (rotation-aware via the signed key_ids) as
+/// needed. Used for the restricted-join authoriser-server check, where the
+/// authorising server differs from the sender.
+async fn verify_event_signed_by_domain(
+    state: &AppState,
+    obj: &serde_json::Map<String, Value>,
+    domain: &str,
+    room_version: vela_core::events::room_version::RoomVersion,
+) -> bool {
+    let Some(domain_sigs) = obj
+        .get("signatures")
+        .and_then(|v| v.as_object())
+        .and_then(|s| s.get(domain))
+        .and_then(|v| v.as_object())
+    else {
+        return false;
+    };
+    if domain_sigs.is_empty() {
+        return false;
+    }
+    let wanted: Vec<&str> = domain_sigs.keys().map(String::as_str).collect();
+    let Ok(keys) = state.remote_keys.get_or_fetch_signed(domain, &wanted).await else {
+        return false;
+    };
+    for key_id in domain_sigs.keys() {
+        let Some(pub_b64) = keys.event_verify_key(key_id) else {
+            continue;
+        };
+        let Ok(public_key) = decode_public_key(pub_b64) else {
+            continue;
+        };
+        if verify_event_signature(obj, domain, key_id, &public_key, room_version).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Restricted-room joins (MSC3083, auth rule 5.2.1): a GENUINE join via the
+/// restricted rule must be signed by the homeserver of the user named in
+/// `join_authorised_via_users_server`, not just the sender. `check_auth`
+/// verifies that user is joined + sufficiently powerful, but can't (it's pure)
+/// verify their server actually vouched — so a peer could otherwise forge a
+/// restricted join over `/send` to a third server, naming any powerful member
+/// as authoriser. This is the only place that signature is checked on the
+/// generic transaction path (send_join checks it for the join handshake).
+///
+/// Gated on it being a real restricted join: skip (Ok) when it's not a join,
+/// when the sender was already joined (a join→join transition — the auth rules
+/// ignore the field there, and clients legitimately send junk like "unused"),
+/// when the join rule isn't restricted, or when the authoriser isn't a
+/// well-formed MXID (left to check_auth's rule 5.2.1, which already passed).
+/// `state_at_event` is the resolved state BEFORE the event.
+async fn verify_restricted_join_authoriser(
+    state: &AppState,
+    event_json: &serde_json::Map<String, Value>,
+    pdu: &Pdu,
+    state_at_event: &std::collections::HashMap<(String, String), Pdu>,
+    sender_domain: &str,
+    room_version: vela_core::events::room_version::RoomVersion,
+) -> Result<(), String> {
+    if pdu.event_type != "m.room.member" {
+        return Ok(());
+    }
+    let content = event_json.get("content");
+    if content
+        .and_then(|c| c.get("membership"))
+        .and_then(|m| m.as_str())
+        != Some("join")
+    {
+        return Ok(());
+    }
+    // The restricted rule (and its authoriser) only applies when the join is
+    // authorised SOLELY by it. check_auth (rule 5.3.5) early-allows a join when
+    // the sender is already joined OR already invited — in those cases the
+    // authoriser field is ignored, so skip the signature requirement to match.
+    // (A join→join transition legitimately carries junk like "unused" here.)
+    let prior_membership = state_at_event
+        .get(&("m.room.member".to_string(), pdu.sender.clone()))
+        .and_then(|m| m.content.get("membership"))
+        .and_then(|m| m.as_str());
+    if matches!(prior_membership, Some("join") | Some("invite")) {
+        return Ok(());
+    }
+    // Only restricted / knock_restricted joins carry an authorising server.
+    let join_rule = state_at_event
+        .get(&("m.room.join_rules".to_string(), String::new()))
+        .and_then(|j| j.content.get("join_rule"))
+        .and_then(|j| j.as_str());
+    if !matches!(join_rule, Some("restricted") | Some("knock_restricted")) {
+        return Ok(());
+    }
+    let Some(authoriser) = content
+        .and_then(|c| c.get("join_authorised_via_users_server"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(authoriser_domain) = authoriser
+        .split_once(':')
+        .map(|(_, d)| d)
+        .filter(|d| !d.is_empty())
+    else {
+        return Ok(());
+    };
+    // Same domain as the sender → the sender-signature check already covered it.
+    if authoriser_domain == sender_domain {
+        return Ok(());
+    }
+    let signed = if authoriser_domain == state.config.server_name.as_str() {
+        let our_key_id = state.signing_key.key_id();
+        let our_pub = state.signing_key.verifying_key();
+        verify_event_signature(
+            event_json,
+            authoriser_domain,
+            our_key_id,
+            &our_pub,
+            room_version,
+        )
+        .is_ok()
+    } else {
+        verify_event_signed_by_domain(state, event_json, authoriser_domain, room_version).await
+    };
+    if signed {
+        Ok(())
+    } else {
+        Err("restricted join missing a valid authoriser-server signature".to_string())
+    }
+}
+
 /// On Accepted / SoftFailed the event has been persisted. On Rejected it has not.
 pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (String, PduOutcome) {
     // --- Check 1: format ---
@@ -692,7 +824,8 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
                     &mut state_at_event,
                 );
                 let sf = |t: &str, sk: &str| state_at_event.get(&(t.to_string(), sk.to_string()));
-                if let Err(AuthError::Rejected(reason)) = check_auth(&effective_pdu, &sf) {
+                let auth_result = check_auth(&effective_pdu, &sf);
+                if let Err(AuthError::Rejected(reason)) = &auth_result {
                     let keys: Vec<String> = state_at_event
                         .keys()
                         .map(|(t, sk)| format!("{t}/{sk}"))
@@ -750,6 +883,23 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
                             PduOutcome::Rejected(format!("state-at-event check failed: {reason}")),
                         );
                     }
+                }
+                // A genuine restricted join that passed the auth rules must
+                // also carry the authoriser server's signature (rule 5.2.1).
+                // Only runs when check_auth actually passed (not soft-failed /
+                // exempted), so it never piles on top of a partial-state defer.
+                if auth_result.is_ok()
+                    && let Err(reason) = verify_restricted_join_authoriser(
+                        state,
+                        &effective_event_json,
+                        &effective_pdu,
+                        &state_at_event,
+                        &sender_domain,
+                        event_room_version,
+                    )
+                    .await
+                {
+                    return (effective_pdu.event_id.clone(), PduOutcome::Rejected(reason));
                 }
             }
             Ok(None) => {
@@ -2992,6 +3142,217 @@ mod tests {
     use super::*;
     use crate::test_helpers::build_test_state;
     use serde_json::json;
+
+    // --- verify_restricted_join_authoriser gating ---
+
+    fn state_pdu(event_type: &str, state_key: &str, content: serde_json::Value) -> Pdu {
+        Pdu {
+            event_id: format!("${event_type}:{state_key}"),
+            room_id: "!r:hs1".to_string(),
+            event_type: event_type.to_string(),
+            state_key: Some(state_key.to_string()),
+            sender: "@x:hs1".to_string(),
+            origin_server_ts: 0,
+            content,
+            auth_events: vec![],
+            prev_events: vec![],
+            depth: 1,
+            signatures: None,
+        }
+    }
+
+    /// Build a restricted-room state-at-event: bob has `prior` membership, the
+    /// join rule is `rule`.
+    fn restricted_sae(
+        bob: &str,
+        prior: &str,
+        rule: &str,
+    ) -> std::collections::HashMap<(String, String), Pdu> {
+        let mut sae = std::collections::HashMap::new();
+        sae.insert(
+            ("m.room.member".to_string(), bob.to_string()),
+            state_pdu("m.room.member", bob, json!({"membership": prior})),
+        );
+        sae.insert(
+            ("m.room.join_rules".to_string(), String::new()),
+            state_pdu("m.room.join_rules", "", json!({"join_rule": rule})),
+        );
+        sae
+    }
+
+    fn join_event(bob: &str, authoriser: serde_json::Value) -> serde_json::Map<String, Value> {
+        let mut content = serde_json::Map::new();
+        content.insert("membership".into(), json!("join"));
+        if !authoriser.is_null() {
+            content.insert("join_authorised_via_users_server".into(), authoriser);
+        }
+        json!({
+            "type": "m.room.member",
+            "room_id": "!r:hs1",
+            "sender": bob,
+            "state_key": bob,
+            "content": Value::Object(content),
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    async fn authoriser_check(
+        state: &AppState,
+        ev: &serde_json::Map<String, Value>,
+        sae: &std::collections::HashMap<(String, String), Pdu>,
+        sender_domain: &str,
+    ) -> Result<(), String> {
+        let pdu = Pdu {
+            event_id: "$ev".to_string(),
+            room_id: "!r:hs1".to_string(),
+            event_type: ev
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            state_key: ev
+                .get("state_key")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            sender: ev
+                .get("sender")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            origin_server_ts: 0,
+            content: ev.get("content").cloned().unwrap_or(Value::Null),
+            auth_events: vec![],
+            prev_events: vec![],
+            depth: 0,
+            signatures: None,
+        };
+        verify_restricted_join_authoriser(
+            state,
+            ev,
+            &pdu,
+            sae,
+            sender_domain,
+            vela_core::events::room_version::RoomVersion::V12,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn authoriser_skipped_on_join_to_join_transition() {
+        // The regression: a join→join transition (already a member) carries a
+        // junk `"unused"` authoriser that the auth rules ignore — must NOT be
+        // checked or rejected.
+        let (state, _tmp) = build_test_state();
+        let sae = restricted_sae("@bob:hs2", "join", "restricted");
+        let ev = join_event("@bob:hs2", json!("unused"));
+        assert!(
+            authoriser_check(&state, &ev, &sae, "hs2").await.is_ok(),
+            "join→join with a junk authoriser must be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoriser_skipped_when_join_rule_not_restricted() {
+        let (state, _tmp) = build_test_state();
+        let sae = restricted_sae("@bob:hs2", "leave", "public");
+        let ev = join_event("@bob:hs2", json!("@boss:hs1"));
+        assert!(
+            authoriser_check(&state, &ev, &sae, "hs2").await.is_ok(),
+            "a public-room join must not require an authoriser signature"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoriser_skipped_when_field_malformed() {
+        // A genuine restricted join with a non-MXID authoriser: leave it to
+        // check_auth's rule 5.2.1 rather than hard-rejecting here.
+        let (state, _tmp) = build_test_state();
+        let sae = restricted_sae("@bob:hs2", "leave", "restricted");
+        let ev = join_event("@bob:hs2", json!("unused"));
+        assert!(
+            authoriser_check(&state, &ev, &sae, "hs2").await.is_ok(),
+            "a malformed authoriser is left to the auth rules"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoriser_required_on_genuine_restricted_join_without_signature() {
+        // Genuine restricted join (prior membership = leave), remote authoriser,
+        // and the event carries NO signature from the authoriser's server →
+        // rejected.
+        let (state, _tmp) = build_test_state();
+        let sae = restricted_sae("@bob:hs2", "leave", "restricted");
+        let ev = join_event("@bob:hs2", json!("@boss:hs3"));
+        let r = authoriser_check(&state, &ev, &sae, "hs2").await;
+        assert!(
+            r.is_err_and(|e| e.contains("authoriser-server signature")),
+            "a restricted join lacking the authoriser-server signature must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoriser_skipped_on_invite_to_join() {
+        // An invited user joining a restricted room is authorised by the invite,
+        // not the restricted rule — the authoriser field is ignored (mirrors
+        // check_auth 5.3.5), so no authoriser signature is required.
+        let (state, _tmp) = build_test_state();
+        let sae = restricted_sae("@bob:hs2", "invite", "restricted");
+        let ev = join_event("@bob:hs2", json!("@boss:hs3"));
+        assert!(
+            authoriser_check(&state, &ev, &sae, "hs2").await.is_ok(),
+            "an invited user's join must not require an authoriser signature"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoriser_required_when_prior_membership_absent() {
+        // No prior member in state (genuine first join) + restricted + remote
+        // authoriser + no signature → still required.
+        let (state, _tmp) = build_test_state();
+        let mut sae = std::collections::HashMap::new();
+        sae.insert(
+            ("m.room.join_rules".to_string(), String::new()),
+            state_pdu("m.room.join_rules", "", json!({"join_rule": "restricted"})),
+        );
+        let ev = join_event("@bob:hs2", json!("@boss:hs3"));
+        assert!(
+            authoriser_check(&state, &ev, &sae, "hs2")
+                .await
+                .is_err_and(|e| e.contains("authoriser-server signature")),
+            "a first join via the restricted rule must require the authoriser signature"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoriser_skipped_when_authoriser_shares_sender_domain() {
+        // Authoriser on the sender's own server → the sender-signature check
+        // (done earlier) already covered it.
+        let (state, _tmp) = build_test_state();
+        let sae = restricted_sae("@bob:hs2", "leave", "restricted");
+        let ev = join_event("@bob:hs2", json!("@boss:hs2"));
+        assert!(
+            authoriser_check(&state, &ev, &sae, "hs2").await.is_ok(),
+            "a same-domain authoriser is covered by the sender-signature check"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoriser_accepts_local_authoriser_signed_by_us() {
+        // We are the authoriser: a genuine restricted join naming a local user,
+        // signed by our own key, passes (the self-key verification branch).
+        let (state, _tmp) = build_test_state();
+        let our = state.config.server_name.clone();
+        let sae = restricted_sae("@bob:hs2", "leave", "restricted");
+        let mut ev = join_event("@bob:hs2", json!(format!("@boss:{our}")));
+        vela_core::events::hash::add_content_hash(&mut ev);
+        state.signing_key.sign_event(&mut ev, &our);
+        assert!(
+            authoriser_check(&state, &ev, &sae, "hs2").await.is_ok(),
+            "a restricted join we authorised and signed must pass"
+        );
+    }
 
     #[tokio::test]
     async fn reject_non_object_pdu() {
