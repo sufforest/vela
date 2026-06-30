@@ -1319,10 +1319,10 @@ fn build_sliding_room(
     };
 
     // Unread counts mirror /sync semantics. Sliding sync clients show
-    // the same badge on a room tile as /sync clients do, so they need
-    // the same per-batch evaluation against the user's read receipts.
+    // the same badge on a room tile as /sync clients do, so they get the
+    // same room-total count since the user's read receipt.
     let (notification_count, highlight_count, _thread_counts) =
-        crate::sync::compute_unread_counts(state, room_nid, user_nid, &timeline, false)?;
+        crate::sync::compute_unread_counts(state, room_nid, user_nid, false)?;
 
     let mut room = json!({
         "initial": is_initial,
