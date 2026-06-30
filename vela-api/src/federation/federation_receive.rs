@@ -129,6 +129,22 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
         );
     }
 
+    // --- Check 1c: size limits ---
+    // The spec caps an event's canonical encoding at 65536 bytes and several
+    // fields at 255. Inbound PDUs were unchecked, so an oversized event a
+    // conforming peer would reject could enter our DAG (and get re-broadcast)
+    // → state divergence + parse/store amplification. The check sizes the
+    // event AS RECEIVED, including any `unsigned` the origin attached (Synapse
+    // does the same); that's stricter than the local send path, which never
+    // carries `unsigned`. event_id isn't known yet (derived below), so skip it
+    // here — it's a fixed-length hash, never over-limit.
+    if let Err(reason) = vela_core::events::limits::check_inbound_event_limits(obj, "") {
+        return (
+            "unknown".into(),
+            PduOutcome::Rejected(format!("PDU exceeds size limits: {reason}")),
+        );
+    }
+
     // v3+ event format derives event_ids from the reference hash. The
     // hash is version-aware (different redaction shapes produce
     // different bytes), so we have to know the room version before
@@ -2834,6 +2850,12 @@ pub async fn persist_join_event(
     event_json: &Map<String, Value>,
 ) -> Result<(), String> {
     use vela_core::canonical::canonical_json_object;
+
+    // Same size-limit gate as the live + backfill paths: a join's state/auth
+    // bundle comes from the resident server we're joining via, but an oversized
+    // event still mustn't enter our DAG.
+    vela_core::events::limits::check_inbound_event_limits(event_json, &pdu.event_id)
+        .map_err(|reason| format!("join event exceeds size limits: {reason}"))?;
 
     let type_nid = state
         .db

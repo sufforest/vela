@@ -541,6 +541,12 @@ pub(crate) async fn persist_remote_event(
 
     let obj = event_json.as_object().ok_or("event is not an object")?;
 
+    // Size gate (same as the live + backfill + resident-join paths): an
+    // oversized state/auth event from the resident server we're joining via
+    // must not enter our DAG. event_id is derived below, so skip it here.
+    vela_core::events::limits::check_inbound_event_limits(obj, "")
+        .map_err(|reason| format!("send_join event exceeds size limits: {reason}"))?;
+
     // Look up the room version FIRST: event_id derivation, sig verify
     // and content-hash all redact under the version-specific shape, so
     // we have to know the version before computing the canonical bytes.
