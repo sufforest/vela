@@ -492,6 +492,25 @@ fn iterative_auth_checks(
         }
     }
 
+    // v12 (MSC4291) omits m.room.create from auth_events — it's identified by
+    // room_id instead. The per-event augmentation below only pulls auth_events,
+    // so without this the create event is absent during the auth checks and
+    // every conflicted event is rejected ("no m.room.create in state"),
+    // silently dropping ALL conflicted state on a genuine fork. Derive create
+    // from any event's room_id and seed it into the auth view. This is correct
+    // because every event in one `resolve` call shares a room (the algorithm's
+    // invariant), and a cross-room/forged event is still rejected by auth rule
+    // 2 (`room_id_matches_create`). Pre-v12 is a no-op: the derived id won't
+    // resolve (its create id is a content hash unrelated to room_id) and create
+    // is already carried in auth_events there.
+    let create_seed: Option<((String, String), Pdu)> = events_in_order
+        .iter()
+        .find_map(|id| event_fn(id))
+        .and_then(|p| p.room_id.strip_prefix('!').map(|rest| format!("${rest}")))
+        .and_then(|cid| event_fn(&cid))
+        .filter(|c| c.event_type == "m.room.create")
+        .map(|c| (("m.room.create".to_string(), String::new()), c));
+
     for event_id in events_in_order {
         let ev = match event_fn(event_id) {
             Some(p) => p,
@@ -506,6 +525,12 @@ fn iterative_auth_checks(
         // We augment eagerly for all auth_events types (simpler and equivalent since
         // those types are exactly the ones auth rules consult).
         let mut augmented_pdus = state_pdus.clone();
+        // Seed the create event (v12 omits it from auth_events; see above).
+        if let Some((key, create_pdu)) = &create_seed {
+            augmented_pdus
+                .entry(key.clone())
+                .or_insert_with(|| create_pdu.clone());
+        }
         for ae_id in &ev.auth_events {
             if let Some(ae_pdu) = event_fn(ae_id)
                 && let Some(sk) = ae_pdu.state_key.as_deref()
@@ -872,6 +897,98 @@ mod tests {
                 .get(&("m.room.topic".to_string(), String::new()))
                 .unwrap(),
             "$topic2"
+        );
+    }
+
+    #[test]
+    fn v12_fork_resolves_without_create_in_auth_events() {
+        // Faithful v12 (MSC4291): the create event is OMITTED from auth_events
+        // and identified by room_id instead. A fork with two competing topic
+        // events must still resolve. Before the fix, the iterative auth checks
+        // had no m.room.create in scope (neither in auth_events nor seeded), so
+        // every conflicted event failed auth and the key vanished entirely.
+        let create = pdu(
+            "$create",
+            "m.room.create",
+            Some(""),
+            "@alice:example.com",
+            json!({"room_version": "12"}),
+            &[],
+            0,
+        );
+        // Even the creator's join omits create from auth_events in v12.
+        let alice_join = pdu(
+            "$alice_join",
+            "m.room.member",
+            Some("@alice:example.com"),
+            "@alice:example.com",
+            json!({"membership": "join"}),
+            &[],
+            1,
+        );
+        // The conflicting topic events list ONLY the member event — NOT $create.
+        let topic1 = pdu(
+            "$topic1",
+            "m.room.topic",
+            Some(""),
+            "@alice:example.com",
+            json!({"topic": "hello"}),
+            &["$alice_join"],
+            2,
+        );
+        let topic2 = pdu(
+            "$topic2",
+            "m.room.topic",
+            Some(""),
+            "@alice:example.com",
+            json!({"topic": "world"}),
+            &["$alice_join"],
+            3,
+        );
+
+        let mut pdus: HashMap<String, Pdu> = HashMap::new();
+        for p in [&create, &alice_join, &topic1, &topic2] {
+            pdus.insert(p.event_id.clone(), p.clone());
+        }
+        let state_set = |topic: &str| -> StateMap {
+            [
+                (
+                    ("m.room.create".to_string(), String::new()),
+                    "$create".to_string(),
+                ),
+                (
+                    (
+                        "m.room.member".to_string(),
+                        "@alice:example.com".to_string(),
+                    ),
+                    "$alice_join".to_string(),
+                ),
+                (
+                    ("m.room.topic".to_string(), String::new()),
+                    topic.to_string(),
+                ),
+            ]
+            .iter()
+            .cloned()
+            .collect()
+        };
+
+        let pdus_ref = pdus.clone();
+        let event_fn = move |id: &str| pdus_ref.get(id).cloned();
+        let auth_chain_fn = |_: &str| HashSet::new();
+        let result = resolve(
+            &[state_set("$topic1"), state_set("$topic2")],
+            &event_fn,
+            &auth_chain_fn,
+        );
+
+        // The fork resolves to one topic (the later by ordering), not dropped.
+        assert_eq!(
+            result
+                .get(&("m.room.topic".to_string(), String::new()))
+                .map(String::as_str),
+            Some("$topic2"),
+            "v12 fork must keep a topic; create comes from room_id, not auth_events"
         );
     }
 
