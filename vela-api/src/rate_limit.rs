@@ -13,10 +13,13 @@
 //! `M_LIMIT_EXCEEDED` and a `retry_after_ms` field telling the client
 //! when to try again.
 //!
-//! Storage: an in-memory `DashMap` keyed by `(endpoint, ip)`. Buckets
-//! are lazily expired by the next access — we don't run a background
-//! janitor since the working set is bounded by the live IP fan-out
-//! (KB-scale even for noisy traffic).
+//! Storage: an in-memory `DashMap` keyed by `(endpoint, ip)`. The working
+//! set tracks live client IPs, so it's small in normal operation — but a
+//! spoofable `X-Forwarded-For` (when `real_ip_header` is set on an origin not
+//! locked to its proxy) could otherwise inflate it without bound. When the
+//! map exceeds a cap we evict idle buckets (last touched > the idle window);
+//! an idle bucket has refilled to capacity, so dropping it never lets a
+//! currently-throttled key slip the limit.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -81,6 +84,14 @@ impl RateLimiter {
         let mut m = HashMap::new();
         m.insert("register", Limits::new(50, 3.0 / 60.0));
         m.insert("login", Limits::new(50, 10.0 / 60.0));
+        // Authenticated write surface — keyed on client IP (per-user keying
+        // pre-auth would let forged tokens grow the bucket map unbounded).
+        // Limits are deliberately generous: they exist to choke spam/flood
+        // abuse, not to pace a normal client, and a shared NAT pools many
+        // real users behind one key. `message` covers send/state/redact (high
+        // frequency); `membership` covers createRoom/join/invite/leave/etc.
+        m.insert("message", Limits::new(100, 1.0));
+        m.insert("membership", Limits::new(50, 0.5));
         Self::new(m)
     }
 
@@ -91,6 +102,21 @@ impl RateLimiter {
         Self::new(HashMap::new())
     }
 
+    /// Drop idle buckets when the map grows past a cap. An idle bucket (not
+    /// touched within the window) has refilled to capacity, so removing it is
+    /// equivalent to never having seen the key — a currently-throttled key,
+    /// which is being hit continuously, has a recent `last_refill` and is
+    /// kept. Bounds the map against an inflated key space (e.g. a spoofed
+    /// `X-Forwarded-For`). O(n) but only runs while over the cap.
+    fn evict_if_oversized(&self, now: Instant) {
+        const MAX_BUCKETS: usize = 50_000;
+        const IDLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+        if self.buckets.len() > MAX_BUCKETS {
+            self.buckets
+                .retain(|_, b| now.duration_since(b.last_refill) < IDLE_WINDOW);
+        }
+    }
+
     /// Try to spend one token for `(endpoint, ip)`. Returns `Ok(())` if
     /// allowed; `Err(retry_after_ms)` if rate-limited.
     pub fn check(&self, endpoint: &'static str, ip: &str) -> Result<(), u64> {
@@ -98,8 +124,9 @@ impl RateLimiter {
             Some(l) => *l,
             None => return Ok(()), // unknown endpoint label = no limit
         };
-        let key = (endpoint.to_string(), ip.to_string());
         let now = Instant::now();
+        self.evict_if_oversized(now);
+        let key = (endpoint.to_string(), ip.to_string());
         let mut entry = self.buckets.entry(key).or_insert_with(|| Bucket {
             tokens: limits.capacity as f64,
             last_refill: now,

@@ -1121,18 +1121,83 @@ async fn rate_limit_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let endpoint = match (req.method().as_str(), req.uri().path()) {
-        ("POST", "/_matrix/client/v3/register" | "/_matrix/client/r0/register") => Some("register"),
-        ("POST", "/_matrix/client/v3/login" | "/_matrix/client/r0/login") => Some("login"),
-        _ => None,
-    };
-    if let Some(endpoint) = endpoint {
-        let ip = real_client_ip(&state, &req);
-        if let Err(retry_ms) = state.rate_limiter.check(endpoint, &ip) {
-            return limit_exceeded_response(retry_ms);
+    if let Some(endpoint) = rate_limit_category(req.method().as_str(), req.uri().path()) {
+        // Appservices are exempt from rate limiting (spec). The middleware runs
+        // pre-auth and keys on IP, so it can't otherwise tell a bridge relaying
+        // a busy room from a spamming client — check the bearer token against
+        // the AS registry and skip when it's a registered as_token.
+        if !request_is_appservice(&state, &req) {
+            let ip = real_client_ip(&state, &req);
+            if let Err(retry_ms) = state.rate_limiter.check(endpoint, &ip) {
+                return limit_exceeded_response(retry_ms);
+            }
         }
     }
     next.run(req).await
+}
+
+/// True when the request carries a registered appservice `as_token` as its
+/// bearer credential — used to exempt appservices from rate limiting.
+fn request_is_appservice(state: &AppState, req: &axum::extract::Request) -> bool {
+    req.headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .is_some_and(|token| {
+            crate::appservice::auth::lookup_appservice(&state.appservice_registry, token).is_some()
+        })
+}
+
+/// Classify a request into a rate-limit bucket label, or `None` to skip
+/// limiting. Pure (method + path only) so it's unit-testable. Covers the
+/// unauth surface (login/register) and the authed write surface the spec
+/// rate-limits: message/state/redaction writes and the membership cluster
+/// (createRoom + join/leave/invite/kick/ban/knock/forget). Reads, sync,
+/// media, and federation are deliberately unlimited here.
+fn rate_limit_category(method: &str, path: &str) -> Option<&'static str> {
+    match method {
+        "POST"
+            if path == "/_matrix/client/v3/register" || path == "/_matrix/client/r0/register" =>
+        {
+            Some("register")
+        }
+        "POST" if path == "/_matrix/client/v3/login" || path == "/_matrix/client/r0/login" => {
+            Some("login")
+        }
+        // Per-room writes: PUT .../rooms/{id}/send|state|redact/...
+        "PUT"
+            if path.starts_with("/_matrix/client/")
+                && path.contains("/rooms/")
+                && (path.contains("/send/")
+                    || path.contains("/state/")
+                    || path.contains("/redact/")) =>
+        {
+            Some("message")
+        }
+        // Membership + room creation cluster.
+        "POST" if is_membership_write(path) => Some("membership"),
+        _ => None,
+    }
+}
+
+/// Membership/room-creation POST paths, matched structurally. `/join/{id}` and
+/// `/knock/{id}` are the alias-or-id forms; the `/rooms/{id}/<action>` forms
+/// end in the action verb.
+fn is_membership_write(path: &str) -> bool {
+    if !path.starts_with("/_matrix/client/") {
+        return false;
+    }
+    path.ends_with("/createRoom")
+        || path.contains("/join/")
+        || path.contains("/knock/")
+        || path.ends_with("/join")
+        || path.ends_with("/leave")
+        || path.ends_with("/invite")
+        || path.ends_with("/kick")
+        || path.ends_with("/ban")
+        || path.ends_with("/unban")
+        || path.ends_with("/knock")
+        || path.ends_with("/forget")
 }
 
 /// The client IP to rate-limit on. When `real_ip_header` is configured
@@ -1191,8 +1256,16 @@ fn pick_client_ip(
 /// the response shape stays identical across endpoints.
 fn limit_exceeded_response(retry_after_ms: u64) -> axum::response::Response {
     use axum::response::IntoResponse;
+    // `retry_after_ms` is the Matrix-native field; the `Retry-After` header
+    // (whole seconds, rounded up) is the HTTP-standard companion that proxies
+    // and generic clients honour (spec v1.10+ / MSC4041).
+    let retry_after_secs = retry_after_ms.div_ceil(1000).max(1);
     (
         StatusCode::TOO_MANY_REQUESTS,
+        [(
+            axum::http::header::RETRY_AFTER,
+            retry_after_secs.to_string(),
+        )],
         axum::Json(serde_json::json!({
             "errcode": "M_LIMIT_EXCEEDED",
             "error": "rate limit exceeded",
@@ -1406,6 +1479,71 @@ fn federation_authed_routes(state: AppState) -> Router<AppState> {
             put(crate::membership::federation_knock::send_knock_v1),
         )
         .layer(axum::middleware::from_fn_with_state(state, federation_auth))
+}
+
+#[cfg(test)]
+mod rate_limit_category_tests {
+    use super::rate_limit_category;
+
+    #[test]
+    fn unauth_surface() {
+        assert_eq!(
+            rate_limit_category("POST", "/_matrix/client/v3/login"),
+            Some("login")
+        );
+        assert_eq!(
+            rate_limit_category("POST", "/_matrix/client/r0/register"),
+            Some("register")
+        );
+    }
+
+    #[test]
+    fn message_writes() {
+        for p in [
+            "/_matrix/client/v3/rooms/!r:x/send/m.room.message/t1",
+            "/_matrix/client/v3/rooms/!r:x/state/m.room.name/",
+            "/_matrix/client/v3/rooms/!r:x/redact/$e/t1",
+        ] {
+            assert_eq!(rate_limit_category("PUT", p), Some("message"), "{p}");
+        }
+        // Reads of the same shapes are NOT limited.
+        assert_eq!(
+            rate_limit_category("GET", "/_matrix/client/v3/rooms/!r:x/state/m.room.name/"),
+            None
+        );
+    }
+
+    #[test]
+    fn membership_writes() {
+        for p in [
+            "/_matrix/client/v3/createRoom",
+            "/_matrix/client/v3/join/!r:x",
+            "/_matrix/client/v3/knock/!r:x",
+            "/_matrix/client/v3/rooms/!r:x/join",
+            "/_matrix/client/v3/rooms/!r:x/leave",
+            "/_matrix/client/v3/rooms/!r:x/invite",
+            "/_matrix/client/v3/rooms/!r:x/kick",
+            "/_matrix/client/v3/rooms/!r:x/ban",
+            "/_matrix/client/v3/rooms/!r:x/forget",
+        ] {
+            assert_eq!(rate_limit_category("POST", p), Some("membership"), "{p}");
+        }
+    }
+
+    #[test]
+    fn unlimited_paths() {
+        assert_eq!(rate_limit_category("GET", "/_matrix/client/v3/sync"), None);
+        assert_eq!(
+            rate_limit_category("GET", "/_matrix/client/v3/rooms/!r:x/messages"),
+            None
+        );
+        assert_eq!(
+            rate_limit_category("POST", "/_matrix/federation/v1/send/txn1"),
+            None
+        );
+        // A non-client path that happens to end in a membership verb is ignored.
+        assert_eq!(rate_limit_category("POST", "/some/other/join"), None);
+    }
 }
 
 #[cfg(test)]
