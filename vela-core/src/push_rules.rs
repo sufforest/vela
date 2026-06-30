@@ -129,12 +129,17 @@ fn match_one_condition(cond: &Value, event: &Value, ctx: &RoomContext) -> bool {
             let Some(key) = cond.get("key").and_then(|v| v.as_str()) else {
                 return false;
             };
-            let Some(pattern) = cond.get("pattern").and_then(|v| v.as_str()) else {
-                return false;
-            };
             let looked_up = json_pointer_get(event, key);
             let val = looked_up.as_ref().and_then(|v| v.as_str()).unwrap_or("");
-            glob_match(pattern, val)
+            match cond.get("pattern").and_then(|v| v.as_str()) {
+                Some(pattern) => glob_match(pattern, val),
+                // No `pattern` → match the recipient's own mxid. The spec's
+                // `.m.rule.invite_for_me` templates the user id into a
+                // `state_key` event_match; vela keeps one shared default rule
+                // and resolves the recipient from context instead (same
+                // approach as `event_property_contains` / `contains_display_name`).
+                None => val == ctx.recipient_user_id,
+            }
         }
         "event_property_is" => {
             let key = cond.get("key").and_then(|v| v.as_str()).unwrap_or("");
@@ -390,6 +395,22 @@ pub fn default_global_rules() -> Value {
                 }],
                 "actions": ["dont_notify"],
             },
+            // Notify (with sound) when the recipient themselves is invited.
+            // MUST precede `.m.rule.member_event` — that rule suppresses ALL
+            // membership events, so without this an invite would never push.
+            // The `state_key` event_match carries no pattern: the evaluator
+            // matches it against the recipient's own mxid.
+            {
+                "rule_id": ".m.rule.invite_for_me",
+                "default": true,
+                "enabled": true,
+                "conditions": [
+                    {"kind": "event_match", "key": "type", "pattern": "m.room.member"},
+                    {"kind": "event_match", "key": "content.membership", "pattern": "invite"},
+                    {"kind": "event_match", "key": "state_key"},
+                ],
+                "actions": ["notify", {"set_tweak": "sound", "value": "default"}],
+            },
             // Membership changes shouldn't push.
             {
                 "rule_id": ".m.rule.member_event",
@@ -450,6 +471,18 @@ pub fn default_global_rules() -> Value {
                     {"set_tweak": "highlight"},
                 ],
             },
+            // Room upgrade: notify + highlight the tombstone so members follow
+            // the room to its successor.
+            {
+                "rule_id": ".m.rule.tombstone",
+                "default": true,
+                "enabled": true,
+                "conditions": [
+                    {"kind": "event_match", "key": "type", "pattern": "m.room.tombstone"},
+                    {"kind": "event_match", "key": "state_key", "pattern": ""},
+                ],
+                "actions": ["notify", {"set_tweak": "highlight"}],
+            },
             // MSC3930: poll responses must not generate push notifications
             // (the user already cast the vote; pushing on it is noise).
             {
@@ -463,12 +496,64 @@ pub fn default_global_rules() -> Value {
                 }],
                 "actions": [],
             },
+            // MSC3958: an edit (m.replace) must not re-notify — the original
+            // event already did. Last override so a mention inside an edit can
+            // still notify via the higher-priority mention rules above.
+            {
+                "rule_id": ".m.rule.suppress_edits",
+                "default": true,
+                "enabled": true,
+                "conditions": [{
+                    "kind": "event_match",
+                    "key": "content.m\\.relates_to.rel_type",
+                    "pattern": "m.replace",
+                }],
+                "actions": [],
+            },
         ],
         "content": [],
         "room": [],
         "sender": [],
         "underride": [
-            // Plain m.room.message events — notify, quietly.
+            // Incoming VoIP call — ring. Must precede the generic message
+            // rules (first matching underride wins).
+            {
+                "rule_id": ".m.rule.call",
+                "default": true,
+                "enabled": true,
+                "conditions": [{
+                    "kind": "event_match",
+                    "key": "type",
+                    "pattern": "m.call.invite",
+                }],
+                "actions": ["notify", {"set_tweak": "sound", "value": "ring"}],
+            },
+            // Encrypted message in a 1:1 room — sound. Must precede
+            // `.m.rule.encrypted` (more specific).
+            {
+                "rule_id": ".m.rule.encrypted_room_one_to_one",
+                "default": true,
+                "enabled": true,
+                "conditions": [
+                    {"kind": "room_member_count", "is": "2"},
+                    {"kind": "event_match", "key": "type", "pattern": "m.room.encrypted"},
+                ],
+                "actions": ["notify", {"set_tweak": "sound", "value": "default"}],
+            },
+            // Plaintext message in a 1:1 room — sound. Must precede
+            // `.m.rule.message`.
+            {
+                "rule_id": ".m.rule.room_one_to_one",
+                "default": true,
+                "enabled": true,
+                "conditions": [
+                    {"kind": "room_member_count", "is": "2"},
+                    {"kind": "event_match", "key": "type", "pattern": "m.room.message"},
+                ],
+                "actions": ["notify", {"set_tweak": "sound", "value": "default"}],
+            },
+            // Plain m.room.message in a group room — notify, NO sound (spec
+            // reserves sound for 1:1 + mentions).
             {
                 "rule_id": ".m.rule.message",
                 "default": true,
@@ -478,12 +563,9 @@ pub fn default_global_rules() -> Value {
                     "key": "type",
                     "pattern": "m.room.message",
                 }],
-                "actions": [
-                    "notify",
-                    {"set_tweak": "sound", "value": "default"},
-                ],
+                "actions": ["notify"],
             },
-            // Encrypted events — notify without peeking at content.
+            // Encrypted event in a group room — notify without peeking, no sound.
             {
                 "rule_id": ".m.rule.encrypted",
                 "default": true,
@@ -493,10 +575,7 @@ pub fn default_global_rules() -> Value {
                     "key": "type",
                     "pattern": "m.room.encrypted",
                 }],
-                "actions": [
-                    "notify",
-                    {"set_tweak": "sound", "value": "default"},
-                ],
+                "actions": ["notify"],
             },
             // MSC3930: poll starts in 1:1 rooms get sound. The
             // room_member_count condition mirrors the .m.rule.room_one_to_one
@@ -638,13 +717,110 @@ mod tests {
     }
 
     #[test]
-    fn default_rules_notify_on_plain_message() {
+    fn plain_message_group_room_notifies_without_sound() {
+        // Spec reserves sound for 1:1 rooms + mentions. A plain message in a
+        // group room (ctx = 3 members) notifies quietly.
         let r = evaluate(&msg("hi"), &default_global_rules(), &ctx(None));
         assert!(r.notify);
+        assert_eq!(r.tweaks.get("sound"), None, "group message must not ring");
+    }
+
+    #[test]
+    fn plain_message_one_to_one_notifies_with_sound() {
+        let mut c = ctx(None);
+        c.joined_member_count = 2;
+        let r = evaluate(&msg("hi"), &default_global_rules(), &c);
+        assert!(r.notify);
+        assert_eq!(
+            r.tweaks.get("sound").and_then(|v| v.as_str()),
+            Some("default"),
+            "1:1 message should ring"
+        );
+    }
+
+    fn member_event(membership: &str, state_key: &str) -> Value {
+        json!({
+            "type": "m.room.member",
+            "sender": "@alice:example.com",
+            "room_id": "!r:x",
+            "state_key": state_key,
+            "content": {"membership": membership},
+        })
+    }
+
+    #[test]
+    fn invite_for_me_notifies_with_sound() {
+        // An invite whose state_key is the recipient pushes (with sound),
+        // beating the member_event suppression.
+        let r = evaluate(
+            &member_event("invite", "@bob:example.com"),
+            &default_global_rules(),
+            &ctx(None),
+        );
+        assert!(r.notify, "my own invite must push");
         assert_eq!(
             r.tweaks.get("sound").and_then(|v| v.as_str()),
             Some("default")
         );
+    }
+
+    #[test]
+    fn invite_for_someone_else_does_not_notify_me() {
+        // An invite of a different user is just a membership event → suppressed.
+        let r = evaluate(
+            &member_event("invite", "@carol:example.com"),
+            &default_global_rules(),
+            &ctx(None),
+        );
+        assert!(!r.notify, "another user's invite must not push me");
+    }
+
+    #[test]
+    fn edit_is_suppressed() {
+        let mut e = msg("* edited");
+        e["content"]["m.relates_to"] = json!({"rel_type": "m.replace", "event_id": "$x"});
+        let r = evaluate(&e, &default_global_rules(), &ctx(None));
+        assert!(!r.notify, "an edit must not re-notify");
+    }
+
+    #[test]
+    fn mention_inside_an_edit_still_notifies() {
+        // suppress_edits is the LAST override, so a mention rule (higher
+        // priority) fires first — an edit that mentions the recipient still
+        // notifies + highlights.
+        let mut e = msg("* @bob look");
+        e["content"]["m.relates_to"] = json!({"rel_type": "m.replace", "event_id": "$x"});
+        e["content"]["m.mentions"] = json!({"user_ids": ["@bob:example.com"]});
+        let r = evaluate(&e, &default_global_rules(), &ctx(None));
+        assert!(r.notify, "a mention inside an edit must still notify");
+        assert!(r.tweaks.contains_key("highlight"));
+    }
+
+    #[test]
+    fn call_invite_rings() {
+        let ev = json!({
+            "type": "m.call.invite",
+            "sender": "@alice:example.com",
+            "room_id": "!r:x",
+            "content": {"call_id": "c1"},
+        });
+        let r = evaluate(&ev, &default_global_rules(), &ctx(None));
+        assert!(r.notify);
+        assert_eq!(r.tweaks.get("sound").and_then(|v| v.as_str()), Some("ring"));
+    }
+
+    #[test]
+    fn tombstone_highlights() {
+        let ev = json!({
+            "type": "m.room.tombstone",
+            "sender": "@alice:example.com",
+            "room_id": "!r:x",
+            "state_key": "",
+            "content": {"replacement_room": "!new:x"},
+        });
+        let r = evaluate(&ev, &default_global_rules(), &ctx(None));
+        assert!(r.notify);
+        assert!(r.tweaks.contains_key("highlight"));
     }
 
     #[test]
