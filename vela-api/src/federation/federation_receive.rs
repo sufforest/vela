@@ -609,6 +609,21 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
             }
         };
         if let Some(sk) = p.state_key.as_deref() {
+            // Auth rule 2.x / receipt rule 3.5: an auth event must belong to
+            // THIS room. m.room.create is exempt — in v12 it carries no room_id
+            // and check_auth rule 2 already binds it to the room via the
+            // room_id↔create-id relation; pre-v12 create matches anyway. Without
+            // this a peer could cite a foreign-room m.room.power_levels (or
+            // member) as an auth event to fake authority it doesn't hold here.
+            if p.event_type != "m.room.create" && p.room_id != effective_pdu.room_id {
+                return (
+                    effective_pdu.event_id.clone(),
+                    PduOutcome::Rejected(format!(
+                        "auth_event {} belongs to a different room",
+                        p.event_id
+                    )),
+                );
+            }
             auth_state.insert((p.event_type.clone(), sk.to_string()), p);
         }
     }
