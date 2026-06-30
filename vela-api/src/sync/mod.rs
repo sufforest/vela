@@ -681,6 +681,10 @@ pub(crate) fn build_sync_response_inner(
         .db
         .count_one_time_keys(user.user_nid, &user.device_id)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let unused_fallback_key_types = state
+        .db
+        .unused_fallback_key_algorithms(user.user_nid, &user.device_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     state
         .db
@@ -800,7 +804,7 @@ pub(crate) fn build_sync_response_inner(
         "to_device": {"events": to_device_events},
         "device_lists": {"changed": device_lists_changed, "left": device_lists_left},
         "device_one_time_keys_count": otk_counts,
-        "device_unused_fallback_key_types": [],
+        "device_unused_fallback_key_types": unused_fallback_key_types,
     }))
 }
 

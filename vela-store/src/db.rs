@@ -1116,6 +1116,17 @@ impl Database {
             batch.delete_cf(&otk, &k);
         }
 
+        // Fallback keys: same `(user_nid || len || device)` prefix (algorithm
+        // is the suffix), so drop the whole device range.
+        let fallback = self.db.cf_handle("fallback_keys").unwrap();
+        for item in self.db.prefix_iterator_cf(&fallback, &prefix) {
+            let (k, _) = item?;
+            if k.len() < prefix.len() || k[..prefix.len()] != prefix[..] {
+                break;
+            }
+            batch.delete_cf(&fallback, &k);
+        }
+
         // Undelivered to-device messages: same `(user_nid || len || device)`
         // prefix as OTKs (msg_id is the 8-byte suffix). Now that delivery is
         // delete-on-ACK, a logged-out device would otherwise leak its queue
@@ -5476,6 +5487,98 @@ impl Database {
         Ok(None)
     }
 
+    /// Build the `(user_nid:8 | len:u16 | device_id)` prefix shared by the
+    /// one-time-key and fallback-key key layouts (the per-key suffix — the OTK
+    /// key_id or the fallback algorithm — is appended raw after it).
+    fn device_key_prefix(user_nid: u64, device_id: &str) -> Vec<u8> {
+        let device_bytes = device_id.as_bytes();
+        let mut prefix = Vec::with_capacity(8 + 2 + device_bytes.len());
+        prefix.extend_from_slice(&keys::encode_u64(user_nid));
+        prefix.extend_from_slice(&(device_bytes.len() as u16).to_be_bytes());
+        prefix.extend_from_slice(device_bytes);
+        prefix
+    }
+
+    /// Store the device's MSC2732 fallback keys (one per algorithm). A new
+    /// upload replaces the existing fallback for that algorithm and resets it
+    /// to unused. `fallback` maps `algorithm:key_id -> key_data`.
+    pub fn set_fallback_keys(
+        &self,
+        user_nid: u64,
+        device_id: &str,
+        fallback: &serde_json::Map<String, Value>,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("fallback_keys").unwrap();
+        let mut batch = WriteBatch::default();
+        for (key_id, key_data) in fallback {
+            let Some(algorithm) = key_id.split(':').next().filter(|a| !a.is_empty()) else {
+                continue;
+            };
+            let db_key =
+                keys::encode_u64_bytes_bytes(user_nid, device_id.as_bytes(), algorithm.as_bytes());
+            let row = serde_json::json!({"key_id": key_id, "key": key_data, "used": false});
+            batch.put_cf(&cf, &db_key, row.to_string().as_bytes());
+        }
+        self.db.write(batch)
+    }
+
+    /// Claim the device's fallback key for `algorithm`, if one exists. Unlike a
+    /// one-time key it is KEPT (marked used) so it can be handed out again
+    /// until the device uploads a replacement — this is what lets a device
+    /// whose OTKs are exhausted still receive an Olm session.
+    pub fn claim_fallback_key(
+        &self,
+        user_nid: u64,
+        device_id: &str,
+        algorithm: &str,
+    ) -> Result<Option<(String, Value)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("fallback_keys").unwrap();
+        let db_key =
+            keys::encode_u64_bytes_bytes(user_nid, device_id.as_bytes(), algorithm.as_bytes());
+        let Some(bytes) = self.db.get_cf(&cf, &db_key)? else {
+            return Ok(None);
+        };
+        let row: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let Some(key_id) = row.get("key_id").and_then(|v| v.as_str()).map(String::from) else {
+            return Ok(None);
+        };
+        let key_data = row.get("key").cloned().unwrap_or(Value::Null);
+        // Mark used (kept, not deleted) so /sync stops advertising it.
+        if row.get("used").and_then(|v| v.as_bool()) != Some(true) {
+            let mut updated = row;
+            if let Some(o) = updated.as_object_mut() {
+                o.insert("used".into(), Value::Bool(true));
+            }
+            self.db
+                .put_cf(&cf, &db_key, updated.to_string().as_bytes())?;
+        }
+        Ok(Some((key_id, key_data)))
+    }
+
+    /// Algorithms for which the device has an UNUSED fallback key — the
+    /// `device_unused_fallback_key_types` list /sync reports (MSC2732).
+    pub fn unused_fallback_key_algorithms(
+        &self,
+        user_nid: u64,
+        device_id: &str,
+    ) -> Result<Vec<String>, rocksdb::Error> {
+        let cf = self.db.cf_handle("fallback_keys").unwrap();
+        let prefix = Self::device_key_prefix(user_nid, device_id);
+        let mut out = Vec::new();
+        let iter = self.db.prefix_iterator_cf(&cf, &prefix);
+        for item in iter {
+            let (key, val) = item?;
+            if key.len() <= prefix.len() || key[..prefix.len()] != prefix[..] {
+                break;
+            }
+            let row: Value = serde_json::from_slice(&val).unwrap_or(Value::Null);
+            if row.get("used").and_then(|v| v.as_bool()) != Some(true) {
+                out.push(String::from_utf8_lossy(&key[prefix.len()..]).to_string());
+            }
+        }
+        Ok(out)
+    }
+
     // --- E2EE: To-device messages ---
 
     pub fn queue_to_device(
@@ -8342,6 +8445,74 @@ mod stream_recovery_tests {
         assert!(db.get_device(user, "ABC").unwrap().is_some());
         assert!(db.get_device_keys(user, "ABC").unwrap().is_some());
         assert!(!db.count_one_time_keys(user, "ABC").unwrap().is_empty());
+    }
+
+    /// MSC2732 fallback keys: stored one-per-algorithm, KEPT after a claim
+    /// (so a device out of one-time keys can still be reached), advertised as
+    /// unused until claimed, and reset to unused by a fresh upload. Deleting
+    /// the device reclaims them.
+    #[test]
+    fn fallback_key_is_kept_after_claim_and_reset_on_reupload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        let user = db.get_or_create_nid("@alice:example.com").unwrap();
+        db.create_device(user, "DEV").unwrap();
+
+        let mut fb = serde_json::Map::new();
+        fb.insert(
+            "signed_curve25519:fb1".to_string(),
+            serde_json::json!({"key": "K1", "fallback": true}),
+        );
+        db.set_fallback_keys(user, "DEV", &fb).unwrap();
+
+        // Advertised as unused before any claim.
+        assert_eq!(
+            db.unused_fallback_key_algorithms(user, "DEV").unwrap(),
+            vec!["signed_curve25519".to_string()]
+        );
+
+        // First claim returns it; a second claim STILL returns it (kept).
+        let (id1, _) = db
+            .claim_fallback_key(user, "DEV", "signed_curve25519")
+            .unwrap()
+            .expect("fallback claimable");
+        assert_eq!(id1, "signed_curve25519:fb1");
+        let again = db
+            .claim_fallback_key(user, "DEV", "signed_curve25519")
+            .unwrap();
+        assert!(again.is_some(), "fallback key must be kept after a claim");
+
+        // Now used → no longer advertised as unused.
+        assert!(
+            db.unused_fallback_key_algorithms(user, "DEV")
+                .unwrap()
+                .is_empty()
+        );
+
+        // A fresh upload replaces it and resets it to unused.
+        let mut fb2 = serde_json::Map::new();
+        fb2.insert(
+            "signed_curve25519:fb2".to_string(),
+            serde_json::json!({"key": "K2"}),
+        );
+        db.set_fallback_keys(user, "DEV", &fb2).unwrap();
+        assert_eq!(
+            db.unused_fallback_key_algorithms(user, "DEV").unwrap(),
+            vec!["signed_curve25519".to_string()]
+        );
+        let (id2, _) = db
+            .claim_fallback_key(user, "DEV", "signed_curve25519")
+            .unwrap()
+            .expect("new fallback claimable");
+        assert_eq!(id2, "signed_curve25519:fb2", "re-upload replaced the key");
+
+        // Device deletion reclaims the fallback key.
+        db.delete_device(user, "DEV").unwrap();
+        assert!(
+            db.claim_fallback_key(user, "DEV", "signed_curve25519")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// `touch_device_seen` records last-seen ts/ip in the dedicated CF (so

@@ -15,9 +15,9 @@
 //!   - `DELETE .../dehydrated_device`              remove
 //!   - `POST   .../dehydrated_device/{id}/events`  drain to-device queue
 //!
-//! `fallback_keys` are accepted but not persisted — vela's `/keys/upload`
-//! doesn't implement fallback keys either, so this keeps parity rather than
-//! growing that surface here.
+//! `fallback_keys` are persisted (MSC2732), like the regular `/keys/upload`
+//! path — a dehydrated device is offline by design, so its fallback key is
+//! what keeps it reachable once its one-time keys are exhausted.
 
 use crate::middleware::json::Json;
 use axum::extract::{Path, Query, State};
@@ -172,6 +172,17 @@ pub async fn put_dehydrated_device(
         state
             .db
             .add_one_time_keys(user.user_nid, device_id, otks)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    }
+    // MSC2732 fallback keys (now persisted, like the regular /keys/upload
+    // path): a dehydrated device is offline by nature, so its OTKs are the
+    // first to run out — the fallback key is exactly what keeps it reachable.
+    if let Some(fallback) = &body.fallback_keys
+        && !fallback.is_empty()
+    {
+        state
+            .db
+            .set_fallback_keys(user.user_nid, device_id, fallback)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     }
 
