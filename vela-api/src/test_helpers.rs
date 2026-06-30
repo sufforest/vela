@@ -120,7 +120,9 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
         uia_sessions: crate::auth::uia::new_sessions(),
         user_senders: Arc::new(DashMap::new()),
         metrics_renderer: None,
-        rate_limiter: crate::rate_limit::RateLimiter::defaults(),
+        // Disabled in tests (see the integration harness for rationale);
+        // rate-limit logic is covered by dedicated unit tests.
+        rate_limiter: crate::rate_limit::RateLimiter::disabled(),
         started_at: Arc::new(Instant::now()),
         started_at_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)

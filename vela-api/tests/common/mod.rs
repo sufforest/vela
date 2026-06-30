@@ -199,7 +199,11 @@ impl Harness {
             uia_sessions: vela_api::auth::uia::new_sessions(),
             user_senders: Arc::new(DashMap::new()),
             metrics_renderer: None,
-            rate_limiter: vela_api::rate_limit::RateLimiter::defaults(),
+            // Disabled in tests (as Complement sets `enabled = false`): the
+            // in-process suite drives all requests from one IP, so the write
+            // surface would pool into shared buckets. Rate-limit logic is
+            // covered by dedicated unit tests instead.
+            rate_limiter: vela_api::rate_limit::RateLimiter::disabled(),
             started_at: Arc::new(Instant::now()),
             started_at_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)

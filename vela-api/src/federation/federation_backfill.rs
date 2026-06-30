@@ -142,6 +142,11 @@ async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Res
         .as_str()
         .to_string();
 
+    // Reject oversized backfilled events for the same reason as live PDUs —
+    // they'd diverge us from conforming peers if persisted.
+    vela_core::events::limits::check_inbound_event_limits(obj, &event_id)
+        .map_err(|reason| format!("event exceeds size limits: {reason}"))?;
+
     if state
         .db
         .get_event_nid_by_id(&event_id)

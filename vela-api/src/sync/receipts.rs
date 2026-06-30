@@ -37,29 +37,54 @@ pub async fn post_receipt(
 
     let thread_id = body.as_ref().and_then(|b| b.thread_id.as_deref());
 
-    state
-        .db
-        .set_local_receipt(
-            room_nid,
-            &receipt_type,
-            user.user_nid,
-            &event_id,
-            now_ms,
-            thread_id,
-        )
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    // Wake local /sync long-polls in this room so other members see
-    // the read marker move immediately. Without this the receipt
-    // sits invisible until the 30s long-poll timeout fires.
+    // `m.read.private` is a per-user, per-server marker that MUST NOT be
+    // federated (spec: "This receipt is only sent to the user that set it").
+    // Route it through `set_receipt`, which records it queryably for the
+    // owner's own /sync but does NOT append to `receipts_stream` — so the
+    // federation sender never fans it out. Every other type uses the local
+    // (federated) write.
+    let is_private = receipt_type == "m.read.private";
+    if is_private {
+        state
+            .db
+            .set_receipt(
+                room_nid,
+                &receipt_type,
+                user.user_nid,
+                &event_id,
+                now_ms,
+                thread_id,
+            )
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    } else {
+        state
+            .db
+            .set_local_receipt(
+                room_nid,
+                &receipt_type,
+                user.user_nid,
+                &event_id,
+                now_ms,
+                thread_id,
+            )
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    }
+    // Wake local /sync long-polls in this room so the read marker moves
+    // immediately. For a private receipt only the owner's own filtered /sync
+    // surfaces it; other members wake, recompute, and see nothing new.
     if let Some(sender) = state
         .room_senders
         .get(&vela_core::identifiers::Nid(room_nid))
     {
         let _ = sender.send(state.db.current_stream_position());
     }
-    // Wake the federation senders for any peers in this room so the
-    // m.receipt EDU rides out without waiting for the idle poll.
-    state.federation_sender.notify_room(room_nid);
+    // Wake the federation senders for peers in this room so the m.receipt EDU
+    // rides out without waiting for the idle poll — but never for a private
+    // receipt (it never entered `receipts_stream`, so there's nothing to
+    // fan out and no reason to spin the senders).
+    if !is_private {
+        state.federation_sender.notify_room(room_nid);
+    }
 
     // AS ephemeral push: each AS with `receive_ephemeral` + interest
     // in this room gets a minimal m.receipt EDU describing just this

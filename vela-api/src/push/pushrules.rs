@@ -83,6 +83,18 @@ pub async fn put_pushrule(
     arr.retain(|r| r.get("rule_id").and_then(|v| v.as_str()) != Some(rule_id.as_str()));
 
     let mut rule = body.as_object().cloned().unwrap_or_default();
+    // Reject a malformed `event_match` condition (spec requires `pattern`).
+    // Beyond spec-conformance, this keeps the evaluator's no-pattern branch —
+    // which matches the recipient's own mxid, reserved for the default
+    // `invite_for_me` rule — unreachable from user-submitted rules.
+    if let Some(conds) = rule.get("conditions").and_then(|v| v.as_array())
+        && conds.iter().any(|c| {
+            c.get("kind").and_then(|v| v.as_str()) == Some("event_match")
+                && c.get("pattern").and_then(|v| v.as_str()).is_none()
+        })
+    {
+        return Err(VelaError::BadJson("event_match condition requires a `pattern`".into()).into());
+    }
     rule.insert("rule_id".to_string(), json!(rule_id));
     rule.entry("enabled".to_string()).or_insert(json!(true));
     rule.entry("default".to_string()).or_insert(json!(false));

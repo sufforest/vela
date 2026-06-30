@@ -1,6 +1,7 @@
 pub mod builder;
 pub mod content;
 pub mod hash;
+pub mod limits;
 pub mod pdu;
 pub mod redact;
 pub mod room_version;
