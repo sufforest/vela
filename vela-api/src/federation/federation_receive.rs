@@ -1419,6 +1419,24 @@ async fn compute_state_at_event(
         }
     }
 
+    // Room version selects the state-res variant (v12 = state-res v2.1).
+    // Resolve it here so the CPU-bound closure below gets a plain Copy value.
+    // Warn on total lookup failure: defaulting a pre-v12 fork to v2.1 is the
+    // exact divergence this threading exists to avoid.
+    let room_version = state
+        .db
+        .get_nid(&event.room_id)
+        .ok()
+        .flatten()
+        .and_then(|room_nid| state.db.get_room_version_typed(room_nid).ok())
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                room_id = %event.room_id,
+                "compute_state_at_event: room version unresolvable, defaulting to v12 state-res"
+            );
+            vela_core::events::room_version::RoomVersion::V12
+        });
+
     // Event + auth chain lookup closures for state_res.
     // Spawn on blocking pool: state_res is CPU-bound.
     let state_sets_clone = state_sets.clone();
@@ -1448,7 +1466,7 @@ async fn compute_state_at_event(
             }
             out
         };
-        state_res::resolve(&state_sets_clone, &event_fn, &auth_chain_fn)
+        state_res::resolve(room_version, &state_sets_clone, &event_fn, &auth_chain_fn)
     })
     .await
     .map_err(|e| format!("state_res task failed: {e}"))?;

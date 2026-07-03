@@ -100,6 +100,18 @@ impl RoomVersion {
         !self.at_least(Self::V11)
     }
 
+    /// v12 uses the "state resolution v2.1" variant of the algorithm: the
+    /// iterative auth checks start from an **empty** state map (not the
+    /// unconflicted map) and the full conflicted set additionally includes
+    /// the *conflicted state subgraph*. Pre-v12 rooms use classic state-res
+    /// v2 — start from the unconflicted map, no subgraph. These only diverge
+    /// on a genuine state fork, but choosing the wrong variant there can
+    /// permanently split resolved state across the federation, so it must
+    /// track the room's version.
+    pub fn uses_state_res_v21(&self) -> bool {
+        self.at_least(Self::V12)
+    }
+
     /// v12 derives `room_id` from `hash(redacted create event)`. Earlier
     /// versions use `!opaque:server` minted at create time.
     pub fn hash_based_room_ids(&self) -> bool {
@@ -218,6 +230,29 @@ mod tests {
         // v11 boundary on creator field
         assert!(!RoomVersion::V11.include_create_in_auth_events());
         assert!(RoomVersion::V10.include_create_in_auth_events());
+    }
+
+    /// state-res v2.1 (empty initial state + conflicted subgraph) is a v12+
+    /// feature; every earlier version — including the v10-based MSC3757 —
+    /// uses classic state-res v2.
+    #[test]
+    fn state_res_v21_starts_at_v12() {
+        assert!(RoomVersion::V12.uses_state_res_v21());
+        for v in [
+            RoomVersion::V6,
+            RoomVersion::V7,
+            RoomVersion::V8,
+            RoomVersion::V9,
+            RoomVersion::V10,
+            RoomVersion::V11,
+            RoomVersion::Msc3757V10,
+        ] {
+            assert!(
+                !v.uses_state_res_v21(),
+                "{} must use classic state-res v2",
+                v.as_str()
+            );
+        }
     }
 
     #[test]
