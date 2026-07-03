@@ -60,6 +60,24 @@ impl IntoResponse for JsonRejection {
     }
 }
 
+/// Map a `serde_json` deserialization failure to the right Matrix errcode.
+/// `Category::Data` means the bytes ARE valid JSON but don't fit the
+/// endpoint's shape — a missing required key or a wrong-typed value — which
+/// the spec calls `M_BAD_JSON`. `Syntax`/`Eof`/`Io` mean the body isn't valid
+/// JSON at all → `M_NOT_JSON`. (For `Json<Value>` handlers `Data` never fires,
+/// so those keep returning `M_NOT_JSON` for genuinely unparseable bodies.)
+fn deserialize_rejection(e: serde_json::Error) -> JsonRejection {
+    let (errcode, prefix) = match e.classify() {
+        serde_json::error::Category::Data => ("M_BAD_JSON", "request body is malformed"),
+        _ => ("M_NOT_JSON", "body is not valid JSON"),
+    };
+    JsonRejection {
+        status: StatusCode::BAD_REQUEST,
+        errcode,
+        message: format!("{prefix}: {e}"),
+    }
+}
+
 impl<T, S> FromRequest<S> for Json<T>
 where
     T: DeserializeOwned,
@@ -77,11 +95,7 @@ where
             })?;
         serde_json::from_slice::<T>(&bytes)
             .map(Json)
-            .map_err(|e| JsonRejection {
-                status: StatusCode::BAD_REQUEST,
-                errcode: "M_NOT_JSON",
-                message: format!("body is not valid JSON: {e}"),
-            })
+            .map_err(deserialize_rejection)
     }
 }
 
@@ -111,11 +125,7 @@ where
         }
         serde_json::from_slice::<T>(&bytes)
             .map(|v| Some(Json(v)))
-            .map_err(|e| JsonRejection {
-                status: StatusCode::BAD_REQUEST,
-                errcode: "M_NOT_JSON",
-                message: format!("body is not valid JSON: {e}"),
-            })
+            .map_err(deserialize_rejection)
     }
 }
 
@@ -130,5 +140,38 @@ impl<T: Serialize> IntoResponse for Json<T> {
             }
             .into_response(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[derive(Debug, serde::Deserialize)]
+    struct Req {
+        #[allow(dead_code)]
+        name: String,
+    }
+
+    #[test]
+    fn not_json_vs_bad_json_classification() {
+        // Not valid JSON at all → M_NOT_JSON.
+        let syntax = serde_json::from_slice::<Value>(b"{not json").unwrap_err();
+        assert_eq!(deserialize_rejection(syntax).errcode, "M_NOT_JSON");
+        // Truncated (eof) → M_NOT_JSON.
+        let eof = serde_json::from_slice::<Value>(b"{\"a\":").unwrap_err();
+        assert_eq!(deserialize_rejection(eof).errcode, "M_NOT_JSON");
+
+        // Valid JSON, wrong type for the target → M_BAD_JSON.
+        let wrong_type = serde_json::from_slice::<u32>(b"\"hello\"").unwrap_err();
+        assert_eq!(deserialize_rejection(wrong_type).errcode, "M_BAD_JSON");
+        // Valid JSON object missing a required field → M_BAD_JSON.
+        let missing = serde_json::from_slice::<Req>(b"{}").unwrap_err();
+        assert_eq!(deserialize_rejection(missing).errcode, "M_BAD_JSON");
+
+        // A `Json<Value>` handler accepts any valid JSON, so it only ever
+        // rejects genuinely-unparseable bodies (M_NOT_JSON), never M_BAD_JSON.
+        assert!(serde_json::from_slice::<Value>(b"{\"anything\": 1}").is_ok());
     }
 }
