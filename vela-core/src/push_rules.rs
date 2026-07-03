@@ -86,13 +86,18 @@ fn rule_enabled(rule: &Value) -> bool {
 fn rule_matches(rule: &Value, kind: &str, event: &Value, ctx: &RoomContext) -> bool {
     match kind {
         "override" | "underride" => match_conditions(rule, event, ctx),
-        // `content` rules use a `pattern` field, matched against the
-        // event's `content.body`. Glob-ish matching with `*` wildcards.
+        // `content` rules carry a `pattern` matched against the event's
+        // `content.body`. This is an `event_match` on `content.body` in all but
+        // spelling, so it uses the same word-boundary substring semantics: a
+        // `alice` keyword rule fires on "hi alice", not "malice". An
+        // absent/non-string body never matches.
         "content" => {
             let Some(pat) = rule.get("pattern").and_then(|v| v.as_str()) else {
                 return false;
             };
-            glob_match(pat, event.body().unwrap_or(""))
+            event
+                .body()
+                .is_some_and(|body| content_body_matches(pat, body))
         }
         // `room` rules match if `rule_id == event.room_id`.
         "room" => {
@@ -132,6 +137,16 @@ fn match_one_condition(cond: &Value, event: &Value, ctx: &RoomContext) -> bool {
             let looked_up = json_pointer_get(event, key);
             let val = looked_up.as_ref().and_then(|v| v.as_str()).unwrap_or("");
             match cond.get("pattern").and_then(|v| v.as_str()) {
+                // Spec special case: for `content.body`, the pattern matches a
+                // substring delimited by word boundaries, not the whole value —
+                // so a `alice` keyword rule fires on "hi alice" but not
+                // "malice". An absent/non-string body never matches (even `*`),
+                // so gate on the looked-up value being a real string. Every
+                // other key matches against the entire value.
+                Some(pattern) if key == "content.body" => looked_up
+                    .as_ref()
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|body| content_body_matches(pattern, body)),
                 Some(pattern) => glob_match(pattern, val),
                 // No `pattern` → match the recipient's own mxid. The spec's
                 // `.m.rule.invite_for_me` templates the user id into a
@@ -265,6 +280,48 @@ pub fn glob_match(pattern: &str, input: &str) -> bool {
         pi += 1;
     }
     pi == pat.len()
+}
+
+/// Spec: for a `content.body` `event_match`, the glob `pattern` must match a
+/// substring of the body that starts and ends at a word boundary — the start
+/// or end of the body, or any character outside `[A-Za-z0-9_]`. This is why a
+/// `alice` keyword rule fires on "hi alice" but not on "malice", and why the
+/// whole-value `glob_match` (which would require the body to *equal* the
+/// keyword) is wrong here.
+///
+/// A bare keyword (no glob metacharacters) is the common case and reduces to a
+/// whole-word search — no regex. Only a pattern with `*`/`?` is compiled to a
+/// word-boundary-anchored regex; the `regex` crate matches in linear time, so
+/// an attacker-controlled push-rule pattern cannot cause catastrophic
+/// backtracking on the synchronous `/sync` eval path. The regex is compiled
+/// per call, but only glob content rules (rare) pay that; keywords never do. If
+/// glob content rules ever become hot, cache the compiled regex by pattern.
+fn content_body_matches(pattern: &str, body: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    if !pattern.contains(['*', '?']) {
+        return contains_whole_word(body, pattern);
+    }
+    // Case-insensitive, dot-matches-newline (glob `*` spans newlines too). The
+    // boundary wrappers consume a non-word char (or anchor at start/end)
+    // around the translated glob — exactly "starts and ends at a word
+    // boundary".
+    let mut re = String::from("(?is)(?:^|[^A-Za-z0-9_])(?:");
+    for c in pattern.chars() {
+        match c {
+            '*' => re.push_str(".*"),
+            '?' => re.push('.'),
+            _ => {
+                if ".^$+()[]{}|\\".contains(c) {
+                    re.push('\\');
+                }
+                re.push(c);
+            }
+        }
+    }
+    re.push_str(")(?:$|[^A-Za-z0-9_])");
+    regex::Regex::new(&re).is_ok_and(|r| r.is_match(body))
 }
 
 /// Word-boundary contains check for `contains_display_name`. A display
@@ -682,6 +739,81 @@ mod tests {
     }
 
     #[test]
+    fn content_body_matches_on_word_boundaries() {
+        // Literal keyword: fires at word boundaries, not mid-word.
+        assert!(content_body_matches("alice", "hey alice!"));
+        assert!(content_body_matches("alice", "alice"));
+        assert!(
+            content_body_matches("Alice", "hey ALICE"),
+            "case-insensitive"
+        );
+        assert!(!content_body_matches("alice", "malice"));
+        assert!(!content_body_matches("alice", "aliceb"));
+        assert!(!content_body_matches("alice", "malicious"));
+
+        // Glob pattern (spec example `ex*ple`).
+        assert!(content_body_matches("ex*ple", "An example event."));
+        assert!(content_body_matches("ex*ple", "example"));
+        assert!(
+            !content_body_matches("ex*ple", "exampleevent"),
+            "no trailing word boundary"
+        );
+        assert!(
+            !content_body_matches("ex*ple", "unexampled"),
+            "no leading word boundary"
+        );
+
+        // `?` matches a single char, still boundary-delimited.
+        assert!(content_body_matches("f?o", "say foo now"));
+        assert!(!content_body_matches("f?o", "say fooo now"));
+
+        // A regex metacharacter inside a glob stays literal: `a*.b` is
+        // `a`, any run, a literal dot, `b` — not `a`, any, any char, `b`.
+        assert!(content_body_matches("a*.b", "the a.b thing"));
+        assert!(
+            !content_body_matches("a*.b", "the axb thing"),
+            "the `.` must be literal, not a wildcard"
+        );
+
+        // The `*keyword*` "contains" idiom keeps working — the outer stars
+        // reach the string-end boundaries.
+        assert!(content_body_matches("*urgent*", "this is urgent"));
+        assert!(content_body_matches("*urgent*", "URGENT!!!"));
+
+        // Empty pattern never matches.
+        assert!(!content_body_matches("", "anything"));
+    }
+
+    #[test]
+    fn content_body_event_match_absent_body_never_matches() {
+        let keyword = json!({"kind": "event_match", "key": "content.body", "pattern": "alice"});
+        assert!(match_one_condition(&keyword, &msg("hi alice"), &ctx(None)));
+        assert!(!match_one_condition(&keyword, &msg("malice"), &ctx(None)));
+
+        // Spec: an absent/non-string body never matches, even for `*`.
+        let star = json!({"kind": "event_match", "key": "content.body", "pattern": "*"});
+        let no_body = json!({"type": "m.room.message", "content": {"msgtype": "m.text"}});
+        let num_body = json!({"type": "m.room.message", "content": {"body": 5}});
+        assert!(!match_one_condition(&star, &no_body, &ctx(None)));
+        assert!(
+            !match_one_condition(&star, &num_body, &ctx(None)),
+            "non-string body never matches"
+        );
+        // A present body of any value does match `*`.
+        assert!(match_one_condition(&star, &msg("anything"), &ctx(None)));
+
+        // The content-KIND rule path shares the same absent-body guard.
+        let content_star = json!({
+            "override": [], "room": [], "sender": [], "underride": [],
+            "content": [{"rule_id": "any", "enabled": true, "pattern": "*",
+                         "actions": ["notify"]}],
+        });
+        assert!(!evaluate(&no_body, &content_star, &ctx(None)).notify);
+        assert!(!evaluate(&num_body, &content_star, &ctx(None)).notify);
+        assert!(evaluate(&msg("hi"), &content_star, &ctx(None)).notify);
+    }
+
+    #[test]
     fn is_user_mention_highlights_recipient() {
         let ev = mention_event(&["@bob:example.com"], false);
         let r = evaluate(&ev, &default_global_rules(), &ctx(None));
@@ -915,6 +1047,25 @@ mod tests {
         let r = evaluate(&msg("urgent: see ops channel"), &rules, &ctx(None));
         assert!(r.notify);
         assert_eq!(r.tweaks.get("highlight"), Some(&json!(true)));
+
+        // A bare keyword (no glob) must match on word boundaries — the fix for
+        // content-kind keyword rules, which previously required the whole body
+        // to equal the keyword.
+        let kw = json!({
+            "override": [], "room": [], "sender": [], "underride": [],
+            "content": [{
+                "rule_id": "ops",
+                "enabled": true,
+                "pattern": "ops",
+                "actions": ["notify", {"set_tweak": "highlight"}],
+            }],
+        });
+        assert!(evaluate(&msg("see ops channel"), &kw, &ctx(None)).notify);
+        assert!(
+            !evaluate(&msg("oops typo"), &kw, &ctx(None)).notify,
+            "keyword must not fire mid-word"
+        );
+        assert!(!evaluate(&msg("chops"), &kw, &ctx(None)).notify);
     }
 
     #[test]

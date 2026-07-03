@@ -3812,6 +3812,7 @@ dependencies = [
  "base64",
  "ed25519-dalek",
  "rand 0.9.3",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
