@@ -562,19 +562,24 @@ pub(crate) fn build_sync_response_inner(
         .db
         .get_user_left_rooms(user.user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    // A room left within this sync window is always surfaced so the client
-    // learns of the leave. Historical left rooms (left at or before the last
-    // sync — and, on an initial sync, all of them, since nothing is "new")
-    // appear only when the room filter sets include_leave (spec default false).
     let include_leave = room_filter
         .and_then(|rf| rf.get("include_leave"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let mut leave_rooms = serde_json::Map::new();
     for &room_nid in &left_room_nids {
+        // A room whose membership changed within this sync window (the leave
+        // itself) is always surfaced so the client learns of the leave. A
+        // historical left room is surfaced only on a full view of the account
+        // — an initial sync or a full_state sync — and only when the filter
+        // opts in via include_leave (spec default false). This is what stops
+        // include_leave from re-surfacing an already-reported leave on every
+        // incremental sync (Complement's TestOlderLeftRoomsNotInLeaveSection).
         let newly_left =
             since.is_some() && membership_changed_since(state, user.user_nid, room_nid, since)?;
-        if !newly_left && !include_leave {
+        let full_sync = since.is_none() || full_state;
+        let show = newly_left || (full_sync && include_leave);
+        if !show {
             continue;
         }
         let room_id = state
@@ -3759,6 +3764,27 @@ mod tests {
             .unwrap();
         let resp = build_sync_response(&state, &user, &[], Some(pos)).unwrap();
         assert!(!has_leave(&resp), "stale leave should not reappear");
+
+        // Crucially, include_leave must NOT re-surface an already-reported
+        // historical leave on an incremental sync — the room was left before
+        // the window, so it appears once (on the leave) and never again.
+        let resp =
+            build_sync_response_with_filter(&state, &user, &[], Some(pos), Some(&filter), false)
+                .unwrap();
+        assert!(
+            !has_leave(&resp),
+            "include_leave must not re-surface a historical leave on incremental sync"
+        );
+
+        // A full-state sync, by contrast, behaves like an initial sync: the
+        // historical leave reappears when include_leave is set.
+        let resp =
+            build_sync_response_with_filter(&state, &user, &[], Some(pos), Some(&filter), true)
+                .unwrap();
+        assert!(
+            has_leave(&resp),
+            "a full-state sync with include_leave should surface historical left rooms"
+        );
     }
 
     #[test]

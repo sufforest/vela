@@ -109,3 +109,37 @@ async fn leave_within_window_is_always_surfaced() {
         s["rooms"]["leave"]
     );
 }
+
+#[tokio::test]
+async fn historical_leave_not_resurfaced_on_incremental_even_with_include_leave() {
+    // Complement's TestOlderLeftRoomsNotInLeaveSection: once a leave has been
+    // reported, include_leave must not make it reappear on every later
+    // incremental sync.
+    let h = Harness::new();
+    let (alice, tok) = h.register("alice", "pw").await;
+    let room = h.create_room(&tok, json!({})).await;
+    let fid = store_filter(&h, &alice, &tok, json!({"room": {"include_leave": true}})).await;
+
+    let s1 = sync(&h, &tok, None, Some(&fid)).await;
+    let since1 = s1["next_batch"].as_str().unwrap().to_string();
+
+    leave(&h, &tok, &room).await;
+
+    // The sync that spans the leave surfaces it once.
+    let s2 = sync(&h, &tok, Some(&since1), Some(&fid)).await;
+    assert!(
+        s2["rooms"]["leave"].get(&room).is_some(),
+        "the leave should appear on the incremental sync that spans it"
+    );
+    let since2 = s2["next_batch"].as_str().unwrap().to_string();
+
+    // A later incremental sync (past the leave), still with include_leave, must
+    // NOT re-surface the now-historical leave.
+    let s3 = sync(&h, &tok, Some(&since2), Some(&fid)).await;
+    assert!(
+        s3["rooms"]["leave"].get(&room).is_none(),
+        "a historical leave must not reappear on a later incremental sync even with \
+         include_leave: {:?}",
+        s3["rooms"]["leave"]
+    );
+}
