@@ -14,6 +14,10 @@ ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Linear-time (RE2-style) regex — used only for glob `content.body` push-rule
+# patterns, where an attacker-set pattern must not cause catastrophic
+# backtracking on the /sync eval hot path.
+regex = { workspace = true }
 
 [lints]
 workspace = true
