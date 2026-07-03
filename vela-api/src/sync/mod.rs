@@ -562,9 +562,19 @@ pub(crate) fn build_sync_response_inner(
         .db
         .get_user_left_rooms(user.user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    // A room left within this sync window is always surfaced so the client
+    // learns of the leave. Historical left rooms (left at or before the last
+    // sync — and, on an initial sync, all of them, since nothing is "new")
+    // appear only when the room filter sets include_leave (spec default false).
+    let include_leave = room_filter
+        .and_then(|rf| rf.get("include_leave"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let mut leave_rooms = serde_json::Map::new();
     for &room_nid in &left_room_nids {
-        if !membership_changed_since(state, user.user_nid, room_nid, since)? {
+        let newly_left =
+            since.is_some() && membership_changed_since(state, user.user_nid, room_nid, since)?;
+        if !newly_left && !include_leave {
             continue;
         }
         let room_id = state
@@ -3712,27 +3722,43 @@ mod tests {
     }
 
     #[test]
-    fn leave_appears_on_initial_and_disappears_on_incremental_after_pos() {
+    fn historical_leave_is_gated_by_include_leave() {
         let (state, _tmp) = build_test_state();
         let db = &state.db;
         let room_nid = db.get_or_create_nid("!leftroom:example.com").unwrap();
         let user = fake_user(&state, "@carol:example.com");
         db.set_membership(room_nid, user.user_nid, 0).unwrap();
 
-        let resp = build_sync_response(&state, &user, &[], None).unwrap();
-        let leaves = resp.pointer("/rooms/leave").unwrap().as_object().unwrap();
-        assert!(leaves.contains_key("!leftroom:example.com"));
+        let has_leave = |r: &Value| {
+            r.pointer("/rooms/leave")
+                .and_then(|v| v.as_object())
+                .is_some_and(|o| o.contains_key("!leftroom:example.com"))
+        };
 
+        // Initial sync, no filter: include_leave defaults to false, so a room
+        // left before the (nonexistent) window must NOT appear.
+        let resp = build_sync_response(&state, &user, &[], None).unwrap();
+        assert!(
+            !has_leave(&resp),
+            "historical left room must not appear on an initial sync without include_leave"
+        );
+
+        // Same initial sync with include_leave=true → it appears.
+        let filter = json!({"room": {"include_leave": true}});
+        let resp = build_sync_response_with_filter(&state, &user, &[], None, Some(&filter), false)
+            .unwrap();
+        assert!(
+            has_leave(&resp),
+            "include_leave=true must surface the historical left room"
+        );
+
+        // Incremental sync past the leave position, no filter → no stale leave.
         let pos = db
             .get_user_room_membership_pos(user.user_nid, room_nid)
             .unwrap()
             .unwrap();
         let resp = build_sync_response(&state, &user, &[], Some(pos)).unwrap();
-        let has_stale_leave = resp
-            .pointer("/rooms/leave")
-            .and_then(|v| v.as_object())
-            .is_some_and(|o| o.contains_key("!leftroom:example.com"));
-        assert!(!has_stale_leave, "stale leave should not reappear");
+        assert!(!has_leave(&resp), "stale leave should not reappear");
     }
 
     #[test]
