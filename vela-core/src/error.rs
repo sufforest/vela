@@ -59,6 +59,12 @@ pub enum VelaError {
     /// it defaults to `M_FORBIDDEN`). Maps to 403.
     #[error("{reason}")]
     ExtensionBlocked { errcode: String, reason: String },
+    /// Spec: `M_WRONG_ROOM_KEYS_VERSION` (status 403) — a `/room_keys` PUT
+    /// named a backup version that isn't the current one. The error body
+    /// carries an extra `current_version` field (beyond `{errcode, error}`),
+    /// rendered specially in `ApiError::into_response`.
+    #[error("Wrong backup version.")]
+    WrongRoomKeysVersion { current_version: String },
 }
 
 impl VelaError {
@@ -82,6 +88,7 @@ impl VelaError {
             Self::Uia { .. } => "M_FORBIDDEN",
             Self::Custom { errcode, .. } => errcode,
             Self::ExtensionBlocked { errcode, .. } => errcode,
+            Self::WrongRoomKeysVersion { .. } => "M_WRONG_ROOM_KEYS_VERSION",
         }
     }
 
@@ -103,6 +110,7 @@ impl VelaError {
             Self::Uia { status, .. } => *status,
             Self::Custom { status, .. } => *status,
             Self::ExtensionBlocked { .. } => 403,
+            Self::WrongRoomKeysVersion { .. } => 403,
             Self::Unknown(_) | Self::Store(_) => 500,
         }
     }

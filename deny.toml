@@ -19,6 +19,15 @@ yanked = "warn"
 unmaintained = "workspace"
 ignore = [
     # Format: { id = "RUSTSEC-YYYY-NNNN", reason = "why we accept this" }
+    # quick-xml 0.39/0.40 XML-parsing DoS (quadratic dup-attr check +
+    # unbounded namespace-decl allocation), fixed in quick-xml >= 0.41.
+    # Reached only transitively via object_store's S3 XML responses, so it's
+    # exposed ONLY when the S3 media backend is configured AND the S3 endpoint
+    # returns crafted XML. object_store 0.14 (latest) still pins quick-xml
+    # ^0.40, so no dep bump reaches 0.41 yet. Re-check and drop these when
+    # object_store ships a quick-xml >= 0.41 release.
+    { id = "RUSTSEC-2026-0194", reason = "transitive quick-xml DoS; S3-backend-only; no object_store release uses quick-xml >=0.41 yet" },
+    { id = "RUSTSEC-2026-0195", reason = "transitive quick-xml DoS; S3-backend-only; no object_store release uses quick-xml >=0.41 yet" },
 ]
 
 [licenses]
