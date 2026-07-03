@@ -2252,14 +2252,6 @@ fn build_invite_stripped_state(
     room_nid: u64,
     room_id: &str,
 ) -> Result<Vec<Value>, ApiError> {
-    static STRIPPED_TYPES: &[&str] = &[
-        "m.room.create",
-        "m.room.name",
-        "m.room.avatar",
-        "m.room.canonical_alias",
-        "m.room.join_rules",
-        "m.room.member",
-    ];
     let state_nids = state
         .db
         .get_all_state_event_nids(room_nid)
@@ -2277,7 +2269,7 @@ fn build_invite_stripped_state(
             continue;
         };
         let etype = ev.event_type().unwrap_or("");
-        if !STRIPPED_TYPES.contains(&etype) {
+        if !vela_core::events::INVITE_STRIPPED_STATE_TYPES.contains(&etype) {
             continue;
         }
         if etype == "m.room.create" {
