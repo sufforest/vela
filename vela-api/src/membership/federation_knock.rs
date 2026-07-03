@@ -466,20 +466,11 @@ pub async fn send_knock_v1(
     Ok(Json(json!({"knock_room_state": knock_room_state})))
 }
 
-/// Spec-defined types that go into knock_room_state. The knocking server
-/// uses these to render room chrome (name, avatar, topic) while waiting
-/// to be admitted. We also include the knocker's own member event.
-const STRIPPED_TYPES: &[&str] = &[
-    "m.room.create",
-    "m.room.name",
-    "m.room.avatar",
-    "m.room.canonical_alias",
-    "m.room.join_rules",
-    "m.room.encryption",
-    "m.room.member",
-];
-
 fn build_knock_room_state(state: &AppState, room_nid: u64) -> Result<Vec<Value>, rocksdb::Error> {
+    // knock_room_state uses the same recommended stripped-state set as invites
+    // (`vela_core::events::INVITE_STRIPPED_STATE_TYPES`): the knocking server
+    // renders room chrome (name, avatar, topic, encrypted badge) while waiting
+    // to be admitted, plus the knocker's own member event.
     let nids = state.db.get_all_state_event_nids(room_nid)?;
     let mut out = Vec::new();
     for nid in nids {
@@ -490,7 +481,7 @@ fn build_knock_room_state(state: &AppState, room_nid: u64) -> Result<Vec<Value>,
             continue;
         };
         let etype = v.event_type().unwrap_or("");
-        if !STRIPPED_TYPES.contains(&etype) {
+        if !vela_core::events::INVITE_STRIPPED_STATE_TYPES.contains(&etype) {
             continue;
         }
         out.push(json!({
@@ -731,7 +722,10 @@ mod tests {
         );
         // Unrelated types not in our test setup; but be sure no invalid leakage.
         for t in &types {
-            assert!(STRIPPED_TYPES.contains(t), "unexpected stripped type: {t}");
+            assert!(
+                vela_core::events::INVITE_STRIPPED_STATE_TYPES.contains(t),
+                "unexpected stripped type: {t}"
+            );
         }
     }
 }
