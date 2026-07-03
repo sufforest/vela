@@ -23,6 +23,16 @@ impl IntoResponse for ApiError {
                 }
             }
         }
+        // M_WRONG_ROOM_KEYS_VERSION carries an extra `current_version` field
+        // (spec) that the standard {errcode, error} shape would drop.
+        if let VelaError::WrongRoomKeysVersion { current_version } = &self.0 {
+            let body = json!({
+                "errcode": self.0.errcode(),
+                "error": self.0.to_string(),
+                "current_version": current_version,
+            });
+            return (StatusCode::FORBIDDEN, Json(body)).into_response();
+        }
         let body = json!({
             "errcode": self.0.errcode(),
             "error": self.0.to_string(),

@@ -206,6 +206,7 @@ pub async fn put_all_keys(
     let version = q
         .version
         .ok_or_else(|| ApiError(VelaError::BadJson("version query param required".into())))?;
+    require_current_version(&state, user.user_nid, &version)?;
     let rooms = body
         .get("rooms")
         .and_then(|v| v.as_object())
@@ -240,6 +241,7 @@ pub async fn put_room_keys(
     let version = q
         .version
         .ok_or_else(|| ApiError(VelaError::BadJson("version query param required".into())))?;
+    require_current_version(&state, user.user_nid, &version)?;
     let sessions = body
         .get("sessions")
         .and_then(|v| v.as_object())
@@ -268,6 +270,7 @@ pub async fn put_session(
     let version = q
         .version
         .ok_or_else(|| ApiError(VelaError::BadJson("version query param required".into())))?;
+    require_current_version(&state, user.user_nid, &version)?;
     let written = write_session(&state, user.user_nid, &version, &room_id, &session_id, body)?;
     let delta = if written { 1 } else { 0 };
     let (etag, total) = bump_stats(&state, user.user_nid, &version, delta)?;
@@ -425,6 +428,24 @@ fn load_versions(state: &AppState, user_nid: u64) -> Result<Value, ApiError> {
         .key_backup_versions_get(user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     Ok(v.unwrap_or_else(|| json!({"versions": {}, "latest": null, "ver_counter": 0})))
+}
+
+/// A `/room_keys` PUT MUST target the current backup version (spec). A version
+/// that isn't the latest (superseded, or deleted) → 403
+/// `M_WRONG_ROOM_KEYS_VERSION` carrying the current version; no backup at all →
+/// 404. Without this a client silently writes keys to a backup nobody restores
+/// from, losing them on recovery.
+fn require_current_version(state: &AppState, user_nid: u64, version: &str) -> Result<(), ApiError> {
+    let store = load_versions(state, user_nid)?;
+    match store.get("latest").and_then(|v| v.as_str()) {
+        None => Err(ApiError(VelaError::NotFound(
+            "no current key backup version".into(),
+        ))),
+        Some(latest) if latest != version => Err(ApiError(VelaError::WrongRoomKeysVersion {
+            current_version: latest.to_string(),
+        })),
+        Some(_) => Ok(()),
+    }
 }
 
 fn save_versions(state: &AppState, user_nid: u64, v: &Value) -> Result<(), ApiError> {
