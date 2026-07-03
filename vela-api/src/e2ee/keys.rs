@@ -5,6 +5,7 @@ use axum::extract::{Query, State};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use vela_core::error::VelaError;
+use vela_core::federation::keys::{decode_public_key, verify_json_signature};
 
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::error::ApiError;
@@ -804,41 +805,66 @@ pub async fn upload_signing_keys(
     }
 
     // Pull the three optional key fields from the JSON body.
-    let master_key = body.get("master_key").filter(|v| !v.is_null()).cloned();
-    let self_signing_key = body
+    let mut master_key = body.get("master_key").filter(|v| !v.is_null()).cloned();
+    let mut self_signing_key = body
         .get("self_signing_key")
         .filter(|v| !v.is_null())
         .cloned();
-    let user_signing_key = body
+    let mut user_signing_key = body
         .get("user_signing_key")
         .filter(|v| !v.is_null())
         .cloned();
+
+    // The master key that anchors this upload's cross-signing links: the one
+    // in the request, else the most-recently-stored master. Spec: a
+    // self/user-signing key "must be signed by the accompanying master
+    // signing key, or by the user's most recently uploaded master signing
+    // key if no master signing key is included in the request." Its public
+    // key lives in `keys`, which signature preservation below never touches,
+    // so cloning the pre-preserve value is fine.
+    let effective_master = master_key
+        .clone()
+        .or_else(|| existing.get("master_key").cloned());
 
     // Preserve signatures across an idempotent re-upload (same key
     // material): a device's signature on the master key, or the
     // self_signing signature, was added via /keys/signatures/upload and
     // lives only in the stored copy — re-uploading the bare key would drop
     // it and break verification. `existing` was fetched above for the UIA
-    // gate.
-    if let Some(mut key) = master_key {
-        preserve_existing_signatures(existing.get("master_key"), &mut key);
+    // gate. Fold those back in FIRST, then verify the cross-signing links
+    // over the merged key so a bare idempotent re-upload (master signature
+    // restored from storage) still verifies, while a genuinely new/changed
+    // key must carry a valid master signature of its own.
+    if let Some(key) = master_key.as_mut() {
+        preserve_existing_signatures(existing.get("master_key"), key);
+    }
+    if let Some(key) = self_signing_key.as_mut() {
+        preserve_existing_signatures(existing.get("self_signing_key"), key);
+        verify_signed_by_master(key, &user.user_id, effective_master.as_ref())?;
+    }
+    if let Some(key) = user_signing_key.as_mut() {
+        preserve_existing_signatures(existing.get("user_signing_key"), key);
+        verify_signed_by_master(key, &user.user_id, effective_master.as_ref())?;
+    }
+
+    // Persist only after every cross-signing link verified, so a mis-signed
+    // key is rejected atomically with no partial write.
+    if let Some(key) = &master_key {
         state
             .db
-            .set_cross_signing_keys(user.user_nid, "master_key", &key)
+            .set_cross_signing_keys(user.user_nid, "master_key", key)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     }
-    if let Some(mut key) = self_signing_key {
-        preserve_existing_signatures(existing.get("self_signing_key"), &mut key);
+    if let Some(key) = &self_signing_key {
         state
             .db
-            .set_cross_signing_keys(user.user_nid, "self_signing_key", &key)
+            .set_cross_signing_keys(user.user_nid, "self_signing_key", key)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     }
-    if let Some(mut key) = user_signing_key {
-        preserve_existing_signatures(existing.get("user_signing_key"), &mut key);
+    if let Some(key) = &user_signing_key {
         state
             .db
-            .set_cross_signing_keys(user.user_nid, "user_signing_key", &key)
+            .set_cross_signing_keys(user.user_nid, "user_signing_key", key)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     }
 
@@ -1170,6 +1196,53 @@ fn signed_content(key: &Value) -> Value {
         obj.remove("unsigned");
     }
     c
+}
+
+/// Verify a self-signing or user-signing key is signed by the user's master
+/// cross-signing key, per the `/keys/device_signing/upload` contract: the
+/// SSK/USK "must be signed by the accompanying master signing key, or by the
+/// user's most recently uploaded master signing key if no master signing key
+/// is included in the request." A key whose master signature is absent,
+/// malformed, or invalid is rejected with `M_INVALID_SIGNATURE` (400) so we
+/// never persist — nor serve to `/keys/query` — a cross-signing identity that
+/// every other client would reject.
+fn verify_signed_by_master(
+    key: &Value,
+    user_id: &str,
+    master: Option<&Value>,
+) -> Result<(), ApiError> {
+    let invalid = |msg: &str| {
+        ApiError(VelaError::Custom {
+            status: 400,
+            errcode: "M_INVALID_SIGNATURE",
+            msg: msg.to_string(),
+        })
+    };
+
+    // A signing key with no master to anchor it can never be validated.
+    let master = master.ok_or_else(|| invalid("no master key to sign the cross-signing key"))?;
+
+    // The master key object is `{keys: {"ed25519:<pub>": "<pub>"}, ...}`; its
+    // single entry gives both the signature key_id and the public key. Cross-
+    // signing key_ids embed the unpadded-base64 public key, so `keys` carries
+    // everything needed to verify without a separate lookup.
+    let (master_key_id, master_pub_b64) = master
+        .get("keys")
+        .and_then(|k| k.as_object())
+        .and_then(|m| m.iter().next())
+        .ok_or_else(|| invalid("master key has no key material"))?;
+    let master_pub_b64 = master_pub_b64
+        .as_str()
+        .ok_or_else(|| invalid("master public key is not a string"))?;
+    let master_pub = decode_public_key(master_pub_b64)
+        .map_err(|_| invalid("master public key is not ed25519"))?;
+
+    let key_obj = key
+        .as_object()
+        .ok_or_else(|| invalid("cross-signing key is not an object"))?;
+
+    verify_json_signature(key_obj, user_id, master_key_id, &master_pub)
+        .map_err(|_| invalid("cross-signing key is not signed by the master key"))
 }
 
 /// Fold the signatures from a previously stored key into a fresh upload of
@@ -2205,6 +2278,84 @@ mod tests {
         assert!(
             res.is_err(),
             "changing master key material without auth must still require UIA"
+        );
+    }
+
+    /// Build a cross-signing signer whose `key_id` is the full
+    /// `ed25519:<pubkey>` form, matching how a master key advertises itself in
+    /// its `keys` map (so its signatures land under the looked-up key_id).
+    fn xsigner() -> vela_core::events::sign::ServerSigningKey {
+        use vela_core::events::sign::ServerSigningKey;
+        let k = ServerSigningKey::generate();
+        let pb = k.public_key_base64();
+        ServerSigningKey::from_bytes(format!("ed25519:{pb}"), k.secret_bytes())
+    }
+
+    fn xsign_key(user: &str, usage: &str, pub_b64: &str) -> Map<String, Value> {
+        let mut keys = Map::new();
+        keys.insert(format!("ed25519:{pub_b64}"), json!(pub_b64));
+        let mut m = Map::new();
+        m.insert("user_id".into(), json!(user));
+        m.insert("usage".into(), json!([usage]));
+        m.insert("keys".into(), Value::Object(keys));
+        m
+    }
+
+    /// The linkage check accepts a self-signing key signed by a master passed
+    /// explicitly — the branch the handler takes when the request omits the
+    /// master and falls back to the stored one (legit SSK rotation, UIA-gated
+    /// end to end, so exercised here directly), and rejects when there is no
+    /// master anywhere to anchor trust.
+    #[test]
+    fn verify_signed_by_master_uses_the_supplied_master() {
+        let user = "@alice:example.com";
+        let master = xsigner();
+        let master_key = Value::Object(xsign_key(user, "master", &master.public_key_base64()));
+
+        let mut ssk = xsign_key(user, "self_signing", &xsigner().public_key_base64());
+        master.sign_json(&mut ssk, user);
+        let ssk = Value::Object(ssk);
+
+        assert!(verify_signed_by_master(&ssk, user, Some(&master_key)).is_ok());
+        assert!(
+            verify_signed_by_master(&ssk, user, None).is_err(),
+            "no master anywhere → cannot validate"
+        );
+    }
+
+    /// The guard behind bare re-uploads: signature preservation folds stored
+    /// signatures ONLY when the signed content is byte-identical, so a
+    /// DIFFERENT self-signing key uploaded bare is not rescued by the stored
+    /// master signature and fails verification.
+    #[test]
+    fn fold_does_not_rescue_a_changed_signing_key() {
+        let user = "@alice:example.com";
+        let master = xsigner();
+        let master_key = Value::Object(xsign_key(user, "master", &master.public_key_base64()));
+
+        // A stored SSK properly signed by the master.
+        let mut stored = xsign_key(user, "self_signing", &xsigner().public_key_base64());
+        master.sign_json(&mut stored, user);
+        let stored = Value::Object(stored);
+
+        // A different SSK (new pubkey), uploaded bare (no signature).
+        let mut fresh = Value::Object(xsign_key(
+            user,
+            "self_signing",
+            &xsigner().public_key_base64(),
+        ));
+        preserve_existing_signatures(Some(&stored), &mut fresh);
+
+        assert!(
+            fresh
+                .get("signatures")
+                .and_then(|s| s.as_object())
+                .is_none_or(|s| s.is_empty()),
+            "changed material must not inherit the stored signature"
+        );
+        assert!(
+            verify_signed_by_master(&fresh, user, Some(&master_key)).is_err(),
+            "an unsigned, changed SSK must fail verification"
         );
     }
 }
