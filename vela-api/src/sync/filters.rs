@@ -199,130 +199,27 @@ pub async fn get_filter(
     Ok(Json(f))
 }
 
-/// Apply the timeline-side of a sync filter to a single room sync block.
-/// Edits the `timeline.events` array in place.
-///
-/// Supported filter fields (spec subset):
-/// - `room.timeline.limit`: cap event count.
-/// - `room.timeline.types`: allow-list event types.
-/// - `room.timeline.not_types`: deny-list event types.
-/// - `room.timeline.not_senders`: deny-list senders.
-/// - `room.timeline.rooms`/`not_rooms`: applied at the per-room loop, not here.
-///
-/// The `state`, `ephemeral`, `presence`, and `account_data` sub-filters are
-/// applied by their own helpers (`apply_state_filter` / `apply_event_filter`)
-/// at the call sites. `event_format` / `event_fields` remain accepted-but-
-/// ignored.
-pub fn apply_timeline_filter(room: &mut Value, timeline_filter: &Value) {
-    let Some(events) = room
-        .pointer_mut("/timeline/events")
-        .and_then(|v| v.as_array_mut())
-    else {
-        return;
+/// Apply a `RoomEventFilter`'s event-level predicates to an event array in
+/// place: `types`/`not_types` (with `m.x.*` wildcards), `senders` (allow-list)
+/// / `not_senders` (deny-list), and `contains_url` (keep only events that have
+/// — or, if `false`, lack — a `content.url` key). Shared by the timeline and
+/// state sync sections, which both carry a `RoomEventFilter`. `limit` is the
+/// caller's concern: only the timeline honours it, and only after the
+/// most-recent trim. Room events always carry a sender, so the sender lists
+/// apply unconditionally (unlike the sender-less `apply_event_filter`).
+fn retain_room_event_filter(events: &mut Vec<Value>, filter: &Value) {
+    let str_list = |k: &str| {
+        filter.get(k).and_then(|v| v.as_array()).map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
     };
-
-    let allow_types = timeline_filter
-        .get("types")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .map(String::from)
-                .collect::<Vec<_>>()
-        });
-    let deny_types = timeline_filter
-        .get("not_types")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .map(String::from)
-                .collect::<Vec<_>>()
-        });
-    let deny_senders = timeline_filter
-        .get("not_senders")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .map(String::from)
-                .collect::<Vec<_>>()
-        });
-
-    events.retain(|e| {
-        let etype = e.event_type().unwrap_or("");
-        let sender = e.sender().unwrap_or("");
-        if let Some(allow) = &allow_types {
-            // Wildcard support: `m.room.*` matches `m.room.message` etc.
-            let ok = allow.iter().any(|p| type_matches(etype, p));
-            if !ok {
-                return false;
-            }
-        }
-        if let Some(deny) = &deny_types
-            && deny.iter().any(|p| type_matches(etype, p))
-        {
-            return false;
-        }
-        if let Some(deny) = &deny_senders
-            && deny.iter().any(|s| s == sender)
-        {
-            return false;
-        }
-        true
-    });
-
-    if let Some(limit) = timeline_filter
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        && events.len() > limit
-    {
-        // Spec: keep most recent. Our timeline is already chronological
-        // (oldest first), so trim from the front.
-        let drop = events.len() - limit;
-        events.drain(0..drop);
-    }
-}
-
-/// Apply the state-side of a sync filter to a single room sync block.
-/// Edits the `state.events` array in place. Same shape as the timeline
-/// filter (the spec uses `RoomEventFilter` for both).
-pub fn apply_state_filter(room: &mut Value, state_filter: &Value) {
-    let Some(events) = room
-        .pointer_mut("/state/events")
-        .and_then(|v| v.as_array_mut())
-    else {
-        return;
-    };
-
-    let allow_types = state_filter
-        .get("types")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .map(String::from)
-                .collect::<Vec<_>>()
-        });
-    let deny_types = state_filter
-        .get("not_types")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .map(String::from)
-                .collect::<Vec<_>>()
-        });
-    let deny_senders = state_filter
-        .get("not_senders")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .map(String::from)
-                .collect::<Vec<_>>()
-        });
+    let allow_types = str_list("types");
+    let deny_types = str_list("not_types");
+    let allow_senders = str_list("senders");
+    let deny_senders = str_list("not_senders");
+    let contains_url = filter.get("contains_url").and_then(|v| v.as_bool());
 
     events.retain(|e| {
         let etype = e.event_type().unwrap_or("");
@@ -337,13 +234,92 @@ pub fn apply_state_filter(room: &mut Value, state_filter: &Value) {
         {
             return false;
         }
+        // `not_senders` takes precedence over `senders` per spec: a sender in
+        // both lists is excluded. Checking the deny-list first honours that.
         if let Some(deny) = &deny_senders
             && deny.iter().any(|s| s == sender)
         {
             return false;
         }
+        if let Some(allow) = &allow_senders
+            && !allow.iter().any(|s| s == sender)
+        {
+            return false;
+        }
+        if let Some(want_url) = contains_url {
+            // Match Synapse: a `url` key whose value is a string. `{"url":
+            // null}` or a non-string url counts as "no url", so the two
+            // servers agree on which events a `contains_url` filter keeps.
+            let has_url = e
+                .get("content")
+                .and_then(|c| c.get("url"))
+                .is_some_and(|u| u.is_string());
+            if has_url != want_url {
+                return false;
+            }
+        }
         true
     });
+}
+
+/// Apply the timeline-side of a sync filter to a single room sync block.
+/// Edits the `timeline.events` array in place.
+///
+/// Supported filter fields (spec subset):
+/// - `room.timeline.limit`: cap event count.
+/// - `room.timeline.types` / `not_types`: allow/deny event types.
+/// - `room.timeline.senders` / `not_senders`: allow/deny senders.
+/// - `room.timeline.contains_url`: keep only events with/without `content.url`.
+/// - `room.timeline.rooms`/`not_rooms`: applied at the per-room loop, not here.
+///
+/// The `state`, `ephemeral`, `presence`, and `account_data` sub-filters are
+/// applied by their own helpers (`apply_state_filter` / `apply_event_filter`)
+/// at the call sites. `event_format` / `event_fields` remain accepted-but-
+/// ignored.
+///
+/// Known limitation: the timeline is already trimmed to `limit` upstream
+/// (the DB query), then filtered here, so a highly selective predicate
+/// (`contains_url`, a narrow `senders`) can return fewer than `limit`
+/// matching events even when more exist earlier in history. Matching
+/// Synapse (filter in the query, then limit) would require pushing these
+/// predicates into the timeline read.
+pub fn apply_timeline_filter(room: &mut Value, timeline_filter: &Value) {
+    let Some(events) = room
+        .pointer_mut("/timeline/events")
+        .and_then(|v| v.as_array_mut())
+    else {
+        return;
+    };
+
+    retain_room_event_filter(events, timeline_filter);
+
+    if let Some(limit) = timeline_filter
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        && events.len() > limit
+    {
+        // Spec: keep most recent. Our timeline is already chronological
+        // (oldest first), so trim from the front.
+        let drop = events.len() - limit;
+        events.drain(0..drop);
+    }
+}
+
+/// Apply the state-side of a sync filter to a single room sync block. Same
+/// shape as the timeline filter (the spec uses `RoomEventFilter` for both).
+///
+/// A room block carries state under the legacy `state` key or, under MSC4222,
+/// the `state_after` key — built internally under the stable name and renamed
+/// for the client afterwards, so at this point it's always `state_after`.
+/// Element opts into MSC4222, so filtering only `/state/events` would be a
+/// no-op for the primary client; we filter whichever key is present.
+pub fn apply_state_filter(room: &mut Value, state_filter: &Value) {
+    for pointer in ["/state/events", "/state_after/events"] {
+        if let Some(events) = room.pointer_mut(pointer).and_then(|v| v.as_array_mut()) {
+            retain_room_event_filter(events, state_filter);
+        }
+    }
 }
 
 /// Apply an `EventFilter`'s `types` / `not_types` / `senders` / `not_senders`
@@ -734,5 +710,123 @@ mod tests {
             .map(|e| e["state_key"].as_str().unwrap())
             .collect();
         assert_eq!(kinds, vec!["@alice:s"]);
+    }
+
+    fn timeline_senders(room: &Value) -> Vec<String> {
+        room["timeline"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["sender"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn timeline_senders_allow_list() {
+        let mk = |s: &str| json!({"type": "m.room.message", "sender": s, "content": {}});
+        let mut room = json!({"timeline": {"events": [mk("@a:s"), mk("@b:s"), mk("@c:s")]}});
+        apply_timeline_filter(&mut room, &json!({"senders": ["@a:s", "@b:s"]}));
+        assert_eq!(timeline_senders(&room), vec!["@a:s", "@b:s"]);
+    }
+
+    #[test]
+    fn not_senders_takes_precedence_over_senders() {
+        // A sender listed in both is excluded (spec).
+        let mk = |s: &str| json!({"type": "m.room.message", "sender": s, "content": {}});
+        let mut room = json!({"timeline": {"events": [mk("@a:s"), mk("@b:s")]}});
+        apply_timeline_filter(
+            &mut room,
+            &json!({"senders": ["@a:s", "@b:s"], "not_senders": ["@a:s"]}),
+        );
+        assert_eq!(timeline_senders(&room), vec!["@b:s"]);
+    }
+
+    #[test]
+    fn contains_url_filters_timeline_and_state() {
+        let with_url =
+            json!({"type": "m.room.message", "sender": "@a:s", "content": {"url": "mxc://x/y"}});
+        let no_url = json!({"type": "m.room.message", "sender": "@a:s", "content": {"body": "hi"}});
+
+        // true → keep only events with a content.url key.
+        let mut room = json!({"timeline": {"events": [with_url.clone(), no_url.clone()]}});
+        apply_timeline_filter(&mut room, &json!({"contains_url": true}));
+        let evs = room["timeline"]["events"].as_array().unwrap();
+        assert_eq!(evs.len(), 1);
+        assert!(evs[0]["content"].get("url").is_some());
+
+        // false → drop events that have a url.
+        let mut room = json!({"timeline": {"events": [with_url.clone(), no_url.clone()]}});
+        apply_timeline_filter(&mut room, &json!({"contains_url": false}));
+        let evs = room["timeline"]["events"].as_array().unwrap();
+        assert_eq!(evs.len(), 1);
+        assert!(evs[0]["content"].get("url").is_none());
+
+        // state filter honours it too.
+        let mut room = json!({"state": {"events": [with_url, no_url]}});
+        apply_state_filter(&mut room, &json!({"contains_url": true}));
+        assert_eq!(room["state"]["events"].as_array().unwrap().len(), 1);
+
+        // omitted → no url-based filtering.
+        let mut room = json!({"timeline": {"events": [
+            json!({"type": "m.room.message", "sender": "@a:s", "content": {"url": "mxc://x/y"}}),
+            json!({"type": "m.room.message", "sender": "@a:s", "content": {}}),
+        ]}});
+        apply_timeline_filter(&mut room, &json!({}));
+        assert_eq!(room["timeline"]["events"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn contains_url_requires_a_string_url() {
+        // A null or non-string url counts as "no url" (Synapse parity), so
+        // contains_url:true drops them and contains_url:false keeps them.
+        let null_url =
+            json!({"type": "m.room.message", "sender": "@a:s", "content": {"url": null}});
+        let int_url = json!({"type": "m.room.message", "sender": "@a:s", "content": {"url": 5}});
+        let no_content = json!({"type": "m.room.message", "sender": "@a:s"});
+
+        let mut room = json!({"timeline": {"events": [null_url.clone(), int_url.clone(), no_content.clone()]}});
+        apply_timeline_filter(&mut room, &json!({"contains_url": true}));
+        assert_eq!(
+            room["timeline"]["events"].as_array().unwrap().len(),
+            0,
+            "no string url anywhere → contains_url:true keeps nothing"
+        );
+
+        let mut room = json!({"timeline": {"events": [null_url, int_url, no_content]}});
+        apply_timeline_filter(&mut room, &json!({"contains_url": false}));
+        assert_eq!(
+            room["timeline"]["events"].as_array().unwrap().len(),
+            3,
+            "contains_url:false keeps events without a string url"
+        );
+    }
+
+    #[test]
+    fn empty_senders_list_excludes_all() {
+        // `senders: []` is present-but-empty → no sender matches → everything
+        // is dropped (distinct from an absent `senders`, which filters nothing).
+        let mk = |s: &str| json!({"type": "m.room.message", "sender": s, "content": {}});
+        let mut room = json!({"timeline": {"events": [mk("@a:s"), mk("@b:s")]}});
+        apply_timeline_filter(&mut room, &json!({"senders": []}));
+        assert!(room["timeline"]["events"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn state_filter_applies_under_state_after() {
+        // MSC4222 rooms carry state under `state_after`, not `state`. The
+        // state filter must reach it or it's a no-op for Element.
+        let ev = |t: &str, sender: &str| json!({"type": t, "state_key": "", "sender": sender, "content": {}});
+        let mut room = json!({"state_after": {"events": [
+            ev("m.room.topic", "@a:s"),
+            ev("m.room.name", "@b:s"),
+        ]}});
+        apply_state_filter(&mut room, &json!({"not_senders": ["@b:s"]}));
+        let types: Vec<&str> = room["state_after"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, vec!["m.room.topic"], "state_after must be filtered");
     }
 }
