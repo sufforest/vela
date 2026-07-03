@@ -229,7 +229,22 @@ pub fn state_before_event(
         }
         out
     };
-    let resolved = state_res::resolve(&state_sets, &event_fn, &auth_chain_fn);
+    // Room version selects the state-res variant (v12 = state-res v2.1).
+    // Warn if the room can't be resolved at all: defaulting a genuine pre-v12
+    // fork to v2.1 is the exact divergence this threading exists to avoid, so
+    // it must not be silent.
+    let room_version = load_pdu_by_event_id(db, event_id)
+        .and_then(|p| db.get_nid(&p.room_id).ok().flatten())
+        .and_then(|room_nid| db.get_room_version_typed(room_nid).ok())
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                event_id,
+                "state_before_event: room version unresolvable, defaulting to v12 state-res"
+            );
+            vela_core::events::room_version::RoomVersion::V12
+        });
+
+    let resolved = state_res::resolve(room_version, &state_sets, &event_fn, &auth_chain_fn);
 
     let mut out: HashMap<(String, String), Pdu> = HashMap::new();
     for (key, eid) in &resolved {

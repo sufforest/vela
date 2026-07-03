@@ -1,14 +1,20 @@
-//! Matrix State Resolution algorithm v2, with Room Version 12 modifications.
+//! Matrix State Resolution algorithm v2, with the Room Version 12 variant
+//! (state-res v2.1) selected per room version.
 //!
 //! Reference: `content/rooms/v12.md` §State resolution and
 //! `content/rooms/fragments/v2-state-res.md`.
 //!
-//! v12 differences from v2:
-//! 1. Step 2 (iterative auth checks on power events) starts from an **empty**
-//!    state map instead of the unconflicted state map.
-//! 2. New definition: **conflicted state subgraph** — the subgraph formed by
-//!    paths between events in the conflicted state set via `auth_events` edges.
-//! 3. Full conflicted set includes the conflicted state subgraph.
+//! `resolve` takes the room version and branches where v12 differs from v2:
+//! 1. Iterative auth checks on power events start from an **empty** state map
+//!    in v12, versus the **unconflicted** state map in classic v2.
+//! 2. v12 defines the **conflicted state subgraph** — the subgraph formed by
+//!    paths between conflicted state events via `auth_events` edges — and
+//!    folds it into the full conflicted set. Classic v2 does not.
+//!
+//! Everything else (both ordering algorithms, the auth rules invoked, the
+//! final unconflicted overlay) is identical across versions. The auth-rule
+//! differences that do exist are handled inside `check_auth`, which reads the
+//! room version from the create event, not here.
 //!
 //! The algorithm is a pure function: no I/O, no async. Callers wrap it in
 //! `tokio::task::spawn_blocking` to isolate CPU usage from the async runtime.
@@ -18,6 +24,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::auth_rules::{check_auth, user_power_level};
 use crate::events::pdu::Pdu;
+use crate::events::room_version::RoomVersion;
 
 /// (event_type, state_key) → event_id.
 pub type StateMap = HashMap<(String, String), String>;
@@ -31,14 +38,21 @@ pub type AuthChainFn<'a> = &'a dyn Fn(&str) -> HashSet<String>;
 
 /// Resolve a set of state maps into a single resolved state map.
 ///
-/// This is the v12 algorithm. Per spec:
-///   resolution(state_sets) → resolved_state_map
+/// `room_version` selects the algorithm variant: v12+ uses state-res v2.1
+/// (empty initial state + conflicted state subgraph), pre-v12 uses classic
+/// state-res v2 (unconflicted initial state, no subgraph). See
+/// `RoomVersion::uses_state_res_v21`. Passing the wrong version for the room
+/// can diverge resolved state on a fork.
+///
+/// Per spec: resolution(state_sets) → resolved_state_map
 ///
 /// Arguments:
+/// - `room_version`: the room's version (selects the algorithm variant)
 /// - `state_sets`: state maps from each prev_event
 /// - `event_fn`: resolves event_id → Pdu
 /// - `auth_chain_fn`: resolves event_id → auth chain (transitive auth_events ancestors)
 pub fn resolve(
+    room_version: RoomVersion,
     state_sets: &[StateMap],
     event_fn: EventFn<'_>,
     auth_chain_fn: AuthChainFn<'_>,
@@ -51,26 +65,36 @@ pub fn resolve(
         return state_sets[0].clone();
     }
 
+    let v21 = room_version.uses_state_res_v21();
+
     // --- Phase 1: split into unconflicted and conflicted ---
     let (unconflicted, conflicted_events) = split_conflicted(state_sets);
 
     // --- Phase 2: auth difference ---
     let auth_diff = auth_difference(state_sets, auth_chain_fn);
 
-    // --- Phase 3 (v12): conflicted state subgraph ---
-    let subgraph = conflicted_state_subgraph(&conflicted_events, event_fn);
-
-    // --- Phase 4: full conflicted set = conflicted ∪ subgraph ∪ auth_diff ---
+    // --- Phase 3+4: full conflicted set = conflicted ∪ auth_diff, plus the
+    // conflicted state subgraph in v12 (state-res v2.1) only. In classic
+    // state-res v2 (pre-v12) the subgraph is not part of the full set. ---
     let mut full_conflicted: HashSet<String> = HashSet::new();
     full_conflicted.extend(conflicted_events.iter().cloned());
-    full_conflicted.extend(subgraph);
+    if v21 {
+        full_conflicted.extend(conflicted_state_subgraph(&conflicted_events, event_fn));
+    }
     full_conflicted.extend(auth_diff);
 
     // --- Phase 5: select power events and sort by reverse topological power ordering ---
     let power_event_list = select_and_sort_power_events(&full_conflicted, event_fn);
 
-    // --- Phase 6: iterative auth checks on power events, starting from EMPTY (v12) ---
-    let partial_state = iterative_auth_checks(&StateMap::new(), &power_event_list, event_fn);
+    // --- Phase 6: iterative auth checks on power events. v12 starts from an
+    // EMPTY state map; classic v2 starts from the unconflicted state map. ---
+    let initial_state = if v21 {
+        StateMap::new()
+    } else {
+        unconflicted.clone()
+    };
+    let partial_state =
+        iterative_auth_checks(room_version, &initial_state, &power_event_list, event_fn);
 
     // --- Phase 7: order remaining events by mainline ordering ---
     let remaining: Vec<String> = full_conflicted
@@ -81,7 +105,7 @@ pub fn resolve(
     let remaining_sorted = mainline_sort(&remaining, &partial_state, event_fn);
 
     // --- Phase 8: iterative auth checks on remaining events ---
-    let resolved = iterative_auth_checks(&partial_state, &remaining_sorted, event_fn);
+    let resolved = iterative_auth_checks(room_version, &partial_state, &remaining_sorted, event_fn);
 
     // --- Phase 9: overlay unconflicted state ---
     let mut final_state = resolved;
@@ -475,6 +499,7 @@ impl PartialOrd for KahnKey {
 /// - If allowed, update the state with this event.
 /// - Otherwise, skip.
 fn iterative_auth_checks(
+    room_version: RoomVersion,
     initial: &StateMap,
     events_in_order: &[String],
     event_fn: EventFn<'_>,
@@ -496,20 +521,30 @@ fn iterative_auth_checks(
     // room_id instead. The per-event augmentation below only pulls auth_events,
     // so without this the create event is absent during the auth checks and
     // every conflicted event is rejected ("no m.room.create in state"),
-    // silently dropping ALL conflicted state on a genuine fork. Derive create
-    // from any event's room_id and seed it into the auth view. This is correct
-    // because every event in one `resolve` call shares a room (the algorithm's
+    // silently dropping ALL conflicted state on a genuine fork. In v12 the
+    // room_id is the create event's hash (`!<hash>` ↔ `$<hash>`), so we can
+    // derive and seed create from any event's room_id. This is correct because
+    // every event in one `resolve` call shares a room (the algorithm's
     // invariant), and a cross-room/forged event is still rejected by auth rule
-    // 2 (`room_id_matches_create`). Pre-v12 is a no-op: the derived id won't
-    // resolve (its create id is a content hash unrelated to room_id) and create
-    // is already carried in auth_events there.
-    let create_seed: Option<((String, String), Pdu)> = events_in_order
-        .iter()
-        .find_map(|id| event_fn(id))
-        .and_then(|p| p.room_id.strip_prefix('!').map(|rest| format!("${rest}")))
-        .and_then(|cid| event_fn(&cid))
-        .filter(|c| c.event_type == "m.room.create")
-        .map(|c| (("m.room.create".to_string(), String::new()), c));
+    // 2 (`room_id_matches_create`).
+    //
+    // Gated to v12: pre-v12 rooms carry create in auth_events (v6–v10) or, for
+    // v11 (create dropped from auth_events but room_id still opaque, not a
+    // hash), the create is always present in the unconflicted state map that
+    // the classic-v2 pass starts from — so the seed is unnecessary there, and
+    // its `!x → $x` derivation wouldn't resolve against an opaque room_id
+    // anyway.
+    let create_seed: Option<((String, String), Pdu)> = if room_version.uses_state_res_v21() {
+        events_in_order
+            .iter()
+            .find_map(|id| event_fn(id))
+            .and_then(|p| p.room_id.strip_prefix('!').map(|rest| format!("${rest}")))
+            .and_then(|cid| event_fn(&cid))
+            .filter(|c| c.event_type == "m.room.create")
+            .map(|c| (("m.room.create".to_string(), String::new()), c))
+    } else {
+        None
+    };
 
     for event_id in events_in_order {
         let ev = match event_fn(event_id) {
@@ -765,7 +800,12 @@ mod tests {
         let pdus: HashMap<String, Pdu> = HashMap::new();
         let event_fn = |id: &str| pdus.get(id).cloned();
         let auth_chain_fn = |_: &str| HashSet::new();
-        let result = resolve(std::slice::from_ref(&state), &event_fn, &auth_chain_fn);
+        let result = resolve(
+            RoomVersion::V12,
+            std::slice::from_ref(&state),
+            &event_fn,
+            &auth_chain_fn,
+        );
         assert_eq!(result, state);
     }
 
@@ -786,7 +826,7 @@ mod tests {
         let pdus: HashMap<String, Pdu> = HashMap::new();
         let event_fn = |id: &str| pdus.get(id).cloned();
         let auth_chain_fn = |_: &str| HashSet::new();
-        let result = resolve(&[s1, s2], &event_fn, &auth_chain_fn);
+        let result = resolve(RoomVersion::V12, &[s1, s2], &event_fn, &auth_chain_fn);
         assert_eq!(
             result
                 .get(&("m.room.create".to_string(), String::new()))
@@ -888,7 +928,7 @@ mod tests {
         let event_fn = move |id: &str| pdus_ref.get(id).cloned();
         let auth_chain_fn = |_: &str| HashSet::new();
 
-        let result = resolve(&[s1, s2], &event_fn, &auth_chain_fn);
+        let result = resolve(RoomVersion::V12, &[s1, s2], &event_fn, &auth_chain_fn);
 
         // Both topic events are valid; mainline ordering by origin_server_ts means
         // topic2 (later ts) wins.
@@ -977,6 +1017,7 @@ mod tests {
         let event_fn = move |id: &str| pdus_ref.get(id).cloned();
         let auth_chain_fn = |_: &str| HashSet::new();
         let result = resolve(
+            RoomVersion::V12,
             &[state_set("$topic1"), state_set("$topic2")],
             &event_fn,
             &auth_chain_fn,
@@ -1060,7 +1101,7 @@ mod tests {
         let pdus: HashMap<String, Pdu> = HashMap::new();
         let event_fn = |id: &str| pdus.get(id).cloned();
         let auth_chain_fn = |_: &str| HashSet::new();
-        let result = resolve(&[], &event_fn, &auth_chain_fn);
+        let result = resolve(RoomVersion::V12, &[], &event_fn, &auth_chain_fn);
         assert!(result.is_empty());
     }
 
@@ -1322,6 +1363,208 @@ mod tests {
         assert!(
             elapsed.as_millis() < 500,
             "conflicted_state_subgraph too slow on N={N}: {elapsed:?}"
+        );
+    }
+
+    /// The room version passed to `resolve` selects the algorithm variant,
+    /// and the choice changes the resolved state on a fork. Here a state event
+    /// (`$m`, an `m.room.name`) sits on the `auth_events` path *between* the
+    /// two conflicted topic events but is in neither state set, so it belongs
+    /// to the conflicted state subgraph only. With an empty `auth_chain_fn`
+    /// the auth difference reduces to the conflicted set itself (each state
+    /// event seeds its own id) and adds nothing new, so the subgraph is the
+    /// sole difference between the variants: v12 (state-res v2.1) folds it into
+    /// the full conflicted set and resolves the name key, while classic v2 (v6)
+    /// does not consider it at all. Both outcomes are spec-correct for their
+    /// version; the bug this guards against is applying one room's algorithm
+    /// to another's fork.
+    #[test]
+    fn subgraph_node_resolved_only_under_v12_variant() {
+        // create → a_join → $b(topic) → $m(name) → $a(topic)
+        let create = pdu(
+            "$create",
+            "m.room.create",
+            Some(""),
+            "@a:x",
+            json!({"room_version": "12"}),
+            &[],
+            0,
+        );
+        let a_join = pdu(
+            "$a_join",
+            "m.room.member",
+            Some("@a:x"),
+            "@a:x",
+            json!({"membership": "join"}),
+            &["$create"],
+            1,
+        );
+        let b = pdu(
+            "$b",
+            "m.room.topic",
+            Some(""),
+            "@a:x",
+            json!({"topic": "old"}),
+            &["$create", "$a_join"],
+            2,
+        );
+        let m = pdu(
+            "$m",
+            "m.room.name",
+            Some(""),
+            "@a:x",
+            json!({"name": "mid"}),
+            &["$create", "$a_join", "$b"],
+            3,
+        );
+        let a = pdu(
+            "$a",
+            "m.room.topic",
+            Some(""),
+            "@a:x",
+            json!({"topic": "new"}),
+            &["$create", "$a_join", "$m"],
+            4,
+        );
+        let mut pdus: HashMap<String, Pdu> = HashMap::new();
+        for p in [&create, &a_join, &b, &m, &a] {
+            pdus.insert(p.event_id.clone(), p.clone());
+        }
+        let event_fn = move |id: &str| pdus.get(id).cloned();
+        let auth_chain_fn = |_: &str| HashSet::new();
+
+        let base: Vec<((String, String), String)> = vec![
+            (("m.room.create".into(), String::new()), "$create".into()),
+            (("m.room.member".into(), "@a:x".into()), "$a_join".into()),
+        ];
+        let mut s1: StateMap = base.iter().cloned().collect();
+        s1.insert(("m.room.topic".into(), String::new()), "$a".into());
+        let mut s2: StateMap = base.iter().cloned().collect();
+        s2.insert(("m.room.topic".into(), String::new()), "$b".into());
+
+        let name_key = &("m.room.name".to_string(), String::new());
+
+        let v12 = resolve(
+            RoomVersion::V12,
+            &[s1.clone(), s2.clone()],
+            &event_fn,
+            &auth_chain_fn,
+        );
+        assert_eq!(
+            v12.get(name_key).map(String::as_str),
+            Some("$m"),
+            "v12 (state-res v2.1) must fold the conflicted-subgraph node into resolution"
+        );
+
+        let v6 = resolve(RoomVersion::V6, &[s1, s2], &event_fn, &auth_chain_fn);
+        assert!(
+            !v6.contains_key(name_key),
+            "classic v2 (v6) has no conflicted state subgraph, so the subgraph-only \
+             node must not appear: {v6:?}"
+        );
+    }
+
+    /// Pins the *initial-state* half of the version branch (the empty vs
+    /// unconflicted starting map for the iterative auth checks), which the
+    /// subgraph test above does not exercise.
+    ///
+    /// Models a v11-shaped room: an opaque (non-hash) `room_id` and topics
+    /// whose `auth_events` omit `m.room.create` (v11 dropped create from
+    /// auth_events). `create` is unconflicted. Under classic v2 the iterative
+    /// checks start from the unconflicted map, so `create` is present and the
+    /// topics authorise; under v2.1 they start from empty and `create_seed`
+    /// cannot derive `create` from the opaque room_id, so the topics are
+    /// rejected for want of a create event. Both are the spec-correct outcome
+    /// for their algorithm — the point is that the branch is load-bearing and
+    /// a real v11 fork must not be run through v2.1.
+    #[test]
+    fn initial_state_map_differs_by_version() {
+        let mk = |id: &str,
+                  ty: &str,
+                  sk: Option<&str>,
+                  content: serde_json::Value,
+                  auth: &[&str],
+                  ts: u64| Pdu {
+            event_id: id.into(),
+            room_id: "!room:srv".into(),
+            event_type: ty.into(),
+            state_key: sk.map(String::from),
+            sender: "@a:srv".into(),
+            origin_server_ts: ts,
+            content,
+            auth_events: auth.iter().map(|s| s.to_string()).collect(),
+            prev_events: vec![],
+            depth: ts,
+            signatures: None,
+        };
+        let create = mk(
+            "$create",
+            "m.room.create",
+            Some(""),
+            json!({"room_version": "11"}),
+            &[],
+            0,
+        );
+        let a_join = mk(
+            "$a_join",
+            "m.room.member",
+            Some("@a:srv"),
+            json!({"membership": "join"}),
+            &["$create"],
+            1,
+        );
+        // Topics omit create from auth_events (v11 shape) — so create is only
+        // reachable via the unconflicted initial state map.
+        let t1 = mk(
+            "$t1",
+            "m.room.topic",
+            Some(""),
+            json!({"topic": "one"}),
+            &["$a_join"],
+            2,
+        );
+        let t2 = mk(
+            "$t2",
+            "m.room.topic",
+            Some(""),
+            json!({"topic": "two"}),
+            &["$a_join"],
+            3,
+        );
+        let mut pdus: HashMap<String, Pdu> = HashMap::new();
+        for p in [&create, &a_join, &t1, &t2] {
+            pdus.insert(p.event_id.clone(), p.clone());
+        }
+        let event_fn = move |id: &str| pdus.get(id).cloned();
+        let auth_chain_fn = |_: &str| HashSet::new();
+
+        let base: Vec<((String, String), String)> = vec![
+            (("m.room.create".into(), String::new()), "$create".into()),
+            (("m.room.member".into(), "@a:srv".into()), "$a_join".into()),
+        ];
+        let mut s1: StateMap = base.iter().cloned().collect();
+        s1.insert(("m.room.topic".into(), String::new()), "$t1".into());
+        let mut s2: StateMap = base.iter().cloned().collect();
+        s2.insert(("m.room.topic".into(), String::new()), "$t2".into());
+        let topic_key = &("m.room.topic".to_string(), String::new());
+
+        let v11 = resolve(
+            RoomVersion::V11,
+            &[s1.clone(), s2.clone()],
+            &event_fn,
+            &auth_chain_fn,
+        );
+        assert!(
+            v11.contains_key(topic_key),
+            "classic v2 starts from the unconflicted map (create present), so the \
+             topics must resolve: {v11:?}"
+        );
+
+        let v12 = resolve(RoomVersion::V12, &[s1, s2], &event_fn, &auth_chain_fn);
+        assert!(
+            !v12.contains_key(topic_key),
+            "v2.1 starts from empty and cannot seed create from an opaque room_id, \
+             so the topics are rejected: {v12:?}"
         );
     }
 }
