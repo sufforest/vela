@@ -79,6 +79,25 @@ struct Config {
     support: SupportSection,
     #[serde(default)]
     extensions: ExtensionsSection,
+    #[serde(default)]
+    search: SearchSection,
+}
+
+/// `[search]` section — full-text message search (`POST /v3/search`).
+/// Enabled by default; when on, vela maintains a RocksDB inverted index on
+/// the event write path (jieba-tokenized, CJK-aware). Turn off to skip all
+/// indexing (the jieba dictionary then never loads). After enabling on an
+/// existing server, run the `!reindex-search` admin command to backfill.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct SearchSection {
+    enabled: bool,
+}
+
+impl Default for SearchSection {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// `[support]` section — drives `.well-known/matrix/support` (MSC1929 /
@@ -1266,8 +1285,21 @@ fn main() -> anyhow::Result<()> {
         let db_path = PathBuf::from(&config.database.path);
         let db = Database::open(&db_path)
             .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
+        // Full-text search: when enabled, the event write/redaction paths
+        // maintain the inverted index. Off → zero indexing cost, jieba
+        // never loads. Warm the dictionary here (at boot, off the request
+        // path) so the first message after a restart doesn't eat the
+        // one-time load latency inline on its persist.
+        db.set_search_indexing_enabled(config.search.enabled);
+        if config.search.enabled {
+            vela_store::search::warm();
+        }
 
-        info!(path = %config.database.path, "database opened");
+        info!(
+            path = %config.database.path,
+            search = config.search.enabled,
+            "database opened"
+        );
 
         // Initialize media store. Filesystem is the single-pod default;
         // S3 (or any S3-compatible: MinIO, Cloudflare R2, B2) is for

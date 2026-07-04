@@ -24,6 +24,7 @@ futures = { workspace = true }
 object_store = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
+jieba-rs = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

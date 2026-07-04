@@ -320,4 +320,13 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // value `u64 BE` = total (key+value) bytes that plugin stores. Updated
     // incrementally on set/delete and recomputed (self-healing) by the sweep.
     "wasm_kv_quota",
+    // Full-text search inverted index (see `search` module).
+    // Key:   `[room_nid:8 BE] | token(UTF-8) | 0xFF | [stream_pos:8 BE]`.
+    //        0xFF never appears in valid UTF-8, so it cleanly delimits the
+    //        variable-length token; the fixed 8-byte stream_pos suffix sorts
+    //        postings chronologically (reverse scan = newest first).
+    // Value: `[event_nid:8 BE] | [field:1] | [tf:1]` — field 0=body 1=name
+    //        2=topic (for the CS-API `keys` filter); tf = term frequency
+    //        (capped 255) summed into the relevance `rank`.
+    "search_index",
 ];

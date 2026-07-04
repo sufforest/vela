@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rocksdb::{ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options, WriteBatch};
 use serde_json::Value;
@@ -208,6 +208,12 @@ pub struct Database {
     /// `(user_nid, pos)`). Shared across users so positions are unique;
     /// recovered from the CF at open.
     pub(crate) notifications_stream_counter: AtomicU64,
+    /// Whether to maintain the full-text `search_index` on the event
+    /// write/redaction paths. Off by default; vela-server flips it on
+    /// from `[search] enabled` at boot. Tests opt in explicitly. When
+    /// off, `persist_event_kind`/`mark_redacted_by` skip all search work
+    /// (and the jieba dictionary is never loaded).
+    pub(crate) search_indexing_enabled: AtomicBool,
 }
 
 impl Database {
@@ -260,6 +266,7 @@ impl Database {
             presence_stream_counter: AtomicU64::new(1),
             notifications_stream_counter: AtomicU64::new(1),
             snapshot_nid_counter: PersistedCounter::ephemeral(1),
+            search_indexing_enabled: AtomicBool::new(false),
         })
     }
 
@@ -389,6 +396,7 @@ impl Database {
             receipts_stream_counter: AtomicU64::new(receipts_stream_counter),
             presence_stream_counter: AtomicU64::new(presence_stream_counter),
             notifications_stream_counter: AtomicU64::new(notifications_stream_counter),
+            search_indexing_enabled: AtomicBool::new(false),
         };
         // Migrate any pre-per-room outbox entries left over from before
         // the federation_sender refactor. No-op on fresh DBs.
@@ -2759,6 +2767,15 @@ impl Database {
                 keys::encode_u64(event_nid),
                 keys::encode_u64(stream_pos),
             );
+            // Full-text search index, in the same batch → atomic with the
+            // event. Parses body/name/topic from event_json and tokenizes
+            // (jieba). Skipped entirely when indexing is off, so the
+            // dictionary never loads and the hot path pays nothing.
+            if self.search_indexing_enabled.load(Ordering::Relaxed) {
+                self.index_event_into_batch(
+                    &mut batch, room_nid, stream_pos, event_nid, event_json,
+                );
+            }
         }
 
         // event_depth CF
@@ -3680,7 +3697,15 @@ impl Database {
             &cf,
             keys::encode_u64(target_event_nid),
             keys::encode_u64(redactor_event_nid),
-        )
+        )?;
+        // Drop the redacted event from the search index so it stops
+        // matching. Best-effort (see `deindex_event_search`); the query
+        // path also filters redacted hits, so a lingering posting is never
+        // a leak.
+        if self.search_indexing_enabled.load(Ordering::Relaxed) {
+            self.deindex_event_search(target_event_nid);
+        }
+        Ok(())
     }
 
     /// Returns the redactor event NID if `target_event_nid` has been redacted.
@@ -3690,6 +3715,170 @@ impl Database {
             Some(bytes) => Ok(Some(keys::decode_u64(&bytes))),
             None => Ok(None),
         }
+    }
+
+    // --- Full-text search index (see the `search` module) ---
+
+    /// Turn full-text search indexing on/off at runtime. vela-server calls
+    /// this at boot from `[search] enabled`; tests opt in explicitly.
+    pub fn set_search_indexing_enabled(&self, on: bool) {
+        self.search_indexing_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the event write/redaction paths maintain the search index.
+    pub fn is_search_indexing_enabled(&self) -> bool {
+        self.search_indexing_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Add this event's inverted-index entries to `batch` so they commit
+    /// atomically with the event. Returns whether anything was indexed
+    /// (false for events with no searchable text). Called from
+    /// `persist_event_kind` for timeline events when indexing is on.
+    fn index_event_into_batch(
+        &self,
+        batch: &mut WriteBatch,
+        room_nid: u64,
+        stream_pos: u64,
+        event_nid: u64,
+        event_json: &[u8],
+    ) -> bool {
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(event_json) else {
+            return false;
+        };
+        let Some((field, text)) = crate::search::searchable_field(&json) else {
+            return false;
+        };
+        let cf = self.db.cf_handle("search_index").unwrap();
+        let mut any = false;
+        for (token, tf) in crate::search::token_frequencies(&text) {
+            let key = crate::search::index_key(room_nid, &token, stream_pos);
+            let val = crate::search::encode_value(event_nid, field, tf.min(255) as u8);
+            batch.put_cf(&cf, key, val);
+            any = true;
+        }
+        any
+    }
+
+    /// Remove an event's entries from the search index. Reconstructs the
+    /// keys from the event's own content — this store keeps the original
+    /// bytes after a redaction marker (redaction doesn't scrub in place), so
+    /// reconstruction is exact. The query path also filters redacted hits,
+    /// so even a missed posting is never a leak. Called from
+    /// `mark_redacted_by` when indexing is on.
+    fn deindex_event_search(&self, event_nid: u64) {
+        let Ok(Some((_hdr, json_bytes))) = self.get_event(event_nid) else {
+            return;
+        };
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(&json_bytes) else {
+            return;
+        };
+        let Some((_field, text)) = crate::search::searchable_field(&json) else {
+            return;
+        };
+        let Some(room_id) = json.get("room_id").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let (Ok(Some(room_nid)), Ok(Some(stream_pos))) =
+            (self.get_nid(room_id), self.event_timeline_pos_of(event_nid))
+        else {
+            return;
+        };
+        let cf = self.db.cf_handle("search_index").unwrap();
+        let mut batch = WriteBatch::default();
+        for token in crate::search::token_frequencies(&text).into_keys() {
+            batch.delete_cf(&cf, crate::search::index_key(room_nid, &token, stream_pos));
+        }
+        let _ = self.db.write(batch);
+    }
+
+    /// All postings for `(room_nid, token)`, newest stream position first.
+    /// The building block the `/search` query intersects across the query's
+    /// tokens. Returns at most `limit` postings, newest stream position
+    /// first. Bounded so a very common token in a large room can't load an
+    /// unbounded posting range into memory.
+    pub fn search_room_token(
+        &self,
+        room_nid: u64,
+        token: &str,
+        limit: usize,
+    ) -> Vec<crate::search::Posting> {
+        let cf = self.db.cf_handle("search_index").unwrap();
+        let prefix = crate::search::token_prefix(room_nid, token);
+        // Seek to `prefix ++ max stream_pos` and walk backwards: postings for
+        // one token are contiguous and all ≤ this bound, so a reverse scan
+        // yields newest-first directly — no load-everything-then-sort.
+        let mut upper = prefix.clone();
+        upper.extend_from_slice(&u64::MAX.to_be_bytes());
+        let mut out = Vec::new();
+        let iter = self
+            .db
+            .iterator_cf(&cf, IteratorMode::From(&upper, Direction::Reverse));
+        for item in iter {
+            if out.len() >= limit {
+                break;
+            }
+            let Ok((key, val)) = item else { break };
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let (Some(stream_pos), Some((event_nid, field, tf))) = (
+                crate::search::key_stream_pos(&key),
+                crate::search::decode_value(&val),
+            ) else {
+                continue;
+            };
+            out.push(crate::search::Posting {
+                stream_pos,
+                event_nid,
+                field,
+                tf,
+            });
+        }
+        out
+    }
+
+    /// Rebuild the search index for every room by walking the live
+    /// timeline. Backfills history after enabling search on an existing DB
+    /// (the `!reindex-search` admin command). Additive and idempotent:
+    /// re-indexing an event overwrites its own keys. Returns the number of
+    /// events indexed.
+    pub fn reindex_search(&self) -> Result<u64, rocksdb::Error> {
+        let cf_tl = self.db.cf_handle("room_timeline").unwrap();
+        let mut indexed: u64 = 0;
+        let mut batch = WriteBatch::default();
+        let mut pending: u64 = 0;
+        for item in self.db.iterator_cf(&cf_tl, IteratorMode::Start) {
+            let (key, val) = item?;
+            // room_timeline key = room_nid(8 BE) ++ stream_pos(8 BE); val = event_nid.
+            if key.len() < 16 {
+                continue;
+            }
+            let room_nid = u64::from_be_bytes(key[..8].try_into().unwrap());
+            let stream_pos = u64::from_be_bytes(key[8..16].try_into().unwrap());
+            let event_nid = keys::decode_u64(&val);
+            // Don't re-index redacted events — a redaction de-indexed them,
+            // and re-adding their tokens would just be filtered again at
+            // query time. Keeps a rebuild consistent with the live path.
+            if matches!(self.get_redacted_by(event_nid), Ok(Some(_))) {
+                continue;
+            }
+            let Ok(Some((_hdr, json_bytes))) = self.get_event(event_nid) else {
+                continue;
+            };
+            if self.index_event_into_batch(&mut batch, room_nid, stream_pos, event_nid, &json_bytes)
+            {
+                indexed += 1;
+                pending += 1;
+            }
+            if pending >= 1000 {
+                self.db.write(std::mem::take(&mut batch))?;
+                pending = 0;
+            }
+        }
+        if pending > 0 {
+            self.db.write(batch)?;
+        }
+        Ok(indexed)
     }
 
     /// Park a redaction whose target event_id isn't on disk yet. Read
@@ -7411,7 +7600,7 @@ fn configure_cf(opts: &mut Options, name: &str) {
             opts.set_bloom_locality(10);
             opts.optimize_for_point_lookup(64 * 1024 * 1024);
         }
-        "room_timeline" | "room_state" | "user_rooms" => {
+        "room_timeline" | "room_state" | "user_rooms" | "search_index" => {
             opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
         }
         _ => {}
@@ -8067,6 +8256,162 @@ mod stream_recovery_tests {
             next > persisted_pos,
             "next allocation ({next}) must be > persisted ({persisted_pos})"
         );
+    }
+
+    /// End-to-end: a persisted message is indexed (English + CJK tokens,
+    /// with term frequency), found by `search_room_token`, and dropped from
+    /// the index on redaction. Exercises the real persist → prefix-scan →
+    /// redact path against RocksDB (validates the prefix-extractor scan).
+    #[test]
+    fn search_index_roundtrip_and_deindex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        db.set_search_indexing_enabled(true);
+
+        let room_id = "!r:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let type_nid = db.get_or_create_nid("m.room.message").unwrap();
+        let sender_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        let event_nid = db.next_nid().unwrap();
+        let json = serde_json::json!({
+            "type": "m.room.message",
+            "room_id": room_id,
+            "sender": "@alice:example.com",
+            "content": {"msgtype": "m.text", "body": "hello 世界 hello"},
+            "origin_server_ts": 1,
+            "depth": 1,
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        let pos = db
+            .persist_event(
+                event_nid,
+                "$evt1:example.com",
+                room_nid,
+                type_nid,
+                sender_nid,
+                0,
+                1,
+                1,
+                &bytes,
+                &[],
+                &[],
+                false,
+                false,
+            )
+            .unwrap();
+
+        // English token: aggregated term frequency = 2.
+        let hits = db.search_room_token(room_nid, "hello", 100);
+        assert_eq!(hits.len(), 1, "one posting for 'hello'");
+        assert_eq!(hits[0].event_nid, event_nid);
+        assert_eq!(hits[0].stream_pos, pos);
+        assert_eq!(hits[0].field, crate::search::FIELD_BODY);
+        assert_eq!(hits[0].tf, 2, "'hello' appears twice");
+
+        // CJK: jieba segmented 世界 into its own token, so it's findable —
+        // the whole point of the feature.
+        assert_eq!(db.search_room_token(room_nid, "世界", 100).len(), 1);
+        // A prefix of an indexed token must NOT match (0xFF separator).
+        assert!(db.search_room_token(room_nid, "hell", 100).is_empty());
+        // An absent word: no hits.
+        assert!(db.search_room_token(room_nid, "goodbye", 100).is_empty());
+
+        // Cross-room isolation: the same token in a different room must not
+        // leak into this room's scan (the room_nid key prefix separates
+        // them). Index "hello" in room 2 and confirm room 1 still sees one.
+        let room2_nid = db.get_or_create_nid("!r2:example.com").unwrap();
+        let e2 = db.next_nid().unwrap();
+        let json2 = serde_json::json!({
+            "type": "m.room.message", "room_id": "!r2:example.com",
+            "sender": "@bob:example.com",
+            "content": {"msgtype": "m.text", "body": "hello there"},
+            "origin_server_ts": 2, "depth": 1,
+        });
+        db.persist_event(
+            e2,
+            "$e2:example.com",
+            room2_nid,
+            type_nid,
+            db.get_or_create_nid("@bob:example.com").unwrap(),
+            0,
+            2,
+            1,
+            &serde_json::to_vec(&json2).unwrap(),
+            &[],
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            db.search_room_token(room_nid, "hello", 100).len(),
+            1,
+            "room 1 unaffected"
+        );
+        assert_eq!(
+            db.search_room_token(room2_nid, "hello", 100).len(),
+            1,
+            "room 2 has its own"
+        );
+        assert_eq!(
+            db.search_room_token(room2_nid, "世界", 100).len(),
+            0,
+            "room 2 has no CJK"
+        );
+
+        // Redaction removes it from the index.
+        let redactor = db.next_nid().unwrap();
+        db.mark_redacted_by(event_nid, redactor).unwrap();
+        assert!(
+            db.search_room_token(room_nid, "hello", 100).is_empty(),
+            "redacted event must leave the index"
+        );
+        assert!(db.search_room_token(room_nid, "世界", 100).is_empty());
+    }
+
+    /// Indexing is off by default: a persisted message produces no postings
+    /// until `set_search_indexing_enabled(true)`. Guards the hot path from
+    /// paying for jieba when search is disabled.
+    #[test]
+    fn search_index_off_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        assert!(!db.is_search_indexing_enabled());
+
+        let room_id = "!r:example.com";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        let type_nid = db.get_or_create_nid("m.room.message").unwrap();
+        let sender_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        let event_nid = db.next_nid().unwrap();
+        let json = serde_json::json!({
+            "type": "m.room.message", "room_id": room_id, "sender": "@alice:example.com",
+            "content": {"msgtype": "m.text", "body": "hello world"},
+            "origin_server_ts": 1, "depth": 1,
+        });
+        let bytes = serde_json::to_vec(&json).unwrap();
+        db.persist_event(
+            event_nid,
+            "$e:example.com",
+            room_nid,
+            type_nid,
+            sender_nid,
+            0,
+            1,
+            1,
+            &bytes,
+            &[],
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(db.search_room_token(room_nid, "hello", 100).is_empty());
+
+        // reindex_search backfills it (as the admin command does).
+        db.set_search_indexing_enabled(true);
+        let n = db.reindex_search().unwrap();
+        assert_eq!(n, 1, "one searchable event backfilled");
+        assert_eq!(db.search_room_token(room_nid, "hello", 100).len(), 1);
     }
 
     /// Stream positions allocated by real-world write paths
