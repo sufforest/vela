@@ -164,6 +164,13 @@ fn build_reqwest_client(
 ) -> Result<reqwest::Client, reqwest::Error> {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        // Bound the connect phase separately from the 30s overall budget: a
+        // black-holing peer (packets dropped, no RST) otherwise ties up the
+        // full 30s before failing, and `signed_request`'s one retry for safe
+        // reads would double that to ~60s. 10s connect + 10s retry connect
+        // keeps a dead hint from stalling an interactive join, while the
+        // fast-reset case the retry targets fails in milliseconds either way.
+        .connect_timeout(Duration::from_secs(10))
         .user_agent(concat!("vela/", env!("CARGO_PKG_VERSION")));
     for cert in extra_ca_certs {
         builder = builder.add_root_certificate(cert.clone());
@@ -533,19 +540,77 @@ impl FederationClient {
         path_and_query: &str,
         body: Option<Value>,
     ) -> Result<Value, FederationClientError> {
-        let resp = self
-            .send_signed(method, destination, path_and_query, body)
-            .await?;
-        let status = resp.status();
-        let resp_body = read_capped_json(resp, MAX_FEDERATION_RESPONSE_BYTES).await?;
-
-        if !status.is_success() {
-            return Err(FederationClientError::Http(format!(
-                "status {status}: {resp_body}"
-            )));
+        // Idempotent reads get one retry on a transient transport failure:
+        // a fresh connection reset during connect/TLS, a keep-alive
+        // connection the peer closed while it sat idle in reqwest's pool, or
+        // a body that dropped mid-stream (surfaces as a `send()` error or an
+        // EOF while parsing the never-arrived body). A single such hiccup
+        // otherwise 403s a whole partial-state join — the dominant
+        // main-branch Complement flake (msc3902 `make_join` and the filler's
+        // `/state(_ids)` probes, all GET). This is what real homeservers do;
+        // it is NOT a mask — the peer never saw a duplicated side effect
+        // because GET has none.
+        //
+        // A non-2xx whose body parses is the peer's real answer (e.g. 404
+        // "room is currently in partial state") and is returned as-is — never
+        // retried. A non-2xx with an unreadable body (an empty/HTML gateway
+        // 502/504) fails the body read and IS retried for safe methods, which
+        // is the right call for a transient proxy blip; spec-compliant Matrix
+        // peers always return JSON errors, so genuine answers are unaffected.
+        // Non-safe verbs (send_join/knock/invite PUT+POST) never retry here;
+        // their callers own resend + txn-id sequencing.
+        //
+        // `is_safe()` (GET/HEAD/OPTIONS/TRACE) — side-effect-free reads only.
+        // Deliberately NOT `is_idempotent()`, which also covers PUT/DELETE:
+        // send_join/send_knock are PUTs whose replay this layer must not do,
+        // and claim_user_keys consumes a one-time key (POST, also excluded).
+        let max_attempts: u32 = if method.is_safe() { 2 } else { 1 };
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let send_result = self
+                .send_signed(method.clone(), destination, path_and_query, body.clone())
+                .await;
+            let resp = match send_result {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if attempt < max_attempts {
+                        debug!(
+                            destination,
+                            path_and_query,
+                            error = %e,
+                            "federation read transport error; retrying once on a fresh connection"
+                        );
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
+            let status = resp.status();
+            match read_capped_json(resp, MAX_FEDERATION_RESPONSE_BYTES).await {
+                Ok(resp_body) => {
+                    if !status.is_success() {
+                        return Err(FederationClientError::Http(format!(
+                            "status {status}: {resp_body}"
+                        )));
+                    }
+                    return Ok(resp_body);
+                }
+                Err(e) => {
+                    if attempt < max_attempts {
+                        debug!(
+                            destination,
+                            path_and_query,
+                            %status,
+                            error = %e,
+                            "federation read body failed; retrying once on a fresh connection"
+                        );
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
         }
-
-        Ok(resp_body)
     }
 
     /// Send a transaction to `destination`. `txn_id` must be unique per destination;
