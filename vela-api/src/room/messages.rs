@@ -1690,11 +1690,21 @@ impl TimelineReadGate {
             _ => None,
         };
         let visibility = current_history_visibility(state, room_nid)?;
-        let needs_hv_filter = match visibility.as_str() {
+        let mut needs_hv_filter = match visibility.as_str() {
             "world_readable" => false,
             "joined" | "invited" => true,
             _ => !matches!(membership, Some(0) | Some(1)),
         };
+        // Fail closed: a departed (leave/ban) caller with no recorded
+        // membership position — legacy rooms that predate the position index —
+        // would otherwise get NEITHER the leave-cap NOR, in a shared-
+        // visibility room, the HV filter, and could read post-departure
+        // events. Force the per-event HV check in that case; it bounds them to
+        // events they were actually a member for. (Matters now that /search
+        // auto-enumerates every left room rather than only explicit ones.)
+        if leave_cap.is_none() && matches!(membership, Some(0) | Some(3)) {
+            needs_hv_filter = true;
+        }
         Ok(Self {
             membership,
             leave_cap,

@@ -5,11 +5,14 @@
 //! Index-backed: matches against the `search_index` inverted index (see
 //! `vela_store::search`), which is jieba-tokenized so Chinese/CJK text is
 //! searched word-by-word. The query is tokenized the same way, then postings
-//! are AND-intersected per room. Supports `keys`, `filter.rooms`,
-//! `filter.senders`, `filter.limit`, `order_by` (`rank` by term frequency, or
-//! `recent`), `event_context` (before/after), `next_batch` pagination, and
-//! predecessor-chain search. Redacted events are filtered, and every hit is
-//! checked against per-event history-visibility.
+//! are AND-intersected per room. Searches every room the caller has been in —
+//! joined and left (a left room is capped to events visible before leaving).
+//! Supports `keys`, `filter.rooms`, `filter.senders`, `filter.limit`,
+//! `order_by` (`rank` by term frequency, or `recent`), `event_context`
+//! (before/after), `groupings.group_by` (room_id / sender), `include_state`,
+//! `next_batch` pagination, and predecessor-chain search. Redacted events are
+//! filtered, and every hit and its context is checked against per-event
+//! history-visibility.
 //!
 //! E2EE rooms are skipped: we hold only ciphertext for them, so the server
 //! can't usefully match. Clients index E2EE rooms locally.
@@ -31,6 +34,13 @@ use crate::router::AppState;
 /// Per-token, per-room postings we consider. Bounds memory and pagination
 /// depth: for a very common token in a huge room we look at the newest
 /// `CANDIDATE_CAP` occurrences. Rare tokens (the usual case) are unaffected.
+///
+/// Caveat for a *left* room that stayed very active: the newest
+/// `CANDIDATE_CAP` postings can all be post-leave, so the leave-cap drops
+/// them and pre-leave matches beyond the window are missed — left-room search
+/// of a busy room may under-return. Fine for quiet/small left rooms (the
+/// common case) and still ahead of Synapse, which doesn't search left rooms
+/// at all. A leave-cap-relative scan bound is a possible follow-up.
 const CANDIDATE_CAP: usize = 1000;
 /// Default `filter.limit` when the caller doesn't supply one.
 const DEFAULT_LIMIT: usize = 10;
@@ -105,16 +115,23 @@ pub async fn post_search(
         .map(|n| n as usize)
         .unwrap_or(0);
 
-    // Determine which rooms to scan. If `filter.rooms` is set, use those
-    // (after checking the caller is joined). Otherwise scan every joined
-    // room. Expand the set with each room's predecessor chain so an
-    // upgrade history is searchable from the new room id.
+    // Determine which rooms to scan. The spec searches every room the user
+    // has been in — joined AND left (the per-event gate caps a left room to
+    // what the user could see before leaving). If `filter.rooms` is set, use
+    // those (restricted to rooms the caller has access to). Expand with each
+    // room's predecessor chain so an upgrade history is searchable from the
+    // new room id.
     let joined: Vec<u64> = state
         .db
         .get_user_joined_rooms(user.user_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    let joined_ids: HashSet<String> = joined
+    let left: Vec<u64> = state
+        .db
+        .get_user_left_rooms(user.user_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let accessible_ids: HashSet<String> = joined
         .iter()
+        .chain(left.iter())
         .filter_map(|nid| state.db.resolve_nid(*nid).ok().flatten())
         .collect();
 
@@ -123,12 +140,9 @@ pub async fn post_search(
     let seed_rooms: Vec<String> = match filter_rooms {
         Some(ids) => ids
             .into_iter()
-            .filter(|rid| joined_ids.contains(rid))
+            .filter(|rid| accessible_ids.contains(rid))
             .collect(),
-        None => joined
-            .iter()
-            .filter_map(|nid| state.db.resolve_nid(*nid).ok().flatten())
-            .collect(),
+        None => accessible_ids.iter().cloned().collect(),
     };
     for room_id in seed_rooms {
         let _ = collect_room_and_predecessors(&state, &room_id, &mut rooms_to_scan, &mut visited);
@@ -277,6 +291,62 @@ pub async fn post_search(
     // Highlights: the query tokens clients should emphasize — the actual
     // (jieba-segmented) tokens we matched on, so CJK words highlight too.
     room_events_resp.insert("highlights".to_string(), json!(q_tokens));
+
+    // Groupings (`groupings.group_by`): partition the returned results by
+    // room_id and/or sender. Each group lists its result event ids and an
+    // `order` clients can sort groups by (we use the best member rank).
+    let group_by = parse_group_by(&room_events);
+    if group_by.room_id || group_by.sender {
+        let mut groups = serde_json::Map::new();
+        if group_by.room_id {
+            let members: Vec<(String, String, u32)> = page
+                .iter()
+                .map(|h| (h.room_id.clone(), event_id_of(&h.event), h.rank))
+                .collect();
+            groups.insert("room_id".to_string(), build_group(&members));
+        }
+        if group_by.sender {
+            let members: Vec<(String, String, u32)> = page
+                .iter()
+                .map(|h| (sender_of(&h.event), event_id_of(&h.event), h.rank))
+                .collect();
+            groups.insert("sender".to_string(), build_group(&members));
+        }
+        room_events_resp.insert("groups".to_string(), Value::Object(groups));
+    }
+
+    // `include_state`: the current state of every room appearing in results.
+    if room_events
+        .get("include_state")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let mut state_map = serde_json::Map::new();
+        let mut seen: HashSet<u64> = HashSet::new();
+        for hit in page {
+            if !seen.insert(hit.room_nid) {
+                continue;
+            }
+            // Only expose *current* state for rooms the caller is still
+            // joined to. A departed member must not learn how the room's
+            // state (members, topic, …) changed after they left — that's why
+            // this is gated even though the hit itself is a left-room event
+            // the leave-cap allowed.
+            if state
+                .db
+                .get_membership(hit.room_nid, user.user_nid)
+                .ok()
+                .flatten()
+                != Some(1)
+            {
+                continue;
+            }
+            let events = current_room_state_events(&state, hit.room_nid, &hit.room_id)?;
+            state_map.insert(hit.room_id.clone(), Value::Array(events));
+        }
+        room_events_resp.insert("state".to_string(), Value::Object(state_map));
+    }
+
     // Spec-loose semantic: include `next_batch` whenever we returned
     // any results, so the client paginates one more call to confirm
     // "no more". Drop it on the first empty page — matches the
@@ -427,6 +497,86 @@ fn parse_keys_mask(room_events: &Value) -> u8 {
         }
     }
     if mask == 0 { all } else { mask }
+}
+
+/// Which groupings the client asked for (`groupings.group_by`).
+struct GroupBy {
+    room_id: bool,
+    sender: bool,
+}
+
+fn parse_group_by(room_events: &Value) -> GroupBy {
+    let mut g = GroupBy {
+        room_id: false,
+        sender: false,
+    };
+    if let Some(arr) = room_events
+        .pointer("/groupings/group_by")
+        .and_then(|v| v.as_array())
+    {
+        for item in arr {
+            match item.get("key").and_then(|v| v.as_str()) {
+                Some("room_id") => g.room_id = true,
+                Some("sender") => g.sender = true,
+                _ => {}
+            }
+        }
+    }
+    g
+}
+
+/// Build the spec group object `{<group_value>: {results: [event_id], order}}`
+/// from `(group_value, event_id, rank)` members. `order` is the best (max)
+/// rank in the group, so more-relevant groups sort higher. No per-group
+/// `next_batch` — we don't paginate within a group (spec allows omitting it).
+fn build_group(members: &[(String, String, u32)]) -> Value {
+    let mut groups: HashMap<String, (Vec<String>, u32)> = HashMap::new();
+    for (gval, eid, rank) in members {
+        if gval.is_empty() {
+            continue;
+        }
+        let e = groups.entry(gval.clone()).or_insert((Vec::new(), 0));
+        e.0.push(eid.clone());
+        e.1 = e.1.max(*rank);
+    }
+    let obj: serde_json::Map<String, Value> = groups
+        .into_iter()
+        .map(|(gid, (results, order))| (gid, json!({ "results": results, "order": order })))
+        .collect();
+    Value::Object(obj)
+}
+
+fn event_id_of(ev: &Value) -> String {
+    ev.get("event_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn sender_of(ev: &Value) -> String {
+    ev.get("sender")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The current state of a room as client events — for `include_state`.
+fn current_room_state_events(
+    state: &AppState,
+    room_nid: u64,
+    room_id: &str,
+) -> Result<Vec<Value>, ApiError> {
+    let nids = state
+        .db
+        .get_all_state_event_nids(room_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let mut out = Vec::with_capacity(nids.len());
+    for enid in nids {
+        if let Some(ev) = load_client_event(state, enid, room_id)? {
+            out.push(ev);
+        }
+    }
+    Ok(out)
 }
 
 /// True iff the room currently has an `m.room.encryption` state event.
