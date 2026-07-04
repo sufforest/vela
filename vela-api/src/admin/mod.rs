@@ -929,6 +929,7 @@ async fn handle_command(
         "tokens" => cmd_tokens(state).await?,
         "create-user" => cmd_create_user(state, sender_nid, rest).await?,
         "rotate-signing-key" => cmd_rotate_signing_key(state).await?,
+        "reindex-search" => cmd_reindex_search(state).await?,
         "reports" => cmd_reports(state, rest).await?,
         "as" => cmd_appservice(state, body).await,
         other => Reply::plain(format!(
@@ -985,6 +986,7 @@ fn cmd_help() -> Reply {
         !token revoke <token>                delete a registration token\n\
         !create-user <localpart> [pw]        force-create a local user (bypasses UIA + tokens)\n\
         !rotate-signing-key                  generate a new server signing key (restart required)\n\
+        !reindex-search                      rebuild the full-text search index from history\n\
         !reports [N]                         last N user-submitted abuse reports (default 20)\n\
         !as register <yaml>                  register an Application Service (paste YAML)\n\
         !as list                             list registered Application Services\n\
@@ -1383,6 +1385,26 @@ async fn cmd_create_user(
 // for the new key to actually be used. Until restart, vela keeps
 // signing with the previous key (which is now in old_verify_keys
 // and so still verifiable by peers).
+/// `!reindex-search` — rebuild the full-text search index from the live
+/// timeline. Used to backfill history after enabling search on an existing
+/// server (new events index automatically on persist). Runs off the async
+/// executor since it walks every room's timeline.
+async fn cmd_reindex_search(state: &AppState) -> Result<Reply, ApiError> {
+    if !state.db.is_search_indexing_enabled() {
+        return Ok(Reply::plain(
+            "search indexing is off ([search] enabled = false); nothing to reindex.".to_string(),
+        ));
+    }
+    let db = state.db.clone();
+    let indexed = tokio::task::spawn_blocking(move || db.reindex_search())
+        .await
+        .map_err(|e| ApiError(VelaError::Store(format!("reindex task join: {e}"))))?
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    Ok(Reply::plain(format!(
+        "reindexed {indexed} events into the search index."
+    )))
+}
+
 async fn cmd_rotate_signing_key(state: &AppState) -> Result<Reply, ApiError> {
     // Refuse a second rotation before restart. The DB's stored active
     // key_id will have advanced past the in-memory one in that case.

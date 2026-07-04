@@ -71,6 +71,14 @@ backend = "fs"
 # prefix             = "media"
 # allow_http         = false
 
+[search]
+# Full-text message search (POST /v3/search). When enabled, vela keeps a
+# RocksDB inverted index on the event write path, tokenized with jieba so
+# Chinese/CJK text is searchable word-by-word (not just whitespace-split).
+# Turn off to skip all indexing. After enabling on a server with existing
+# history, run the `!reindex-search` admin command once to backfill.
+enabled = true
+
 [room_defaults]
 # Server-side encryption-by-default for new rooms. When `/createRoom`
 # omits `m.room.encryption` in `initial_state`, vela injects it for
