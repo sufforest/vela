@@ -430,6 +430,23 @@ pub(crate) fn build_sync_response_inner(
             !lazy_load && !partial && cleared_at.is_some_and(|c| since.is_none_or(|s| s < c));
         let effective_since = if force_full_state { None } else { since };
 
+        // Fast path: on an incremental sync, skip the whole per-room build
+        // for rooms with nothing new since the caller's cursor. A typical
+        // poll leaves most joined rooms quiet, and without this each one
+        // still ran the full builder (timeline + state + receipts + unread
+        // scans) only for `room_is_unchanged` to discard it afterwards —
+        // O(all joined rooms) wasted work per poll. `room_has_changes_since`
+        // is conservative (any doubt → build), and the authoritative
+        // `room_is_unchanged` gate still runs below for whatever passes, so
+        // this can only save work, never drop an update.
+        if let Some(since_pos) = since
+            && !full_state
+            && !force_full_state
+            && !room_has_changes_since(state, room_nid, user.user_nid, since_pos)
+        {
+            continue;
+        }
+
         // Honour the filter's timeline.limit at DB query time so
         // prev_batch is computed from the trimmed batch (not the
         // pre-trim one — that breaks /messages backward pagination).
@@ -2258,6 +2275,47 @@ fn collect_invite_or_knock_stripped(
 /// timeline, empty state delta, no ephemeral events, no per-room
 /// account data. Such rooms must be omitted from `rooms.join` on
 /// incremental sync per spec.
+/// Cheap "does this room have anything new for the caller since `since_pos`?"
+/// check, used to skip the full per-room build for quiet rooms on an
+/// incremental sync (a few point-gets vs. the whole builder).
+///
+/// CONSERVATIVE: returns `true` (build the room) whenever a change source
+/// can't be cheaply ruled out — a DB error, or any tracked position past the
+/// cursor. It therefore can only ever SAVE work, never drop an update; the
+/// authoritative `room_is_unchanged` gate still runs after the build for
+/// anything this lets through. The change sources mirror what the builder
+/// actually emits: new timeline/state events (both carry a stream_pos), new
+/// room receipts, new per-(user,room) account data, and a typing transition.
+fn room_has_changes_since(state: &AppState, room_nid: u64, user_nid: u64, since_pos: u64) -> bool {
+    // New timeline (or state — state events are timelined) events.
+    match state.db.get_room_latest_timeline_pos(room_nid) {
+        Ok(Some(p)) if p > since_pos => return true,
+        Err(_) => return true, // uncertain → build
+        _ => {}
+    }
+    // New receipts anywhere in the room.
+    match state.db.get_room_receipts_max_pos(room_nid) {
+        Ok(Some(p)) if p > since_pos => return true,
+        Err(_) => return true,
+        _ => {}
+    }
+    // New per-(user, room) account data.
+    match state.db.get_room_account_data_max_pos(user_nid, room_nid) {
+        Ok(Some(p)) if p > since_pos => return true,
+        Err(_) => return true,
+        _ => {}
+    }
+    // A typing transition since the cursor (in-memory, per-room).
+    if state
+        .typing_change_pos
+        .get(&room_nid)
+        .is_some_and(|p| *p > since_pos)
+    {
+        return true;
+    }
+    false
+}
+
 fn room_is_unchanged(room: &Value) -> bool {
     let arr_empty = |ptr: &str| {
         room.pointer(ptr)
