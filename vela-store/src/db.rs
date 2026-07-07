@@ -4360,6 +4360,20 @@ impl Database {
         Ok(results)
     }
 
+    /// The highest timeline stream position in a room (its newest live
+    /// event), or `None` if the room has no timeline events. Cheap — one
+    /// reverse seek. Used by /sync to skip the full per-room build for
+    /// rooms with nothing new since the caller's cursor.
+    pub fn get_room_latest_timeline_pos(
+        &self,
+        room_nid: u64,
+    ) -> Result<Option<u64>, rocksdb::Error> {
+        Ok(self
+            .get_timeline_before(room_nid, u64::MAX, 1)?
+            .first()
+            .map(|(pos, _)| *pos))
+    }
+
     // --- Sync position ---
 
     pub fn get_sync_position(
