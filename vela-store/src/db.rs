@@ -214,6 +214,14 @@ pub struct Database {
     /// off, `persist_event_kind`/`mark_redacted_by` skip all search work
     /// (and the jieba dictionary is never loaded).
     pub(crate) search_indexing_enabled: AtomicBool,
+    /// In-memory cache of the NID mappings (string→nid and nid→string).
+    /// NIDs are immutable once assigned, so hits never need invalidation.
+    /// Bounded by `NID_CACHE_CAP` (cleared wholesale on overflow — safe, a
+    /// miss just re-reads RocksDB). Cuts the many repeated `get_nid`/
+    /// `resolve_nid` point-gets on hot paths (e.g. /sync re-resolving
+    /// `m.room.member`, room ids, user ids per room).
+    pub(crate) nid_cache: dashmap::DashMap<String, u64>,
+    pub(crate) nid_reverse_cache: dashmap::DashMap<u64, std::sync::Arc<str>>,
 }
 
 impl Database {
@@ -267,6 +275,8 @@ impl Database {
             notifications_stream_counter: AtomicU64::new(1),
             snapshot_nid_counter: PersistedCounter::ephemeral(1),
             search_indexing_enabled: AtomicBool::new(false),
+            nid_cache: dashmap::DashMap::new(),
+            nid_reverse_cache: dashmap::DashMap::new(),
         })
     }
 
@@ -397,6 +407,8 @@ impl Database {
             presence_stream_counter: AtomicU64::new(presence_stream_counter),
             notifications_stream_counter: AtomicU64::new(notifications_stream_counter),
             search_indexing_enabled: AtomicBool::new(false),
+            nid_cache: dashmap::DashMap::new(),
+            nid_reverse_cache: dashmap::DashMap::new(),
         };
         // Migrate any pre-per-room outbox entries left over from before
         // the federation_sender refactor. No-op on fresh DBs.
@@ -621,23 +633,57 @@ impl Database {
     // --- NID operations ---
 
     pub fn get_or_create_nid(&self, string: &str) -> Result<u64, rocksdb::Error> {
+        if let Some(nid) = self.nid_cache.get(string) {
+            return Ok(*nid);
+        }
         // Fast path: existing mapping wins lock-free.
         if let Some(nid) = nid::get_nid(&self.db, string)? {
+            self.cache_nid(string, nid);
             return Ok(nid);
         }
         // Serialise allocation so two writers can't both miss the
         // existence check and each consume a counter slot — see
         // `nid_alloc_lock` doc comment.
         let _guard = self.nid_alloc_lock.lock().expect("nid_alloc_lock poisoned");
-        nid::get_or_create_nid(&self.db, &self.string_nid_counter, string)
+        let nid = nid::get_or_create_nid(&self.db, &self.string_nid_counter, string)?;
+        self.cache_nid(string, nid);
+        Ok(nid)
     }
 
     pub fn get_nid(&self, string: &str) -> Result<Option<u64>, rocksdb::Error> {
-        nid::get_nid(&self.db, string)
+        if let Some(nid) = self.nid_cache.get(string) {
+            return Ok(Some(*nid));
+        }
+        let res = nid::get_nid(&self.db, string)?;
+        if let Some(nid) = res {
+            self.cache_nid(string, nid);
+        }
+        Ok(res)
     }
 
     pub fn resolve_nid(&self, nid: u64) -> Result<Option<String>, rocksdb::Error> {
-        nid::resolve_nid(&self.db, nid)
+        if let Some(s) = self.nid_reverse_cache.get(&nid) {
+            return Ok(Some(s.to_string()));
+        }
+        let res = nid::resolve_nid(&self.db, nid)?;
+        if let Some(s) = &res {
+            self.cache_nid(s, nid);
+        }
+        Ok(res)
+    }
+
+    /// Populate both directions of the NID cache. NIDs are immutable once
+    /// assigned, so entries never go stale; memory is bounded by clearing the
+    /// whole cache on overflow (a subsequent miss just re-reads RocksDB).
+    fn cache_nid(&self, string: &str, nid: u64) {
+        const NID_CACHE_CAP: usize = 200_000;
+        if self.nid_cache.len() >= NID_CACHE_CAP {
+            self.nid_cache.clear();
+            self.nid_reverse_cache.clear();
+        }
+        self.nid_cache.insert(string.to_string(), nid);
+        self.nid_reverse_cache
+            .insert(nid, std::sync::Arc::from(string));
     }
 
     // --- User operations ---

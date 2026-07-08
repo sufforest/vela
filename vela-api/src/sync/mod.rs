@@ -846,12 +846,13 @@ pub(crate) fn build_sync_response_inner(
 /// `user_nid` is `None`.
 fn attach_membership_for_user(
     state: &AppState,
+    room_nid: u64,
     ev: &mut Value,
     user_nid: Option<u64>,
     event_nid: u64,
 ) {
     let Some(uid) = user_nid else { return };
-    let membership = crate::room::messages::membership_at_event(state, 0, uid, event_nid)
+    let membership = crate::room::messages::membership_at_event(state, room_nid, uid, event_nid)
         .ok()
         .flatten()
         .unwrap_or_else(|| "leave".to_string());
@@ -992,7 +993,7 @@ fn compute_state_delta(
     let mut out = Vec::with_capacity(latest_by_slot.len());
     for (_, (_, nid)) in latest_by_slot {
         if let Some(mut ev) = load_client_event(state, nid, room_id)? {
-            attach_membership_for_user(state, &mut ev, user_nid, nid);
+            attach_membership_for_user(state, room_nid, &mut ev, user_nid, nid);
             attach_txn_id_for_user(state, &mut ev, user_nid, device_id, nid);
             out.push(ev);
         }
@@ -1238,7 +1239,7 @@ fn build_room_sync_for_user(
             let mut state_events = Vec::new();
             for nid in &state_nids {
                 if let Some(mut ev) = load_client_event(state, *nid, room_id)? {
-                    attach_membership_for_user(state, &mut ev, user_nid, *nid);
+                    attach_membership_for_user(state, room_nid, &mut ev, user_nid, *nid);
                     attach_txn_id_for_user(state, &mut ev, user_nid, device_id, *nid);
                     state_events.push(ev);
                 }
