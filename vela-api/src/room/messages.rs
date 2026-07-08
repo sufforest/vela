@@ -1897,7 +1897,7 @@ fn event_is_own_member_event(
 /// or joined yet).
 pub(crate) fn membership_at_event(
     state: &AppState,
-    _room_nid: u64,
+    room_nid: u64,
     user_nid: u64,
     event_nid: u64,
 ) -> Result<Option<String>, ApiError> {
@@ -1940,28 +1940,42 @@ pub(crate) fn membership_at_event(
         None => return Ok(None),
     };
 
+    // Fast path (when the caller supplies `room_nid`): the user's CURRENT
+    // member event has a known nid. If the state-at-`event_nid` snapshot
+    // contains that exact nid, then the user's membership at the event IS
+    // their current one — no need to load every state event to find theirs.
+    // Provably correct: the snapshot lists the state event nids in effect at
+    // the event, so containing the current member nid means it was current
+    // then too. This turns the common case (recent events of a still-current
+    // member) from O(state) event loads into an O(state) integer scan + one
+    // load. Falls through to the scan when `room_nid` is unknown (0) or the
+    // snapshot holds an older/absent membership for the user.
+    if room_nid != 0
+        && let Some(current_member_nid) = state
+            .db
+            .get_state_event_nid(room_nid, member_type_nid, user_sk_nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        && snapshot.contains(&current_member_nid)
+    {
+        return read_event_membership(state, current_member_nid);
+    }
+
+    // Fallback: scan the snapshot for the user's member event (an older
+    // membership than current, or a caller who isn't a current member).
     for nid in snapshot {
-        let header = match state
+        let (header, bytes) = match state
             .db
             .get_event(nid)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
         {
-            Some((h, _)) => h,
+            Some(hb) => hb,
             None => continue,
         };
         if header.type_nid != member_type_nid || header.state_key_nid != user_sk_nid {
             continue;
         }
-        // Found the user's member event in the snapshot — read its
-        // `content.membership`.
-        let bytes = match state
-            .db
-            .get_event(nid)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        {
-            Some((_, b)) => b,
-            None => return Ok(None),
-        };
+        // Found the user's member event — read its `content.membership`
+        // from the bytes we already loaded (no second get_event).
         let value: Value = match serde_json::from_slice(&bytes) {
             Ok(v) => v,
             Err(_) => return Ok(None),
@@ -1972,6 +1986,25 @@ pub(crate) fn membership_at_event(
             .map(String::from));
     }
     Ok(None)
+}
+
+/// Read `content.membership` from a member event by nid.
+fn read_event_membership(state: &AppState, event_nid: u64) -> Result<Option<String>, ApiError> {
+    let Some((_, bytes)) = state
+        .db
+        .get_event(event_nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(None);
+    };
+    let value: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    Ok(value
+        .pointer("/content/membership")
+        .and_then(|m| m.as_str())
+        .map(String::from))
 }
 
 #[cfg(test)]
