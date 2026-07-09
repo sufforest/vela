@@ -3,7 +3,10 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use rocksdb::{ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options, WriteBatch};
+use rocksdb::{
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DataBlockIndexType, Direction,
+    IteratorMode, Options, WriteBatch,
+};
 use serde_json::Value;
 
 use crate::cf::COLUMN_FAMILIES;
@@ -248,11 +251,12 @@ impl Database {
         // running server's.
         let existing = DB::list_cf(&db_opts, primary)
             .unwrap_or_else(|_| COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect());
+        let block_cache = Cache::new_hyper_clock_cache(BLOCK_CACHE_BYTES, 0);
         let cfs: Vec<ColumnFamilyDescriptor> = existing
             .iter()
             .map(|name| {
                 let mut cf_opts = Options::default();
-                configure_cf(&mut cf_opts, name);
+                configure_cf(&mut cf_opts, name, &block_cache);
                 ColumnFamilyDescriptor::new(name, cf_opts)
             })
             .collect();
@@ -287,11 +291,20 @@ impl Database {
         db_opts.set_max_background_jobs(4);
         db_opts.increase_parallelism(num_cpus() as i32);
 
+        // One shared block cache across all CFs. HyperClockCache is
+        // near-lock-free on lookup/release, which the default sharded LRU
+        // cache is NOT — under concurrent /sync the LRU shard mutex
+        // (`LRUCacheShard::Release`) was the top contention point and made
+        // throughput regress as concurrency rose. Sharing one large cache
+        // also pools memory across CFs for a better hit rate than the old
+        // per-CF `optimize_for_point_lookup` caches.
+        let block_cache = Cache::new_hyper_clock_cache(BLOCK_CACHE_BYTES, 0);
+
         let cfs: Vec<ColumnFamilyDescriptor> = COLUMN_FAMILIES
             .iter()
             .map(|name| {
                 let mut cf_opts = Options::default();
-                configure_cf(&mut cf_opts, name);
+                configure_cf(&mut cf_opts, name, &block_cache);
                 ColumnFamilyDescriptor::new(*name, cf_opts)
             })
             .collect();
@@ -7654,17 +7667,44 @@ pub struct EventHeader {
 
 // --- Helpers ---
 
-fn configure_cf(opts: &mut Options, name: &str) {
+/// Size of the shared block cache (all CFs). Big enough that the hot read
+/// set (`events`, `room_timeline`, `room_state`, nid maps, …) stays resident
+/// so /sync reads hit the cache instead of decompressing SST blocks.
+const BLOCK_CACHE_BYTES: usize = 512 * 1024 * 1024;
+
+fn configure_cf(opts: &mut Options, name: &str, block_cache: &Cache) {
+    let mut bbt = BlockBasedOptions::default();
+    // Share ONE cache across every CF (near-lock-free HyperClockCache). The
+    // previous `optimize_for_point_lookup` gave a few CFs their own LRU cache
+    // and left the hottest one (`events`) on the small default cache, whose
+    // shard mutex was the concurrency bottleneck.
+    bbt.set_block_cache(block_cache);
     match name {
         "event_ids" | "memberships" | "tokens" | "nid_map" => {
+            // Point-lookup CFs. Re-add everything `optimize_for_point_lookup`
+            // gave these (minus its per-CF LRU cache, now the shared HCC):
+            // a whole-key bloom on the SST + memtable so a lookup skips files
+            // and memtables that can't hold the key, and a per-data-block hash
+            // index so the in-block lookup is O(1) instead of a binary search.
             opts.set_bloom_locality(10);
-            opts.optimize_for_point_lookup(64 * 1024 * 1024);
+            // Both are needed for a memtable whole-key bloom: the filter flag
+            // alone is a no-op — RocksDB only allocates the bloom when the
+            // size ratio is > 0. `optimize_for_point_lookup` set both (0.02).
+            opts.set_memtable_whole_key_filtering(true);
+            opts.set_memtable_prefix_bloom_ratio(0.02);
+            bbt.set_bloom_filter(10.0, false);
+            bbt.set_whole_key_filtering(true);
+            bbt.set_data_block_index_type(DataBlockIndexType::BinaryAndHash);
+            bbt.set_data_block_hash_ratio(0.75);
         }
         "room_timeline" | "room_state" | "user_rooms" | "search_index" => {
             opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(8));
+            // Prefix bloom so a prefix scan skips SSTs without that prefix.
+            bbt.set_bloom_filter(10.0, false);
         }
         _ => {}
     }
+    opts.set_block_based_table_factory(&bbt);
 }
 
 fn num_cpus() -> usize {
