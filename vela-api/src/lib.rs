@@ -20,6 +20,7 @@ pub mod media;
 pub mod membership;
 pub mod metrics;
 pub mod middleware;
+pub mod moderation;
 #[cfg(feature = "otel")]
 pub mod otel;
 pub mod presence;

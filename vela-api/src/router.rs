@@ -431,6 +431,12 @@ pub struct AppState {
     /// binds `on_event`); a background worker drains it and runs the observers
     /// off the request path. Cheap to clone; inert when nothing binds `on_event`.
     pub observe_queue: crate::extensions::ObserveQueue,
+    /// Native moderation / policy-list enforcement. Inert unless `[moderation]
+    /// enabled = true`; the enforcement sites (invite/join, local + federation)
+    /// consult it and every check short-circuits when disabled. Holds the
+    /// compiled ban list behind `ArcSwap` so policy-rule changes swap it
+    /// without locking the request path.
+    pub moderation: crate::moderation::ModerationState,
 }
 
 /// An empty extension runtime (no plugins) — allows everything. Lets external

@@ -439,6 +439,21 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
         );
     }
 
+    // Moderation: reject events whose sender (or their server) is policy-banned,
+    // so a globally-banned account or server can't get events into our DAG.
+    // Coarse by design (a banned server's events are dropped wholesale, like a
+    // global ACL); cleanup of already-resident offenders is a later feature.
+    if let Some(reason) = state.moderation.check_user(&pdu.sender) {
+        tracing::debug!(
+            sender = %pdu.sender, %reason,
+            "moderation: rejected inbound PDU from banned sender"
+        );
+        return (
+            pdu.event_id,
+            PduOutcome::Rejected(format!("moderation policy: {reason}")),
+        );
+    }
+
     // Pass the key ids this event is signed with so a sender that rotated its
     // signing key is re-fetched rather than rejected against a stale cache.
     let wanted: Vec<&str> = obj
@@ -1632,6 +1647,12 @@ async fn persist_received_pdu(
             .db
             .promote_state_event(room_nid, event_nid, type_nid, state_key_nid)
             .map_err(|e| format!("db: {e}"))?;
+
+        // Keep the moderation ban list live when a federated policy rule lands
+        // in a watched policy room. No-op unless moderation is on for this room.
+        state
+            .moderation
+            .maybe_refresh(&state.db, room_nid, &pdu.event_type);
 
         // Mirror m.room.member transitions into user_rooms so /sync's
         // get_user_left_rooms / get_user_joined_rooms reflect the
