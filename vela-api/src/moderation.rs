@@ -33,11 +33,25 @@ const BAN_RECOMMENDATIONS: [&str; 2] = ["m.ban", "org.matrix.mjolnir.ban"];
 /// Cadence of the background safety-net rebuild (see [`ModerationState::spawn_sweeper`]).
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// One compiled ban rule: a glob entity + the moderator's reason.
+/// One compiled ban rule: a glob entity, the moderator's reason, and the nid of
+/// the policy room it came from (so a listing can show the source and whether
+/// `!unban` applies — only rules from the admin room are locally revocable).
 #[derive(Debug, Clone)]
 struct Rule {
     entity: String,
     reason: String,
+    source_room_nid: u64,
+}
+
+/// A ban list entry flattened for display (`!bans`).
+#[derive(Debug, Clone)]
+pub struct BanEntry {
+    /// `"user"` | `"server"` | `"room"`.
+    pub kind: &'static str,
+    pub entity: String,
+    pub reason: String,
+    /// The policy room this rule was compiled from.
+    pub source_room_nid: u64,
 }
 
 /// The compiled ban list — three glob buckets. Empty = nothing banned.
@@ -63,6 +77,30 @@ impl BanList {
 
     pub fn is_empty(&self) -> bool {
         self.users.is_empty() && self.servers.is_empty() && self.rooms.is_empty()
+    }
+
+    /// All entries, grouped users → servers → rooms and sorted by entity within
+    /// each group, for `!bans` listing. The stable order keeps pagination
+    /// deterministic across calls (the underlying scan order isn't).
+    fn entries(&self) -> Vec<BanEntry> {
+        let mut out = Vec::with_capacity(self.users.len() + self.servers.len() + self.rooms.len());
+        for (kind, rules) in [
+            ("user", &self.users),
+            ("server", &self.servers),
+            ("room", &self.rooms),
+        ] {
+            let start = out.len();
+            for r in rules {
+                out.push(BanEntry {
+                    kind,
+                    entity: r.entity.clone(),
+                    reason: r.reason.clone(),
+                    source_room_nid: r.source_room_nid,
+                });
+            }
+            out[start..].sort_by(|a, b| a.entity.cmp(&b.entity));
+        }
+        out
     }
 }
 
@@ -210,6 +248,13 @@ impl ModerationState {
     /// `(users, servers, rooms)` ban counts for the current list.
     pub fn ban_counts(&self) -> (usize, usize, usize) {
         self.ban_list.load().counts()
+    }
+
+    /// All current ban entries (users → servers → rooms) for the `!bans`
+    /// listing. Cloned out of the `ArcSwap` snapshot so the caller isn't tied to
+    /// the guard's lifetime.
+    pub fn list_bans(&self) -> Vec<BanEntry> {
+        self.ban_list.load().entries()
     }
 
     /// Rebuild the ban list if `event_type` is a policy rule applied to a
@@ -362,7 +407,8 @@ fn collect_rules(db: &Database, room_nid: u64, type_str: &str, out: &mut Vec<Rul
                 continue;
             }
         };
-        if let Some(rule) = parse_rule(content.get("content")) {
+        if let Some(mut rule) = parse_rule(content.get("content")) {
+            rule.source_room_nid = room_nid;
             out.push(rule);
         }
     }
@@ -400,6 +446,8 @@ fn parse_rule(content: Option<&Value>) -> Option<Rule> {
     Some(Rule {
         entity: entity.to_string(),
         reason,
+        // Set by collect_rules, which knows the source room.
+        source_room_nid: 0,
     })
 }
 
@@ -414,6 +462,7 @@ mod tests {
                 .map(|e| Rule {
                     entity: e.to_string(),
                     reason: "spam".into(),
+                    source_room_nid: 0,
                 })
                 .collect()
         };
