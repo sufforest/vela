@@ -931,6 +931,11 @@ async fn handle_command(
         "rotate-signing-key" => cmd_rotate_signing_key(state).await?,
         "reindex-search" => cmd_reindex_search(state).await?,
         "reports" => cmd_reports(state, rest).await?,
+        "moderation" => cmd_moderation(state).await?,
+        "ban" => cmd_ban(state, rest).await?,
+        "unban" => cmd_unban(state, rest).await?,
+        "watch" => cmd_watch(state, rest).await?,
+        "unwatch" => cmd_unwatch(state, rest).await?,
         "as" => cmd_appservice(state, body).await,
         other => Reply::plain(format!(
             "unknown command: !{other}\ntype `!help` for the list of commands"
@@ -988,6 +993,11 @@ fn cmd_help() -> Reply {
         !rotate-signing-key                  generate a new server signing key (restart required)\n\
         !reindex-search                      rebuild the full-text search index from history\n\
         !reports [N]                         last N user-submitted abuse reports (default 20)\n\
+        !moderation                          moderation status: watched rooms + ban counts\n\
+        !ban <user|server|room> <glob> [why] add a policy ban (enforced locally)\n\
+        !unban <user|server|room> <glob>     revoke a ban issued via !ban\n\
+        !watch <room_id> [server]            compile a policy room's rules (joins remote rooms)\n\
+        !unwatch <room_id>                   stop compiling a policy room's rules\n\
         !as register <yaml>                  register an Application Service (paste YAML)\n\
         !as list                             list registered Application Services\n\
         !as unregister <id>                  remove an Application Service\n\
@@ -1872,6 +1882,273 @@ fn html_escape(s: &str) -> String {
 }
 
 // =====================================================================
+// Moderation commands (see crate::moderation)
+// =====================================================================
+
+fn moderation_disabled_reply() -> Reply {
+    Reply::plain("moderation is disabled — set `[moderation] enabled = true` and restart")
+}
+
+fn policy_event_type(kind: &str) -> Option<&'static str> {
+    match kind {
+        "user" => Some("m.policy.rule.user"),
+        "server" => Some("m.policy.rule.server"),
+        "room" => Some("m.policy.rule.room"),
+        _ => None,
+    }
+}
+
+/// Deterministic state key for a policy rule targeting `entity`. Using the mxid
+/// directly would trip the owned-state-key rule (a `@…` state_key must match the
+/// sender); a hash — the Mjolnir/Draupnir convention — is never `@`-prefixed and
+/// lets `!unban` recompute the same key to revoke the rule. The entity itself
+/// lives in `content.entity`, which is what enforcement reads.
+fn policy_state_key(entity: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(entity.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `!moderation` — status: watched policy rooms + ban counts.
+async fn cmd_moderation(state: &AppState) -> Result<Reply, ApiError> {
+    if !state.moderation.enabled {
+        return Ok(moderation_disabled_reply());
+    }
+    let (u, s, r) = state.moderation.ban_counts();
+    let watched = state.moderation.watched_rooms();
+    let mut lines = vec![
+        "moderation: enabled".to_string(),
+        format!("bans: {u} users, {s} servers, {r} rooms"),
+    ];
+    if watched.is_empty() {
+        lines.push("watched policy rooms: none".to_string());
+    } else {
+        lines.push(format!("watched policy rooms ({}):", watched.len()));
+        for nid in watched {
+            match state.db.resolve_nid(nid) {
+                Ok(Some(rid)) => lines.push(format!("  {rid}")),
+                _ => lines.push(format!("  <nid {nid}>")),
+            }
+        }
+    }
+    Ok(Reply::plain(lines.join("\n")))
+}
+
+/// `!ban <user|server|room> <entity> [reason]` — write an `m.policy.rule.*`
+/// ban into the admin room, which doubles as this server's local policy room, so
+/// the existing enforcement + refresh machinery picks it up. Enforced locally
+/// only (the admin room is unfederated) — publishing a shareable list is a
+/// separate feature. state_key = a hash of the entity, so it's idempotent.
+async fn cmd_ban(state: &AppState, args: &[String]) -> Result<Reply, ApiError> {
+    if !state.moderation.enabled {
+        return Ok(moderation_disabled_reply());
+    }
+    let Some((kind, rest)) = args.split_first() else {
+        return Ok(Reply::plain(
+            "usage: !ban <user|server|room> <entity> [reason]",
+        ));
+    };
+    let Some(event_type) = policy_event_type(kind) else {
+        return Ok(Reply::plain(format!(
+            "unknown ban target `{kind}` (use user|server|room)"
+        )));
+    };
+    let Some((entity, reason_parts)) = rest.split_first() else {
+        return Ok(Reply::plain(
+            "usage: !ban <user|server|room> <entity> [reason]",
+        ));
+    };
+    if entity.chars().all(|c| c == '*' || c == '?') {
+        return Ok(Reply::plain(
+            "refusing an all-wildcard entity — it would ban everything",
+        ));
+    }
+    let reason = reason_parts.join(" ");
+    let room_nid = ensure_policy_room_watched(state).await?;
+    let bot = bot_auth_user(state)?;
+    let content = json!({"entity": entity, "recommendation": "m.ban", "reason": reason});
+    emit_event_as(
+        state,
+        room_nid,
+        bot.user_nid,
+        &bot.user_id,
+        event_type,
+        content,
+        Some(&policy_state_key(entity)),
+    )
+    .await?;
+    // emit_event_as bypasses the generic /state refresh hook — refresh here.
+    state
+        .moderation
+        .maybe_refresh(&state.db, room_nid, event_type);
+    Ok(Reply::plain(format!("banned {kind} `{entity}`")))
+}
+
+/// `!unban <user|server|room> <entity>` — revoke a `!ban` by writing empty
+/// content to the same policy-rule state key (a revoked rule).
+async fn cmd_unban(state: &AppState, args: &[String]) -> Result<Reply, ApiError> {
+    if !state.moderation.enabled {
+        return Ok(moderation_disabled_reply());
+    }
+    let Some((kind, rest)) = args.split_first() else {
+        return Ok(Reply::plain("usage: !unban <user|server|room> <entity>"));
+    };
+    let Some(event_type) = policy_event_type(kind) else {
+        return Ok(Reply::plain(format!(
+            "unknown ban target `{kind}` (use user|server|room)"
+        )));
+    };
+    let Some(entity) = rest.first() else {
+        return Ok(Reply::plain("usage: !unban <user|server|room> <entity>"));
+    };
+    let Some(room_nid) = state
+        .db
+        .get_admin_room_nid()
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(Reply::plain("no admin room; nothing to unban"));
+    };
+    let bot = bot_auth_user(state)?;
+    emit_event_as(
+        state,
+        room_nid,
+        bot.user_nid,
+        &bot.user_id,
+        event_type,
+        json!({}),
+        Some(&policy_state_key(entity)),
+    )
+    .await?;
+    state
+        .moderation
+        .maybe_refresh(&state.db, room_nid, event_type);
+    Ok(Reply::plain(format!(
+        "unbanned {kind} `{entity}` (reverses !ban only; external lists are unaffected)"
+    )))
+}
+
+/// `!watch <room_id> [server_hint …]` — compile a policy room's rules into the
+/// ban list. A remote room is joined by the admin bot first so we receive its
+/// state (the shared-list subscription path).
+async fn cmd_watch(state: &AppState, args: &[String]) -> Result<Reply, ApiError> {
+    if !state.moderation.enabled {
+        return Ok(moderation_disabled_reply());
+    }
+    let Some((room_id_str, hints)) = args.split_first() else {
+        return Ok(Reply::plain("usage: !watch <room_id> [server_hint …]"));
+    };
+    let Ok(room_id) = RoomId::parse(room_id_str) else {
+        return Ok(Reply::plain(format!(
+            "`{room_id_str}` is not a valid room id"
+        )));
+    };
+    let room_nid = match state
+        .db
+        .get_nid(room_id.as_str())
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    {
+        Some(nid) => nid,
+        None => {
+            // Remote room — the admin bot joins it so we receive its state.
+            let bot = bot_auth_user(state)?;
+            let mut server_hints: Vec<String> = hints.to_vec();
+            if server_hints.is_empty()
+                && let Some((_, domain)) = room_id.as_str().split_once(':')
+            {
+                server_hints.push(domain.to_string());
+            }
+            // A remote join can legitimately fail (unreachable server, no hint) —
+            // report it back to the operator rather than silently erroring out.
+            if let Err(e) = crate::membership::federation_outbound_join::do_remote_join(
+                state,
+                &bot.user_id,
+                bot.user_nid,
+                &room_id,
+                &server_hints,
+            )
+            .await
+            {
+                return Ok(Reply::plain(format!(
+                    "could not join {room_id}: {} — pass a reachable server hint and retry",
+                    e.0
+                )));
+            }
+            state
+                .db
+                .get_nid(room_id.as_str())
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                .ok_or_else(|| {
+                    ApiError(VelaError::Store(
+                        "joined the policy room but it did not become local".into(),
+                    ))
+                })?
+        }
+    };
+    state
+        .moderation
+        .watch_room(&state.db, room_nid, room_id.as_str())
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let (u, s, r) = state.moderation.ban_counts();
+    Ok(Reply::plain(format!(
+        "watching {room_id}\nban list now: {u} users, {s} servers, {r} rooms"
+    )))
+}
+
+/// `!unwatch <room_id>` — stop compiling a policy room's rules. The admin bot
+/// stays joined to any remote room (leave it manually if you want).
+async fn cmd_unwatch(state: &AppState, args: &[String]) -> Result<Reply, ApiError> {
+    if !state.moderation.enabled {
+        return Ok(moderation_disabled_reply());
+    }
+    let Some(room_id_str) = args.first() else {
+        return Ok(Reply::plain("usage: !unwatch <room_id>"));
+    };
+    // Refuse to unwatch the admin room — it doubles as the local policy room for
+    // `!ban`, so unwatching it would silently disable every local ban.
+    if let Some(admin_room) = state
+        .db
+        .get_admin_room_id()
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        && admin_room == *room_id_str
+    {
+        return Ok(Reply::plain(
+            "refusing to unwatch the admin room — it holds this server's own `!ban`s",
+        ));
+    }
+    let was_watched = state
+        .moderation
+        .unwatch_room(&state.db, room_id_str)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if was_watched {
+        Ok(Reply::plain(format!("stopped watching {room_id_str}")))
+    } else {
+        Ok(Reply::plain(format!("{room_id_str} was not being watched")))
+    }
+}
+
+/// Ensure the admin room (this server's local policy room for `!ban`) is watched,
+/// returning its nid. Idempotent — `watch_room` no-ops when already watched.
+async fn ensure_policy_room_watched(state: &AppState) -> Result<u64, ApiError> {
+    let room_nid = state
+        .db
+        .get_admin_room_nid()
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        .ok_or_else(|| ApiError(VelaError::Store("admin room missing".into())))?;
+    let room_id = state
+        .db
+        .get_admin_room_id()
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        .ok_or_else(|| ApiError(VelaError::Store("admin room id missing".into())))?;
+    state
+        .moderation
+        .watch_room(&state.db, room_nid, &room_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    Ok(room_nid)
+}
+
+// =====================================================================
 // Internal bot send + auth identity
 // =====================================================================
 
@@ -2105,6 +2382,115 @@ mod tests {
     use super::*;
     use crate::test_helpers::build_test_state;
     use serde_json::json;
+
+    fn arg(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    #[tokio::test]
+    async fn moderation_ban_writes_policy_and_enforces() {
+        let (mut state, _tmp) = build_test_state();
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        bootstrap(&state).await.unwrap();
+
+        let r = cmd_ban(&state, &arg("user @bad:evil.com being a spammer"))
+            .await
+            .unwrap();
+        assert!(r.text.contains("banned"), "reply: {}", r.text);
+        assert!(state.moderation.check_user("@bad:evil.com").is_some());
+
+        // A server ban blocks the whole domain.
+        cmd_ban(&state, &arg("server evil.com")).await.unwrap();
+        assert!(state.moderation.check_user("@anyone:evil.com").is_some());
+
+        // Unban the user; the server ban still covers the domain.
+        cmd_unban(&state, &arg("user @bad:evil.com")).await.unwrap();
+        assert!(state.moderation.check_user("@bad:evil.com").is_some()); // via server rule
+        cmd_unban(&state, &arg("server evil.com")).await.unwrap();
+        assert!(state.moderation.check_user("@bad:evil.com").is_none());
+    }
+
+    #[tokio::test]
+    async fn moderation_commands_noop_when_disabled() {
+        // build_test_state leaves moderation disabled.
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let r = cmd_ban(&state, &arg("user @x:y.com")).await.unwrap();
+        assert!(r.text.contains("disabled"), "reply: {}", r.text);
+        assert!(state.moderation.check_user("@x:y.com").is_none());
+    }
+
+    #[tokio::test]
+    async fn moderation_all_wildcard_ban_refused() {
+        let (mut state, _tmp) = build_test_state();
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        bootstrap(&state).await.unwrap();
+        let r = cmd_ban(&state, &arg("user *")).await.unwrap();
+        assert!(r.text.contains("refusing"), "reply: {}", r.text);
+        assert!(state.moderation.check_user("@anyone:anywhere").is_none());
+    }
+
+    #[tokio::test]
+    async fn moderation_status_reports_state() {
+        let (mut state, _tmp) = build_test_state();
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        bootstrap(&state).await.unwrap();
+        cmd_ban(&state, &arg("user @bad:evil.com")).await.unwrap();
+        let r = cmd_moderation(&state).await.unwrap();
+        assert!(r.text.contains("enabled"), "reply: {}", r.text);
+        assert!(r.text.contains("1 users"), "reply: {}", r.text);
+    }
+
+    #[tokio::test]
+    async fn moderation_watch_unwatch_local_room_persists() {
+        let (mut state, _tmp) = build_test_state();
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        bootstrap(&state).await.unwrap();
+        // A local room id (interned) that isn't the admin room.
+        let room = "!watched:localhost".to_string();
+        let nid = state.db.get_or_create_nid(&room).unwrap();
+
+        let r = cmd_watch(&state, &arg(&room)).await.unwrap();
+        assert!(r.text.contains("watching"), "reply: {}", r.text);
+        assert!(state.moderation.is_watched(nid));
+        assert!(
+            state
+                .db
+                .get_moderation_watched_rooms()
+                .unwrap()
+                .contains(&room),
+            "watch persisted"
+        );
+
+        let r = cmd_unwatch(&state, &arg(&room)).await.unwrap();
+        assert!(r.text.contains("stopped"), "reply: {}", r.text);
+        assert!(!state.moderation.is_watched(nid));
+        assert!(
+            !state
+                .db
+                .get_moderation_watched_rooms()
+                .unwrap()
+                .contains(&room),
+            "unwatch persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn moderation_refuses_to_unwatch_admin_room() {
+        let (mut state, _tmp) = build_test_state();
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        bootstrap(&state).await.unwrap();
+        // A ban arms the admin room as the local policy room.
+        cmd_ban(&state, &arg("user @bad:evil.com")).await.unwrap();
+        let admin_room = state.db.get_admin_room_id().unwrap().unwrap();
+        let admin_nid = state.db.get_nid(&admin_room).unwrap().unwrap();
+
+        let r = cmd_unwatch(&state, &arg(&admin_room)).await.unwrap();
+        assert!(r.text.contains("refusing"), "reply: {}", r.text);
+        // Still watched, ban still enforced.
+        assert!(state.moderation.is_watched(admin_nid));
+        assert!(state.moderation.check_user("@bad:evil.com").is_some());
+    }
 
     #[tokio::test]
     async fn bootstrap_creates_bot_and_room() {
