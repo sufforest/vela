@@ -108,7 +108,7 @@ async fn put_room_visibility_requires_power_level() {
     // bob joins (power 0).
     let resp = h
         .request(
-            Request::post(format!("/_matrix/client/v3/rooms/{}/join", &room))
+            Request::post(format!("/_matrix/client/v3/rooms/{}/join", room))
                 .header("authorization", format!("Bearer {bob_tok}"))
                 .header("content-type", "application/json")
                 .body(Body::from("{}"))
@@ -122,7 +122,7 @@ async fn put_room_visibility_requires_power_level() {
     );
 
     let put_visibility = |tok: &str| {
-        Request::put(format!("/_matrix/client/v3/directory/list/room/{}", &room))
+        Request::put(format!("/_matrix/client/v3/directory/list/room/{}", room))
             .header("authorization", format!("Bearer {tok}"))
             .header("content-type", "application/json")
             .body(Body::from(json!({"visibility": "public"}).to_string()))

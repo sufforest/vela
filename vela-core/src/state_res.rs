@@ -688,15 +688,10 @@ fn mainline_position(
             None => return usize::MAX,
         };
         // Find power_levels in pdu's auth_events
-        let next = pdu.auth_events.iter().find_map(|ae_id| {
-            event_fn(ae_id).and_then(|ae| {
-                if ae.event_type == "m.room.power_levels" {
-                    Some(ae)
-                } else {
-                    None
-                }
-            })
-        });
+        let next = pdu
+            .auth_events
+            .iter()
+            .find_map(|ae_id| event_fn(ae_id).filter(|ae| ae.event_type == "m.room.power_levels"));
         match next {
             Some(pl) => {
                 if let Some(&idx) = mainline_index.get(&pl.event_id) {
