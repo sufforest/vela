@@ -141,6 +141,20 @@ pub async fn make_join(
     // template at all.
     crate::federation::server_acl::deny_if_blocked(&state, room_nid, &origin.0)?;
 
+    // Moderation: block a policy-banned user (or their server) from getting a
+    // join template. `check_user` covers the origin server too.
+    if let Some(reason) = state.moderation.check_user(&user_id) {
+        tracing::info!(
+            room = %room_id, user = %user_id, %reason,
+            "moderation: rejected make_join from banned user"
+        );
+        return Err(err_response(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "user is subject to a moderation policy on this server",
+        ));
+    }
+
     // Accept public + restricted/knock_restricted rooms outright.
     // For invite-only rooms, accept iff the user has a current
     // `m.room.member` invite — the spec lets invited users
@@ -413,6 +427,21 @@ pub async fn send_join_v2(
     // when the origin is banned by the room's ACL.
     if let Some(room_nid) = state.db.get_nid(&room_id).ok().flatten() {
         crate::federation::server_acl::deny_if_blocked(&state, room_nid, &origin.0)?;
+    }
+
+    // Moderation: reject a send_join whose sender (or their server) is
+    // policy-banned. Not gated on the room existing locally — the sender is
+    // always known. `check_user` covers the origin server too.
+    if let Some(reason) = state.moderation.check_user(sender) {
+        tracing::info!(
+            room = %room_id, %sender, %reason,
+            "moderation: rejected send_join from banned sender"
+        );
+        return Err(err_response(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "sender is subject to a moderation policy on this server",
+        ));
     }
 
     // Look up the room version up-front so verify_event_signature

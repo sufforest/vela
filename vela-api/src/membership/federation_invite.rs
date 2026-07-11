@@ -132,6 +132,34 @@ pub async fn invite_v2(
         crate::federation::server_acl::deny_if_blocked(&state, room_nid, &origin.0)?;
     }
 
+    // Moderation: reject invites from a policy-banned user or server, or into a
+    // banned room. Checked unconditionally (not gated on the room existing
+    // locally) — sender and room are always known, and a first-time invite is
+    // exactly when we most want to keep a banned account out. `check_user`
+    // covers the sender's server too.
+    if let Some(reason) = state.moderation.check_user(&sender) {
+        tracing::info!(
+            room = %room_id, %sender, %reason,
+            "moderation: rejected federated invite from banned sender"
+        );
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "sender is subject to a moderation policy on this server",
+        ));
+    }
+    if let Some(reason) = state.moderation.check_room(&room_id) {
+        tracing::info!(
+            room = %room_id, %reason,
+            "moderation: rejected federated invite into banned room"
+        );
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "room is subject to a moderation policy on this server",
+        ));
+    }
+
     // MSC4155 invite filtering: consult the target's
     // `org.matrix.msc4155.invite_permission_config` account_data and
     // reject (Block) or silently swallow (Ignore) accordingly.

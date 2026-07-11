@@ -172,6 +172,23 @@ async fn do_join(
     server_hints: Vec<String>,
     extra_content: Option<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    // Moderation: block joins to a banned room and joins by a banned user.
+    // Checked on `room_id` (a string) before the local/remote branch below so
+    // a banned *remote* room is refused before we fire an outbound federated
+    // join.
+    if let Some(reason) = state.moderation.check_room(room_id.as_str()) {
+        tracing::info!(room = %room_id, %reason, "moderation: blocked join of banned room");
+        return Err(ApiError(VelaError::Forbidden(
+            "This room is subject to a moderation policy on this server".into(),
+        )));
+    }
+    if let Some(reason) = state.moderation.check_user(&user.user_id) {
+        tracing::info!(user = %user.user_id, %reason, "moderation: blocked banned user from joining");
+        return Err(ApiError(VelaError::Forbidden(
+            "You are subject to a moderation policy on this server".into(),
+        )));
+    }
+
     // If the room is known locally, run the regular local join flow.
     // Otherwise, if the client supplied server_name hints, dispatch to the
     // federated outbound-join path.
@@ -1329,6 +1346,22 @@ pub async fn knock_room(
         (room_id, Vec::new())
     };
 
+    // Moderation: block a banned user from knocking, and block knocks on a
+    // banned room. Checked on the room id (before nid resolution) so a banned
+    // remote room is refused before any outbound make_knock fires.
+    if let Some(reason) = state.moderation.check_room(room_id.as_str()) {
+        tracing::info!(room = %room_id, %reason, "moderation: blocked knock on banned room");
+        return Err(ApiError(VelaError::Forbidden(
+            "This room is subject to a moderation policy on this server".into(),
+        )));
+    }
+    if let Some(reason) = state.moderation.check_user(&user.user_id) {
+        tracing::info!(user = %user.user_id, %reason, "moderation: blocked banned user from knocking");
+        return Err(ApiError(VelaError::Forbidden(
+            "You are subject to a moderation policy on this server".into(),
+        )));
+    }
+
     // Unknown room → assume remote; use `?server_name=` hints to locate a
     // resident server and run the federated make_knock/send_knock flow.
     let room_nid = match state
@@ -2025,6 +2058,33 @@ async fn emit_membership_event_for_target(
     membership: &str,
     extra_content: Option<&Value>,
 ) -> Result<(), ApiError> {
+    // Moderation: keep policy-banned entities out of rooms. Only invites are
+    // gated here (this is also the join/leave/kick/ban author) — removing a
+    // banned user must always succeed. This covers the /invite API and
+    // createRoom's *remote* invitees (routed via `invite_user_internal`).
+    // createRoom's local invitees (built inline in `create_room`) and raw
+    // `/state` m.room.member invites are gated at their own sites.
+    if membership == "invite" {
+        if let Some(reason) = state.moderation.check_user(target_user_id) {
+            tracing::info!(
+                room = %room_id, target = %target_user_id, %reason,
+                "moderation: blocked invite of banned user"
+            );
+            return Err(ApiError(VelaError::Forbidden(
+                "This user is subject to a moderation policy on this server".into(),
+            )));
+        }
+        if let Some(reason) = state.moderation.check_user(&sender.user_id) {
+            tracing::info!(
+                room = %room_id, sender = %sender.user_id, %reason,
+                "moderation: blocked banned user from inviting"
+            );
+            return Err(ApiError(VelaError::Forbidden(
+                "You are subject to a moderation policy on this server".into(),
+            )));
+        }
+    }
+
     let signing_key = get_or_create_signing_key(state)?;
     let server_name = &state.config.server_name;
     let room_version = state

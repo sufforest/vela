@@ -81,6 +81,22 @@ struct Config {
     extensions: ExtensionsSection,
     #[serde(default)]
     search: SearchSection,
+    #[serde(default)]
+    moderation: ModerationSection,
+}
+
+/// `[moderation]` section — native enforcement of Matrix policy lists
+/// (`m.policy.rule.*`). Off by default: only public/community deployments
+/// that want to enforce a ban list turn it on. `policy_rooms` names the rooms
+/// whose policy-rule state events are compiled into the in-memory ban list;
+/// PR-1 reads *local* policy rooms (ones this server hosts), so create the
+/// room here and set rules from a client. Rooms not held locally are skipped
+/// with a warning.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct ModerationSection {
+    enabled: bool,
+    policy_rooms: Vec<String>,
 }
 
 /// `[search]` section — full-text message search (`POST /v3/search`).
@@ -1488,6 +1504,15 @@ fn main() -> anyhow::Result<()> {
         )?));
         let observe_queue = vela_api::extensions::ObserveQueue::new(&db);
 
+        // Native moderation. Resolves the configured policy rooms and compiles
+        // their current ban rules; inert (every check short-circuits) when
+        // `[moderation] enabled = false`.
+        let moderation = vela_api::moderation::ModerationState::init(
+            &db,
+            config.moderation.enabled,
+            &config.moderation.policy_rooms,
+        );
+
         // SIGHUP → re-read [extensions] from the config file and atomically swap
         // the plugin set in. A bad new config (missing file, invalid component)
         // is logged and the current set is kept — a reload must never disarm
@@ -1648,6 +1673,7 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or(0),
             extensions,
             observe_queue,
+            moderation,
         };
 
         // Wire AppState into the emit service now that it exists (the runtime
@@ -1676,6 +1702,12 @@ fn main() -> anyhow::Result<()> {
         // Always on — there's no useful "off" mode (would mean stale
         // presence survives forever, which is the bug this fixes).
         let _presence_sweeper_handle = vela_api::presence::presence_sweeper::spawn(state.clone());
+
+        // Moderation ban-list safety-net rebuilder. No-op unless moderation is
+        // enabled with watched policy rooms; then it recompiles the list every
+        // interval so changes that arrive outside the two live hooks (redaction
+        // revoke, federated state-resolution) still converge.
+        state.moderation.spawn_sweeper(db.clone());
 
         // Periodic pruner for the unbounded dedup caches (client txn
         // idempotency + inbound to-device dedup). Always on — these

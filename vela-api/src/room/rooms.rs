@@ -487,6 +487,25 @@ pub async fn create_room(
         &body,
     )?;
 
+    // Moderation: gate createRoom's initial invites. Local invitees are built
+    // inline further down and never pass through
+    // `emit_membership_event_for_target`, so without this a banned user could
+    // be invited via createRoom. Validate the whole list up front and fail
+    // before any room state is written.
+    if let Some(invitees) = &body.invite {
+        for target in invitees {
+            if let Some(reason) = state.moderation.check_user(target) {
+                tracing::info!(
+                    creator = %user.user_id, room_id = room_id.as_str(), target = %target, %reason,
+                    "moderation: blocked createRoom invite of banned user"
+                );
+                return Err(ApiError(VelaError::Forbidden(
+                    "An invited user is subject to a moderation policy on this server".into(),
+                )));
+            }
+        }
+    }
+
     // --- 6b. room_alias_name ---
     // Register the alias and pin it as the canonical alias. The alias
     // record lives in the directory CF (used by /directory/room/...)

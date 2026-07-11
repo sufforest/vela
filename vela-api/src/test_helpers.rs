@@ -134,6 +134,8 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
         // Inert: nothing binds on_event in the harness, so nothing is enqueued
         // and no worker drains it.
         observe_queue,
+        // Off by default in tests; moderation-specific tests build their own.
+        moderation: crate::moderation::ModerationState::disabled(),
     };
     (state, tmp)
 }

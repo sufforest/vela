@@ -211,6 +211,7 @@ impl Harness {
                 .unwrap_or(0),
             extensions: vela_api::router::empty_extension_runtime(),
             observe_queue,
+            moderation: vela_api::moderation::ModerationState::disabled(),
         };
         let router = build_router(state.clone());
         Harness {
@@ -297,6 +298,40 @@ impl Harness {
             )
             .await;
         assert_eq!(resp.status(), StatusCode::OK, "join failed");
+    }
+
+    /// Send a state event and return the raw response (so the caller can
+    /// assert the status — moderation tests expect either 200 or 403).
+    pub async fn send_state(
+        &self,
+        token: &str,
+        room_id: &str,
+        event_type: &str,
+        state_key: &str,
+        content: Value,
+    ) -> Response<Body> {
+        self.request(
+            Request::put(format!(
+                "/_matrix/client/v3/rooms/{room_id}/state/{event_type}/{state_key}"
+            ))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(content.to_string()))
+            .unwrap(),
+        )
+        .await
+    }
+
+    /// Turn moderation on, compiling the ban list from the given local policy
+    /// rooms, and rebuild the router so enforcement is live. Call after the
+    /// policy rooms and their `m.policy.rule.*` events already exist in the DB.
+    /// The rebuilt router shares the same `Database`, so everything created via
+    /// the pre-enable harness stays visible.
+    pub fn enable_moderation(&mut self, policy_rooms: &[&str]) {
+        let ids: Vec<String> = policy_rooms.iter().map(|s| s.to_string()).collect();
+        self.state.moderation =
+            vela_api::moderation::ModerationState::init(&self.state.db, true, &ids);
+        self.router = build_router(self.state.clone());
     }
 
     pub async fn set_pusher(&self, token: &str, app_id: &str, pushkey: &str, url: &str) {

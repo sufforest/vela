@@ -3681,6 +3681,32 @@ impl Database {
         Ok(nids)
     }
 
+    /// Get the current state event NIDs of a single `type_nid` in a room.
+    /// Narrows `get_all_state_event_nids` to one type via the 16-byte
+    /// `(room_nid ++ type_nid)` prefix — `room_state` keys are
+    /// `(room, type, state_key)`, so a type's rows are contiguous. Used by
+    /// the moderation layer to pull just the `m.policy.rule.*` events of a
+    /// policy room without loading its unrelated state.
+    pub fn get_state_events_of_type(
+        &self,
+        room_nid: u64,
+        type_nid: u64,
+    ) -> Result<Vec<u64>, rocksdb::Error> {
+        let cf = self.db.cf_handle("room_state").unwrap();
+        let prefix = keys::encode_u64_pair(room_nid, type_nid);
+        let mut nids = Vec::new();
+
+        let iter = self.db.prefix_iterator_cf(&cf, prefix);
+        for item in iter {
+            let (key, val) = item?;
+            if key.len() < 24 || key[..16] != prefix[..] {
+                break;
+            }
+            nids.push(keys::decode_u64(&val));
+        }
+        Ok(nids)
+    }
+
     // --- Event retrieval ---
 
     /// Get event by NID. Returns (header_fields, json_bytes).

@@ -95,6 +95,20 @@ pub async fn make_knock(
     // m.room.server_acl gate.
     crate::federation::server_acl::deny_if_blocked(&state, room_nid, &origin.0)?;
 
+    // Moderation: block a banned user (or their server) from getting a knock
+    // template. `check_user` covers the origin server too.
+    if let Some(reason) = state.moderation.check_user(&user_id) {
+        tracing::info!(
+            room = %room_id, user = %user_id, %reason,
+            "moderation: rejected make_knock from banned user"
+        );
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "user is subject to a moderation policy on this server",
+        ));
+    }
+
     // Knock requires `join_rule: knock` or `knock_restricted`. Other rules
     // (public, invite, restricted) reject — knocking on a public room makes
     // no sense and on an invite-only room is forbidden by spec.
@@ -261,6 +275,19 @@ pub async fn send_knock_v1(
 
     // m.room.server_acl gate.
     crate::federation::server_acl::deny_if_blocked(&state, room_nid, &origin.0)?;
+
+    // Moderation: reject a knock whose sender (or their server) is banned.
+    if let Some(reason) = state.moderation.check_user(sender) {
+        tracing::info!(
+            room = %room_id, %sender, %reason,
+            "moderation: rejected send_knock from banned sender"
+        );
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            "sender is subject to a moderation policy on this server",
+        ));
+    }
 
     // Same join_rule gate as make_knock — defence in depth in case the room
     // changed rules between the two calls.

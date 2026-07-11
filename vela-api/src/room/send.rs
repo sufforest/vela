@@ -595,6 +595,36 @@ pub(crate) async fn send_state_inner(
         return Err(VelaError::Forbidden("not a member of this room".into()).into());
     }
 
+    // Moderation: a raw m.room.member INVITE via the /state API bypasses the
+    // /invite choke point (`emit_membership_event_for_target`), so gate it here
+    // too. Join/knock via /state aren't a banned-outsider vector — sending any
+    // state event requires already being a joined member (checked just above).
+    // Removals (leave / ban / kick) must always be allowed to go through.
+    if event_type == "m.room.member"
+        && content.get("membership").and_then(|m| m.as_str()) == Some("invite")
+    {
+        if let Some(reason) = state.moderation.check_user(&state_key) {
+            tracing::info!(
+                room = %room_id_str, target = %state_key, %reason,
+                "moderation: blocked /state invite of banned user"
+            );
+            return Err(VelaError::Forbidden(
+                "This user is subject to a moderation policy on this server".into(),
+            )
+            .into());
+        }
+        if let Some(reason) = state.moderation.check_user(&user.user_id) {
+            tracing::info!(
+                room = %room_id_str, sender = %user.user_id, %reason,
+                "moderation: blocked banned user from inviting via /state"
+            );
+            return Err(VelaError::Forbidden(
+                "You are subject to a moderation policy on this server".into(),
+            )
+            .into());
+        }
+    }
+
     let lock = state
         .room_locks
         .entry(Nid(room_nid))
@@ -774,6 +804,12 @@ pub(crate) async fn send_state_inner(
         .db
         .promote_state_event(room_nid, event_nid, type_nid, state_key_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+
+    // If a moderation policy rule changed in a watched policy room, recompile
+    // the ban list. No-op unless moderation is on and this is a policy room.
+    state
+        .moderation
+        .maybe_refresh(&state.db, room_nid, &event_type);
 
     // A member event sent through the generic /state path must also maintain
     // the membership index + E2EE/sync side effects — promote_state_event
