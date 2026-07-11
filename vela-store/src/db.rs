@@ -6966,6 +6966,24 @@ impl Database {
         self.get_nid(&room_id)
     }
 
+    // --- Moderation (vela-specific) ---
+
+    /// The set of policy-room ids added at runtime via the `!watch` admin
+    /// command, persisted (JSON array) so it survives restart. Unioned with the
+    /// static `[moderation].policy_rooms` config at boot. Empty when unset or
+    /// on a decode error.
+    pub fn get_moderation_watched_rooms(&self) -> Result<Vec<String>, rocksdb::Error> {
+        Ok(self
+            .get_meta("moderation_watched_rooms")?
+            .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn set_moderation_watched_rooms(&self, rooms: &[String]) -> Result<(), rocksdb::Error> {
+        let bytes = serde_json::to_vec(rooms).unwrap_or_else(|_| b"[]".to_vec());
+        self.set_meta("moderation_watched_rooms", &bytes)
+    }
+
     // --- Registration tokens (vela-specific dynamic tokens) ---
     //
     // The static `[registration] token` from vela.toml is seeded into

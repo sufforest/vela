@@ -73,11 +73,18 @@ impl BanList {
 #[derive(Clone)]
 pub struct ModerationState {
     pub enabled: bool,
-    /// Watched policy-room nids, resolved from `[moderation].policy_rooms` at
-    /// boot. The refresh hooks ignore state changes in any other room.
-    policy_rooms: Arc<HashSet<u64>>,
+    /// Watched policy-room nids. Seeded at boot from `[moderation].policy_rooms`
+    /// (static) unioned with the persisted runtime set, and mutated at runtime by
+    /// the `!watch` / `!unwatch` admin commands — hence `ArcSwap`, so the refresh
+    /// hooks read a lock-free snapshot. The refresh hooks ignore state changes in
+    /// any other room.
+    policy_rooms: Arc<ArcSwap<HashSet<u64>>>,
     /// Lock-free-swappable compiled list. Refreshed on policy-rule changes.
     ban_list: Arc<ArcSwap<BanList>>,
+    /// Serializes `watch_room` / `unwatch_room` so the in-memory set and the
+    /// persisted meta list update together — concurrent admin commands (each on
+    /// its own spawned task) would otherwise lost-update either one and diverge.
+    mutation_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl ModerationState {
@@ -86,18 +93,21 @@ impl ModerationState {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
-            policy_rooms: Arc::new(HashSet::new()),
+            policy_rooms: Arc::new(ArcSwap::from_pointee(HashSet::new())),
             ban_list: Arc::new(ArcSwap::from_pointee(BanList::default())),
+            mutation_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
-    /// Build from `[moderation]` at boot: resolve the configured policy-room
-    /// ids to nids (skipping any not held locally), compile their current
-    /// rules, and log the result. Cheap enough to run inline on the boot path.
+    /// Build from `[moderation]` at boot: resolve the watched policy rooms — the
+    /// static `[moderation].policy_rooms` config unioned with the persisted
+    /// runtime set (added via `!watch`) — to nids, compile their current rules,
+    /// and log the result. Cheap enough to run inline on the boot path.
     pub fn init(db: &Database, enabled: bool, policy_room_ids: &[String]) -> Self {
         let mut policy_rooms = HashSet::new();
         if enabled {
-            for rid in policy_room_ids {
+            let persisted = db.get_moderation_watched_rooms().unwrap_or_default();
+            for rid in policy_room_ids.iter().chain(persisted.iter()) {
                 match db.get_nid(rid) {
                     Ok(Some(nid)) => {
                         policy_rooms.insert(nid);
@@ -105,7 +115,7 @@ impl ModerationState {
                     Ok(None) => tracing::warn!(
                         room = %rid,
                         "moderation: policy room not present locally; its rules are ignored until \
-                         the room exists here (remote-list subscription is a later feature)"
+                         the room exists here (join it, or `!watch` a remote one)"
                     ),
                     Err(e) => tracing::error!(
                         room = %rid, error = %e,
@@ -127,9 +137,79 @@ impl ModerationState {
         }
         Self {
             enabled,
-            policy_rooms: Arc::new(policy_rooms),
+            policy_rooms: Arc::new(ArcSwap::from_pointee(policy_rooms)),
             ban_list: Arc::new(ArcSwap::from_pointee(list)),
+            mutation_lock: Arc::new(std::sync::Mutex::new(())),
         }
+    }
+
+    /// Add `room_nid` (id `room_id`) to the watched set, persist it, and
+    /// recompile the ban list — all under the mutation lock so a concurrent
+    /// command can't lose the update or diverge the persisted list from the live
+    /// set. Idempotent (no rebuild when already watched). No-op when disabled.
+    pub fn watch_room(
+        &self,
+        db: &Database,
+        room_nid: u64,
+        room_id: &str,
+    ) -> Result<(), rocksdb::Error> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let _guard = self.mutation_lock.lock().unwrap();
+        let mut persisted = db.get_moderation_watched_rooms()?;
+        if !persisted.iter().any(|r| r == room_id) {
+            persisted.push(room_id.to_string());
+            db.set_moderation_watched_rooms(&persisted)?;
+        }
+        let mut set = HashSet::clone(&self.policy_rooms.load());
+        if set.insert(room_nid) {
+            self.policy_rooms.store(Arc::new(set));
+            self.rebuild(db);
+        }
+        Ok(())
+    }
+
+    /// Remove `room_id` from the watched set (persisted + in-memory) and
+    /// recompile. Returns whether it was actually being watched. Removing from
+    /// the persisted list always happens even if the room isn't locally
+    /// resolvable. No-op when disabled. Held under the mutation lock.
+    pub fn unwatch_room(&self, db: &Database, room_id: &str) -> Result<bool, rocksdb::Error> {
+        if !self.enabled {
+            return Ok(false);
+        }
+        let _guard = self.mutation_lock.lock().unwrap();
+        let mut persisted = db.get_moderation_watched_rooms()?;
+        let before = persisted.len();
+        persisted.retain(|r| r != room_id);
+        if persisted.len() != before {
+            db.set_moderation_watched_rooms(&persisted)?;
+        }
+        let Some(room_nid) = db.get_nid(room_id)? else {
+            return Ok(false);
+        };
+        let mut set = HashSet::clone(&self.policy_rooms.load());
+        let was_watched = set.remove(&room_nid);
+        if was_watched {
+            self.policy_rooms.store(Arc::new(set));
+            self.rebuild(db);
+        }
+        Ok(was_watched)
+    }
+
+    /// Whether a room is currently watched.
+    pub fn is_watched(&self, room_nid: u64) -> bool {
+        self.policy_rooms.load().contains(&room_nid)
+    }
+
+    /// Snapshot of the watched room nids (for status display).
+    pub fn watched_rooms(&self) -> Vec<u64> {
+        self.policy_rooms.load().iter().copied().collect()
+    }
+
+    /// `(users, servers, rooms)` ban counts for the current list.
+    pub fn ban_counts(&self) -> (usize, usize, usize) {
+        self.ban_list.load().counts()
     }
 
     /// Rebuild the ban list if `event_type` is a policy rule applied to a
@@ -140,11 +220,11 @@ impl ModerationState {
     pub fn maybe_refresh(&self, db: &Database, room_nid: u64, event_type: &str) {
         if !self.enabled
             || !event_type.starts_with("m.policy.rule.")
-            || !self.policy_rooms.contains(&room_nid)
+            || !self.policy_rooms.load().contains(&room_nid)
         {
             return;
         }
-        let list = build_ban_list(db, &self.policy_rooms);
+        let list = build_ban_list(db, &self.policy_rooms.load());
         let (u, s, r) = list.counts();
         tracing::info!(
             banned_users = u,
@@ -166,7 +246,7 @@ impl ModerationState {
             return;
         }
         let before = self.ban_list.load().counts();
-        let list = build_ban_list(db, &self.policy_rooms);
+        let list = build_ban_list(db, &self.policy_rooms.load());
         let after = list.counts();
         self.ban_list.store(Arc::new(list));
         if before != after {
@@ -179,10 +259,11 @@ impl ModerationState {
     }
 
     /// Spawn the background safety-net rebuilder. No-op (nothing spawned) when
-    /// moderation is off or nothing is watched. Bounds worst-case staleness
-    /// from the un-hooked mutation paths to one `SWEEP_INTERVAL`.
+    /// moderation is off. Runs even with an empty watched set, since `!watch`
+    /// can add rooms at runtime. Bounds worst-case staleness from the un-hooked
+    /// mutation paths to one `SWEEP_INTERVAL`.
     pub fn spawn_sweeper(&self, db: Arc<Database>) {
-        if !self.enabled || self.policy_rooms.is_empty() {
+        if !self.enabled {
             return;
         }
         let this = self.clone();
@@ -346,8 +427,9 @@ mod tests {
     fn state_with(list: BanList) -> ModerationState {
         ModerationState {
             enabled: true,
-            policy_rooms: Arc::new(HashSet::new()),
+            policy_rooms: Arc::new(ArcSwap::from_pointee(HashSet::new())),
             ban_list: Arc::new(ArcSwap::from_pointee(list)),
+            mutation_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -467,5 +549,95 @@ mod tests {
         let s = state_with(banlist(&[], &["evil.com"], &[]));
         // No `:` → empty domain → no server match, no panic.
         assert!(s.check_user("no-colon").is_none());
+    }
+}
+
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+    use vela_store::db::Database;
+
+    fn temp_db() -> (Database, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::open(tmp.path()).unwrap();
+        (db, tmp)
+    }
+
+    #[test]
+    fn watch_unwatch_roundtrip() {
+        let (db, _tmp) = temp_db();
+        let ms = ModerationState::init(&db, true, &[]);
+        let nid = db.get_or_create_nid("!p:local").unwrap();
+        assert!(!ms.is_watched(nid));
+        ms.watch_room(&db, nid, "!p:local").unwrap();
+        assert!(ms.is_watched(nid));
+        assert_eq!(ms.watched_rooms(), vec![nid]);
+        // persisted
+        assert_eq!(db.get_moderation_watched_rooms().unwrap(), vec!["!p:local"]);
+        ms.watch_room(&db, nid, "!p:local").unwrap(); // idempotent
+        assert_eq!(ms.watched_rooms().len(), 1);
+        assert_eq!(db.get_moderation_watched_rooms().unwrap().len(), 1);
+        assert!(ms.unwatch_room(&db, "!p:local").unwrap());
+        assert!(!ms.is_watched(nid));
+        assert!(db.get_moderation_watched_rooms().unwrap().is_empty());
+        assert!(!ms.unwatch_room(&db, "!p:local").unwrap()); // already gone
+    }
+
+    #[test]
+    fn concurrent_watch_has_no_lost_update() {
+        // 16 threads each watch a distinct room; the mutation lock must keep
+        // both the in-memory set and the persisted list consistent (without it,
+        // the load-clone-store on each side loses updates).
+        let (db, _tmp) = temp_db();
+        let db = std::sync::Arc::new(db);
+        let ms = ModerationState::init(&db, true, &[]);
+        // Pre-intern nids so the threads only exercise watch_room.
+        let rooms: Vec<(u64, String)> = (0..16)
+            .map(|i| {
+                let rid = format!("!room{i}:local");
+                (db.get_or_create_nid(&rid).unwrap(), rid)
+            })
+            .collect();
+        let handles: Vec<_> = rooms
+            .into_iter()
+            .map(|(nid, rid)| {
+                let ms = ms.clone();
+                let db = db.clone();
+                std::thread::spawn(move || ms.watch_room(&db, nid, &rid).unwrap())
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(ms.watched_rooms().len(), 16, "in-memory set");
+        assert_eq!(
+            db.get_moderation_watched_rooms().unwrap().len(),
+            16,
+            "persisted list"
+        );
+    }
+
+    #[test]
+    fn init_merges_config_and_persisted_watched_rooms() {
+        let (db, _tmp) = temp_db();
+        let cfg_nid = db.get_or_create_nid("!cfg:local").unwrap();
+        let persisted_nid = db.get_or_create_nid("!persisted:local").unwrap();
+        db.set_moderation_watched_rooms(&["!persisted:local".to_string()])
+            .unwrap();
+        let ms = ModerationState::init(&db, true, &["!cfg:local".to_string()]);
+        assert!(ms.is_watched(cfg_nid), "config room watched");
+        assert!(ms.is_watched(persisted_nid), "persisted room watched");
+    }
+
+    #[test]
+    fn disabled_init_watches_nothing_and_watch_is_noop() {
+        let (db, _tmp) = temp_db();
+        let nid = db.get_or_create_nid("!p:local").unwrap();
+        db.set_moderation_watched_rooms(&["!p:local".to_string()])
+            .unwrap();
+        let ms = ModerationState::init(&db, false, &["!p:local".to_string()]);
+        assert!(!ms.is_watched(nid)); // disabled → empty set
+        ms.watch_room(&db, nid, "!p:local").unwrap(); // no-op when disabled
+        assert!(!ms.is_watched(nid));
     }
 }
