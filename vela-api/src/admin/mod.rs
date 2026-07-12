@@ -929,6 +929,191 @@ async fn handle_command(
     send_bot_notice(state, room_nid, response).await
 }
 
+/// Everything a command handler might need. Each handler pulls what it wants;
+/// the registry adapts this to the handler's own signature.
+pub(crate) struct CmdCtx<'a> {
+    state: &'a AppState,
+    sender_nid: u64,
+    /// Whitespace-split arguments after the command word.
+    args: &'a [String],
+    /// The full raw message body (a few commands, e.g. `!as`, parse it directly).
+    body: &'a str,
+}
+
+type CmdResult<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Reply, ApiError>> + Send + 'a>>;
+
+/// One admin command: metadata (single source of truth for dispatch AND help)
+/// plus the adapter that invokes its handler.
+struct Command {
+    name: &'static str,
+    group: &'static str,
+    usage: &'static str,
+    summary: &'static str,
+    run: for<'a> fn(CmdCtx<'a>) -> CmdResult<'a>,
+}
+
+/// The command table. Adding a command = one entry here + its handler; `!help`
+/// and dispatch both read from this, so they can't drift.
+fn commands() -> &'static [Command] {
+    &[
+        Command {
+            name: "help",
+            group: "General",
+            usage: "!help [command]",
+            summary: "show this help, or detail for one command",
+            run: |c| Box::pin(async move { Ok(render_help(c.args)) }),
+        },
+        Command {
+            name: "server",
+            group: "Server",
+            usage: "!server",
+            summary: "uptime, version, user count, room count",
+            run: |c| Box::pin(cmd_server(c.state, c.sender_nid)),
+        },
+        Command {
+            name: "rotate-signing-key",
+            group: "Server",
+            usage: "!rotate-signing-key",
+            summary: "generate a new server signing key (restart required)",
+            run: |c| Box::pin(cmd_rotate_signing_key(c.state)),
+        },
+        Command {
+            name: "reindex-search",
+            group: "Server",
+            usage: "!reindex-search",
+            summary: "rebuild the full-text search index from history",
+            run: |c| Box::pin(cmd_reindex_search(c.state)),
+        },
+        Command {
+            name: "users",
+            group: "Users",
+            usage: "!users [page]",
+            summary: "list local users (20 per page)",
+            run: |c| Box::pin(cmd_users(c.state, c.args)),
+        },
+        Command {
+            name: "user",
+            group: "Users",
+            usage: "!user <mxid>",
+            summary: "show user details",
+            run: |c| Box::pin(cmd_user(c.state, c.args)),
+        },
+        Command {
+            name: "deactivate",
+            group: "Users",
+            usage: "!deactivate <mxid>",
+            summary: "deactivate account; kicks from rooms",
+            run: |c| Box::pin(cmd_deactivate(c.state, c.sender_nid, c.args)),
+        },
+        Command {
+            name: "reactivate",
+            group: "Users",
+            usage: "!reactivate <mxid>",
+            summary: "undo !deactivate (then run !reset-password)",
+            run: |c| Box::pin(cmd_reactivate(c.state, c.sender_nid, c.args)),
+        },
+        Command {
+            name: "reset-password",
+            group: "Users",
+            usage: "!reset-password <mxid> [pw]",
+            summary: "set a fresh password; clears deactivated; invalidates sessions",
+            run: |c| Box::pin(cmd_reset_password(c.state, c.sender_nid, c.args)),
+        },
+        Command {
+            name: "create-user",
+            group: "Users",
+            usage: "!create-user <localpart> [pw]",
+            summary: "force-create a local user (bypasses UIA + tokens)",
+            run: |c| Box::pin(cmd_create_user(c.state, c.sender_nid, c.args)),
+        },
+        Command {
+            name: "promote",
+            group: "Users",
+            usage: "!promote <mxid>",
+            summary: "invite user to admin room (grant admin)",
+            run: |c| Box::pin(cmd_promote(c.state, c.sender_nid, c.args)),
+        },
+        Command {
+            name: "demote",
+            group: "Users",
+            usage: "!demote <mxid>",
+            summary: "kick user from admin room (revoke admin)",
+            run: |c| Box::pin(cmd_demote(c.state, c.sender_nid, c.args)),
+        },
+        Command {
+            name: "token",
+            group: "Tokens",
+            usage: "!token create [uses=N] [expires=24h] | !token revoke <token>",
+            summary: "mint or revoke a registration token",
+            run: |c| Box::pin(cmd_token(c.state, c.sender_nid, c.args)),
+        },
+        Command {
+            name: "tokens",
+            group: "Tokens",
+            usage: "!tokens",
+            summary: "list registration tokens",
+            run: |c| Box::pin(cmd_tokens(c.state)),
+        },
+        Command {
+            name: "reports",
+            group: "Moderation",
+            usage: "!reports [N]",
+            summary: "last N user-submitted abuse reports (default 20)",
+            run: |c| Box::pin(cmd_reports(c.state, c.args)),
+        },
+        Command {
+            name: "moderation",
+            group: "Moderation",
+            usage: "!moderation",
+            summary: "moderation status: watched rooms + ban counts",
+            run: |c| Box::pin(cmd_moderation(c.state)),
+        },
+        Command {
+            name: "bans",
+            group: "Moderation",
+            usage: "!bans [page]",
+            summary: "list individual ban entries (20 per page)",
+            run: |c| Box::pin(cmd_bans(c.state, c.args)),
+        },
+        Command {
+            name: "ban",
+            group: "Moderation",
+            usage: "!ban <user|server|room> <glob> [reason]",
+            summary: "add a policy ban (enforced locally)",
+            run: |c| Box::pin(cmd_ban(c.state, c.args)),
+        },
+        Command {
+            name: "unban",
+            group: "Moderation",
+            usage: "!unban <user|server|room> <glob>",
+            summary: "revoke a ban issued via !ban",
+            run: |c| Box::pin(cmd_unban(c.state, c.args)),
+        },
+        Command {
+            name: "watch",
+            group: "Moderation",
+            usage: "!watch <room_id> [server]",
+            summary: "compile a policy room's rules (joins remote rooms)",
+            run: |c| Box::pin(cmd_watch(c.state, c.args)),
+        },
+        Command {
+            name: "unwatch",
+            group: "Moderation",
+            usage: "!unwatch <room_id>",
+            summary: "stop compiling a policy room's rules",
+            run: |c| Box::pin(cmd_unwatch(c.state, c.args)),
+        },
+        Command {
+            name: "as",
+            group: "Appservices",
+            usage: "!as register <yaml> | list | unregister <id> | enable|disable <id>",
+            summary: "manage Application Services",
+            run: |c| Box::pin(async move { Ok(cmd_appservice(c.state, c.body).await) }),
+        },
+    ]
+}
+
 /// Route a parsed command word to its handler. Returns the reply, or an error
 /// that `handle_command` turns into an operator-visible failure notice.
 async fn dispatch_command(
@@ -938,33 +1123,20 @@ async fn dispatch_command(
     rest: &[String],
     body: &str,
 ) -> Result<Reply, ApiError> {
-    Ok(match cmd {
-        "help" => cmd_help(),
-        "server" => cmd_server(state, sender_nid).await?,
-        "users" => cmd_users(state, rest).await?,
-        "user" => cmd_user(state, rest).await?,
-        "deactivate" => cmd_deactivate(state, sender_nid, rest).await?,
-        "reactivate" => cmd_reactivate(state, sender_nid, rest).await?,
-        "reset-password" => cmd_reset_password(state, sender_nid, rest).await?,
-        "promote" => cmd_promote(state, sender_nid, rest).await?,
-        "demote" => cmd_demote(state, sender_nid, rest).await?,
-        "token" => cmd_token(state, sender_nid, rest).await?,
-        "tokens" => cmd_tokens(state).await?,
-        "create-user" => cmd_create_user(state, sender_nid, rest).await?,
-        "rotate-signing-key" => cmd_rotate_signing_key(state).await?,
-        "reindex-search" => cmd_reindex_search(state).await?,
-        "reports" => cmd_reports(state, rest).await?,
-        "moderation" => cmd_moderation(state).await?,
-        "bans" => cmd_bans(state, rest).await?,
-        "ban" => cmd_ban(state, rest).await?,
-        "unban" => cmd_unban(state, rest).await?,
-        "watch" => cmd_watch(state, rest).await?,
-        "unwatch" => cmd_unwatch(state, rest).await?,
-        "as" => cmd_appservice(state, body).await,
-        other => Reply::plain(format!(
-            "unknown command: !{other}\ntype `!help` for the list of commands"
-        )),
-    })
+    match commands().iter().find(|c| c.name == cmd) {
+        Some(command) => {
+            (command.run)(CmdCtx {
+                state,
+                sender_nid,
+                args: rest,
+                body,
+            })
+            .await
+        }
+        None => Ok(Reply::plain(format!(
+            "unknown command: !{cmd}\ntype `!help` for the list of commands"
+        ))),
+    }
 }
 
 /// A reply from the admin bot. Always sent as `m.notice` (per spec,
@@ -994,38 +1166,61 @@ impl Reply {
 
 // --- !help ---
 //
-// Print every command in a single message. Stable ordering so it
-// matches docs.
-fn cmd_help() -> Reply {
-    let text = "Server admin commands:\n\
-        \n\
-        !help                                show this help text\n\
-        !server                              uptime, version, user count, room count\n\
-        !users [page]                        list local users (20 per page)\n\
-        !user <mxid>                         show user details\n\
-        !deactivate <mxid>                   deactivate account; kicks from rooms\n\
-        !reactivate <mxid>                   undo !deactivate (then run !reset-password)\n\
-        !reset-password <mxid> [pw]          set a fresh password; clears deactivated; invalidates sessions\n\
-        !promote <mxid>                      invite user to admin room (grant admin)\n\
-        !demote <mxid>                       kick user from admin room (revoke admin)\n\
-        !token create [uses=N] [expires=24h] mint a registration token\n\
-        !tokens                              list registration tokens\n\
-        !token revoke <token>                delete a registration token\n\
-        !create-user <localpart> [pw]        force-create a local user (bypasses UIA + tokens)\n\
-        !rotate-signing-key                  generate a new server signing key (restart required)\n\
-        !reindex-search                      rebuild the full-text search index from history\n\
-        !reports [N]                         last N user-submitted abuse reports (default 20)\n\
-        !moderation                          moderation status: watched rooms + ban counts\n\
-        !bans [page]                         list individual ban entries (20 per page)\n\
-        !ban <user|server|room> <glob> [why] add a policy ban (enforced locally)\n\
-        !unban <user|server|room> <glob>     revoke a ban issued via !ban\n\
-        !watch <room_id> [server]            compile a policy room's rules (joins remote rooms)\n\
-        !unwatch <room_id>                   stop compiling a policy room's rules\n\
-        !as register <yaml>                  register an Application Service (paste YAML)\n\
-        !as list                             list registered Application Services\n\
-        !as unregister <id>                  remove an Application Service\n\
-        !as enable|disable <id>              halt/resume an AS's delivery";
-    Reply::plain(text)
+// Rendered from the command registry (single source of truth). `!help` groups
+// every command; `!help <cmd>` shows one command's usage + summary.
+fn render_help(args: &[String]) -> Reply {
+    let cmds = commands();
+
+    // `!help <cmd>` — detail for one command.
+    if let Some(name) = args.first() {
+        let target = name.trim_start_matches('!');
+        return match cmds.iter().find(|c| c.name == target) {
+            Some(c) => Reply::rich(
+                format!("{}\n  {}", c.usage, c.summary),
+                format!(
+                    "<p><code>{}</code></p><p>{}</p>",
+                    html_escape(c.usage),
+                    html_escape(c.summary)
+                ),
+            ),
+            None => Reply::plain(format!(
+                "unknown command: !{target}\ntype `!help` for the list of commands"
+            )),
+        };
+    }
+
+    // `!help` — every command, grouped, rendered as a table (aligns in clients
+    // that render HTML; the plain fallback stays readable too).
+    let groups = [
+        "General",
+        "Server",
+        "Users",
+        "Tokens",
+        "Moderation",
+        "Appservices",
+    ];
+    let mut text = String::from("Server admin commands:\n");
+    let mut html = String::from(
+        "<p>Server admin commands — <code>!help &lt;command&gt;</code> for detail.</p>",
+    );
+    for group in groups {
+        let in_group: Vec<&Command> = cmds.iter().filter(|c| c.group == group).collect();
+        if in_group.is_empty() {
+            continue;
+        }
+        text.push_str(&format!("\n{group}:\n"));
+        html.push_str(&format!("<p><b>{group}</b></p><table><tbody>"));
+        for c in in_group {
+            text.push_str(&format!("  {:<40} {}\n", c.usage, c.summary));
+            html.push_str(&format!(
+                "<tr><td><code>{}</code></td><td>{}</td></tr>",
+                html_escape(c.usage),
+                html_escape(c.summary)
+            ));
+        }
+        html.push_str("</tbody></table>");
+    }
+    Reply::rich(text, html)
 }
 
 // --- !server ---
@@ -2848,10 +3043,60 @@ mod tests {
 
     #[tokio::test]
     async fn help_lists_commands() {
-        let reply = cmd_help();
-        assert!(reply.text.contains("!help"));
-        assert!(reply.text.contains("!token"));
-        assert!(reply.html.is_none());
+        let reply = render_help(&[]);
+        // Grouped, and every registered command appears.
+        assert!(reply.text.contains("Users:"));
+        assert!(reply.text.contains("Moderation:"));
+        for c in commands() {
+            assert!(reply.text.contains(c.usage), "help missing `{}`", c.usage);
+        }
+        assert!(reply.html.is_some(), "help renders rich");
+    }
+
+    #[tokio::test]
+    async fn help_for_one_command() {
+        // `!help ban` (and the `!ban` form) shows that command's usage.
+        let r = render_help(&["ban".to_string()]);
+        assert!(r.text.contains("!ban <user|server|room>"), "{}", r.text);
+        let r = render_help(&["!ban".to_string()]);
+        assert!(r.text.contains("!ban <user|server|room>"), "{}", r.text);
+        // Unknown command name.
+        let r = render_help(&["nope".to_string()]);
+        assert!(r.text.contains("unknown command"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn every_command_is_dispatchable() {
+        // Guard against a registry entry whose `run` wrapper is miswired: each
+        // command, called with empty args, must route (not fall through to
+        // "unknown command") and not error out. Skips the two commands with real
+        // side effects — they have their own tests. Moderation is enabled so the
+        // moderation commands emit their usage rather than a "disabled" reply.
+        let (mut state, _tmp) = build_test_state();
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, true, &[]);
+        bootstrap(&state).await.unwrap();
+        for c in commands() {
+            if matches!(c.name, "rotate-signing-key" | "reindex-search") {
+                continue;
+            }
+            let reply = dispatch_command(&state, 0, c.name, &[], "").await.unwrap();
+            assert!(
+                !reply.text.starts_with("unknown command"),
+                "command `{}` did not dispatch",
+                c.name
+            );
+            // If the empty-args reply is a usage message, it must name THIS
+            // command — catches a `run` wired to a wrong same-signature handler
+            // (e.g. `ban` → cmd_unban), which would otherwise still dispatch OK.
+            if reply.text.contains("usage:") {
+                assert!(
+                    reply.text.contains(&format!("!{}", c.name)),
+                    "command `{}` usage names a different command: {}",
+                    c.name,
+                    reply.text
+                );
+            }
+        }
     }
 
     #[tokio::test]
