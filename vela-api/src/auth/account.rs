@@ -202,8 +202,7 @@ pub async fn deactivate(
 
     // Force the user out of every room. Errors per-room are logged and
     // skipped; remote-resident rooms are leaved in the background.
-    crate::membership::force_leave_all_rooms_for_deactivation(&state, &user, "Account deactivated")
-        .await;
+    crate::membership::force_leave_all_rooms(&state, &user, "Account deactivated").await;
 
     // We don't bind 3PIDs to an identity server, so nothing to unbind —
     // spec allows `success` when there are no identifiers to unbind.

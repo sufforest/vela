@@ -111,6 +111,10 @@ impl BanList {
 #[derive(Clone)]
 pub struct ModerationState {
     pub enabled: bool,
+    /// When true (default), an operator `!ban` of an exact local user also
+    /// force-leaves them from every room (see the admin command). Set false to
+    /// ban-without-removing (block re-entry but preserve membership/history).
+    pub remove_on_ban: bool,
     /// Watched policy-room nids. Seeded at boot from `[moderation].policy_rooms`
     /// (static) unioned with the persisted runtime set, and mutated at runtime by
     /// the `!watch` / `!unwatch` admin commands — hence `ArcSwap`, so the refresh
@@ -131,6 +135,7 @@ impl ModerationState {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
+            remove_on_ban: false,
             policy_rooms: Arc::new(ArcSwap::from_pointee(HashSet::new())),
             ban_list: Arc::new(ArcSwap::from_pointee(BanList::default())),
             mutation_lock: Arc::new(std::sync::Mutex::new(())),
@@ -141,7 +146,12 @@ impl ModerationState {
     /// static `[moderation].policy_rooms` config unioned with the persisted
     /// runtime set (added via `!watch`) — to nids, compile their current rules,
     /// and log the result. Cheap enough to run inline on the boot path.
-    pub fn init(db: &Database, enabled: bool, policy_room_ids: &[String]) -> Self {
+    pub fn init(
+        db: &Database,
+        enabled: bool,
+        remove_on_ban: bool,
+        policy_room_ids: &[String],
+    ) -> Self {
         let mut policy_rooms = HashSet::new();
         if enabled {
             let persisted = db.get_moderation_watched_rooms().unwrap_or_default();
@@ -175,6 +185,7 @@ impl ModerationState {
         }
         Self {
             enabled,
+            remove_on_ban,
             policy_rooms: Arc::new(ArcSwap::from_pointee(policy_rooms)),
             ban_list: Arc::new(ArcSwap::from_pointee(list)),
             mutation_lock: Arc::new(std::sync::Mutex::new(())),
@@ -476,6 +487,7 @@ mod tests {
     fn state_with(list: BanList) -> ModerationState {
         ModerationState {
             enabled: true,
+            remove_on_ban: false,
             policy_rooms: Arc::new(ArcSwap::from_pointee(HashSet::new())),
             ban_list: Arc::new(ArcSwap::from_pointee(list)),
             mutation_lock: Arc::new(std::sync::Mutex::new(())),
@@ -615,7 +627,7 @@ mod db_tests {
     #[test]
     fn watch_unwatch_roundtrip() {
         let (db, _tmp) = temp_db();
-        let ms = ModerationState::init(&db, true, &[]);
+        let ms = ModerationState::init(&db, true, true, &[]);
         let nid = db.get_or_create_nid("!p:local").unwrap();
         assert!(!ms.is_watched(nid));
         ms.watch_room(&db, nid, "!p:local").unwrap();
@@ -639,7 +651,7 @@ mod db_tests {
         // the load-clone-store on each side loses updates).
         let (db, _tmp) = temp_db();
         let db = std::sync::Arc::new(db);
-        let ms = ModerationState::init(&db, true, &[]);
+        let ms = ModerationState::init(&db, true, true, &[]);
         // Pre-intern nids so the threads only exercise watch_room.
         let rooms: Vec<(u64, String)> = (0..16)
             .map(|i| {
@@ -673,7 +685,7 @@ mod db_tests {
         let persisted_nid = db.get_or_create_nid("!persisted:local").unwrap();
         db.set_moderation_watched_rooms(&["!persisted:local".to_string()])
             .unwrap();
-        let ms = ModerationState::init(&db, true, &["!cfg:local".to_string()]);
+        let ms = ModerationState::init(&db, true, true, &["!cfg:local".to_string()]);
         assert!(ms.is_watched(cfg_nid), "config room watched");
         assert!(ms.is_watched(persisted_nid), "persisted room watched");
     }
@@ -684,7 +696,7 @@ mod db_tests {
         let nid = db.get_or_create_nid("!p:local").unwrap();
         db.set_moderation_watched_rooms(&["!p:local".to_string()])
             .unwrap();
-        let ms = ModerationState::init(&db, false, &["!p:local".to_string()]);
+        let ms = ModerationState::init(&db, false, false, &["!p:local".to_string()]);
         assert!(!ms.is_watched(nid)); // disabled → empty set
         ms.watch_room(&db, nid, "!p:local").unwrap(); // no-op when disabled
         assert!(!ms.is_watched(nid));
