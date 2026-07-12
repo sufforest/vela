@@ -92,11 +92,24 @@ struct Config {
 /// PR-1 reads *local* policy rooms (ones this server hosts), so create the
 /// room here and set rules from a client. Rooms not held locally are skipped
 /// with a warning.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 #[serde(default)]
 struct ModerationSection {
     enabled: bool,
     policy_rooms: Vec<String>,
+    /// When true (default), an operator `!ban` of an exact local user also
+    /// force-leaves them from every room. Set false to ban-without-removing.
+    remove_on_ban: bool,
+}
+
+impl Default for ModerationSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            policy_rooms: Vec::new(),
+            remove_on_ban: true,
+        }
+    }
 }
 
 /// `[search]` section — full-text message search (`POST /v3/search`).
@@ -1510,6 +1523,7 @@ fn main() -> anyhow::Result<()> {
         let moderation = vela_api::moderation::ModerationState::init(
             &db,
             config.moderation.enabled,
+            config.moderation.remove_on_ban,
             &config.moderation.policy_rooms,
         );
 

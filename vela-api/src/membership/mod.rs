@@ -2390,11 +2390,16 @@ fn resolve_auth_nids(state: &AppState, auth_events: &[EventId]) -> Result<Vec<u6
 ///
 /// Used by the deactivate endpoint; not part of the spec contract for
 /// `/leave`. Don't use this from a regular leave handler.
-pub(crate) async fn force_leave_all_rooms_for_deactivation(
+/// Force-leave `user` from every room they're joined to / invited to / knocking
+/// on, embedding `reason`. Authored as self-leaves (always auth-allowed, no power
+/// level needed), so the server can eject its own user unconditionally. Remote-
+/// resident rooms are left off the response path. Returns the number of rooms
+/// acted on. Used by `!deactivate` and by moderation's remove-on-ban.
+pub(crate) async fn force_leave_all_rooms(
     state: &AppState,
     user: &AuthenticatedUser,
     reason: &str,
-) {
+) -> usize {
     use std::collections::BTreeSet;
 
     // Union joined / invited / knocked rooms. Already-left/banned states
@@ -2409,8 +2414,9 @@ pub(crate) async fn force_leave_all_rooms_for_deactivation(
     if let Ok(knocked) = state.db.get_user_knocked_rooms(user.user_nid) {
         rooms.extend(knocked);
     }
+    let count = rooms.len();
     if rooms.is_empty() {
-        return;
+        return 0;
     }
 
     for room_nid in rooms {
@@ -2476,10 +2482,11 @@ pub(crate) async fn force_leave_all_rooms_for_deactivation(
             tracing::warn!(
                 room = %room_id_str,
                 error = ?e.0,
-                "deactivate: local leave emit failed, continuing",
+                "force-leave: local leave emit failed, continuing",
             );
         }
     }
+    count
 }
 
 /// Emit a self-targeted `m.room.member` leave for `user` in `room_nid`,
@@ -2819,6 +2826,27 @@ mod tests {
             device_id: "DEV".into(),
             appservice_nid: None,
         }
+    }
+
+    #[tokio::test]
+    async fn force_leave_all_rooms_removes_joined_user() {
+        // setup_knock_room leaves alice joined to a real room.
+        let (state, _tmp, _room_id, room_nid, _bob_nid) = setup_knock_room();
+        let alice_nid = state.db.get_nid("@alice:example.com").unwrap().unwrap();
+        assert_eq!(
+            state.db.get_membership(room_nid, alice_nid).unwrap(),
+            Some(1)
+        );
+
+        let alice = user(alice_nid, "@alice:example.com");
+        let n = force_leave_all_rooms(&state, &alice, "banned by test").await;
+        assert_eq!(n, 1, "reported one room");
+        // Alice is no longer joined.
+        assert_ne!(
+            state.db.get_membership(room_nid, alice_nid).unwrap(),
+            Some(1),
+            "alice should have been force-left"
+        );
     }
 
     #[tokio::test]

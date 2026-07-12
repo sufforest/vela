@@ -330,7 +330,7 @@ impl Harness {
     pub fn enable_moderation(&mut self, policy_rooms: &[&str]) {
         let ids: Vec<String> = policy_rooms.iter().map(|s| s.to_string()).collect();
         self.state.moderation =
-            vela_api::moderation::ModerationState::init(&self.state.db, true, &ids);
+            vela_api::moderation::ModerationState::init(&self.state.db, true, true, &ids);
         self.router = build_router(self.state.clone());
     }
 

@@ -1192,38 +1192,9 @@ async fn cmd_deactivate(
         .db
         .delete_user_tokens(nid, None)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    // Force-leave every joined / invited / knocking room via the
-    // existing helper. The helper takes an AuthenticatedUser; build a
-    // stand-in for the target so events are signed correctly as
-    // "target leaves".
-    let device_id = state
-        .db
-        .list_devices(nid)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        .into_iter()
-        .find_map(|d| {
-            d.get("device_id")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-        .unwrap_or_else(|| "ADMIN_KICK".to_string());
-    let target_user_id = state
-        .db
-        .resolve_nid(nid)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        .ok_or_else(|| ApiError(VelaError::NotFound("user disappeared".into())))?;
-    let target = crate::middleware::auth::AuthenticatedUser {
-        user_nid: nid,
-        user_id: target_user_id,
-        device_id,
-        appservice_nid: None,
-    };
-    crate::membership::force_leave_all_rooms_for_deactivation(
-        state,
-        &target,
-        "Deactivated by server admin",
-    )
-    .await;
+    // Force-leave every joined / invited / knocking room.
+    let target = target_auth_user(state, nid)?;
+    crate::membership::force_leave_all_rooms(state, &target, "Deactivated by server admin").await;
     Ok(Reply::plain(format!("deactivated {mxid}")))
 }
 
@@ -1904,6 +1875,37 @@ fn html_escape(s: &str) -> String {
     out
 }
 
+/// Build a stand-in `AuthenticatedUser` for a local user (by nid) so the server
+/// can author events "as" them — e.g. the self-leaves in `force_leave_all_rooms`.
+/// Picks any of the user's device_ids, or a placeholder when they have none.
+fn target_auth_user(
+    state: &AppState,
+    nid: u64,
+) -> Result<crate::middleware::auth::AuthenticatedUser, ApiError> {
+    let user_id = state
+        .db
+        .resolve_nid(nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        .ok_or_else(|| ApiError(VelaError::NotFound("user disappeared".into())))?;
+    let device_id = state
+        .db
+        .list_devices(nid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        .into_iter()
+        .find_map(|d| {
+            d.get("device_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| "ADMIN_ACTION".to_string());
+    Ok(crate::middleware::auth::AuthenticatedUser {
+        user_nid: nid,
+        user_id,
+        device_id,
+        appservice_nid: None,
+    })
+}
+
 // =====================================================================
 // Moderation commands (see crate::moderation)
 // =====================================================================
@@ -2052,7 +2054,57 @@ async fn cmd_ban(state: &AppState, args: &[String]) -> Result<Reply, ApiError> {
     state
         .moderation
         .maybe_refresh(&state.db, room_nid, event_type);
-    Ok(Reply::plain(format!("banned {kind} `{entity}`")))
+
+    // Remove-on-ban: eject the just-banned user from every room they're in.
+    // Only for an exact, local user — a glob can't be resolved to specific
+    // members, and a remote user isn't ours to force-leave (their events are
+    // already rejected). Bounded to this one entity; the watched-list refresh
+    // path never triggers removal.
+    let note = maybe_remove_banned_user(state, kind, entity).await?;
+    Ok(Reply::plain(format!("banned {kind} `{entity}`{note}")))
+}
+
+/// If remove-on-ban applies and `entity` is an exact local user, force-leave
+/// them from all their rooms and return a note describing the outcome. Returns
+/// an empty note when removal doesn't apply (server/room bans, globs, remote
+/// users, or `remove_on_ban = false`).
+async fn maybe_remove_banned_user(
+    state: &AppState,
+    kind: &str,
+    entity: &str,
+) -> Result<String, ApiError> {
+    if kind != "user" || !state.moderation.remove_on_ban {
+        return Ok(String::new());
+    }
+    if entity.contains('*') || entity.contains('?') {
+        return Ok(" (glob rule — enforced going forward, not auto-removed)".to_string());
+    }
+    let is_local = entity
+        .split_once(':')
+        .map(|(_, domain)| domain == state.config.server_name)
+        .unwrap_or(false);
+    if !is_local {
+        return Ok(
+            " (remote user — enforced going forward; their events are rejected)".to_string(),
+        );
+    }
+    let Some(nid) = state
+        .db
+        .get_nid(entity)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        // A local mxid the server has never seen — nothing to remove.
+        return Ok(String::new());
+    };
+    let target = target_auth_user(state, nid)?;
+    let rooms =
+        crate::membership::force_leave_all_rooms(state, &target, "Banned by moderation policy")
+            .await;
+    Ok(match rooms {
+        0 => " (was in no rooms)".to_string(),
+        1 => " and removed them from 1 room".to_string(),
+        n => format!(" and removed them from {n} rooms"),
+    })
 }
 
 /// `!unban <user|server|room> <entity>` — revoke a `!ban` by writing empty
@@ -2459,7 +2511,7 @@ mod tests {
     #[tokio::test]
     async fn moderation_ban_writes_policy_and_enforces() {
         let (mut state, _tmp) = build_test_state();
-        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, true, &[]);
         bootstrap(&state).await.unwrap();
 
         let r = cmd_ban(&state, &arg("user @bad:evil.com being a spammer"))
@@ -2492,7 +2544,7 @@ mod tests {
     #[tokio::test]
     async fn moderation_all_wildcard_ban_refused() {
         let (mut state, _tmp) = build_test_state();
-        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, true, &[]);
         bootstrap(&state).await.unwrap();
         let r = cmd_ban(&state, &arg("user *")).await.unwrap();
         assert!(r.text.contains("refusing"), "reply: {}", r.text);
@@ -2502,7 +2554,7 @@ mod tests {
     #[tokio::test]
     async fn moderation_status_reports_state() {
         let (mut state, _tmp) = build_test_state();
-        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, true, &[]);
         bootstrap(&state).await.unwrap();
         cmd_ban(&state, &arg("user @bad:evil.com")).await.unwrap();
         let r = cmd_moderation(&state).await.unwrap();
@@ -2513,7 +2565,7 @@ mod tests {
     #[tokio::test]
     async fn moderation_watch_unwatch_local_room_persists() {
         let (mut state, _tmp) = build_test_state();
-        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, true, &[]);
         bootstrap(&state).await.unwrap();
         // A local room id (interned) that isn't the admin room.
         let room = "!watched:localhost".to_string();
@@ -2547,7 +2599,7 @@ mod tests {
     #[tokio::test]
     async fn moderation_bans_lists_entries_with_source() {
         let (mut state, _tmp) = build_test_state();
-        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, true, &[]);
         bootstrap(&state).await.unwrap();
         cmd_ban(&state, &arg("user @bad:evil.com being a spammer"))
             .await
@@ -2566,7 +2618,7 @@ mod tests {
     #[tokio::test]
     async fn moderation_bans_empty_and_disabled() {
         let (mut state, _tmp) = build_test_state();
-        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, true, &[]);
         bootstrap(&state).await.unwrap();
         let r = cmd_bans(&state, &[]).await.unwrap();
         assert!(r.text.contains("no active bans"), "reply: {}", r.text);
@@ -2579,7 +2631,7 @@ mod tests {
     #[tokio::test]
     async fn moderation_bans_paginates() {
         let (mut state, _tmp) = build_test_state();
-        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, true, &[]);
         bootstrap(&state).await.unwrap();
         for i in 0..21 {
             cmd_ban(&state, &arg(&format!("user @u{i}:evil.com")))
@@ -2604,7 +2656,7 @@ mod tests {
         // write to, so cmd_ban returns Err. dispatch_command must propagate it
         // (handle_command turns it into a "command failed" reply).
         let (mut state, _tmp) = build_test_state();
-        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, true, &[]);
         let result = dispatch_command(&state, 0, "ban", &arg("user @x:y.com"), "").await;
         assert!(
             result.is_err(),
@@ -2613,9 +2665,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_on_ban_local_user_reports_removal() {
+        let (mut state, _tmp) = build_test_state();
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, true, &[]);
+        bootstrap(&state).await.unwrap();
+        state.db.create_user("@spammer:example.com", "h").unwrap();
+        // Local, exact, in no rooms → force-leave runs and reports zero rooms.
+        let r = cmd_ban(&state, &arg("user @spammer:example.com"))
+            .await
+            .unwrap();
+        assert!(r.text.contains("banned"), "reply: {}", r.text);
+        assert!(r.text.contains("no rooms"), "reply: {}", r.text);
+        assert!(
+            state
+                .moderation
+                .check_user("@spammer:example.com")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_on_ban_skips_glob_entity() {
+        let (mut state, _tmp) = build_test_state();
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, true, &[]);
+        bootstrap(&state).await.unwrap();
+        let r = cmd_ban(&state, &arg("user @spam_*:example.com"))
+            .await
+            .unwrap();
+        assert!(r.text.contains("glob rule"), "reply: {}", r.text);
+    }
+
+    #[tokio::test]
+    async fn remove_on_ban_skips_remote_user() {
+        let (mut state, _tmp) = build_test_state();
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, true, &[]);
+        bootstrap(&state).await.unwrap();
+        let r = cmd_ban(&state, &arg("user @bad:evil.com")).await.unwrap();
+        assert!(r.text.contains("remote user"), "reply: {}", r.text);
+    }
+
+    #[tokio::test]
+    async fn remove_on_ban_disabled_leaves_no_note() {
+        let (mut state, _tmp) = build_test_state();
+        // Enabled moderation, but remove_on_ban = false.
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, false, &[]);
+        bootstrap(&state).await.unwrap();
+        state.db.create_user("@spammer:example.com", "h").unwrap();
+        let r = cmd_ban(&state, &arg("user @spammer:example.com"))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.text, "banned user `@spammer:example.com`",
+            "reply: {}",
+            r.text
+        );
+    }
+
+    #[tokio::test]
     async fn moderation_refuses_to_unwatch_admin_room() {
         let (mut state, _tmp) = build_test_state();
-        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, true, &[]);
         bootstrap(&state).await.unwrap();
         // A ban arms the admin room as the local policy room.
         cmd_ban(&state, &arg("user @bad:evil.com")).await.unwrap();
