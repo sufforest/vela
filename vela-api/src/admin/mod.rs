@@ -915,7 +915,30 @@ async fn handle_command(
         return Ok(());
     };
 
-    let response: Reply = match cmd.as_str() {
+    // Always reply, even on failure — a command that errors out otherwise leaves
+    // the operator staring at silence. Keep a WARN too, so infra-level failures
+    // still hit the server log for alerting (not just the room).
+    let response = match dispatch_command(state, sender_nid, cmd, rest, body).await {
+        Ok(reply) => reply,
+        Err(e) => {
+            warn!(command = %cmd, error = ?e.0, "admin command failed");
+            Reply::plain(format!("command failed: {}", e.0))
+        }
+    };
+
+    send_bot_notice(state, room_nid, response).await
+}
+
+/// Route a parsed command word to its handler. Returns the reply, or an error
+/// that `handle_command` turns into an operator-visible failure notice.
+async fn dispatch_command(
+    state: &AppState,
+    sender_nid: u64,
+    cmd: &str,
+    rest: &[String],
+    body: &str,
+) -> Result<Reply, ApiError> {
+    Ok(match cmd {
         "help" => cmd_help(),
         "server" => cmd_server(state, sender_nid).await?,
         "users" => cmd_users(state, rest).await?,
@@ -932,6 +955,7 @@ async fn handle_command(
         "reindex-search" => cmd_reindex_search(state).await?,
         "reports" => cmd_reports(state, rest).await?,
         "moderation" => cmd_moderation(state).await?,
+        "bans" => cmd_bans(state, rest).await?,
         "ban" => cmd_ban(state, rest).await?,
         "unban" => cmd_unban(state, rest).await?,
         "watch" => cmd_watch(state, rest).await?,
@@ -940,9 +964,7 @@ async fn handle_command(
         other => Reply::plain(format!(
             "unknown command: !{other}\ntype `!help` for the list of commands"
         )),
-    };
-
-    send_bot_notice(state, room_nid, response).await
+    })
 }
 
 /// A reply from the admin bot. Always sent as `m.notice` (per spec,
@@ -994,6 +1016,7 @@ fn cmd_help() -> Reply {
         !reindex-search                      rebuild the full-text search index from history\n\
         !reports [N]                         last N user-submitted abuse reports (default 20)\n\
         !moderation                          moderation status: watched rooms + ban counts\n\
+        !bans [page]                         list individual ban entries (20 per page)\n\
         !ban <user|server|room> <glob> [why] add a policy ban (enforced locally)\n\
         !unban <user|server|room> <glob>     revoke a ban issued via !ban\n\
         !watch <room_id> [server]            compile a policy room's rules (joins remote rooms)\n\
@@ -1936,6 +1959,52 @@ async fn cmd_moderation(state: &AppState) -> Result<Reply, ApiError> {
     Ok(Reply::plain(lines.join("\n")))
 }
 
+/// `!bans [page]` — list the individual ban entries (20/page). Each entry shows
+/// its source: "local" for the admin room (revocable via `!unban`), or the
+/// source room id for a watched external list (change it via `!unwatch`).
+async fn cmd_bans(state: &AppState, args: &[String]) -> Result<Reply, ApiError> {
+    if !state.moderation.enabled {
+        return Ok(moderation_disabled_reply());
+    }
+    const PER_PAGE: usize = 20;
+    let entries = state.moderation.list_bans();
+    if entries.is_empty() {
+        return Ok(Reply::plain("no active bans"));
+    }
+    let total = entries.len();
+    // `.max(1)` keeps this self-contained: even if the empty-list early return
+    // above were removed, `clamp(1, pages)` never sees min > max.
+    let pages = total.div_ceil(PER_PAGE).max(1);
+    let page = args
+        .first()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, pages);
+    let admin_room_nid = state.db.get_admin_room_nid().ok().flatten();
+
+    let mut lines = vec![format!("bans ({total} total) — page {page}/{pages}:")];
+    for e in entries.iter().skip((page - 1) * PER_PAGE).take(PER_PAGE) {
+        let source = if Some(e.source_room_nid) == admin_room_nid {
+            "local".to_string()
+        } else {
+            match state.db.resolve_nid(e.source_room_nid) {
+                Ok(Some(rid)) => format!("from {rid}"),
+                _ => "from ?".to_string(),
+            }
+        };
+        let reason = if e.reason.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", e.reason)
+        };
+        lines.push(format!("[{}] {}{} ({})", e.kind, e.entity, reason, source));
+    }
+    if pages > 1 {
+        lines.push(format!("(!bans <n> for another page, 1–{pages})"));
+    }
+    Ok(Reply::plain(lines.join("\n")))
+}
+
 /// `!ban <user|server|room> <entity> [reason]` — write an `m.policy.rule.*`
 /// ban into the admin room, which doubles as this server's local policy room, so
 /// the existing enforcement + refresh machinery picks it up. Enforced locally
@@ -2472,6 +2541,74 @@ mod tests {
                 .unwrap()
                 .contains(&room),
             "unwatch persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn moderation_bans_lists_entries_with_source() {
+        let (mut state, _tmp) = build_test_state();
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        bootstrap(&state).await.unwrap();
+        cmd_ban(&state, &arg("user @bad:evil.com being a spammer"))
+            .await
+            .unwrap();
+        cmd_ban(&state, &arg("server evil.com")).await.unwrap();
+
+        let r = cmd_bans(&state, &[]).await.unwrap();
+        assert!(r.text.contains("2 total"), "reply: {}", r.text);
+        assert!(r.text.contains("@bad:evil.com"), "reply: {}", r.text);
+        assert!(r.text.contains("being a spammer"), "reply: {}", r.text);
+        assert!(r.text.contains("[server] evil.com"), "reply: {}", r.text);
+        // `!ban` writes to the admin room, so entries are labelled "local".
+        assert!(r.text.contains("local"), "reply: {}", r.text);
+    }
+
+    #[tokio::test]
+    async fn moderation_bans_empty_and_disabled() {
+        let (mut state, _tmp) = build_test_state();
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        bootstrap(&state).await.unwrap();
+        let r = cmd_bans(&state, &[]).await.unwrap();
+        assert!(r.text.contains("no active bans"), "reply: {}", r.text);
+
+        let (state2, _tmp2) = build_test_state(); // moderation disabled
+        let r = cmd_bans(&state2, &[]).await.unwrap();
+        assert!(r.text.contains("disabled"), "reply: {}", r.text);
+    }
+
+    #[tokio::test]
+    async fn moderation_bans_paginates() {
+        let (mut state, _tmp) = build_test_state();
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        bootstrap(&state).await.unwrap();
+        for i in 0..21 {
+            cmd_ban(&state, &arg(&format!("user @u{i}:evil.com")))
+                .await
+                .unwrap();
+        }
+        let p1 = cmd_bans(&state, &arg("1")).await.unwrap();
+        assert!(p1.text.contains("21 total"), "p1: {}", p1.text);
+        assert!(p1.text.contains("page 1/2"), "p1: {}", p1.text);
+        let p2 = cmd_bans(&state, &arg("2")).await.unwrap();
+        assert!(p2.text.contains("page 2/2"), "p2: {}", p2.text);
+        // Page 2 holds the 21st entry only → far fewer lines than page 1.
+        assert!(p2.text.lines().count() < p1.text.lines().count());
+        // Out-of-range page clamps into range rather than erroring.
+        let p9 = cmd_bans(&state, &arg("9")).await.unwrap();
+        assert!(p9.text.contains("page 2/2"), "p9: {}", p9.text);
+    }
+
+    #[tokio::test]
+    async fn dispatch_surfaces_command_errors() {
+        // Enabled moderation but NOT bootstrapped → `!ban` has no admin room to
+        // write to, so cmd_ban returns Err. dispatch_command must propagate it
+        // (handle_command turns it into a "command failed" reply).
+        let (mut state, _tmp) = build_test_state();
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, &[]);
+        let result = dispatch_command(&state, 0, "ban", &arg("user @x:y.com"), "").await;
+        assert!(
+            result.is_err(),
+            "command error should propagate to the reply layer"
         );
     }
 
