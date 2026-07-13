@@ -986,6 +986,20 @@ fn commands() -> &'static [Command] {
             run: |c| Box::pin(cmd_reindex_search(c.state)),
         },
         Command {
+            name: "rooms",
+            group: "Rooms",
+            usage: "!rooms [page]",
+            summary: "list local rooms (20 per page)",
+            run: |c| Box::pin(cmd_rooms(c.state, c.args)),
+        },
+        Command {
+            name: "room",
+            group: "Rooms",
+            usage: "!room <room_id>",
+            summary: "show room details",
+            run: |c| Box::pin(cmd_room(c.state, c.args)),
+        },
+        Command {
             name: "users",
             group: "Users",
             usage: "!users [page]",
@@ -1194,6 +1208,7 @@ fn render_help(args: &[String]) -> Reply {
     let groups = [
         "General",
         "Server",
+        "Rooms",
         "Users",
         "Tokens",
         "Moderation",
@@ -1388,6 +1403,178 @@ async fn cmd_user(state: &AppState, args: &[String]) -> Result<Reply, ApiError> 
                 .collect::<String>()
         ));
     }
+    Ok(Reply::rich(text, html))
+}
+
+/// Content of a room's `""`-state-key state event of `event_type`, if present.
+fn room_state_content(state: &AppState, room_nid: u64, event_type: &str) -> Option<Value> {
+    let type_nid = state.db.get_nid(event_type).ok().flatten()?;
+    let sk_nid = state.db.get_nid("").ok().flatten()?;
+    let event_nid = state
+        .db
+        .get_state_event_nid(room_nid, type_nid, sk_nid)
+        .ok()
+        .flatten()?;
+    let (_, json) = state.db.get_event(event_nid).ok().flatten()?;
+    serde_json::from_slice::<Value>(&json)
+        .ok()?
+        .get("content")
+        .cloned()
+}
+
+/// The room creator (sender of `m.room.create`).
+fn room_creator(state: &AppState, room_nid: u64) -> Option<String> {
+    let type_nid = state.db.get_nid("m.room.create").ok().flatten()?;
+    let sk_nid = state.db.get_nid("").ok().flatten()?;
+    let event_nid = state
+        .db
+        .get_state_event_nid(room_nid, type_nid, sk_nid)
+        .ok()
+        .flatten()?;
+    let (header, _) = state.db.get_event(event_nid).ok().flatten()?;
+    state.db.resolve_nid(header.sender_nid).ok().flatten()
+}
+
+// --- !rooms [page] ---
+//
+// List local rooms: id, name, joined-member count, room version.
+async fn cmd_rooms(state: &AppState, args: &[String]) -> Result<Reply, ApiError> {
+    const PER_PAGE: usize = 20;
+    let mut ids = state
+        .db
+        .list_room_meta_room_ids()
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if ids.is_empty() {
+        return Ok(Reply::plain("no rooms"));
+    }
+    ids.sort();
+    let total = ids.len();
+    let pages = total.div_ceil(PER_PAGE).max(1);
+    let page = args
+        .first()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, pages);
+
+    let mut rows = Vec::new();
+    for id in ids.iter().skip((page - 1) * PER_PAGE).take(PER_PAGE) {
+        let Some(nid) = state
+            .db
+            .get_nid(id)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        else {
+            continue;
+        };
+        let name = room_state_content(state, nid, "m.room.name")
+            .and_then(|c| c.get("name").and_then(|v| v.as_str()).map(String::from))
+            .unwrap_or_default();
+        let members = state
+            .db
+            .count_room_members_by_membership(nid, 1)
+            .unwrap_or(0);
+        let version = state
+            .db
+            .get_room_version(nid)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "?".to_string());
+        rows.push(vec![id.clone(), name, members.to_string(), version]);
+    }
+    let (t, h) = render_table(&["room", "name", "members", "ver"], &rows);
+    let head = format!("rooms ({total} total) — page {page}/{pages}");
+    let footer = if pages > 1 {
+        format!("\n!rooms <n> for another page (1–{pages})")
+    } else {
+        String::new()
+    };
+    Ok(Reply::rich(
+        format!("{head}:\n{t}{footer}"),
+        format!("<p>{head}:</p>{h}"),
+    ))
+}
+
+// --- !room <room_id> ---
+//
+// Detail for one room: creator, version, join rule, encryption, alias, members.
+async fn cmd_room(state: &AppState, args: &[String]) -> Result<Reply, ApiError> {
+    let Some(room_id) = args.first() else {
+        return Ok(Reply::plain("usage: !room <!roomid:server>"));
+    };
+    let Some(nid) = state
+        .db
+        .get_nid(room_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(Reply::plain(format!("unknown room: {room_id}")));
+    };
+
+    let name = room_state_content(state, nid, "m.room.name")
+        .and_then(|c| c.get("name").and_then(|v| v.as_str()).map(String::from))
+        .unwrap_or_else(|| "(no name)".to_string());
+    let creator = room_creator(state, nid).unwrap_or_else(|| "?".to_string());
+    let version = state
+        .db
+        .get_room_version(nid)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "?".to_string());
+    let create = room_state_content(state, nid, "m.room.create");
+    let federated = create
+        .as_ref()
+        .and_then(|c| c.get("m.federate").and_then(|v| v.as_bool()))
+        .unwrap_or(true);
+    let join_rule = room_state_content(state, nid, "m.room.join_rules")
+        .and_then(|c| {
+            c.get("join_rule")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| "?".to_string());
+    let encryption = room_state_content(state, nid, "m.room.encryption").and_then(|c| {
+        c.get("algorithm")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    });
+    let alias = room_state_content(state, nid, "m.room.canonical_alias")
+        .and_then(|c| c.get("alias").and_then(|v| v.as_str()).map(String::from));
+    let joined = state
+        .db
+        .count_room_members_by_membership(nid, 1)
+        .unwrap_or(0);
+    let invited = state
+        .db
+        .count_room_members_by_membership(nid, 2)
+        .unwrap_or(0);
+
+    let enc = encryption.as_deref().unwrap_or("off");
+    let alias_line = alias.as_deref().unwrap_or("(none)");
+    let text = format!(
+        "{room_id}\n\
+         name: {name}\n\
+         creator: {creator}\n\
+         version: {version}   federated: {federated}\n\
+         join_rule: {join_rule}   encryption: {enc}\n\
+         canonical_alias: {alias_line}\n\
+         members: {joined} joined, {invited} invited"
+    );
+    let html = format!(
+        "<p><b>{}</b> — {}</p><ul>\
+         <li>creator: <code>{}</code></li>\
+         <li>version: {} · federated: {}</li>\
+         <li>join_rule: {} · encryption: {}</li>\
+         <li>canonical_alias: {}</li>\
+         <li>members: {} joined, {} invited</li></ul>",
+        html_escape(room_id),
+        html_escape(&name),
+        html_escape(&creator),
+        html_escape(&version),
+        federated,
+        html_escape(&join_rule),
+        html_escape(enc),
+        html_escape(alias_line),
+        joined,
+        invited,
+    );
     Ok(Reply::rich(text, html))
 }
 
@@ -3254,6 +3441,34 @@ mod tests {
             .await
             .unwrap();
         assert!(r.text.contains("unknown user"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn cmd_rooms_and_room_detail() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let admin_room = state.db.get_admin_room_id().unwrap().unwrap();
+
+        // Listing includes the bootstrapped admin room.
+        let r = cmd_rooms(&state, &[]).await.unwrap();
+        assert!(r.text.contains("total"), "{}", r.text);
+        assert!(r.text.contains(&admin_room), "{}", r.text);
+        assert!(r.html.is_some(), "rooms renders rich");
+
+        // Detail view resolves the room's fields.
+        let r = cmd_room(&state, std::slice::from_ref(&admin_room))
+            .await
+            .unwrap();
+        assert!(r.text.contains(&admin_room), "{}", r.text);
+        assert!(r.text.contains("creator:"), "{}", r.text);
+        assert!(r.text.contains("version:"), "{}", r.text);
+        assert!(r.text.contains("members:"), "{}", r.text);
+
+        // Unknown room.
+        let r = cmd_room(&state, &["!nope:example.com".to_string()])
+            .await
+            .unwrap();
+        assert!(r.text.contains("unknown room"), "{}", r.text);
     }
 
     #[tokio::test]
