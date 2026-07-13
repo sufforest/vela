@@ -1238,11 +1238,11 @@ async fn cmd_server(state: &AppState, _sender_nid: u64) -> Result<Reply, ApiErro
     Ok(Reply::plain(format!(
         "vela {version}\n\
          server_name: {server}\n\
-         uptime: {uptime}s\n\
+         uptime: {uptime}\n\
          local users: {user_count}\n\
          local rooms: {room_count}",
         server = state.config.server_name,
-        uptime = uptime_secs,
+        uptime = fmt_duration(uptime_secs),
     )))
 }
 
@@ -1324,38 +1324,71 @@ async fn cmd_user(state: &AppState, args: &[String]) -> Result<Reply, ApiError> 
         .as_ref()
         .and_then(|r| r.get("deactivated").and_then(|v| v.as_bool()))
         .unwrap_or(false);
+    let admin = is_admin(state, nid)?;
+    let now = now_ms();
+
+    // Per-device: id, last seen (relative), last ip.
     let devices = state
         .db
         .list_devices(nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    let device_ids: Vec<String> = devices
-        .iter()
-        .filter_map(|d| {
-            d.get("device_id")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-        .collect();
-    let joined = state
+    let mut dev_rows = Vec::new();
+    for d in &devices {
+        let device_id = d.get("device_id").and_then(|v| v.as_str()).unwrap_or("?");
+        let (ts, ip) = state
+            .db
+            .get_device_last_seen(nid, device_id)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        dev_rows.push(vec![
+            device_id.to_string(),
+            fmt_ts(ts.unwrap_or(0), now),
+            ip.unwrap_or_else(|| "-".to_string()),
+        ]);
+    }
+
+    // Joined rooms (resolve nids → ids), sorted for stable output.
+    let joined_nids = state
         .db
         .get_user_joined_rooms(nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-    let admin = is_admin(state, nid)?;
-    let text = format!(
-        "{mxid}\n\
-         deactivated: {deactivated}\n\
-         admin: {admin}\n\
-         devices ({dc}): {dl}\n\
-         joined rooms: {rc}",
-        dc = device_ids.len(),
-        dl = if device_ids.is_empty() {
-            "<none>".to_string()
-        } else {
-            device_ids.join(", ")
-        },
-        rc = joined.len(),
+    let mut rooms: Vec<String> = joined_nids
+        .iter()
+        .filter_map(|n| state.db.resolve_nid(*n).ok().flatten())
+        .collect();
+    rooms.sort();
+
+    let mut text = format!("{mxid}\ndeactivated: {deactivated}   admin: {admin}\n\n");
+    let mut html = format!(
+        "<p><b>{}</b><br>deactivated: {deactivated} · admin: {admin}</p>",
+        html_escape(mxid)
     );
-    Ok(Reply::plain(text))
+    if dev_rows.is_empty() {
+        text.push_str("devices: none\n");
+        html.push_str("<p>devices: none</p>");
+    } else {
+        let (t, h) = render_table(&["device", "last seen", "ip"], &dev_rows);
+        text.push_str(&format!("devices ({}):\n{t}", dev_rows.len()));
+        html.push_str(&format!("<p>devices ({}):</p>{h}", dev_rows.len()));
+    }
+    if rooms.is_empty() {
+        text.push_str("\njoined rooms: none");
+        html.push_str("<p>joined rooms: none</p>");
+    } else {
+        text.push_str(&format!(
+            "\njoined rooms ({}):\n  {}",
+            rooms.len(),
+            rooms.join("\n  ")
+        ));
+        html.push_str(&format!(
+            "<p>joined rooms ({}):</p><ul>{}</ul>",
+            rooms.len(),
+            rooms
+                .iter()
+                .map(|r| format!("<li><code>{}</code></li>", html_escape(r)))
+                .collect::<String>()
+        ));
+    }
+    Ok(Reply::rich(text, html))
 }
 
 // --- !deactivate <mxid> ---
@@ -1844,7 +1877,7 @@ async fn cmd_token_create(
         "never".to_string()
     } else {
         let secs_left = expires_at_ms.saturating_sub(now_ms()) / 1000;
-        format!("in {secs_left}s")
+        format!("in {}", fmt_duration(secs_left))
     };
     Ok(Reply::plain(format!(
         "minted token (uses: {uses_disp}, expires: {exp_disp}):\n{token}"
@@ -1932,27 +1965,35 @@ async fn cmd_reports(state: &AppState, args: &[String]) -> Result<Reply, ApiErro
     if reports.is_empty() {
         return Ok(Reply::plain("no reports"));
     }
-    let mut text = format!("last {} reports (newest first):\n", reports.len());
-    for r in &reports {
-        let kind = r["kind"].as_str().unwrap_or("?");
-        let ts = r["ts_ms"].as_u64().unwrap_or(0);
-        let reporter = r["reporter_user_id"].as_str().unwrap_or("?");
-        let reason = r["reason"].as_str().unwrap_or("");
-        let subject = match kind {
-            "event" => format!(
-                "{} in {}",
-                r["event_id"].as_str().unwrap_or("?"),
-                r["room_id"].as_str().unwrap_or("?")
-            ),
-            "room" => r["room_id"].as_str().unwrap_or("?").to_string(),
-            "user" => r["target_user_id"].as_str().unwrap_or("?").to_string(),
-            _ => "?".to_string(),
-        };
-        text.push_str(&format!(
-            "  [{kind}] ts={ts} by {reporter}: {subject}\n    reason: {reason}\n"
-        ));
-    }
-    Ok(Reply::plain(text))
+    let now = now_ms();
+    let rows: Vec<Vec<String>> = reports
+        .iter()
+        .map(|r| {
+            let kind = r["kind"].as_str().unwrap_or("?");
+            let subject = match kind {
+                "event" => format!(
+                    "{} in {}",
+                    r["event_id"].as_str().unwrap_or("?"),
+                    r["room_id"].as_str().unwrap_or("?")
+                ),
+                "room" => r["room_id"].as_str().unwrap_or("?").to_string(),
+                "user" => r["target_user_id"].as_str().unwrap_or("?").to_string(),
+                _ => "?".to_string(),
+            };
+            vec![
+                fmt_ts(r["ts_ms"].as_u64().unwrap_or(0), now),
+                kind.to_string(),
+                subject,
+                r["reporter_user_id"].as_str().unwrap_or("?").to_string(),
+                r["reason"].as_str().unwrap_or("").to_string(),
+            ]
+        })
+        .collect();
+    let (t, h) = render_table(&["when", "kind", "subject", "by", "reason"], &rows);
+    Ok(Reply::rich(
+        format!("last {} reports (newest first):\n{t}", reports.len()),
+        format!("<p>last {} reports (newest first):</p>{h}", reports.len()),
+    ))
 }
 
 // --- !as <subcmd> dispatch ---
@@ -2070,6 +2111,93 @@ fn html_escape(s: &str) -> String {
     out
 }
 
+/// Human-readable duration, two largest non-zero units: "3d 4h", "2h 5m",
+/// "45s", "0s". Used for uptime and token-expiry display.
+fn fmt_duration(secs: u64) -> String {
+    let units = [(86400u64, "d"), (3600, "h"), (60, "m"), (1, "s")];
+    let mut parts = Vec::new();
+    let mut rem = secs;
+    for (size, label) in units {
+        let n = rem / size;
+        if n > 0 {
+            parts.push(format!("{n}{label}"));
+            rem %= size;
+            if parts.len() == 2 {
+                break;
+            }
+        }
+    }
+    if parts.is_empty() {
+        "0s".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// Relative timestamp against `now_ms`: "3h ago" / "just now" / "never".
+/// `now_ms` is threaded in (not read from the clock) so it's testable.
+fn fmt_ts(ms: u64, now_ms: u64) -> String {
+    if ms == 0 {
+        return "never".to_string();
+    }
+    if now_ms <= ms {
+        return "just now".to_string();
+    }
+    let ago = fmt_duration((now_ms - ms) / 1000);
+    if ago == "0s" {
+        "just now".to_string()
+    } else {
+        format!("{ago} ago")
+    }
+}
+
+/// Render `rows` under `headers` as an aligned plain-text block plus an HTML
+/// table, for `Reply::rich`. The HTML side escapes every cell; the plain side
+/// pads columns to the widest cell so it stays readable in any client.
+fn render_table(headers: &[&str], rows: &[Vec<String>]) -> (String, String) {
+    let ncol = headers.len();
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate().take(ncol) {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+    }
+    let pad = |out: &mut String, cells: &[String]| {
+        for (i, &w) in widths.iter().enumerate() {
+            let cell = cells.get(i).map(String::as_str).unwrap_or("");
+            out.push_str(cell);
+            if i + 1 < ncol {
+                let gap = w.saturating_sub(cell.chars().count()) + 2;
+                out.push_str(&" ".repeat(gap));
+            }
+        }
+        out.push('\n');
+    };
+    let mut text = String::new();
+    pad(
+        &mut text,
+        &headers.iter().map(|h| h.to_string()).collect::<Vec<_>>(),
+    );
+    for row in rows {
+        pad(&mut text, row);
+    }
+
+    let mut html = String::from("<table><thead><tr>");
+    for h in headers {
+        html.push_str(&format!("<th>{}</th>", html_escape(h)));
+    }
+    html.push_str("</tr></thead><tbody>");
+    for row in rows {
+        html.push_str("<tr>");
+        for cell in row.iter().take(ncol) {
+            html.push_str(&format!("<td>{}</td>", html_escape(cell)));
+        }
+        html.push_str("</tr>");
+    }
+    html.push_str("</tbody></table>");
+    (text, html)
+}
+
 /// Build a stand-in `AuthenticatedUser` for a local user (by nid) so the server
 /// can author events "as" them — e.g. the self-leaves in `force_leave_all_rooms`.
 /// Picks any of the user's device_ids, or a placeholder when they have none.
@@ -2179,27 +2307,38 @@ async fn cmd_bans(state: &AppState, args: &[String]) -> Result<Reply, ApiError> 
         .clamp(1, pages);
     let admin_room_nid = state.db.get_admin_room_nid().ok().flatten();
 
-    let mut lines = vec![format!("bans ({total} total) — page {page}/{pages}:")];
-    for e in entries.iter().skip((page - 1) * PER_PAGE).take(PER_PAGE) {
-        let source = if Some(e.source_room_nid) == admin_room_nid {
-            "local".to_string()
-        } else {
-            match state.db.resolve_nid(e.source_room_nid) {
-                Ok(Some(rid)) => format!("from {rid}"),
-                _ => "from ?".to_string(),
-            }
-        };
-        let reason = if e.reason.is_empty() {
-            String::new()
-        } else {
-            format!(" — {}", e.reason)
-        };
-        lines.push(format!("[{}] {}{} ({})", e.kind, e.entity, reason, source));
-    }
-    if pages > 1 {
-        lines.push(format!("(!bans <n> for another page, 1–{pages})"));
-    }
-    Ok(Reply::plain(lines.join("\n")))
+    let rows: Vec<Vec<String>> = entries
+        .iter()
+        .skip((page - 1) * PER_PAGE)
+        .take(PER_PAGE)
+        .map(|e| {
+            let source = if Some(e.source_room_nid) == admin_room_nid {
+                "local".to_string()
+            } else {
+                match state.db.resolve_nid(e.source_room_nid) {
+                    Ok(Some(rid)) => format!("from {rid}"),
+                    _ => "from ?".to_string(),
+                }
+            };
+            vec![
+                e.kind.to_string(),
+                e.entity.clone(),
+                e.reason.clone(),
+                source,
+            ]
+        })
+        .collect();
+    let (t, h) = render_table(&["kind", "entity", "reason", "source"], &rows);
+    let head = format!("bans ({total} total) — page {page}/{pages}");
+    let footer = if pages > 1 {
+        format!("\n!bans <n> for another page (1–{pages})")
+    } else {
+        String::new()
+    };
+    Ok(Reply::rich(
+        format!("{head}:\n{t}{footer}"),
+        format!("<p>{head}:</p>{h}"),
+    ))
 }
 
 /// `!ban <user|server|room> <entity> [reason]` — write an `m.policy.rule.*`
@@ -2805,7 +2944,9 @@ mod tests {
         assert!(r.text.contains("2 total"), "reply: {}", r.text);
         assert!(r.text.contains("@bad:evil.com"), "reply: {}", r.text);
         assert!(r.text.contains("being a spammer"), "reply: {}", r.text);
-        assert!(r.text.contains("[server] evil.com"), "reply: {}", r.text);
+        // Table columns: kind "server", entity "evil.com".
+        assert!(r.text.contains("server"), "reply: {}", r.text);
+        assert!(r.text.contains("evil.com"), "reply: {}", r.text);
         // `!ban` writes to the admin room, so entries are labelled "local".
         assert!(r.text.contains("local"), "reply: {}", r.text);
     }
@@ -3065,6 +3206,56 @@ mod tests {
         assert!(r.text.contains("unknown command"), "{}", r.text);
     }
 
+    #[test]
+    fn fmt_duration_two_largest_units() {
+        assert_eq!(fmt_duration(0), "0s");
+        assert_eq!(fmt_duration(45), "45s");
+        assert_eq!(fmt_duration(90), "1m 30s");
+        assert_eq!(fmt_duration(3600), "1h");
+        assert_eq!(fmt_duration(3661), "1h 1m");
+        assert_eq!(fmt_duration(90000), "1d 1h");
+    }
+
+    #[test]
+    fn fmt_ts_relative() {
+        assert_eq!(fmt_ts(0, 1_000), "never");
+        assert_eq!(fmt_ts(5_000, 5_000), "just now");
+        assert_eq!(fmt_ts(9_000, 5_000), "just now"); // future timestamp
+        assert_eq!(fmt_ts(1_000, 1_000 + 3_600_000), "1h ago");
+    }
+
+    #[test]
+    fn render_table_aligns_and_escapes() {
+        let (text, html) = render_table(
+            &["a", "bb"],
+            &[vec!["x".into(), "y".into()], vec!["<z>".into(), "w".into()]],
+        );
+        assert!(text.contains("<z>"), "plain text is unescaped: {text}");
+        assert!(html.contains("<th>a</th>"));
+        assert!(html.contains("&lt;z&gt;"), "html escapes cells: {html}");
+        assert!(html.contains("<td>"));
+    }
+
+    #[tokio::test]
+    async fn cmd_user_whois_renders() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        state.db.create_user("@alice:example.com", "h").unwrap();
+        let r = cmd_user(&state, &["@alice:example.com".to_string()])
+            .await
+            .unwrap();
+        assert!(r.text.contains("@alice:example.com"), "{}", r.text);
+        assert!(r.text.contains("deactivated: false"), "{}", r.text);
+        assert!(r.text.contains("devices"), "{}", r.text);
+        assert!(r.text.contains("joined rooms"), "{}", r.text);
+        assert!(r.html.is_some(), "whois renders rich");
+        // Unknown user.
+        let r = cmd_user(&state, &["@nobody:example.com".to_string()])
+            .await
+            .unwrap();
+        assert!(r.text.contains("unknown user"), "{}", r.text);
+    }
+
     #[tokio::test]
     async fn every_command_is_dispatchable() {
         // Guard against a registry entry whose `run` wrapper is miswired: each
@@ -3209,7 +3400,8 @@ mod tests {
             )
             .unwrap();
         let r = cmd_reports(&state, &[]).await.unwrap();
-        assert!(r.text.contains("[event]"));
+        // Table columns: kind "event", subject with the event id, reason "spam".
+        assert!(r.text.contains("event"), "{}", r.text);
         assert!(r.text.contains("$e:example.com"));
         assert!(r.text.contains("spam"));
     }
