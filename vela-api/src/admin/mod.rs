@@ -1077,6 +1077,13 @@ fn commands() -> &'static [Command] {
             run: |c| Box::pin(cmd_reports(c.state, c.args)),
         },
         Command {
+            name: "redact",
+            group: "Moderation",
+            usage: "!redact <room_id> <event_id> [reason]",
+            summary: "redact an event (bot must have redact power in the room)",
+            run: |c| Box::pin(cmd_redact(c.state, c.args)),
+        },
+        Command {
             name: "moderation",
             group: "Moderation",
             usage: "!moderation",
@@ -1576,6 +1583,45 @@ async fn cmd_room(state: &AppState, args: &[String]) -> Result<Reply, ApiError> 
         invited,
     );
     Ok(Reply::rich(text, html))
+}
+
+// --- !redact <room_id> <event_id> [reason] ---
+//
+// Redact an event as the admin bot. The bot must be joined to the room with
+// sufficient redact power (it isn't in most rooms), so this works in rooms the
+// bot moderates; elsewhere the redaction is refused and reported.
+async fn cmd_redact(state: &AppState, args: &[String]) -> Result<Reply, ApiError> {
+    let (Some(room_id), Some(event_id)) = (args.first(), args.get(1)) else {
+        return Ok(Reply::plain("usage: !redact <room_id> <event_id> [reason]"));
+    };
+    let reason = args.get(2..).map(|r| r.join(" ")).filter(|s| !s.is_empty());
+    let bot = bot_auth_user(state)?;
+    let txn = format!("admin-redact-{}", now_ms());
+    let result = crate::room::redaction::redact_event(
+        axum::extract::State(state.clone()),
+        bot,
+        axum::extract::Path((room_id.clone(), event_id.clone(), txn)),
+        crate::middleware::json::Json(crate::room::redaction::RedactBody {
+            reason: reason.clone(),
+        }),
+    )
+    .await;
+    match result {
+        Ok(json) => {
+            let eid = json
+                .0
+                .get("event_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            Ok(Reply::plain(format!(
+                "redacted {event_id} in {room_id} (redaction {eid})"
+            )))
+        }
+        Err(e) => Ok(Reply::plain(format!(
+            "could not redact: {} — the admin bot must be joined to {room_id} with redact power",
+            e.0
+        ))),
+    }
 }
 
 // --- !deactivate <mxid> ---
@@ -3469,6 +3515,43 @@ mod tests {
             .await
             .unwrap();
         assert!(r.text.contains("unknown room"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn cmd_redact_in_admin_room() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let room_id = state.db.get_admin_room_id().unwrap().unwrap();
+        let room_nid = state.db.get_admin_room_nid().unwrap().unwrap();
+        let bot = bot_auth_user(&state).unwrap();
+
+        // The bot posts a message (it has power in the admin room), then redacts
+        // its own event — the redaction is allowed.
+        let eid = emit_event_as(
+            &state,
+            room_nid,
+            bot.user_nid,
+            &bot.user_id,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": "hi"}),
+            None,
+        )
+        .await
+        .unwrap();
+        let r = cmd_redact(&state, &[room_id.clone(), eid.as_str().to_string()])
+            .await
+            .unwrap();
+        assert!(r.text.contains("redacted"), "{}", r.text);
+
+        // A room the bot isn't in → refused, reported (not an error).
+        let r = cmd_redact(&state, &["!nope:example.com".to_string(), "$x".to_string()])
+            .await
+            .unwrap();
+        assert!(r.text.contains("could not redact"), "{}", r.text);
+
+        // Usage.
+        let r = cmd_redact(&state, &[]).await.unwrap();
+        assert!(r.text.contains("usage"), "{}", r.text);
     }
 
     #[tokio::test]
