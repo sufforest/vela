@@ -3311,7 +3311,6 @@ dependencies = [
 name = "vela-store"
 version = "0.3.0"
 dependencies = [
- "argon2",
  "async-trait",
  "base64",
  "bytes",

@@ -450,6 +450,7 @@ pub(crate) async fn send_message_inner(
         user.user_nid,
         &event_type,
         &content_for_dispatch,
+        event_id.as_str(),
     );
 
     Ok(Json(json!({"event_id": event_id.as_str()})))

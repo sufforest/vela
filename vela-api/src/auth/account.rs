@@ -45,7 +45,7 @@ pub async fn change_password(
     // enough — require the caller to re-enter their password (bound to the
     // caller, so a stolen token + someone else's password won't do).
     uia::require_uia_identifier_matches(&state, &body, &user.user_id)?;
-    uia::require_password_auth(&state, &body)?;
+    uia::require_password_auth(&state, &body).await?;
 
     let new_password = body
         .get("new_password")
@@ -60,7 +60,9 @@ pub async fn change_password(
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    let hash = hash_password(new_password);
+    let hash = crate::auth::password::hash(new_password)
+        .await
+        .map_err(ApiError)?;
     state
         .db
         .update_user_password(user.user_nid, &hash)
@@ -138,7 +140,7 @@ pub async fn deactivate(
     }
 
     uia::require_uia_identifier_matches(&state, &body, &user.user_id)?;
-    uia::require_password_auth(&state, &body)?;
+    uia::require_password_auth(&state, &body).await?;
 
     let erase = body.get("erase").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -281,17 +283,6 @@ fn federate_device_list_deletes(state: &AppState, user: &AuthenticatedUser, devi
     }
 }
 
-pub(crate) fn hash_password(password: &str) -> String {
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
-    let salt: [u8; 16] = rand::random();
-    let salt_str = SaltString::encode_b64(&salt).unwrap();
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt_str)
-        .unwrap()
-        .to_string()
-}
-
 /// GET /_matrix/client/v3/account/3pid
 ///
 /// List third-party identifiers (emails, phone numbers) associated
@@ -311,7 +302,7 @@ mod tests {
     use axum::extract::State;
 
     fn register_test_user(state: &AppState, user_id: &str, password: &str) -> (u64, String) {
-        let hash = hash_password(password);
+        let hash = crate::auth::password::hash_sync(password);
         let nid = state.db.create_user(user_id, &hash).unwrap();
         let device_id = "TEST_DEV".to_string();
         state.db.create_device(nid, &device_id).unwrap();

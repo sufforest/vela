@@ -9,6 +9,7 @@ pub mod devices;
 pub mod login;
 pub mod logout;
 pub mod oidc;
+pub mod password;
 pub mod refresh;
 pub mod register;
 pub mod uia;

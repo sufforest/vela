@@ -801,7 +801,7 @@ pub async fn upload_signing_keys(
         });
     if !existing.is_empty() && any_change {
         crate::auth::uia::require_uia_identifier_matches(&state, &body, &user.user_id)?;
-        crate::auth::uia::require_password_auth(&state, &body)?;
+        crate::auth::uia::require_password_auth(&state, &body).await?;
     }
 
     // Pull the three optional key fields from the JSON body.

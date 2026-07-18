@@ -155,39 +155,47 @@ pub async fn login(
         UserId::new(&username.to_lowercase(), &state.config.server_name)
     };
 
-    // Look up user
+    // Look up the account. Unknown user, AS-minted passwordless account
+    // and deactivated account (deactivation blanks the hash) all reach
+    // the verify below with no usable stored hash: `password::verify`
+    // burns one argon2 run against a dummy hash and fails, so every
+    // reject costs the same time and returns the same error — response
+    // timing can't enumerate usernames. The spec allows plain
+    // M_FORBIDDEN for deactivated users whose password was wiped
+    // (login.yaml, 403 responses).
     let user_nid = state
         .db
         .get_nid(user_id.as_str())
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        .ok_or(ApiError(VelaError::Forbidden("invalid credentials".into())))?;
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let user_record = match user_nid {
+        Some(nid) => state
+            .db
+            .get_user(nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?,
+        None => None,
+    };
+    let stored_hash = user_record
+        .as_ref()
+        .and_then(|r| r.get("password_hash"))
+        .and_then(|v| v.as_str());
 
-    let user_record = state
-        .db
-        .get_user(user_nid)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        .ok_or(ApiError(VelaError::Forbidden("invalid credentials".into())))?;
+    if !crate::auth::password::verify(password, stored_hash).await {
+        return Err(VelaError::Forbidden("invalid credentials".into()).into());
+    }
+    // Verification succeeded, so the record (and its hash) exist.
+    let user_nid = user_nid.expect("password verified against a stored hash");
 
+    // Deactivation blanks the hash, so a deactivated account normally
+    // fails above. This branch only fires if credentials survived
+    // deactivation some other way — after the verify, so probing it
+    // requires the correct password.
     if user_record
-        .get("deactivated")
+        .as_ref()
+        .and_then(|r| r.get("deactivated"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
     {
         return Err(VelaError::UserDeactivated.into());
-    }
-
-    // argon2 verify is CPU-bound; spawn_blocking keeps it off the
-    // tokio worker so a slow login doesn't pile up other requests.
-    let stored_hash = user_record["password_hash"]
-        .as_str()
-        .ok_or(ApiError(VelaError::Unknown("corrupt user record".into())))?
-        .to_string();
-    let password_owned = password.to_string();
-    let ok = tokio::task::spawn_blocking(move || verify_password(&password_owned, &stored_hash))
-        .await
-        .map_err(|e| ApiError(VelaError::Unknown(format!("verify task: {e}"))))?;
-    if !ok {
-        return Err(VelaError::Forbidden("invalid credentials".into()).into());
     }
 
     // Create device + token
@@ -247,70 +255,137 @@ pub async fn login(
     Ok(Json(response))
 }
 
-fn verify_password(password: &str, stored_hash: &str) -> bool {
-    use argon2::Argon2;
-    use argon2::PasswordVerifier;
-    use argon2::password_hash::PasswordHash;
-
-    let parsed = match PasswordHash::new(stored_hash) {
-        Ok(h) => h,
-        Err(_) => return false,
-    };
-
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::password::hash_sync as hash_password;
     use crate::test_helpers::build_test_state;
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
     use axum::extract::State;
 
-    fn hash_password(password: &str) -> String {
-        let salt: [u8; 16] = rand::random();
-        let salt_str = SaltString::encode_b64(&salt).unwrap();
-        Argon2::default()
-            .hash_password(password.as_bytes(), &salt_str)
-            .unwrap()
-            .to_string()
-    }
-
-    /// Deactivated users get a 403 `M_USER_DEACTIVATED`, not a generic
-    /// invalid-credentials path. Verifies the explicit deactivation
-    /// branch in `login` is exercised before password comparison.
+    /// Deactivated accounts have their hash blanked, so login fails with
+    /// the same generic invalid-credentials as an unknown user — the
+    /// deactivated state is not observable without the password.
     #[tokio::test]
     async fn login_rejects_deactivated_user() {
         let (state, _tmp) = build_test_state();
         let hash = hash_password("pw");
         let user_nid = state.db.create_user("@alice:example.com", &hash).unwrap();
-        // Mark deactivated. (`deactivate_user` also clears the password
-        // hash, but the deactivation flag is the authoritative signal.)
+        // Blanks the hash AND sets the deactivation flag.
         state.db.deactivate_user(user_nid).unwrap();
 
         let err = login(
             State(state.clone()),
             axum::http::HeaderMap::new(),
-            Json(LoginRequest {
-                login_type: "m.login.password".into(),
-                identifier: Some(LoginIdentifier {
-                    id_type: "m.id.user".into(),
-                    user: Some("@alice:example.com".into()),
-                }),
-                user: None,
-                password: Some("pw".into()),
-                device_id: None,
-                initial_device_display_name: None,
-                refresh_token: false,
-            }),
+            Json(pw_login("@alice:example.com", "pw")),
         )
         .await
         .expect_err("deactivated user must not log in");
 
+        assert!(matches!(err.0, VelaError::Forbidden(_)));
+    }
+
+    fn pw_login(user: &str, password: &str) -> LoginRequest {
+        LoginRequest {
+            login_type: "m.login.password".into(),
+            identifier: Some(LoginIdentifier {
+                id_type: "m.id.user".into(),
+                user: Some(user.into()),
+            }),
+            user: None,
+            password: Some(password.into()),
+            device_id: None,
+            initial_device_display_name: None,
+            refresh_token: false,
+        }
+    }
+
+    /// The belt-and-braces branch: an account that is deactivated but
+    /// somehow kept valid credentials is still refused — but only after
+    /// the password check, so the state isn't probeable without it.
+    #[tokio::test]
+    async fn deactivated_with_surviving_credentials_refused_post_verify() {
+        let (state, _tmp) = build_test_state();
+        let user_nid = state
+            .db
+            .create_user("@alice:example.com", &hash_password("pw"))
+            .unwrap();
+        state.db.deactivate_user(user_nid).unwrap();
+        // Re-set a hash while the deactivation flag stays.
+        state
+            .db
+            .update_user_password(user_nid, &hash_password("pw"))
+            .unwrap();
+
+        let err = login(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(pw_login("@alice:example.com", "pw")),
+        )
+        .await
+        .expect_err("deactivated user must not log in");
         assert!(matches!(err.0, VelaError::UserDeactivated));
+
+        // Without the password the caller learns nothing but "invalid
+        // credentials".
+        let err = login(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(pw_login("@alice:example.com", "wrong")),
+        )
+        .await
+        .expect_err("wrong password must not log in");
+        assert!(matches!(err.0, VelaError::Forbidden(_)));
+    }
+
+    /// Unknown user and wrong password must be indistinguishable in the
+    /// response (the timing side is handled by the dummy verify in
+    /// `auth::password`).
+    #[tokio::test]
+    async fn unknown_user_and_wrong_password_same_error() {
+        let (state, _tmp) = build_test_state();
+        state
+            .db
+            .create_user("@alice:example.com", &hash_password("pw"))
+            .unwrap();
+
+        let unknown = login(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(pw_login("@ghost:example.com", "pw")),
+        )
+        .await
+        .expect_err("unknown user must not log in");
+        let wrong = login(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(pw_login("@alice:example.com", "nope")),
+        )
+        .await
+        .expect_err("wrong password must not log in");
+
+        let (VelaError::Forbidden(a), VelaError::Forbidden(b)) = (unknown.0, wrong.0) else {
+            panic!("expected Forbidden for both");
+        };
+        assert_eq!(a, b);
+    }
+
+    /// Oversized passwords are refused without burning argon2 on them.
+    #[tokio::test]
+    async fn oversized_password_is_invalid_credentials() {
+        let (state, _tmp) = build_test_state();
+        state
+            .db
+            .create_user("@alice:example.com", &hash_password("pw"))
+            .unwrap();
+        let long = "x".repeat(crate::auth::password::MAX_PASSWORD_LEN + 1);
+        let err = login(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            Json(pw_login("@alice:example.com", &long)),
+        )
+        .await
+        .expect_err("oversized password must not log in");
+        assert!(matches!(err.0, VelaError::Forbidden(_)));
     }
 
     /// A check_login plugin blocks a banned username before any DB lookup or

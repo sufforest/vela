@@ -227,6 +227,9 @@ pub async fn register(
     if password.is_empty() {
         return Err(VelaError::BadJson("password is required".into()).into());
     }
+    if password.len() > crate::auth::password::MAX_PASSWORD_LEN {
+        return Err(crate::auth::password::too_long().into());
+    }
 
     let user_id = UserId::new(&username, &state.config.server_name);
 
@@ -253,9 +256,11 @@ pub async fn register(
         &headers,
     )?;
 
-    // Hash password with argon2
-    let salt: [u8; 16] = rand::random();
-    let password_hash = hash_password(password, &salt);
+    // Hash password with argon2 (off-runtime + concurrency-capped in
+    // `auth::password`).
+    let password_hash = crate::auth::password::hash(password)
+        .await
+        .map_err(ApiError)?;
 
     // Consume the registration token atomically before creating the
     // user. If a concurrent registrant already consumed the last use
@@ -458,19 +463,6 @@ async fn register_as_appservice(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     Ok(Json(json!({ "user_id": user_id.as_str() })))
-}
-
-fn hash_password(password: &str, salt: &[u8; 16]) -> String {
-    use argon2::Argon2;
-    use argon2::PasswordHasher;
-    use argon2::password_hash::SaltString;
-
-    let salt_str = SaltString::encode_b64(salt).unwrap();
-    let argon2 = Argon2::default();
-    argon2
-        .hash_password(password.as_bytes(), &salt_str)
-        .unwrap()
-        .to_string()
 }
 
 #[derive(Deserialize)]
