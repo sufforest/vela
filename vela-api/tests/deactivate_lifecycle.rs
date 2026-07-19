@@ -9,8 +9,9 @@
 //!   `m.room.member` `leave` event with a deactivation reason.
 //! - The deactivated user's access token is revoked, so subsequent
 //!   authenticated requests return `M_UNKNOWN_TOKEN`.
-//! - A second login attempt with the same credentials returns
-//!   `M_USER_DEACTIVATED`.
+//! - A second login attempt with the same credentials returns the same
+//!   generic `M_FORBIDDEN` as any bad credential (deactivation wipes the
+//!   hash; the deactivated state is not probeable without the password).
 
 mod common;
 
@@ -98,7 +99,10 @@ async fn deactivate_force_leaves_local_rooms_and_revokes_session() {
         .await;
     assert_eq!(whoami.status(), StatusCode::UNAUTHORIZED);
 
-    // Subsequent login attempt returns 403 M_USER_DEACTIVATED.
+    // Subsequent login attempt returns the same generic 403 M_FORBIDDEN
+    // as any bad credential (deactivation wiped the hash; the spec
+    // allows M_FORBIDDEN in that case, and the uniform error keeps the
+    // deactivated state unprobeable without the password).
     let login_body = json!({
         "type": "m.login.password",
         "identifier": {"type": "m.id.user", "user": alice_id},
@@ -114,5 +118,5 @@ async fn deactivate_force_leaves_local_rooms_and_revokes_session() {
         .await;
     assert_eq!(login_resp.status(), StatusCode::FORBIDDEN);
     let err = read_json(login_resp).await;
-    assert_eq!(err["errcode"].as_str(), Some("M_USER_DEACTIVATED"));
+    assert_eq!(err["errcode"].as_str(), Some("M_FORBIDDEN"));
 }

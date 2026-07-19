@@ -153,7 +153,7 @@ pub async fn delete_device(
     // Identifier-match before the password check (closes a cross-user
     // password oracle), then verify the caller's password.
     uia::require_uia_identifier_matches(&state, &body, &user.user_id)?;
-    uia::require_password_auth(&state, &body)?;
+    uia::require_password_auth(&state, &body).await?;
 
     if state
         .db
@@ -241,7 +241,7 @@ pub async fn delete_devices(
     // Identifier-match before the password check (closes a cross-user
     // password oracle), then verify the caller's password.
     uia::require_uia_identifier_matches(&state, &body, &user.user_id)?;
-    uia::require_password_auth(&state, &body)?;
+    uia::require_password_auth(&state, &body).await?;
 
     let devices = body
         .get("devices")

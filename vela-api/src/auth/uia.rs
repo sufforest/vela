@@ -95,7 +95,7 @@ fn challenge_body(session: &str, completed: Option<&[&str]>) -> Value {
 /// call [`require_uia_identifier_matches`] so a stolen token + the
 /// attacker's own password can't authorise an action on the victim's
 /// account.
-pub fn require_password_auth(state: &AppState, body: &Value) -> Result<(), UiaError> {
+pub async fn require_password_auth(state: &AppState, body: &Value) -> Result<(), UiaError> {
     let auth = match body.get("auth") {
         Some(a) if !a.is_null() => a,
         _ => {
@@ -143,28 +143,21 @@ pub fn require_password_auth(state: &AppState, body: &Value) -> Result<(), UiaEr
         format!("@{}:{}", user_ref.to_lowercase(), state.config.server_name)
     };
 
-    let user_nid = match state.db.get_nid(&user_id) {
-        Ok(Some(n)) => n,
-        _ => {
-            return Err(UiaError::Failed {
-                session,
-                errcode: "M_FORBIDDEN",
-                error: "invalid credentials".into(),
-            });
-        }
-    };
-    let record = match state.db.get_user(user_nid) {
-        Ok(Some(r)) => r,
-        _ => {
-            return Err(UiaError::Failed {
-                session,
-                errcode: "M_FORBIDDEN",
-                error: "invalid credentials".into(),
-            });
-        }
-    };
-    let stored_hash = record["password_hash"].as_str().unwrap_or("");
-    if stored_hash.is_empty() || !verify_password(password, stored_hash) {
+    // Unknown user, store error and passwordless account all resolve to
+    // `None`; `password::verify` then burns one argon2 run against its
+    // dummy hash and fails, so every reject takes the same time and
+    // surfaces the same error.
+    let record = state
+        .db
+        .get_nid(&user_id)
+        .ok()
+        .flatten()
+        .and_then(|nid| state.db.get_user(nid).ok().flatten());
+    let stored_hash = record
+        .as_ref()
+        .and_then(|r| r.get("password_hash"))
+        .and_then(|v| v.as_str());
+    if !crate::auth::password::verify(password, stored_hash).await {
         return Err(UiaError::Failed {
             session,
             errcode: "M_FORBIDDEN",
@@ -225,49 +218,30 @@ fn mint_session(state: &AppState) -> String {
     id
 }
 
-fn verify_password(password: &str, stored_hash: &str) -> bool {
-    use argon2::Argon2;
-    use argon2::PasswordVerifier;
-    use argon2::password_hash::PasswordHash;
-
-    let parsed = match PasswordHash::new(stored_hash) {
-        Ok(h) => h,
-        Err(_) => return false,
-    };
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_helpers::build_test_state;
 
     fn register(state: &AppState, user_id: &str, password: &str) {
-        use argon2::password_hash::SaltString;
-        use argon2::{Argon2, PasswordHasher};
-        let salt: [u8; 16] = rand::random();
-        let salt_str = SaltString::encode_b64(&salt).unwrap();
-        let hash = Argon2::default()
-            .hash_password(password.as_bytes(), &salt_str)
-            .unwrap()
-            .to_string();
+        let hash = crate::auth::password::hash_sync(password);
         state.db.create_user(user_id, &hash).unwrap();
     }
 
-    #[test]
-    fn empty_body_returns_challenge() {
+    #[tokio::test]
+    async fn empty_body_returns_challenge() {
         let (state, _tmp) = build_test_state();
-        let err = require_password_auth(&state, &json!({})).expect_err("challenge");
+        let err = require_password_auth(&state, &json!({}))
+            .await
+            .expect_err("challenge");
         match err {
             UiaError::Challenge { session } => assert!(!session.is_empty()),
             other => panic!("expected Challenge, got {other:?}"),
         }
     }
 
-    #[test]
-    fn wrong_password_returns_failed_with_session_echoed() {
+    #[tokio::test]
+    async fn wrong_password_returns_failed_with_session_echoed() {
         let (state, _tmp) = build_test_state();
         register(&state, "@alice:example.com", "right");
 
@@ -279,7 +253,9 @@ mod tests {
                 "session": "client_session_xyz"
             }
         });
-        let err = require_password_auth(&state, &body).expect_err("failed");
+        let err = require_password_auth(&state, &body)
+            .await
+            .expect_err("failed");
         match err {
             UiaError::Failed {
                 session, errcode, ..
@@ -291,8 +267,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn right_password_succeeds() {
+    #[tokio::test]
+    async fn right_password_succeeds() {
         let (state, _tmp) = build_test_state();
         register(&state, "@alice:example.com", "right");
         let body = json!({
@@ -302,11 +278,11 @@ mod tests {
                 "password": "right",
             }
         });
-        require_password_auth(&state, &body).expect("ok");
+        require_password_auth(&state, &body).await.expect("ok");
     }
 
-    #[test]
-    fn localpart_only_is_accepted() {
+    #[tokio::test]
+    async fn localpart_only_is_accepted() {
         let (state, _tmp) = build_test_state();
         register(&state, "@bob:example.com", "pw");
         let body = json!({
@@ -316,11 +292,11 @@ mod tests {
                 "password": "pw",
             }
         });
-        require_password_auth(&state, &body).expect("ok");
+        require_password_auth(&state, &body).await.expect("ok");
     }
 
-    #[test]
-    fn unknown_user_returns_failed() {
+    #[tokio::test]
+    async fn unknown_user_returns_failed() {
         let (state, _tmp) = build_test_state();
         let body = json!({
             "auth": {
@@ -329,17 +305,40 @@ mod tests {
                 "password": "any",
             }
         });
-        let err = require_password_auth(&state, &body).expect_err("failed");
+        let err = require_password_auth(&state, &body)
+            .await
+            .expect_err("failed");
         assert!(matches!(err, UiaError::Failed { .. }));
     }
 
-    #[test]
-    fn unsupported_auth_type_returns_failed() {
+    /// A passwordless (AS-minted) account must not satisfy UIA — the
+    /// empty stored hash routes to the dummy verify and fails.
+    #[tokio::test]
+    async fn passwordless_account_cannot_pass_uia() {
+        let (state, _tmp) = build_test_state();
+        state.db.create_user("@asbot:example.com", "").unwrap();
+        let body = json!({
+            "auth": {
+                "type": "m.login.password",
+                "identifier": {"type": "m.id.user", "user": "@asbot:example.com"},
+                "password": "",
+            }
+        });
+        let err = require_password_auth(&state, &body)
+            .await
+            .expect_err("failed");
+        assert!(matches!(err, UiaError::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn unsupported_auth_type_returns_failed() {
         let (state, _tmp) = build_test_state();
         let body = json!({
             "auth": {"type": "m.login.token", "token": "x"}
         });
-        let err = require_password_auth(&state, &body).expect_err("failed");
+        let err = require_password_auth(&state, &body)
+            .await
+            .expect_err("failed");
         assert!(matches!(err, UiaError::Failed { .. }));
     }
 

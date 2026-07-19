@@ -8,6 +8,20 @@ minor versions.
 
 ## [Unreleased]
 
+### Security
+
+- **Password-path hardening.** All argon2 hashing/verification now runs in
+  one module, off the async runtime and capped at core-count concurrency
+  (bounds worst-case hashing memory under a login flood). Login and UIA
+  rejections are uniform in error and timing: unknown users, passwordless
+  accounts, and deactivated accounts all burn one argon2 verification
+  against a dummy hash, closing a username-enumeration timing oracle.
+  Deactivated-account login returns generic `M_FORBIDDEN` (spec-permitted
+  when the password was wiped) instead of pre-auth `M_USER_DEACTIVATED`.
+  Passwords are capped at 512 bytes. `!reset-password` / `!create-user`
+  redact the operator's command message when it carried a plaintext
+  password.
+
 ## [0.3.0] — 2026-06-27
 
 A sandboxed WebAssembly extension platform, plus a round of federation,

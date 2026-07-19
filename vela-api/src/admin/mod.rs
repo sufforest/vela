@@ -280,7 +280,7 @@ pub async fn bootstrap(state: &AppState) -> Result<(), ApiError> {
                 .get_or_create_nid(bot_user_id.as_str())
                 .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
             // Stamp a user record with no password (empty hash → login
-            // is refused; see login.rs's argon2 parse step).
+            // is refused via auth::password's dummy verify).
             if state
                 .db
                 .get_user(nid)
@@ -847,6 +847,7 @@ pub fn maybe_dispatch_admin_command(
     sender_nid: u64,
     event_type: &str,
     content: &Value,
+    event_id: &str,
 ) {
     if event_type != "m.room.message" {
         return;
@@ -887,8 +888,9 @@ pub fn maybe_dispatch_admin_command(
     }
 
     let state = state.clone();
+    let event_id = event_id.to_string();
     tokio::spawn(async move {
-        if let Err(e) = handle_command(&state, room_nid, sender_nid, &body).await {
+        if let Err(e) = handle_command(&state, room_nid, sender_nid, &body, &event_id).await {
             warn!(error = ?e.0, "admin command handler failed");
         }
     });
@@ -908,6 +910,7 @@ async fn handle_command(
     room_nid: u64,
     sender_nid: u64,
     body: &str,
+    event_id: &str,
 ) -> Result<(), ApiError> {
     let stripped = body.trim_start().trim_start_matches('!').trim();
     let argv = split_args(stripped);
@@ -918,7 +921,7 @@ async fn handle_command(
     // Always reply, even on failure — a command that errors out otherwise leaves
     // the operator staring at silence. Keep a WARN too, so infra-level failures
     // still hit the server log for alerting (not just the room).
-    let response = match dispatch_command(state, sender_nid, cmd, rest, body).await {
+    let response = match dispatch_command(state, sender_nid, cmd, rest, body, event_id).await {
         Ok(reply) => reply,
         Err(e) => {
             warn!(command = %cmd, error = ?e.0, "admin command failed");
@@ -938,6 +941,9 @@ pub(crate) struct CmdCtx<'a> {
     args: &'a [String],
     /// The full raw message body (a few commands, e.g. `!as`, parse it directly).
     body: &'a str,
+    /// Event id of the command message, so commands whose arguments are
+    /// sensitive (e.g. a plaintext password) can redact it after use.
+    event_id: &'a str,
 }
 
 type CmdResult<'a> =
@@ -1032,14 +1038,21 @@ fn commands() -> &'static [Command] {
             group: "Users",
             usage: "!reset-password <mxid> [pw]",
             summary: "set a fresh password; clears deactivated; invalidates sessions",
-            run: |c| Box::pin(cmd_reset_password(c.state, c.sender_nid, c.args)),
+            run: |c| {
+                Box::pin(cmd_reset_password(
+                    c.state,
+                    c.sender_nid,
+                    c.args,
+                    c.event_id,
+                ))
+            },
         },
         Command {
             name: "create-user",
             group: "Users",
             usage: "!create-user <localpart> [pw]",
             summary: "force-create a local user (bypasses UIA + tokens)",
-            run: |c| Box::pin(cmd_create_user(c.state, c.sender_nid, c.args)),
+            run: |c| Box::pin(cmd_create_user(c.state, c.sender_nid, c.args, c.event_id)),
         },
         Command {
             name: "promote",
@@ -1143,6 +1156,7 @@ async fn dispatch_command(
     cmd: &str,
     rest: &[String],
     body: &str,
+    event_id: &str,
 ) -> Result<Reply, ApiError> {
     match commands().iter().find(|c| c.name == cmd) {
         Some(command) => {
@@ -1151,6 +1165,7 @@ async fn dispatch_command(
                 sender_nid,
                 args: rest,
                 body,
+                event_id,
             })
             .await
         }
@@ -1624,6 +1639,38 @@ async fn cmd_redact(state: &AppState, args: &[String]) -> Result<Reply, ApiError
     }
 }
 
+/// Redact a command message in the admin room because it carried a
+/// plaintext password. Best-effort: the credential change has already
+/// landed, so a failure only means the operator should redact by hand —
+/// returns the warning to append to the reply in that case.
+async fn scrub_command_event(state: &AppState, event_id: &str) -> Option<String> {
+    let room_id = match state.db.get_admin_room_id() {
+        Ok(Some(id)) => id,
+        _ => return Some("could not redact your command (no admin room id)".into()),
+    };
+    let bot = match bot_auth_user(state) {
+        Ok(b) => b,
+        Err(e) => return Some(format!("could not redact your command: {}", e.0)),
+    };
+    let txn = format!("admin-scrub-{}", now_ms());
+    let result = crate::room::redaction::redact_event(
+        axum::extract::State(state.clone()),
+        bot,
+        axum::extract::Path((room_id, event_id.to_string(), txn)),
+        crate::middleware::json::Json(crate::room::redaction::RedactBody {
+            reason: Some("contained a plaintext password".into()),
+        }),
+    )
+    .await;
+    match result {
+        Ok(_) => None,
+        Err(e) => Some(format!(
+            "could not redact your command — redact it yourself: {}",
+            e.0
+        )),
+    }
+}
+
 // --- !deactivate <mxid> ---
 async fn cmd_deactivate(
     state: &AppState,
@@ -1720,6 +1767,7 @@ async fn cmd_reset_password(
     state: &AppState,
     _sender_nid: u64,
     args: &[String],
+    event_id: &str,
 ) -> Result<Reply, ApiError> {
     let Some(mxid) = args.first() else {
         return Ok(Reply::plain(
@@ -1727,16 +1775,30 @@ async fn cmd_reset_password(
              with no password, the bot generates a random one and replies with it.",
         ));
     };
+    // If the command carried a plaintext password, scrub it from the room
+    // history BEFORE any validation — the failure paths below (typo'd
+    // mxid, refused target) are exactly when the operator retypes the
+    // command and the credential would otherwise linger.
+    let scrub_note = scrub_if_password_arg(state, args, event_id).await;
+
     let nid = match state
         .db
         .get_nid(mxid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
     {
         Some(n) => n,
-        None => return Ok(Reply::plain(format!("unknown user: {mxid}"))),
+        None => {
+            return Ok(reply_with_note(
+                format!("unknown user: {mxid}"),
+                &scrub_note,
+            ));
+        }
     };
     if Some(nid) == state.db.get_admin_bot_user_nid().ok().flatten() {
-        return Ok(Reply::plain("refusing to reset the admin bot's password"));
+        return Ok(reply_with_note(
+            "refusing to reset the admin bot's password",
+            &scrub_note,
+        ));
     }
 
     // Pick the password: operator-supplied or server-generated.
@@ -1745,7 +1807,9 @@ async fn cmd_reset_password(
         _ => (generate_random_password(), true),
     };
 
-    let hash = crate::auth::account::hash_password(&password);
+    let hash = crate::auth::password::hash(&password)
+        .await
+        .map_err(ApiError)?;
 
     state
         .db
@@ -1767,8 +1831,9 @@ async fn cmd_reset_password(
         format!(
             "password reset for {mxid}\n\
              temporary password: `{password}`\n\
-             communicate this out-of-band; ask the user to change it via their client \
-             after they log in. all existing sessions invalidated."
+             communicate this out-of-band, then redact this message; ask the user \
+             to change it via their client after they log in. all existing \
+             sessions invalidated."
         )
     } else {
         format!(
@@ -1776,7 +1841,33 @@ async fn cmd_reset_password(
              all existing sessions invalidated."
         )
     };
-    Ok(Reply::plain(body))
+    Ok(reply_with_note(body, &scrub_note))
+}
+
+/// Scrub the command message if it carried an operator-supplied password
+/// (second argument). Returns the note to append to whatever reply the
+/// command produces; `None` when there was nothing to scrub.
+async fn scrub_if_password_arg(
+    state: &AppState,
+    args: &[String],
+    event_id: &str,
+) -> Option<String> {
+    if !args.get(1).is_some_and(|p| !p.is_empty()) {
+        return None;
+    }
+    Some(match scrub_command_event(state, event_id).await {
+        None => "your command was redacted.".to_string(),
+        Some(warning) => warning,
+    })
+}
+
+fn reply_with_note(text: impl Into<String>, note: &Option<String>) -> Reply {
+    let mut text = text.into();
+    if let Some(n) = note {
+        text.push('\n');
+        text.push_str(n);
+    }
+    Reply::plain(text)
 }
 
 // --- !create-user <localpart> [password] ---
@@ -1789,6 +1880,7 @@ async fn cmd_create_user(
     state: &AppState,
     _sender_nid: u64,
     args: &[String],
+    event_id: &str,
 ) -> Result<Reply, ApiError> {
     let Some(localpart) = args.first() else {
         return Ok(Reply::plain(
@@ -1796,16 +1888,21 @@ async fn cmd_create_user(
              with no password, the bot generates one and replies with it.",
         ));
     };
+    // Same hygiene as `!reset-password`: scrub a plaintext password from
+    // the room history before any validation can bail out.
+    let scrub_note = scrub_if_password_arg(state, args, event_id).await;
+
     let lp = localpart.to_lowercase();
     if lp.is_empty() || lp.len() > 255 {
-        return Ok(Reply::plain("invalid localpart"));
+        return Ok(reply_with_note("invalid localpart", &scrub_note));
     }
     if !lp
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || "._-=/+".contains(c))
     {
-        return Ok(Reply::plain(
+        return Ok(reply_with_note(
             "invalid localpart (allowed: 0-9 a-z . _ - = / +)",
+            &scrub_note,
         ));
     }
     assert_bot_localpart_not_reserved(state, &lp)?;
@@ -1816,14 +1913,19 @@ async fn cmd_create_user(
         .user_exists(&mxid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
     {
-        return Ok(Reply::plain(format!("user {mxid} already exists")));
+        return Ok(reply_with_note(
+            format!("user {mxid} already exists"),
+            &scrub_note,
+        ));
     }
 
     let (password, generated) = match args.get(1) {
         Some(p) if !p.is_empty() => (p.clone(), false),
         _ => (generate_random_password(), true),
     };
-    let hash = crate::auth::account::hash_password(&password);
+    let hash = crate::auth::password::hash(&password)
+        .await
+        .map_err(ApiError)?;
     state
         .db
         .create_user(&mxid, &hash)
@@ -1833,12 +1935,13 @@ async fn cmd_create_user(
         format!(
             "created {mxid}\n\
              temporary password: `{password}`\n\
-             share out-of-band; ask the user to log in and change it.",
+             share out-of-band, then redact this message; ask the user to log in \
+             and change it.",
         )
     } else {
         format!("created {mxid}")
     };
-    Ok(Reply::plain(reply))
+    Ok(reply_with_note(reply, &scrub_note))
 }
 
 // --- !rotate-signing-key ---
@@ -3226,7 +3329,7 @@ mod tests {
         // (handle_command turns it into a "command failed" reply).
         let (mut state, _tmp) = build_test_state();
         state.moderation = crate::moderation::ModerationState::init(&state.db, true, true, &[]);
-        let result = dispatch_command(&state, 0, "ban", &arg("user @x:y.com"), "").await;
+        let result = dispatch_command(&state, 0, "ban", &arg("user @x:y.com"), "", "$evt").await;
         assert!(
             result.is_err(),
             "command error should propagate to the reply layer"
@@ -3568,7 +3671,9 @@ mod tests {
             if matches!(c.name, "rotate-signing-key" | "reindex-search") {
                 continue;
             }
-            let reply = dispatch_command(&state, 0, c.name, &[], "").await.unwrap();
+            let reply = dispatch_command(&state, 0, c.name, &[], "", "$evt")
+                .await
+                .unwrap();
             assert!(
                 !reply.text.starts_with("unknown command"),
                 "command `{}` did not dispatch",
@@ -3618,6 +3723,7 @@ mod tests {
             999,
             "m.room.message",
             &json!({"msgtype": "m.text", "body": "!help"}),
+            "$evt",
         );
     }
 
@@ -3635,6 +3741,7 @@ mod tests {
             alice,
             "m.room.message",
             &json!({"msgtype": "m.image", "body": "!image.png"}),
+            "$evt",
         );
         // (No assertion; just verifies the early return path doesn't panic.)
     }
@@ -3758,10 +3865,27 @@ mod tests {
         let stale_tok = state.db.create_token(alice, "DEV1").unwrap();
         assert!(state.db.validate_token(&stale_tok).unwrap().is_some());
 
+        // Emit the command as a real event so the plaintext-password
+        // scrub has something to redact.
+        let room_nid = state.db.get_admin_room_nid().unwrap().unwrap();
+        let bot = bot_auth_user(&state).unwrap();
+        let cmd_eid = emit_event_as(
+            &state,
+            room_nid,
+            bot.user_nid,
+            &bot.user_id,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": "!reset-password @alice:example.com newpass123"}),
+            None,
+        )
+        .await
+        .unwrap();
+
         let r = cmd_reset_password(
             &state,
             0,
             &["@alice:example.com".into(), "newpass123".into()],
+            cmd_eid.as_str(),
         )
         .await
         .unwrap();
@@ -3769,6 +3893,13 @@ mod tests {
         // Generated-password marker must NOT appear when caller
         // supplied a password.
         assert!(!r.text.contains("temporary password"));
+        // The command message held the password in plaintext — it must
+        // have been redacted from the room history.
+        assert!(
+            r.text.contains("your command was redacted"),
+            "expected the scrub confirmation: {}",
+            r.text
+        );
 
         // Deactivated flag cleared.
         assert!(!state.db.user_is_deactivated(alice).unwrap());
@@ -3791,7 +3922,7 @@ mod tests {
             .create_user("@alice:example.com", "stale-hash")
             .unwrap();
 
-        let r = cmd_reset_password(&state, 0, &["@alice:example.com".into()])
+        let r = cmd_reset_password(&state, 0, &["@alice:example.com".into()], "$evt")
             .await
             .unwrap();
         // Reply must surface the generated password so the operator
@@ -3811,7 +3942,7 @@ mod tests {
     async fn cmd_reset_password_refuses_bot() {
         let (state, _tmp) = build_test_state();
         bootstrap(&state).await.unwrap();
-        let r = cmd_reset_password(&state, 0, &["@admin:example.com".into()])
+        let r = cmd_reset_password(&state, 0, &["@admin:example.com".into()], "$evt")
             .await
             .unwrap();
         assert!(r.text.contains("refusing"));
@@ -3821,7 +3952,7 @@ mod tests {
     async fn cmd_reset_password_unknown_user() {
         let (state, _tmp) = build_test_state();
         bootstrap(&state).await.unwrap();
-        let r = cmd_reset_password(&state, 0, &["@nobody:example.com".into()])
+        let r = cmd_reset_password(&state, 0, &["@nobody:example.com".into()], "$evt")
             .await
             .unwrap();
         assert!(r.text.contains("unknown user"));
@@ -3902,6 +4033,7 @@ mod tests {
             outsider,
             "m.room.message",
             &json!({"msgtype": "m.text", "body": "!help"}),
+            "$evt",
         );
         // Yield briefly so any spawned tasks would have a chance to
         // misbehave; the assertion is that the runtime stayed sane.
@@ -3917,7 +4049,7 @@ mod tests {
         let admin_room = state.db.get_admin_room_nid().unwrap().unwrap();
         let alice = state.db.create_user("@alice:example.com", "h").unwrap();
         state.db.set_membership(admin_room, alice, 1).unwrap();
-        handle_command(&state, admin_room, alice, "!help")
+        handle_command(&state, admin_room, alice, "!help", "$evt")
             .await
             .unwrap();
         // The bot's reply should be the most recent timeline event.
@@ -4050,11 +4182,36 @@ mod tests {
     async fn cmd_create_user_creates_user_with_password() {
         let (state, _tmp) = build_test_state();
         bootstrap(&state).await.unwrap();
-        let reply = cmd_create_user(&state, 0, &["alice".into(), "secret123".into()])
-            .await
-            .expect("cmd ok");
+        // Emit the command as a real event so the plaintext-password
+        // scrub has something to redact.
+        let room_nid = state.db.get_admin_room_nid().unwrap().unwrap();
+        let bot = bot_auth_user(&state).unwrap();
+        let cmd_eid = emit_event_as(
+            &state,
+            room_nid,
+            bot.user_nid,
+            &bot.user_id,
+            "m.room.message",
+            json!({"msgtype": "m.text", "body": "!create-user alice secret123"}),
+            None,
+        )
+        .await
+        .unwrap();
+        let reply = cmd_create_user(
+            &state,
+            0,
+            &["alice".into(), "secret123".into()],
+            cmd_eid.as_str(),
+        )
+        .await
+        .expect("cmd ok");
         assert!(reply.text.contains("created @alice:example.com"));
         assert!(state.db.user_exists("@alice:example.com").unwrap());
+        assert!(
+            reply.text.contains("your command was redacted"),
+            "expected the scrub confirmation: {}",
+            reply.text
+        );
     }
 
     /// !create-user without a password generates one and returns it.
@@ -4062,7 +4219,7 @@ mod tests {
     async fn cmd_create_user_generates_password_when_omitted() {
         let (state, _tmp) = build_test_state();
         bootstrap(&state).await.unwrap();
-        let reply = cmd_create_user(&state, 0, &["bob".into()])
+        let reply = cmd_create_user(&state, 0, &["bob".into()], "$evt")
             .await
             .expect("cmd ok");
         assert!(reply.text.contains("temporary password:"));
@@ -4074,9 +4231,14 @@ mod tests {
     async fn cmd_create_user_refuses_bot_localpart() {
         let (state, _tmp) = build_test_state();
         bootstrap(&state).await.unwrap();
-        let err = cmd_create_user(&state, 0, &[DEFAULT_BOT_LOCALPART.into(), "pw".into()])
-            .await
-            .expect_err("must refuse bot localpart");
+        let err = cmd_create_user(
+            &state,
+            0,
+            &[DEFAULT_BOT_LOCALPART.into(), "pw".into()],
+            "$evt",
+        )
+        .await
+        .expect_err("must refuse bot localpart");
         assert!(matches!(err.0, VelaError::Forbidden(_)));
     }
 
@@ -4086,7 +4248,7 @@ mod tests {
         let (state, _tmp) = build_test_state();
         bootstrap(&state).await.unwrap();
         state.db.create_user("@alice:example.com", "h").unwrap();
-        let reply = cmd_create_user(&state, 0, &["alice".into(), "pw".into()])
+        let reply = cmd_create_user(&state, 0, &["alice".into(), "pw".into()], "$evt")
             .await
             .expect("cmd ok");
         assert!(reply.text.contains("already exists"));
