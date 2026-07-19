@@ -1127,8 +1127,8 @@ fn commands() -> &'static [Command] {
         Command {
             name: "watch",
             group: "Moderation",
-            usage: "!watch <room_id> [server]",
-            summary: "compile a policy room's rules (joins remote rooms)",
+            usage: "!watch <room_id>",
+            summary: "compile a local policy room's rules",
             run: |c| Box::pin(cmd_watch(c.state, c.args)),
         },
         Command {
@@ -2827,8 +2827,8 @@ async fn cmd_watch(state: &AppState, args: &[String]) -> Result<Reply, ApiError>
     if !state.moderation.enabled {
         return Ok(moderation_disabled_reply());
     }
-    let Some((room_id_str, hints)) = args.split_first() else {
-        return Ok(Reply::plain("usage: !watch <room_id> [server_hint …]"));
+    let Some(room_id_str) = args.first() else {
+        return Ok(Reply::plain("usage: !watch <room_id>"));
     };
     let Ok(room_id) = RoomId::parse(room_id_str) else {
         return Ok(Reply::plain(format!(
@@ -2842,39 +2842,17 @@ async fn cmd_watch(state: &AppState, args: &[String]) -> Result<Reply, ApiError>
     {
         Some(nid) => nid,
         None => {
-            // Remote room — the admin bot joins it so we receive its state.
-            let bot = bot_auth_user(state)?;
-            let mut server_hints: Vec<String> = hints.to_vec();
-            if server_hints.is_empty()
-                && let Some((_, domain)) = room_id.as_str().split_once(':')
-            {
-                server_hints.push(domain.to_string());
-            }
-            // A remote join can legitimately fail (unreachable server, no hint) —
-            // report it back to the operator rather than silently erroring out.
-            if let Err(e) = crate::membership::federation_outbound_join::do_remote_join(
-                state,
-                &bot.user_id,
-                bot.user_nid,
-                &room_id,
-                &server_hints,
-            )
-            .await
-            {
-                return Ok(Reply::plain(format!(
-                    "could not join {room_id}: {} — pass a reachable server hint and retry",
-                    e.0
-                )));
-            }
-            state
-                .db
-                .get_nid(room_id.as_str())
-                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-                .ok_or_else(|| {
-                    ApiError(VelaError::Store(
-                        "joined the policy room but it did not become local".into(),
-                    ))
-                })?
+            // The room isn't present locally. We deliberately do NOT join it:
+            // the admin bot must stay confined to the admin room, so it never
+            // joins another room to fetch a policy list. Remote/shared lists
+            // are unsupported today — host the list locally (a policy room on
+            // this server) instead. A dedicated, non-admin moderation bot is
+            // the future path for subscribing to remote lists.
+            return Ok(Reply::plain(format!(
+                "{room_id} is not a policy room on this server. remote/shared lists \
+                 aren't supported — the admin bot won't join other rooms. host the \
+                 policy rules in a local room and `!watch` that."
+            )));
         }
     };
     state
@@ -2887,8 +2865,9 @@ async fn cmd_watch(state: &AppState, args: &[String]) -> Result<Reply, ApiError>
     )))
 }
 
-/// `!unwatch <room_id>` — stop compiling a policy room's rules. The admin bot
-/// stays joined to any remote room (leave it manually if you want).
+/// `!unwatch <room_id>` — stop compiling a policy room's rules. `!watch` no
+/// longer joins remote rooms (the admin bot stays confined to the admin room),
+/// so watched rooms are local; unwatch just drops the room from the set.
 async fn cmd_unwatch(state: &AppState, args: &[String]) -> Result<Reply, ApiError> {
     if !state.moderation.enabled {
         return Ok(moderation_disabled_reply());
@@ -3263,6 +3242,31 @@ mod tests {
                 .unwrap()
                 .contains(&room),
             "unwatch persisted"
+        );
+    }
+
+    /// `!watch` of a room that isn't present locally must REFUSE — the admin
+    /// bot never joins another room to fetch a policy list. Nothing is watched
+    /// and no membership is created.
+    #[tokio::test]
+    async fn moderation_watch_refuses_non_local_room() {
+        let (mut state, _tmp) = build_test_state();
+        state.moderation = crate::moderation::ModerationState::init(&state.db, true, true, &[]);
+        bootstrap(&state).await.unwrap();
+        // A room id that has never been interned → not present locally.
+        let room = "!nowhere:other.example".to_string();
+
+        let r = cmd_watch(&state, &arg(&room)).await.unwrap();
+        assert!(
+            r.text.contains("not a policy room on this server") && r.text.contains("won't join"),
+            "expected a refusal, got: {}",
+            r.text
+        );
+        // Nothing was interned, watched, or persisted.
+        assert!(state.db.get_nid(&room).unwrap().is_none(), "no nid created");
+        assert!(
+            state.db.get_moderation_watched_rooms().unwrap().is_empty(),
+            "nothing persisted"
         );
     }
 

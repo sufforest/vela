@@ -13,9 +13,12 @@
 //! consult it via [`ModerationState::check_user`] /
 //! [`ModerationState::check_server`] / [`ModerationState::check_room`].
 //!
-//! PR-1 sources rules from *local* policy rooms only — vela already holds their
-//! state, so no join is required. Subscribing to a remote/shared list (admin-bot
-//! auto-join) is a later step.
+//! Rules are sourced from *local* policy rooms only — vela already holds their
+//! state, so no join is required. Subscribing to a remote/shared list is
+//! deliberately unsupported: it would require the admin bot to join the remote
+//! room (the only way to receive its state over federation), and the admin bot
+//! must stay confined to the admin room. Remote lists can return only via a
+//! future dedicated, non-admin moderation bot.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -162,8 +165,9 @@ impl ModerationState {
                     }
                     Ok(None) => tracing::warn!(
                         room = %rid,
-                        "moderation: policy room not present locally; its rules are ignored until \
-                         the room exists here (join it, or `!watch` a remote one)"
+                        "moderation: policy room not present locally; its rules are ignored. \
+                         remote/shared lists are unsupported (the admin bot won't join other \
+                         rooms) — host the policy rules in a local room"
                     ),
                     Err(e) => tracing::error!(
                         room = %rid, error = %e,
