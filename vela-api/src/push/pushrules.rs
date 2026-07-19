@@ -251,6 +251,31 @@ fn load_global(state: &AppState, user_nid: u64) -> Result<Value, ApiError> {
 
 fn save_global(state: &AppState, user_nid: u64, global: &Value) -> Result<(), ApiError> {
     let body = json!({"global": global});
+    // Push rules live in the same per-user storage class as account
+    // data (same CF, synthesized into every initial /sync), so the same
+    // size cap applies — otherwise a client refused by the account-data
+    // cap just parks its blob in push rules instead. Enforced only on
+    // GROWTH: a pre-existing over-cap ruleset can always be shrunk back
+    // under the limit one delete at a time.
+    let max = state.config.max_account_data_bytes;
+    let new_size = serde_json::to_vec(&body)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX);
+    if max != 0 && new_size > max {
+        let old_size = state
+            .db
+            .get_account_data(user_nid, STORE_TYPE)
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::to_vec(&v).ok())
+            .map_or(0, |v| v.len());
+        if new_size > old_size {
+            tracing::warn!(new_size, max, "refused oversized push ruleset");
+            return Err(ApiError(VelaError::EventTooLarge(format!(
+                "push rules too large ({new_size} > {max} bytes)"
+            ))));
+        }
+    }
     state
         .db
         .set_account_data(user_nid, STORE_TYPE, &body)
@@ -307,4 +332,34 @@ fn update_rule_field(
     }
     save_global(state, user_nid, &global)?;
     Ok(Json(json!({})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::build_test_state;
+
+    /// The account-data size cap applies to push rules too — but only on
+    /// growth, so an over-cap legacy ruleset can still be shrunk.
+    #[test]
+    fn save_global_caps_growth_but_allows_shrink() {
+        let (state, _tmp) = build_test_state();
+        let nid = state.db.create_user("@u:example.com", "h").unwrap();
+
+        let over = state.config.max_account_data_bytes;
+        let big = json!({"underride": [{"rule_id": "big", "pattern": "x".repeat(over + 1000)}]});
+        let err = save_global(&state, nid, &big).expect_err("oversized ruleset refused");
+        assert!(matches!(err.0, VelaError::EventTooLarge(_)));
+
+        // Seed an over-cap blob directly (legacy state), then verify a
+        // smaller-but-still-over-cap write is allowed (shrink path).
+        state
+            .db
+            .set_account_data(nid, STORE_TYPE, &json!({"global": {"underride": [{"rule_id": "big", "pattern": "x".repeat(over + 50_000)}]}}))
+            .unwrap();
+        save_global(&state, nid, &big).expect("shrinking write allowed");
+
+        // And a small ruleset is always fine.
+        save_global(&state, nid, &json!({"underride": []})).expect("small ruleset ok");
+    }
 }

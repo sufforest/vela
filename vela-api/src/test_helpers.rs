@@ -74,6 +74,7 @@ pub fn build_test_state_with_name(server_name: &str) -> (AppState, TempDir) {
             registration_enabled: true,
             registration_token: None,
             max_upload_size: 50 * 1024 * 1024,
+            max_account_data_bytes: 1024 * 1024,
             url_preview_allow_private_ips: false,
             encrypt_by_default: crate::router::EncryptByDefault::Off,
             allow_public_rooms_over_federation: false,

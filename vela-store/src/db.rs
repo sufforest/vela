@@ -4556,16 +4556,25 @@ impl Database {
 
     // --- Profile operations ---
 
-    /// Walk the `users` CF and return every `(user_nid, record)` pair.
-    /// Used by user-directory search — caller does the substring filter +
-    /// deactivation screen in memory since the full user set is typically
-    /// small. Don't call this on a hot path.
-    pub fn scan_all_users(&self) -> Result<Vec<(u64, Value)>, rocksdb::Error> {
+    /// Walk the `users` CF and return up to `max` `(user_nid, record)`
+    /// pairs plus a truncation flag. Used by user-directory search —
+    /// caller does the substring filter + deactivation screen in memory.
+    /// The cap bounds the per-query work; a truncated scan means the
+    /// directory answer may be incomplete, not wrong.
+    pub fn scan_users_capped(
+        &self,
+        max: usize,
+    ) -> Result<(Vec<(u64, Value)>, bool), rocksdb::Error> {
         let cf = self.db.cf_handle("users").unwrap();
         let mut out = Vec::new();
         let iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
-        for item in iter {
+        // The cap counts rows SCANNED, not rows returned, so malformed
+        // rows can't make the walk unbounded.
+        for (scanned, item) in iter.enumerate() {
             let (k, v) = item?;
+            if scanned >= max {
+                return Ok((out, true));
+            }
             if k.len() != 8 {
                 continue;
             }
@@ -4576,7 +4585,7 @@ impl Database {
                 out.push((nid, record));
             }
         }
-        Ok(out)
+        Ok((out, false))
     }
 
     pub fn update_user_profile(

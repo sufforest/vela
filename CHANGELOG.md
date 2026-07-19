@@ -21,6 +21,12 @@ minor versions.
   Passwords are capped at 512 bytes. `!reset-password` / `!create-user`
   redact the operator's command message when it carried a plaintext
   password.
+- **Resource caps.** Account-data values (including the merged `m.tag`
+  blob and, growth-only, the `m.push_rules` ruleset) get a guard-rail
+  cap — `[limits] max_account_data_bytes`, default 1 MiB, 0 disables;
+  key backups capped at 65536 keys per version (bulk PUTs stop at the
+  cap) and 64 live versions per user; user-directory search bounds its
+  candidate walk at 10k rows and reports `limited: true` when truncated.
 
 ## [0.3.0] — 2026-06-27
 
