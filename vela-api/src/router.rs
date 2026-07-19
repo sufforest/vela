@@ -75,6 +75,14 @@ pub struct ServerConfig {
     /// Maximum upload size in bytes. Enforced both at the global body
     /// limit layer and inside the media upload handler. Default 50 MiB.
     pub max_upload_size: u64,
+    /// Cap on one account-data value's serialized size (also applied,
+    /// growth-only, to the merged `m.push_rules` blob). `0` disables.
+    /// Default 1 MiB — a guard-rail against runaway blobs, not a quota:
+    /// no other homeserver caps account data at all (Synapse's only
+    /// bound is its generic ~12.5 MiB request cap), and every known
+    /// legitimate value sits orders of magnitude below 1 MiB (the
+    /// largest, `m.direct`, is ~80 bytes per DM contact).
+    pub max_account_data_bytes: usize,
     /// When false (default), `/preview_url` refuses to fetch URLs that
     /// resolve to non-public addresses (loopback, RFC1918, link-local —
     /// including the `169.254.169.254` cloud-metadata endpoint), closing

@@ -37,6 +37,27 @@ fn is_empty_object(v: &Value) -> bool {
     v.as_object().is_some_and(|o| o.is_empty())
 }
 
+/// Guard-rail on one account-data value's serialized size, from
+/// `[limits] max_account_data_bytes` (0 = disabled). See the config
+/// field's doc for the rationale; the warn keeps a legitimate
+/// rejection diagnosable, since no other homeserver enforces this.
+pub(crate) fn check_value_size(state: &AppState, body: &Value) -> Result<(), ApiError> {
+    let max = state.config.max_account_data_bytes;
+    if max == 0 {
+        return Ok(());
+    }
+    let size = serde_json::to_vec(body)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX);
+    if size > max {
+        tracing::warn!(size, max, "refused oversized account data value");
+        return Err(ApiError(VelaError::EventTooLarge(format!(
+            "account data value too large ({size} > {max} bytes)"
+        ))));
+    }
+    Ok(())
+}
+
 /// PUT /_matrix/client/v3/user/{userId}/account_data/{type}
 pub async fn set_account_data(
     State(state): State<AppState>,
@@ -47,6 +68,7 @@ pub async fn set_account_data(
     if user.user_id != user_id {
         return Err(VelaError::Forbidden("can only set own account data".into()).into());
     }
+    check_value_size(&state, &body)?;
 
     state
         .db
@@ -100,6 +122,7 @@ pub async fn set_room_account_data(
     if user.user_id != user_id {
         return Err(VelaError::Forbidden("can only set own account data".into()).into());
     }
+    check_value_size(&state, &body)?;
 
     let room_nid = state
         .db
@@ -201,6 +224,10 @@ pub async fn put_tag(
         .entry("tags".to_string())
         .or_insert_with(|| json!({}));
     tags.as_object_mut().unwrap().insert(tag, body);
+    // The cap applies to the MERGED blob: tags accumulate via
+    // read-modify-write, so checking only the incoming body would let
+    // the stored value grow past the limit one tag at a time.
+    check_value_size(&state, &current)?;
 
     state
         .db
@@ -242,4 +269,79 @@ pub async fn delete_tag(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     crate::router::notify_user(&state, user.user_nid);
     Ok(Json(json!({})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::build_test_state;
+    use axum::extract::{Path, State};
+
+    fn auth(nid: u64) -> AuthenticatedUser {
+        AuthenticatedUser {
+            user_nid: nid,
+            user_id: "@u:example.com".into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_value_refused_small_value_lands() {
+        let (state, _tmp) = build_test_state();
+        let nid = state.db.create_user("@u:example.com", "h").unwrap();
+
+        let big = json!({"blob": "x".repeat(state.config.max_account_data_bytes + 1)});
+        let err = set_account_data(
+            State(state.clone()),
+            auth(nid),
+            Path(("@u:example.com".into(), "m.test".into())),
+            Json(big.clone()),
+        )
+        .await
+        .expect_err("oversized user account data");
+        assert!(matches!(err.0, VelaError::EventTooLarge(_)));
+
+        set_account_data(
+            State(state.clone()),
+            auth(nid),
+            Path(("@u:example.com".into(), "m.test".into())),
+            Json(json!({"ok": true})),
+        )
+        .await
+        .expect("small value lands");
+
+        // Room-scoped endpoint enforces the same cap (before the room
+        // lookup, so the room only needs to exist for the happy path).
+        state.db.get_or_create_nid("!r:example.com").unwrap();
+        let err = set_room_account_data(
+            State(state.clone()),
+            auth(nid),
+            Path((
+                "@u:example.com".into(),
+                "!r:example.com".into(),
+                "m.test".into(),
+            )),
+            Json(big),
+        )
+        .await
+        .expect_err("oversized room account data");
+        assert!(matches!(err.0, VelaError::EventTooLarge(_)));
+
+        // The tag read-modify-write path enforces the cap on the
+        // merged m.tag blob, not just the incoming body.
+        let err = put_tag(
+            State(state.clone()),
+            auth(nid),
+            Path((
+                "@u:example.com".into(),
+                "!r:example.com".into(),
+                "huge".into(),
+            )),
+            Json(json!({"order": "x".repeat(state.config.max_account_data_bytes + 1)})),
+        )
+        .await
+        .expect_err("oversized tag");
+        assert!(matches!(err.0, VelaError::EventTooLarge(_)));
+    }
 }

@@ -52,6 +52,8 @@ struct Config {
     #[serde(default)]
     media: MediaSection,
     #[serde(default)]
+    limits: LimitsSection,
+    #[serde(default)]
     room_defaults: RoomDefaultsSection,
     #[serde(default)]
     backup: BackupSection,
@@ -814,6 +816,25 @@ struct UserDirectorySection {
     federate: bool,
 }
 
+/// `[limits]` section. Per-user resource guard-rails.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct LimitsSection {
+    /// Cap on one account-data value's serialized size, also applied
+    /// (growth-only) to the merged push ruleset. `0` disables. Default
+    /// 1 MiB — a guard-rail against runaway blobs, far above every
+    /// known legitimate value; no other homeserver caps this at all.
+    max_account_data_bytes: usize,
+}
+
+impl Default for LimitsSection {
+    fn default() -> Self {
+        Self {
+            max_account_data_bytes: 1024 * 1024,
+        }
+    }
+}
+
 /// `[directory]` section. Controls public-room directory exposure.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -1573,6 +1594,7 @@ fn main() -> anyhow::Result<()> {
                 registration_enabled: config.registration.enabled,
                 registration_token: config.registration.token.clone(),
                 max_upload_size: parse_size(&config.media.max_upload_size)?,
+                max_account_data_bytes: config.limits.max_account_data_bytes,
                 url_preview_allow_private_ips: config.media.url_preview_allow_private_ips,
                 encrypt_by_default: parse_encrypt_policy(&config.room_defaults.encrypt_by_default)?,
                 allow_public_rooms_over_federation: config

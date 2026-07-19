@@ -41,6 +41,34 @@ use crate::router::AppState;
 
 const LEGACY_BACKUP_STORE: &str = "m.vela.key_backup";
 
+/// Per-user quotas. Backups are client-driven bulk storage; without
+/// caps one account can grow the `key_backup` CF unboundedly. 65536
+/// sessions (~64 MiB at typical session size) is far beyond real
+/// client usage; at quota, key PUTs are refused (413) until the user
+/// deletes keys or rotates to a fresh version. The bulk PUT loops also
+/// stop adding NEW sessions once the in-flight total reaches the cap
+/// (spec-shaped partial accept: the response `count` tells the client
+/// how far it got), so a single request can't overshoot either.
+const MAX_KEYS_PER_VERSION: u64 = 65536;
+/// Live (undeleted) backup versions per user. Clients keep one.
+const MAX_BACKUP_VERSIONS: usize = 64;
+
+/// Refuse at quota; otherwise return the version's current key count so
+/// bulk PUTs can bound the headroom they consume.
+fn check_key_quota(state: &AppState, user_nid: u64, version: &str) -> Result<u64, ApiError> {
+    let (count, _etag) = state
+        .db
+        .key_backup_stats_get(user_nid, version)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    if count >= MAX_KEYS_PER_VERSION {
+        return Err(ApiError(VelaError::EventTooLarge(format!(
+            "key backup quota reached ({MAX_KEYS_PER_VERSION} keys); \
+             delete keys or create a new backup version"
+        ))));
+    }
+    Ok(count)
+}
+
 // --- Versions ---
 
 #[derive(Deserialize)]
@@ -62,6 +90,15 @@ pub async fn post_version(
     migrate_legacy_if_needed(&state, user.user_nid)?;
 
     let mut store = load_versions(&state, user.user_nid)?;
+    let live = store
+        .get("versions")
+        .and_then(|v| v.as_object())
+        .map_or(0, |m| m.len());
+    if live >= MAX_BACKUP_VERSIONS {
+        return Err(ApiError(VelaError::EventTooLarge(format!(
+            "too many backup versions ({live}); delete an old version first"
+        ))));
+    }
     let next = next_version(&store);
     let version = next.to_string();
     let meta = json!({
@@ -207,18 +244,23 @@ pub async fn put_all_keys(
         .version
         .ok_or_else(|| ApiError(VelaError::BadJson("version query param required".into())))?;
     require_current_version(&state, user.user_nid, &version)?;
+    let current = check_key_quota(&state, user.user_nid, &version)?;
+    let headroom = MAX_KEYS_PER_VERSION - current;
     let rooms = body
         .get("rooms")
         .and_then(|v| v.as_object())
         .ok_or_else(|| ApiError(VelaError::BadJson("missing rooms".into())))?;
     let mut count_added = 0u64;
-    for (room_id, room_body) in rooms {
+    'rooms: for (room_id, room_body) in rooms {
         let sessions = room_body
             .get("sessions")
             .and_then(|v| v.as_object())
             .cloned()
             .unwrap_or_default();
         for (session_id, sess) in sessions {
+            if count_added >= headroom {
+                break 'rooms;
+            }
             if write_session(&state, user.user_nid, &version, room_id, &session_id, sess)? {
                 count_added += 1;
             }
@@ -242,6 +284,8 @@ pub async fn put_room_keys(
         .version
         .ok_or_else(|| ApiError(VelaError::BadJson("version query param required".into())))?;
     require_current_version(&state, user.user_nid, &version)?;
+    let current = check_key_quota(&state, user.user_nid, &version)?;
+    let headroom = MAX_KEYS_PER_VERSION - current;
     let sessions = body
         .get("sessions")
         .and_then(|v| v.as_object())
@@ -249,6 +293,9 @@ pub async fn put_room_keys(
         .unwrap_or_default();
     let mut count_added = 0u64;
     for (session_id, sess) in sessions {
+        if count_added >= headroom {
+            break;
+        }
         if write_session(&state, user.user_nid, &version, &room_id, &session_id, sess)? {
             count_added += 1;
         }
@@ -271,6 +318,7 @@ pub async fn put_session(
         .version
         .ok_or_else(|| ApiError(VelaError::BadJson("version query param required".into())))?;
     require_current_version(&state, user.user_nid, &version)?;
+    check_key_quota(&state, user.user_nid, &version)?;
     let written = write_session(&state, user.user_nid, &version, &room_id, &session_id, body)?;
     let delta = if written { 1 } else { 0 };
     let (etag, total) = bump_stats(&state, user.user_nid, &version, delta)?;
@@ -708,5 +756,102 @@ mod tests {
     #[test]
     fn should_replace_full_tie_keeps_existing() {
         assert!(!should_replace(&key(false, 10, 5), &key(false, 10, 5)));
+    }
+
+    use crate::test_helpers::build_test_state;
+    use axum::extract::{Query, State};
+
+    fn auth(nid: u64) -> crate::middleware::auth::AuthenticatedUser {
+        crate::middleware::auth::AuthenticatedUser {
+            user_nid: nid,
+            user_id: "@u:example.com".into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        }
+    }
+
+    async fn make_version(state: &crate::router::AppState, nid: u64) -> String {
+        let res = post_version(
+            State(state.clone()),
+            auth(nid),
+            Json(CreateBackupBody {
+                algorithm: "m.megolm_backup.v1.curve25519-aes-sha2".into(),
+                auth_data: json!({}),
+            }),
+        )
+        .await
+        .expect("version created");
+        res.0["version"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn key_put_refused_at_quota() {
+        let (state, _tmp) = build_test_state();
+        let nid = state.db.create_user("@u:example.com", "h").unwrap();
+        let version = make_version(&state, nid).await;
+
+        // Below quota: a put lands.
+        put_session(
+            State(state.clone()),
+            auth(nid),
+            Path(("!r:example.com".into(), "sess1".into())),
+            Query(KeysVersionQuery {
+                version: Some(version.clone()),
+            }),
+            Json(key(false, 0, 0)),
+        )
+        .await
+        .expect("under quota");
+
+        // Force the stats row to the cap: further puts are refused,
+        // including overwrites of existing sessions.
+        state
+            .db
+            .key_backup_stats_set(nid, &version, MAX_KEYS_PER_VERSION, 7)
+            .unwrap();
+        let err = put_session(
+            State(state.clone()),
+            auth(nid),
+            Path(("!r:example.com".into(), "sess2".into())),
+            Query(KeysVersionQuery {
+                version: Some(version.clone()),
+            }),
+            Json(key(false, 0, 0)),
+        )
+        .await
+        .expect_err("at quota");
+        assert!(matches!(err.0, VelaError::EventTooLarge(_)));
+
+        // A fresh version starts from zero and accepts keys again.
+        let v2 = make_version(&state, nid).await;
+        put_session(
+            State(state.clone()),
+            auth(nid),
+            Path(("!r:example.com".into(), "sess1".into())),
+            Query(KeysVersionQuery { version: Some(v2) }),
+            Json(key(false, 0, 0)),
+        )
+        .await
+        .expect("new version under quota");
+    }
+
+    #[tokio::test]
+    async fn version_creation_refused_at_cap() {
+        let (state, _tmp) = build_test_state();
+        let nid = state.db.create_user("@u:example.com", "h").unwrap();
+        for _ in 0..MAX_BACKUP_VERSIONS {
+            make_version(&state, nid).await;
+        }
+        let err = post_version(
+            State(state.clone()),
+            auth(nid),
+            Json(CreateBackupBody {
+                algorithm: "m.megolm_backup.v1.curve25519-aes-sha2".into(),
+                auth_data: json!({}),
+            }),
+        )
+        .await
+        .expect_err("version cap");
+        assert!(matches!(err.0, VelaError::EventTooLarge(_)));
     }
 }

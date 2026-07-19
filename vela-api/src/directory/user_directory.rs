@@ -51,22 +51,46 @@ pub async fn search(
     if term.is_empty() {
         return Ok(Json(json!({"results": [], "limited": false})));
     }
+    let (matches, truncated) =
+        search_inner(&state, user.user_nid, &term, limit, MAX_CANDIDATE_SCAN)?;
+    Ok(Json(json!({
+        "results": matches,
+        "limited": truncated,
+    })))
+}
 
+/// Work bound for one query: total member/user rows examined while
+/// building the candidate set (shared-room walk + public-room walk, or
+/// the open-directory user scan). Without it every query costs
+/// O(rooms × members) DB reads, driven by a cheap client request. When
+/// the budget runs out the candidate set is partial: results are still
+/// correct, and `limited: true` tells the client they may be incomplete.
+const MAX_CANDIDATE_SCAN: usize = 10_000;
+
+fn search_inner(
+    state: &AppState,
+    caller_nid: u64,
+    term: &str,
+    limit: usize,
+    scan_budget: usize,
+) -> Result<(Vec<Value>, bool), ApiError> {
+    let mut budget = scan_budget;
     let mut matches: Vec<Value> = Vec::new();
     let mut truncated = false;
 
     if state.config.search_all_users {
-        // Open-directory path: linear scan over the whole user table.
+        // Open-directory path: linear scan over the user table, capped.
         // Skip the caller themself — they don't expect to find themselves.
-        let all = state
+        let (all, scan_truncated) = state
             .db
-            .scan_all_users()
+            .scan_users_capped(budget)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+        truncated |= scan_truncated;
         for (nid, record) in all {
-            if nid == user.user_nid {
+            if nid == caller_nid {
                 continue;
             }
-            if try_push(&record, &term, limit, &mut matches) {
+            if try_push(&record, term, limit, &mut matches) {
                 truncated = true;
                 break;
             }
@@ -78,8 +102,9 @@ pub async fn search(
         // The caller themself is always omitted from results: a directory
         // search for "find people I know" should not echo the requester
         // back, and Synapse/Element clients rely on this filtering.
-        let mut candidates = resolve_shared_room_peers(&state, user.user_nid)?;
-        candidates.extend(resolve_public_room_members(&state)?);
+        let mut candidates = resolve_shared_room_peers(state, caller_nid, &mut budget)?;
+        candidates.extend(resolve_public_room_members(state, &mut budget)?);
+        truncated |= budget == 0;
         // Keep self in candidates so a directory search that targets
         // the caller's own localpart (e.g. MSC3902's rocky-finds-rocky
         // sanity check) returns a hit. `try_push_for_self` below
@@ -87,7 +112,7 @@ pub async fn search(
         // specifically, so unrelated searches for shared prefixes
         // ("@user-…") don't accidentally surface the caller alongside
         // the genuine match (TestRoomSpecificUsername*).
-        candidates.insert(user.user_nid);
+        candidates.insert(caller_nid);
         for peer_nid in candidates {
             // Local users have a row in the `users` CF. Remote peers
             // (federation users vela has only ever seen via member
@@ -109,18 +134,15 @@ pub async fn search(
                     json!({"user_id": uid})
                 }
             };
-            let is_self = peer_nid == user.user_nid;
-            if try_push_filtered(&record, &term, limit, is_self, &mut matches) {
+            let is_self = peer_nid == caller_nid;
+            if try_push_filtered(&record, term, limit, is_self, &mut matches) {
                 truncated = true;
                 break;
             }
         }
     }
 
-    Ok(Json(json!({
-        "results": matches,
-        "limited": truncated,
-    })))
+    Ok((matches, truncated))
 }
 
 /// Caller-aware wrapper around `try_push` that narrows the substring
@@ -204,22 +226,34 @@ fn matches_substring(user_id: &str, displayname: &str, term_lc: &str) -> bool {
     user_id.to_lowercase().contains(term_lc) || displayname.to_lowercase().contains(term_lc)
 }
 
-/// Collect every user_nid that co-occupies at least one room with `caller`.
+/// Collect every user_nid that co-occupies at least one room with `caller`,
+/// spending `budget` per member row examined (stops when exhausted).
 /// The caller themself is intentionally NOT inserted — see the comment on
 /// the privacy-default path where the union with public-room members
 /// happens; the caller is removed there before the search runs.
-fn resolve_shared_room_peers(state: &AppState, caller_nid: u64) -> Result<HashSet<u64>, ApiError> {
+fn resolve_shared_room_peers(
+    state: &AppState,
+    caller_nid: u64,
+    budget: &mut usize,
+) -> Result<HashSet<u64>, ApiError> {
     let mut peers = HashSet::new();
     let rooms = state
         .db
         .get_user_joined_rooms(caller_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     for room_nid in rooms {
+        if *budget == 0 {
+            break;
+        }
         let members = state
             .db
             .get_room_members(room_nid)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
         for m in members {
+            if *budget == 0 {
+                break;
+            }
+            *budget -= 1;
             peers.insert(m);
         }
     }
@@ -232,14 +266,24 @@ fn resolve_shared_room_peers(state: &AppState, caller_nid: u64) -> Result<HashSe
 /// the caller shares a room with them — that's what makes "find Alice
 /// by name" work for users who haven't met yet.
 ///
-/// Cost scales with the number of public rooms × members per room. For
-/// large public servers this would justify a dedicated index; for
-/// development and homeservers with a small public footprint, the
-/// scan is cheap enough.
-fn resolve_public_room_members(state: &AppState) -> Result<HashSet<u64>, ApiError> {
+/// Cost scales with the number of public rooms × members per room, so
+/// the walk spends `budget` per member row and stops when exhausted —
+/// a dedicated index is the upgrade if a deployment ever hits the cap
+/// in practice.
+fn resolve_public_room_members(
+    state: &AppState,
+    budget: &mut usize,
+) -> Result<HashSet<u64>, ApiError> {
     let mut members = HashSet::new();
     let rooms = state.db.list_room_ids().unwrap_or_default();
     for room_id in rooms {
+        if *budget == 0 {
+            break;
+        }
+        // Each room examined costs a unit too — non-public rooms do
+        // nid + visibility reads, so a server with many private rooms
+        // must not walk them all for free.
+        *budget -= 1;
         let Some(room_nid) = state
             .db
             .get_nid(&room_id)
@@ -263,6 +307,10 @@ fn resolve_public_room_members(state: &AppState) -> Result<HashSet<u64>, ApiErro
             .get_room_members(room_nid)
             .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
         for m in room_members {
+            if *budget == 0 {
+                break;
+            }
+            *budget -= 1;
             members.insert(m);
         }
     }
@@ -287,5 +335,31 @@ mod tests {
         // lowercases before invoking it.
         assert!(matches_substring("@Alice:example.com", "Alice", "alice"));
         assert!(matches_substring("@alice:example.com", "ALICE", "alice"));
+    }
+
+    /// The scan budget bounds the candidate walk: a tiny budget must
+    /// truncate (and say so via `limited`), a roomy one must find all
+    /// peers with no truncation flag.
+    #[test]
+    fn budget_bounds_shared_room_walk() {
+        let (state, _tmp) = crate::test_helpers::build_test_state();
+        let caller = state.db.create_user("@caller:example.com", "h").unwrap();
+        let room = state.db.get_or_create_nid("!r:example.com").unwrap();
+        state.db.set_membership(room, caller, 1).unwrap();
+        for i in 0..20 {
+            let nid = state
+                .db
+                .create_user(&format!("@peer{i}:example.com"), "h")
+                .unwrap();
+            state.db.set_membership(room, nid, 1).unwrap();
+        }
+
+        let (matches, truncated) = search_inner(&state, caller, "peer", 50, 10_000).unwrap();
+        assert_eq!(matches.len(), 20);
+        assert!(!truncated);
+
+        let (matches, truncated) = search_inner(&state, caller, "peer", 50, 3).unwrap();
+        assert!(truncated, "exhausted budget must set limited");
+        assert!(matches.len() <= 3, "results bounded by scanned candidates");
     }
 }
