@@ -8,6 +8,15 @@ minor versions.
 
 ## [Unreleased]
 
+### Added
+
+- **Local-user moderation commands.** `!kick <@user> [<room>]` force-removes a
+  local user from one room or all their rooms, and `!redact-user <@user>
+  [<room>] [limit]` redacts a local user's recent messages. Both act as the
+  user's own identity (a self-leave / self-redaction is always authorized), so
+  they need no room power and no bot in the room, and work in federated and
+  encrypted rooms. Local users only — a remote user's server controls them.
+
 ### Security
 
 - **Password-path hardening.** All argon2 hashing/verification now runs in

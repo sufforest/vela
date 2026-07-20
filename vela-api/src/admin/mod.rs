@@ -1097,6 +1097,20 @@ fn commands() -> &'static [Command] {
             run: |c| Box::pin(cmd_redact(c.state, c.args)),
         },
         Command {
+            name: "kick",
+            group: "Moderation",
+            usage: "!kick <@user> [<room_id>]",
+            summary: "force a local user out of a room (or all rooms)",
+            run: |c| Box::pin(cmd_kick(c.state, c.args)),
+        },
+        Command {
+            name: "redact-user",
+            group: "Moderation",
+            usage: "!redact-user <@user> [<room_id>] [limit]",
+            summary: "redact a local user's recent messages (as them)",
+            run: |c| Box::pin(cmd_redact_user(c.state, c.args)),
+        },
+        Command {
             name: "moderation",
             group: "Moderation",
             usage: "!moderation",
@@ -1637,6 +1651,277 @@ async fn cmd_redact(state: &AppState, args: &[String]) -> Result<Reply, ApiError
             e.0
         ))),
     }
+}
+
+/// Redaction sweep bounds for `!redact-user`: at most this many redactions
+/// per room, scanning at most this many recent timeline events. Keeps a
+/// bulk cleanup bounded (each redaction is its own federated event).
+const MAX_REDACT_PER_ROOM: usize = 50;
+const MAX_REDACT_SCAN: usize = 1000;
+/// Global cap on redactions across an all-rooms `!redact-user` sweep, so a
+/// user in many rooms can't trigger an unbounded federated redaction burst.
+const MAX_REDACT_TOTAL: usize = 500;
+
+/// True when `mxid` is a well-formed local user id (`@localpart:this-server`).
+fn is_local_user(state: &AppState, mxid: &str) -> bool {
+    mxid.starts_with('@')
+        && mxid
+            .split_once(':')
+            .map(|(_, domain)| domain == state.config.server_name)
+            .unwrap_or(false)
+}
+
+// --- !kick <@user> [<room_id>] ---
+//
+// Force a LOCAL user out of a room (or all their rooms). This emits the
+// user's OWN leave — a self-leave is always authorized, so it needs no power
+// level and no bot in the room, and it works in federated + encrypted rooms.
+// Remote users are refused: their own server controls their membership.
+async fn cmd_kick(state: &AppState, args: &[String]) -> Result<Reply, ApiError> {
+    let Some(mxid) = args.first() else {
+        return Ok(Reply::plain("usage: !kick <@user:server> [<room_id>]"));
+    };
+    if !is_local_user(state, mxid) {
+        return Ok(Reply::plain(format!(
+            "{mxid} is not a local user — only local users can be force-removed. \
+             a remote user's own server controls their membership."
+        )));
+    }
+    let Some(nid) = state
+        .db
+        .get_nid(mxid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(Reply::plain(format!("unknown user: {mxid}")));
+    };
+    if Some(nid) == state.db.get_admin_bot_user_nid().ok().flatten() {
+        return Ok(Reply::plain("refusing to remove the admin bot"));
+    }
+    let target = target_auth_user(state, nid)?;
+    let reason = "Removed by server admin";
+
+    match args.get(1) {
+        Some(room_id_str) => {
+            let Some(room_nid) = state
+                .db
+                .get_nid(room_id_str)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+            else {
+                return Ok(Reply::plain(format!("unknown room: {room_id_str}")));
+            };
+            // Only joined / invited / knocking states have anything to leave.
+            let membership = state.db.get_membership(room_nid, nid).ok().flatten();
+            if !matches!(membership, Some(1) | Some(2) | Some(4)) {
+                return Ok(Reply::plain(format!("{mxid} is not in {room_id_str}")));
+            }
+            crate::membership::force_leave_room(state, &target, room_nid, reason).await;
+            Ok(Reply::plain(format!(
+                "removed {mxid} from {room_id_str}. they can rejoin unless also \
+                 banned (`!ban user {mxid}`)."
+            )))
+        }
+        None => {
+            let n = crate::membership::force_leave_all_rooms(state, &target, reason).await;
+            Ok(Reply::plain(format!(
+                "removed {mxid} from {n} room(s). they can rejoin unless also \
+                 banned (`!ban user {mxid}`)."
+            )))
+        }
+    }
+}
+
+// --- !redact-user <@user> [<room_id>] [limit] ---
+//
+// Redact a LOCAL user's recent messages, emitted AS that user. A user (or
+// anyone on their server) can redact their own events with no power level —
+// so this needs no bot and no power, and works in encrypted rooms (redaction
+// is by event_id, no decryption). The user must still be JOINED to redact, so
+// rooms they've already left are skipped.
+async fn cmd_redact_user(state: &AppState, args: &[String]) -> Result<Reply, ApiError> {
+    let Some(mxid) = args.first() else {
+        return Ok(Reply::plain(
+            "usage: !redact-user <@user:server> [<room_id>] [limit]",
+        ));
+    };
+    if !is_local_user(state, mxid) {
+        return Ok(Reply::plain(format!(
+            "{mxid} is not a local user — only a local user's own messages can be \
+             redacted this way (the server acts as them). a remote user's messages \
+             need power level in each room."
+        )));
+    }
+    let Some(nid) = state
+        .db
+        .get_nid(mxid)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+    else {
+        return Ok(Reply::plain(format!("unknown user: {mxid}")));
+    };
+    if Some(nid) == state.db.get_admin_bot_user_nid().ok().flatten() {
+        return Ok(Reply::plain("refusing to redact the admin bot"));
+    }
+
+    // Optional trailing args in any order: a room id (`!…`) and a numeric limit.
+    // Reject anything else — silently ignoring a mistyped room id (e.g. a
+    // missing `!`) would fall through to the all-rooms sweep below, turning a
+    // one-room request into a destructive, irreversible bulk redaction.
+    let mut only_room: Option<String> = None;
+    let mut per_room_limit = MAX_REDACT_PER_ROOM;
+    for a in &args[1..] {
+        if let Ok(n) = a.parse::<usize>() {
+            if n == 0 {
+                return Ok(Reply::plain("limit must be >= 1"));
+            }
+            per_room_limit = n.min(MAX_REDACT_PER_ROOM);
+        } else if a.starts_with('!') {
+            only_room = Some(a.clone());
+        } else {
+            return Ok(Reply::plain(format!(
+                "unrecognized argument `{a}` — usage: !redact-user <@user> [<!room_id>] [limit] \
+                 (room ids start with `!`; aliases aren't accepted)"
+            )));
+        }
+    }
+
+    // Target rooms: the named one, else every room the user is joined to.
+    let rooms: Vec<u64> = match &only_room {
+        Some(rid) => match state
+            .db
+            .get_nid(rid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        {
+            Some(rn) => vec![rn],
+            None => return Ok(Reply::plain(format!("unknown room: {rid}"))),
+        },
+        None => state
+            .db
+            .get_user_joined_rooms(nid)
+            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?,
+    };
+
+    let target = target_auth_user(state, nid)?;
+    let mut total_redacted = 0usize;
+    let mut rooms_touched = 0usize;
+    let mut skipped_not_joined = 0usize;
+    let mut hit_total_cap = false;
+
+    for room_nid in rooms {
+        // Global cap across the whole sweep — a user in hundreds of rooms
+        // otherwise emits an unbounded federated redaction burst.
+        if total_redacted >= MAX_REDACT_TOTAL {
+            hit_total_cap = true;
+            break;
+        }
+        // Self-redaction requires the target to be joined here.
+        if state.db.get_membership(room_nid, nid).ok().flatten() != Some(1) {
+            skipped_not_joined += 1;
+            continue;
+        }
+        let Ok(Some(room_id_str)) = state.db.resolve_nid(room_nid) else {
+            continue;
+        };
+        let ids = collect_redactable_events(state, room_nid, nid, per_room_limit);
+        if ids.is_empty() {
+            continue;
+        }
+        let mut redacted_here = 0usize;
+        for (i, event_id) in ids.iter().enumerate() {
+            let txn = format!("admin-redactuser-{}-{}", now_ms(), i);
+            let res = crate::room::redaction::redact_event(
+                axum::extract::State(state.clone()),
+                target.clone(),
+                axum::extract::Path((room_id_str.clone(), event_id.clone(), txn)),
+                crate::middleware::json::Json(crate::room::redaction::RedactBody {
+                    reason: Some("Redacted by server admin".to_string()),
+                }),
+            )
+            .await;
+            match res {
+                Ok(_) => redacted_here += 1,
+                Err(e) => {
+                    tracing::warn!(event = %event_id, error = ?e.0, "redact-user: redaction failed")
+                }
+            }
+        }
+        if redacted_here > 0 {
+            rooms_touched += 1;
+            total_redacted += redacted_here;
+        }
+    }
+
+    let mut msg =
+        format!("redacted {total_redacted} message(s) from {mxid} across {rooms_touched} room(s)");
+    if skipped_not_joined > 0 {
+        msg.push_str(&format!(
+            "; skipped {skipped_not_joined} room(s) they've already left (can't self-redact after leaving)"
+        ));
+    }
+    if hit_total_cap {
+        msg.push_str(&format!(
+            "; stopped at the {MAX_REDACT_TOTAL}-redaction cap — re-run to continue"
+        ));
+    }
+    Ok(Reply::plain(msg))
+}
+
+/// Collect up to `limit` of a user's most-recent redactable timeline events in
+/// a room (newest first), scanning at most `MAX_REDACT_SCAN` events. Redactable
+/// = a non-state event the user sent that isn't itself a redaction and isn't
+/// already redacted. Membership/power auth is left to `redact_event`.
+fn collect_redactable_events(
+    state: &AppState,
+    room_nid: u64,
+    sender_nid: u64,
+    limit: usize,
+) -> Vec<String> {
+    let timeline = state
+        .db
+        .get_timeline_latest(room_nid, MAX_REDACT_SCAN)
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    // Timeline is chronological (ascending); walk from the newest backwards so
+    // we redact the most recent messages first up to the cap.
+    for (_, event_nid) in timeline.iter().rev() {
+        if out.len() >= limit {
+            break;
+        }
+        let Ok(Some((header, json))) = state.db.get_event(*event_nid) else {
+            continue;
+        };
+        if header.sender_nid != sender_nid {
+            continue;
+        }
+        // Already redacted? vela tracks this with a separate marker, not by
+        // mutating the stored event — so check the marker, not the JSON.
+        if state
+            .db
+            .get_redacted_by(*event_nid)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            continue;
+        }
+        let Ok(ev) = serde_json::from_slice::<Value>(&json) else {
+            continue;
+        };
+        // State events keep the room working — never redact them here. A
+        // non-state event may still carry `"state_key": null`, so treat only a
+        // non-null state_key as "this is state".
+        if ev.get("state_key").is_some_and(|v| !v.is_null()) {
+            continue;
+        }
+        // Don't redact a redaction event itself.
+        if ev.get("type").and_then(|v| v.as_str()) == Some("m.room.redaction") {
+            continue;
+        }
+        // v11+ rooms don't carry `event_id` in the event body (it's a content
+        // hash), so resolve it from the nid.
+        if let Ok(Some(eid)) = state.db.get_event_id_by_nid(*event_nid) {
+            out.push(eid);
+        }
+    }
+    out
 }
 
 /// Redact a command message in the admin room because it carried a
@@ -3659,6 +3944,216 @@ mod tests {
         // Usage.
         let r = cmd_redact(&state, &[]).await.unwrap();
         assert!(r.text.contains("usage"), "{}", r.text);
+    }
+
+    fn mk_auth(nid: u64, mxid: &str) -> crate::middleware::auth::AuthenticatedUser {
+        crate::middleware::auth::AuthenticatedUser {
+            user_nid: nid,
+            user_id: mxid.into(),
+            device_id: "DEV".into(),
+            appservice_nid: None,
+        }
+    }
+
+    /// Create a local user, returning (nid, auth).
+    fn mk_user(state: &AppState, mxid: &str) -> (u64, crate::middleware::auth::AuthenticatedUser) {
+        let nid = state.db.create_user(mxid, "h").unwrap();
+        (nid, mk_auth(nid, mxid))
+    }
+
+    /// `creator` makes a PUBLIC room (so others can join). Returns (nid, id).
+    async fn mk_public_room(
+        state: &AppState,
+        creator: &crate::middleware::auth::AuthenticatedUser,
+    ) -> (u64, String) {
+        let resp = crate::room::rooms::create_room(
+            axum::extract::State(state.clone()),
+            creator.clone(),
+            axum::body::Bytes::from_static(b"{\"preset\":\"public_chat\"}"),
+        )
+        .await
+        .unwrap();
+        let room_id = resp.0["room_id"].as_str().unwrap().to_string();
+        let room_nid = state.db.get_nid(&room_id).unwrap().unwrap();
+        (room_nid, room_id)
+    }
+
+    async fn join(
+        state: &AppState,
+        user: &crate::middleware::auth::AuthenticatedUser,
+        room_id: &str,
+    ) {
+        crate::membership::join_room(
+            axum::extract::State(state.clone()),
+            user.clone(),
+            axum::extract::Path(room_id.to_string()),
+            axum::extract::RawQuery(None),
+            axum::body::Bytes::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn post_n(state: &AppState, room_nid: u64, sender_nid: u64, mxid: &str, n: usize) {
+        for i in 0..n {
+            emit_event_as(
+                state,
+                room_nid,
+                sender_nid,
+                mxid,
+                "m.room.message",
+                json!({"msgtype": "m.text", "body": format!("m{i}")}),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cmd_kick_refuses_remote_and_bot() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+
+        // Remote user → refused (their server controls them).
+        let r = cmd_kick(&state, &arg("@evil:other.example")).await.unwrap();
+        assert!(r.text.contains("not a local user"), "{}", r.text);
+
+        // Admin bot → refused.
+        let bot = state
+            .db
+            .resolve_nid(state.db.get_admin_bot_user_nid().unwrap().unwrap())
+            .unwrap()
+            .unwrap();
+        let r = cmd_kick(&state, &arg(&bot)).await.unwrap();
+        assert!(r.text.contains("refusing"), "{}", r.text);
+
+        // Usage.
+        let r = cmd_kick(&state, &[]).await.unwrap();
+        assert!(r.text.contains("usage"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn cmd_kick_removes_local_user_from_room() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let (_alice_nid, alice) = mk_user(&state, "@alice:example.com");
+        let (bob_nid, bob) = mk_user(&state, "@bob:example.com");
+        let (room_nid, room_id) = mk_public_room(&state, &alice).await;
+        join(&state, &bob, &room_id).await;
+        assert_eq!(state.db.get_membership(room_nid, bob_nid).unwrap(), Some(1));
+
+        // Targeted single-room kick removes bob from that room.
+        let r = cmd_kick(&state, &["@bob:example.com".into(), room_id.clone()])
+            .await
+            .unwrap();
+        assert!(r.text.contains("removed @bob:example.com"), "{}", r.text);
+        assert_ne!(
+            state.db.get_membership(room_nid, bob_nid).unwrap(),
+            Some(1),
+            "bob should no longer be joined"
+        );
+
+        // Kicking someone not in the room reports so, doesn't error.
+        state.db.create_user("@carol:example.com", "h").unwrap();
+        let r = cmd_kick(&state, &["@carol:example.com".into(), room_id.clone()])
+            .await
+            .unwrap();
+        assert!(r.text.contains("is not in"), "{}", r.text);
+
+        // No-room form uses the all-rooms path; bob rejoins then is removed.
+        join(&state, &bob, &room_id).await;
+        let r = cmd_kick(&state, &arg("@bob:example.com")).await.unwrap();
+        assert!(
+            r.text.contains("removed @bob:example.com from 1 room"),
+            "{}",
+            r.text
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_redact_user_redacts_only_targets_messages() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let (alice_nid, alice) = mk_user(&state, "@alice:example.com");
+        let (bob_nid, bob) = mk_user(&state, "@bob:example.com");
+        let (room_nid, room_id) = mk_public_room(&state, &alice).await;
+        join(&state, &bob, &room_id).await;
+        post_n(&state, room_nid, alice_nid, "@alice:example.com", 2).await;
+        post_n(&state, room_nid, bob_nid, "@bob:example.com", 1).await;
+
+        let al = |extra: &str| arg(&format!("@alice:example.com {room_id}{extra}"));
+        // Redact alice's messages — exactly her two (state events untouched).
+        let r = cmd_redact_user(&state, &al("")).await.unwrap();
+        assert!(r.text.contains("redacted 2 message"), "{}", r.text);
+
+        // Idempotent: a second pass finds them already redacted.
+        let r = cmd_redact_user(&state, &al("")).await.unwrap();
+        assert!(r.text.contains("redacted 0 message"), "{}", r.text);
+
+        // Bob's single message was untouched by alice's redaction.
+        let r = cmd_redact_user(&state, &arg(&format!("@bob:example.com {room_id}")))
+            .await
+            .unwrap();
+        assert!(r.text.contains("redacted 1 message"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn cmd_redact_user_respects_limit() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let (alice_nid, alice) = mk_user(&state, "@alice:example.com");
+        let (room_nid, room_id) = mk_public_room(&state, &alice).await;
+        post_n(&state, room_nid, alice_nid, "@alice:example.com", 4).await;
+
+        // limit 2 → only two redacted, rest remain for the next pass.
+        let r = cmd_redact_user(&state, &arg(&format!("@alice:example.com {room_id} 2")))
+            .await
+            .unwrap();
+        assert!(r.text.contains("redacted 2 message"), "{}", r.text);
+        let r = cmd_redact_user(&state, &arg(&format!("@alice:example.com {room_id}")))
+            .await
+            .unwrap();
+        assert!(r.text.contains("redacted 2 message"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn cmd_redact_user_refuses_remote() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let r = cmd_redact_user(&state, &arg("@evil:other.example"))
+            .await
+            .unwrap();
+        assert!(r.text.contains("not a local user"), "{}", r.text);
+    }
+
+    /// A mistyped room id (missing the `!` sigil) must be REJECTED, not
+    /// silently ignored — otherwise it falls through to the all-rooms sweep,
+    /// turning a one-room request into a destructive bulk redaction.
+    #[tokio::test]
+    async fn cmd_redact_user_rejects_unrecognized_args() {
+        let (state, _tmp) = build_test_state();
+        bootstrap(&state).await.unwrap();
+        let (alice_nid, alice) = mk_user(&state, "@alice:example.com");
+        let (room_nid, room_id) = mk_public_room(&state, &alice).await;
+        post_n(&state, room_nid, alice_nid, "@alice:example.com", 2).await;
+
+        // Missing `!` on the room id → rejected, nothing redacted.
+        let r = cmd_redact_user(&state, &arg("@alice:example.com room123"))
+            .await
+            .unwrap();
+        assert!(r.text.contains("unrecognized argument"), "{}", r.text);
+        // Alice's messages are untouched (a following explicit-room pass finds them).
+        let r = cmd_redact_user(&state, &arg(&format!("@alice:example.com {room_id}")))
+            .await
+            .unwrap();
+        assert!(r.text.contains("redacted 2 message"), "{}", r.text);
+
+        // limit 0 is refused.
+        let r = cmd_redact_user(&state, &arg("@alice:example.com 0"))
+            .await
+            .unwrap();
+        assert!(r.text.contains("limit must be"), "{}", r.text);
     }
 
     #[tokio::test]

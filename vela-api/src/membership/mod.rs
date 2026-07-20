@@ -2420,73 +2420,88 @@ pub(crate) async fn force_leave_all_rooms(
     }
 
     for room_nid in rooms {
-        let room_id_str = match state.db.resolve_nid(room_nid) {
-            Ok(Some(s)) => s,
-            _ => {
-                tracing::warn!(room_nid, "deactivate: failed to resolve room_id, skipping");
-                continue;
-            }
-        };
-        let room_id = match RoomId::parse(&room_id_str) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(room = %room_id_str, error = %e, "deactivate: bad room_id, skipping");
-                continue;
-            }
-        };
-
-        // Determine resident server. If remote, schedule the remote leave
-        // off the response path so federation latency doesn't block us.
-        let resident = match creator_server(state, room_nid) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(room = %room_id_str, error = ?e.0, "deactivate: creator_server lookup failed, skipping");
-                continue;
-            }
-        };
-        if let Some(rs) = resident
-            && rs != state.config.server_name
-        {
-            let state_clone = state.clone();
-            let user_clone = AuthenticatedUser {
-                user_nid: user.user_nid,
-                user_id: user.user_id.clone(),
-                device_id: user.device_id.clone(),
-                appservice_nid: None,
-            };
-            let room_id_owned = room_id.clone();
-            let resident_owned = rs.clone();
-            tokio::spawn(async move {
-                if let Err(e) = do_remote_leave(
-                    &state_clone,
-                    &user_clone,
-                    room_nid,
-                    &room_id_owned,
-                    &resident_owned,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        room = %room_id_owned.as_str(),
-                        resident = %resident_owned,
-                        error = ?e.0,
-                        "deactivate: remote leave failed",
-                    );
-                }
-            });
-            continue;
-        }
-
-        // Local-resident: emit leave with reason in content.
-        if let Err(e) = emit_self_leave_with_reason(state, user, room_nid, &room_id, reason).await {
-            tracing::warn!(
-                room = %room_id_str,
-                error = ?e.0,
-                "force-leave: local leave emit failed, continuing",
-            );
-        }
+        force_leave_room(state, user, room_nid, reason).await;
     }
     count
+}
+
+/// Force `user` (a local user we can author events as) out of one room by
+/// emitting their own `leave`. A self-leave is always authorized, so this
+/// needs no power level and no bot — the server just acts as its own user.
+/// For a remote-resident room the leave is sent off-path (spawned) so
+/// federation latency doesn't block the caller. Best-effort: failures are
+/// logged and swallowed. Shared by `force_leave_all_rooms` and `!kick`.
+pub(crate) async fn force_leave_room(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    room_nid: u64,
+    reason: &str,
+) {
+    let room_id_str = match state.db.resolve_nid(room_nid) {
+        Ok(Some(s)) => s,
+        _ => {
+            tracing::warn!(room_nid, "force-leave: failed to resolve room_id, skipping");
+            return;
+        }
+    };
+    let room_id = match RoomId::parse(&room_id_str) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(room = %room_id_str, error = %e, "force-leave: bad room_id, skipping");
+            return;
+        }
+    };
+
+    // Determine resident server. If remote, schedule the remote leave off the
+    // response path so federation latency doesn't block us.
+    let resident = match creator_server(state, room_nid) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(room = %room_id_str, error = ?e.0, "force-leave: creator_server lookup failed, skipping");
+            return;
+        }
+    };
+    if let Some(rs) = resident
+        && rs != state.config.server_name
+    {
+        let state_clone = state.clone();
+        let user_clone = AuthenticatedUser {
+            user_nid: user.user_nid,
+            user_id: user.user_id.clone(),
+            device_id: user.device_id.clone(),
+            appservice_nid: None,
+        };
+        let room_id_owned = room_id.clone();
+        let resident_owned = rs.clone();
+        tokio::spawn(async move {
+            if let Err(e) = do_remote_leave(
+                &state_clone,
+                &user_clone,
+                room_nid,
+                &room_id_owned,
+                &resident_owned,
+            )
+            .await
+            {
+                tracing::warn!(
+                    room = %room_id_owned.as_str(),
+                    resident = %resident_owned,
+                    error = ?e.0,
+                    "force-leave: remote leave failed",
+                );
+            }
+        });
+        return;
+    }
+
+    // Local-resident: emit leave with reason in content.
+    if let Err(e) = emit_self_leave_with_reason(state, user, room_nid, &room_id, reason).await {
+        tracing::warn!(
+            room = %room_id_str,
+            error = ?e.0,
+            "force-leave: local leave emit failed, continuing",
+        );
+    }
 }
 
 /// Emit a self-targeted `m.room.member` leave for `user` in `room_nid`,
