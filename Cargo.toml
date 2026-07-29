@@ -72,7 +72,7 @@ rand = "0.9"
 base64 = "0.22"
 sha2 = "0.10"
 sha1 = "0.10"
-hmac = "0.12"
+hmac = "0.13"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 # JWT for matrix-rtc (MSC4143) — LiveKit's JWT auth.
 jsonwebtoken = { version = "9", default-features = false }
