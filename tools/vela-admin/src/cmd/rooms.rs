@@ -116,6 +116,15 @@ pub fn run_one(db: &Database, room_id: &str) -> Result<()> {
         .map_err(anyhow::Error::msg)?;
     println!("room_id  {room_id}");
     println!("nid      {nid}");
+    // The meta record's version drives every version-gated code path
+    // (auth selection, redaction shape, event-id format); print it raw
+    // so drift from the create event's `room_version` is visible.
+    println!(
+        "version  {}",
+        db.get_room_version(nid)
+            .map_err(anyhow::Error::msg)?
+            .unwrap_or_else(|| "<missing from room_meta>".to_string())
+    );
     println!("state    {} events", state_nids.len());
     println!();
     for state_nid in state_nids {
