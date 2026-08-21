@@ -76,7 +76,8 @@ pub fn encode_u64_array(values: &[u64]) -> Vec<u8> {
 
 /// Decode a packed array of u64 values.
 pub fn decode_u64_array(bytes: &[u8]) -> Vec<u64> {
-    bytes.chunks_exact(8).map(decode_u64).collect()
+    let (chunks, _remainder) = bytes.as_chunks::<8>();
+    chunks.iter().map(|c| decode_u64(c)).collect()
 }
 
 #[cfg(test)]

@@ -33,15 +33,17 @@ COPY vela-api/Cargo.toml vela-api/
 COPY vela-server/Cargo.toml vela-server/
 COPY tools/vela-admin/Cargo.toml tools/vela-admin/
 COPY vela-extensions/Cargo.toml vela-extensions/
+COPY tools/testing/interop/Cargo.toml tools/testing/interop/
 
 # Stub sources so the workspace resolves for the dep-build step. vela-extensions
 # is a workspace member (its manifest must resolve) but not a dependency of the
 # vela binaries, so it isn't compiled here — no wasmtime in the image build.
-RUN mkdir -p vela-core/src vela-store/src vela-api/src vela-server/src tools/vela-admin/src vela-extensions/src \
+RUN mkdir -p vela-core/src vela-store/src vela-api/src vela-server/src tools/vela-admin/src vela-extensions/src tools/testing/interop/src \
     && echo "" > vela-core/src/lib.rs \
     && echo "" > vela-store/src/lib.rs \
     && echo "" > vela-api/src/lib.rs \
     && echo "" > vela-extensions/src/lib.rs \
+    && echo "" > tools/testing/interop/src/lib.rs \
     && echo "fn main() {}" > vela-server/src/main.rs \
     && echo "fn main() {}" > tools/vela-admin/src/main.rs \
     && cargo build --release --features extensions --bin vela --bin vela-backup || true
@@ -53,6 +55,8 @@ COPY vela-api/ vela-api/
 COPY vela-server/ vela-server/
 COPY tools/vela-admin/ tools/vela-admin/
 COPY vela-extensions/ vela-extensions/
+# Workspace member only (env-gated interop tests); not compiled into the image.
+COPY tools/testing/interop/ tools/testing/interop/
 
 RUN touch vela-core/src/lib.rs vela-store/src/lib.rs vela-api/src/lib.rs vela-server/src/main.rs \
               tools/vela-admin/src/main.rs vela-extensions/src/lib.rs \
