@@ -528,12 +528,14 @@ fn iterative_auth_checks(
     // invariant), and a cross-room/forged event is still rejected by auth rule
     // 2 (`room_id_matches_create`).
     //
-    // Gated to v12: pre-v12 rooms carry create in auth_events (v6–v10) or, for
-    // v11 (create dropped from auth_events but room_id still opaque, not a
-    // hash), the create is always present in the unconflicted state map that
-    // the classic-v2 pass starts from — so the seed is unnecessary there, and
-    // its `!x → $x` derivation wouldn't resolve against an opaque room_id
-    // anyway.
+    // Gated to v12: every pre-v12 room (v6–v11) carries create in
+    // auth_events — only v12/MSC4291 dropped it — and classic-v2 starts its
+    // iterative pass from the unconflicted state map where create sits
+    // anyway. So the seed is unnecessary pre-v12, and its `!x → $x`
+    // derivation wouldn't resolve against an opaque (non-hash) room_id
+    // regardless. (An event whose auth_events omit create in a ≤v11 room is
+    // itself malformed — pre-fix vela emitted such events — but tolerating
+    // it on read costs nothing here.)
     let create_seed: Option<((String, String), Pdu)> = if room_version.uses_state_res_v21() {
         events_in_order
             .iter()
@@ -1463,9 +1465,11 @@ mod tests {
     /// unconflicted starting map for the iterative auth checks), which the
     /// subgraph test above does not exercise.
     ///
-    /// Models a v11-shaped room: an opaque (non-hash) `room_id` and topics
-    /// whose `auth_events` omit `m.room.create` (v11 dropped create from
-    /// auth_events). `create` is unconflicted. Under classic v2 the iterative
+    /// Models an opaque-room_id (pre-v12) room whose topics' `auth_events`
+    /// omit `m.room.create`. That shape is malformed for ≤v11 (create
+    /// belongs in auth_events through v11 — a boundary vela once got wrong)
+    /// but is exactly what pre-fix vela and lenient peers produced, so the
+    /// robustness matters. `create` is unconflicted. Under classic v2 the iterative
     /// checks start from the unconflicted map, so `create` is present and the
     /// topics authorise; under v2.1 they start from empty and `create_seed`
     /// cannot derive `create` from the opaque room_id, so the topics are
@@ -1508,8 +1512,9 @@ mod tests {
             &["$create"],
             1,
         );
-        // Topics omit create from auth_events (v11 shape) — so create is only
-        // reachable via the unconflicted initial state map.
+        // Topics omit create from auth_events (malformed-for-≤v11 shape,
+        // as pre-fix vela emitted) — so create is only reachable via the
+        // unconflicted initial state map.
         let t1 = mk(
             "$t1",
             "m.room.topic",

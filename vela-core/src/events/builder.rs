@@ -281,6 +281,54 @@ mod tests {
         assert!(auth.is_empty());
     }
 
+    /// The v11/v12 boundary of create-in-auth_events, pinned at the
+    /// selector level. A ≤v11 message MUST list the create event —
+    /// spec-compliant peers reject it otherwise ("No create event in
+    /// auth events"); a v12 message MUST NOT (MSC4291: implied by the
+    /// room id). Regression test for the interop finding where the
+    /// boundary sat at v11 and federated v11 messages were rejected.
+    #[test]
+    fn message_auth_includes_create_through_v11_not_v12() {
+        let mut state = HashMap::<(String, String), EventId>::new();
+        let create_eid = EventId::from_reference_hash("create");
+        let pl_eid = EventId::from_reference_hash("powerlevels");
+        let member_eid = EventId::from_reference_hash("member");
+        state.insert(("m.room.create".into(), "".into()), create_eid.clone());
+        state.insert(("m.room.power_levels".into(), "".into()), pl_eid);
+        state.insert(
+            ("m.room.member".into(), "@alice:example.com".into()),
+            member_eid,
+        );
+        let lookup = |t: &str, sk: &str| state.get(&(t.to_string(), sk.to_string())).cloned();
+
+        for version in [RoomVersion::V10, RoomVersion::V11] {
+            let auth = select_auth_events(
+                "m.room.message",
+                "@alice:example.com",
+                None,
+                None,
+                version,
+                &lookup,
+            );
+            assert!(
+                auth.contains(&create_eid),
+                "{version:?} message must list the create event in auth_events"
+            );
+        }
+        let auth = select_auth_events(
+            "m.room.message",
+            "@alice:example.com",
+            None,
+            None,
+            RoomVersion::V12,
+            &lookup,
+        );
+        assert!(
+            !auth.contains(&create_eid),
+            "v12 message must NOT list the create event in auth_events"
+        );
+    }
+
     #[test]
     fn member_join_includes_power_levels_and_sender_member() {
         let mut state = HashMap::<(String, String), EventId>::new();
