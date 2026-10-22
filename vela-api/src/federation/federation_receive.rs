@@ -1761,11 +1761,10 @@ async fn persist_received_pdu(
         // If this is a redaction and the target is on-disk, apply a marker
         // when the sender is actually allowed to redact it. When the
         // target is unknown locally (the redaction arrived before its
-        // target via /send/{txn}), try a one-shot /event/{id} fetch
-        // against the origin server, then park the redactor so a later
-        // target arrival can apply the marker retroactively.
+        // target), park the redactor so a later target arrival can apply
+        // the marker retroactively.
         if pdu.event_type == "m.room.redaction" {
-            try_apply_redaction_marker(state, room_nid, pdu, event_nid, origin).await;
+            try_apply_redaction_marker(state, room_nid, pdu, event_nid);
         }
 
         // If THIS event is the target of a previously-parked
@@ -2011,18 +2010,11 @@ fn try_record_relation(
     }
 }
 
-/// For an accepted `m.room.redaction` event, apply the redaction marker if
-/// (a) the target is present locally and (b) the sender passes the v3-handling
-/// apply check. If either condition fails we silently skip — the redaction
-/// event itself is still persisted and federated. Missing targets may be
-/// back-filled in a future pass; insufficient-power redactions from remote
-/// servers are simply no-ops per spec.
-/// When `target_event_id` arrives via /send/{txn} and we have a
-/// previously-parked redaction for it, apply the marker now.
+/// When `target_event_id` has just been persisted (live or fetched) and
+/// we have a previously-parked redaction for it, apply the marker now.
 /// Mirrors the core of `try_apply_redaction_marker` (auth check +
-/// `mark_redacted_by` + relation bookkeeping) but skips the /event
-/// fetch — we just persisted the target, it's on disk by
-/// construction.
+/// `mark_redacted_by` + relation bookkeeping) for a target we just
+/// persisted, on the live or the fetched path.
 fn apply_parked_redaction_for_target(
     state: &AppState,
     room_nid: u64,
@@ -2076,12 +2068,20 @@ fn apply_parked_redaction_for_target(
         debug!(target = %target_event_id, "parked redaction failed auth check at target arrival");
         return;
     }
+    let already_redacted = state
+        .db
+        .get_redacted_by(target_event_nid)
+        .ok()
+        .flatten()
+        .is_some();
     if let Err(e) = state.db.mark_redacted_by(target_event_nid, redactor_nid) {
         warn!(target = %target_event_id, error = %e,
             "mark_redacted_by (parked) failed");
         return;
     }
-    if let Some(rel) = target_pdu.content.get("m.relates_to")
+    // Counter moves once per target, like the live and local paths.
+    if !already_redacted
+        && let Some(rel) = target_pdu.content.get("m.relates_to")
         && let Some(parent_event_id) = rel.get("event_id").and_then(|v| v.as_str())
         && let Some(rel_type) = rel.get("rel_type").and_then(|v| v.as_str())
         && let Ok(Some(parent_nid)) = state.db.get_event_nid_by_id(parent_event_id)
@@ -2092,13 +2092,12 @@ fn apply_parked_redaction_for_target(
     debug!(target = %target_event_id, "applied parked redaction after target arrival");
 }
 
-async fn try_apply_redaction_marker(
-    state: &AppState,
-    room_nid: u64,
-    pdu: &Pdu,
-    redactor_nid: u64,
-    origin: &str,
-) {
+/// For an accepted `m.room.redaction` event, apply the redaction marker if
+/// (a) the target is present locally and (b) the sender passes the v3-handling
+/// apply check. An unknown target parks the redactor until it arrives; an
+/// insufficient-power redaction from a remote server is a no-op per spec.
+/// Either way the redaction event itself is still persisted and federated.
+fn try_apply_redaction_marker(state: &AppState, room_nid: u64, pdu: &Pdu, redactor_nid: u64) {
     // v11+ carries the target in content.redacts; through v10 it is the
     // top-level `redacts`. Accept either so a peer on the other rule is
     // understood regardless of what this room's version strictly says.
@@ -2112,60 +2111,24 @@ async fn try_apply_redaction_marker(
         None => return,
     };
 
-    // Out-of-order redaction backfill: if the target arrives later
-    // via /send/{txn}, the live path would silently drop the marker
-    // and the target would render unredacted forever. Try /event/{id}
-    // against the origin first; it's a one-shot best-effort fetch
-    // with its own budget. A peer 404 or persist failure still falls
-    // through to the same drop the pre-fix path took — but at warn
-    // level so the operator can see when the backfill probe missed.
-    if state
-        .db
-        .get_event_nid_by_id(target_id)
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        match state
-            .federation_client
-            .fetch_event_pdu(origin, target_id)
-            .await
-        {
-            Ok(pdu_value) => {
-                let budget = new_fetch_budget();
-                // FetchKind::Backfill (vs AuthChain) lands the target
-                // as BackfillTimeline so it gets a stream_pos and
-                // shows up in /sync — not just /messages. The target
-                // is by construction historical (peer 200'd /event
-                // for an event_id we don't have on the live path),
-                // so the no-extremity posture is correct: it doesn't
-                // belong on the forward DAG tip.
-                if let Err(e) =
-                    persist_fetched_event(state, &pdu_value, origin, budget, FetchKind::Backfill)
-                        .await
-                {
-                    warn!(target = %target_id, origin = %origin, error = %e,
-                        "redaction backfill: persist_fetched_event failed");
-                }
-            }
-            Err(e) => {
-                warn!(target = %target_id, origin = %origin, error = %e,
-                    "redaction backfill: /event probe failed");
-            }
-        }
-    }
-
     let target_nid = match state.db.get_event_nid_by_id(target_id) {
         Ok(Some(n)) => n,
         _ => {
-            // Probe missed (peer 404'd or returned garbage). Park
-            // the redactor so the receive path applies it
-            // retroactively when /send/{txn} eventually delivers
-            // the target.
+            // Unknown target: park the redactor and apply it when the
+            // target shows up, whether over /send or a later fetch. We
+            // never go and get the target ourselves — a redaction of an
+            // event we don't have is not a reason to hit the peer.
             if let Err(e) = state.db.park_pending_redaction(target_id, redactor_nid) {
                 warn!(target = %target_id, error = %e, "park_pending_redaction failed");
-            } else {
-                debug!(target = %target_id, "parked redaction for later target arrival");
+                return;
+            }
+            debug!(target = %target_id, "parked redaction for later target arrival");
+            // Client-side fetches (/messages, /timestamp_to_event) persist
+            // without the room lock, so the target may have landed between
+            // our lookup and the park; its own parked-apply would then have
+            // found nothing. Look once more and apply if so.
+            if let Ok(Some(nid)) = state.db.get_event_nid_by_id(target_id) {
+                apply_parked_redaction_for_target(state, room_nid, target_id, nid);
             }
             return;
         }
@@ -3046,6 +3009,10 @@ async fn persist_fetched_event_inner(
         )
         .map_err(|e| format!("persist_event: {e}"))?;
 
+    // A redaction that arrived before this event was parked; now that
+    // the target is on disk, apply it. The live path does the same.
+    apply_parked_redaction_for_target(state, room_nid, &target_pdu.event_id, event_nid);
+
     Ok(())
 }
 
@@ -3664,6 +3631,252 @@ mod tests {
 
         let joined = db.get_user_joined_rooms(alice_nid).unwrap();
         assert_eq!(joined, vec![room_joined]);
+    }
+
+    // --- redaction parking ---
+
+    /// Room with alice's create, join and one message; returns
+    /// (room_nid, message_nid, message_event_id). Events are persisted
+    /// straight into the store (no signatures needed below the receive
+    /// path).
+    fn seed_room_with_message(state: &AppState) -> (u64, u64, &'static str) {
+        let db = &state.db;
+        let alice = "@alice:remote.example";
+        let room_id = "!parked:remote.example";
+        let room_nid = db.get_or_create_nid(room_id).unwrap();
+        db.create_room_meta(room_nid, room_id, "10").unwrap();
+        let alice_nid = db.get_or_create_nid(alice).unwrap();
+        let persist =
+            |nid: u64, eid: &str, ty: &str, sk: Option<&str>, content: Value, prev: &[u64]| {
+                let type_nid = db.get_or_create_nid(ty).unwrap();
+                let sk_nid = sk.map(|k| db.get_or_create_nid(k).unwrap()).unwrap_or(0);
+                let mut ev = json!({
+                    "type": ty, "sender": alice, "room_id": room_id,
+                    "content": content, "origin_server_ts": nid, "depth": nid,
+                    "prev_events": [], "auth_events": [],
+                });
+                if let Some(k) = sk {
+                    ev["state_key"] = json!(k);
+                }
+                db.persist_event(
+                    nid,
+                    eid,
+                    room_nid,
+                    type_nid,
+                    alice_nid,
+                    sk_nid,
+                    nid,
+                    nid,
+                    &serde_json::to_vec(&ev).unwrap(),
+                    prev,
+                    &[],
+                    sk.is_some(),
+                    false,
+                )
+                .unwrap();
+            };
+        persist(
+            200,
+            "$parked_create",
+            "m.room.create",
+            Some(""),
+            json!({"room_version": "10", "creator": alice}),
+            &[],
+        );
+        persist(
+            201,
+            "$parked_join",
+            "m.room.member",
+            Some(alice),
+            json!({"membership": "join"}),
+            &[200],
+        );
+        persist(
+            202,
+            "$parked_msg",
+            "m.room.message",
+            None,
+            json!({"body": "hi"}),
+            &[201],
+        );
+        (room_nid, 202, "$parked_msg")
+    }
+
+    fn redaction_pdu(target: &str, in_content: bool) -> Pdu {
+        Pdu {
+            event_id: "$parked_redaction".to_string(),
+            room_id: "!parked:remote.example".to_string(),
+            event_type: "m.room.redaction".to_string(),
+            state_key: None,
+            sender: "@alice:remote.example".to_string(),
+            origin_server_ts: 300,
+            content: if in_content {
+                json!({"redacts": target})
+            } else {
+                json!({})
+            },
+            auth_events: vec![],
+            prev_events: vec![],
+            depth: 300,
+            signatures: None,
+            redacts: if in_content {
+                None
+            } else {
+                Some(target.to_string())
+            },
+        }
+    }
+
+    /// A redaction whose target we don't have is parked, not fetched:
+    /// nothing about an unknown target justifies a request to the peer.
+    #[tokio::test]
+    async fn unknown_redaction_target_is_parked() {
+        let (state, _tmp) = build_test_state();
+        let (room_nid, _, _) = seed_room_with_message(&state);
+        for (in_content, redactor_nid) in [(false, 301u64), (true, 302u64)] {
+            let target = format!("$never_seen_{redactor_nid}");
+            try_apply_redaction_marker(
+                &state,
+                room_nid,
+                &redaction_pdu(&target, in_content),
+                redactor_nid,
+            );
+            assert_eq!(
+                state.db.take_pending_redaction(&target).unwrap(),
+                Some(redactor_nid),
+                "redactor parked under its target (in_content={in_content})"
+            );
+        }
+    }
+
+    /// A known target is marked straight away, from either placement.
+    #[tokio::test]
+    async fn known_redaction_target_is_marked() {
+        let (state, _tmp) = build_test_state();
+        let (room_nid, msg_nid, msg_eid) = seed_room_with_message(&state);
+        try_apply_redaction_marker(&state, room_nid, &redaction_pdu(msg_eid, false), 303);
+        assert_eq!(state.db.get_redacted_by(msg_nid).unwrap(), Some(303));
+        assert_eq!(state.db.take_pending_redaction(msg_eid).unwrap(), None);
+    }
+
+    /// Persist a redaction of `target` by alice under `nid` as an ordinary
+    /// stored event, the way the receive path leaves a redactor that
+    /// arrived before its target.
+    fn persist_redactor(state: &AppState, room_nid: u64, nid: u64, target: &str) {
+        let redactor = redaction_pdu(target, false);
+        let type_nid = state.db.get_or_create_nid("m.room.redaction").unwrap();
+        let sender_nid = state.db.get_or_create_nid(&redactor.sender).unwrap();
+        state
+            .db
+            .persist_event(
+                nid,
+                &format!("$parked_redaction_{nid}"),
+                room_nid,
+                type_nid,
+                sender_nid,
+                0,
+                nid,
+                nid,
+                &serde_json::to_vec(&json!({
+                    "type": "m.room.redaction", "sender": redactor.sender,
+                    "room_id": redactor.room_id, "content": {}, "redacts": target,
+                    "origin_server_ts": nid, "depth": nid,
+                    "prev_events": [], "auth_events": [],
+                }))
+                .unwrap(),
+                &[],
+                &[],
+                false,
+                false,
+            )
+            .unwrap();
+    }
+
+    /// The parked redactor is applied once the target is persisted,
+    /// through the shared parked-apply step.
+    #[tokio::test]
+    async fn parked_redaction_applies_when_target_is_persisted() {
+        let (state, _tmp) = build_test_state();
+        let (room_nid, msg_nid, msg_eid) = seed_room_with_message(&state);
+        persist_redactor(&state, room_nid, 304, msg_eid);
+        state.db.park_pending_redaction(msg_eid, 304).unwrap();
+        apply_parked_redaction_for_target(&state, room_nid, msg_eid, msg_nid);
+        assert_eq!(state.db.get_redacted_by(msg_nid).unwrap(), Some(304));
+        assert_eq!(
+            state.db.take_pending_redaction(msg_eid).unwrap(),
+            None,
+            "consumed"
+        );
+    }
+
+    /// A parked redactor landing on a target that is already redacted
+    /// must not move the (parent, rel_type) counter a second time.
+    #[tokio::test]
+    async fn parked_redaction_on_redacted_target_keeps_relation_counter() {
+        let (state, _tmp) = build_test_state();
+        let (room_nid, parent_nid, parent_eid) = seed_room_with_message(&state);
+        let db = &state.db;
+        let alice_nid = db.get_or_create_nid("@alice:remote.example").unwrap();
+        let type_msg = db.get_or_create_nid("m.room.message").unwrap();
+        let thread_nid = db.get_or_create_nid("m.thread").unwrap();
+        // Two thread replies on the same parent: the counter starts at 2,
+        // so one spurious decrement is observable (it saturates at 0).
+        for (nid, eid) in [(210u64, "$reply_a"), (211u64, "$reply_b")] {
+            let ev = json!({
+                "type": "m.room.message", "sender": "@alice:remote.example",
+                "room_id": "!parked:remote.example", "origin_server_ts": nid, "depth": nid,
+                "content": {"body": "reply", "m.relates_to": {"rel_type": "m.thread", "event_id": parent_eid}},
+                "prev_events": [], "auth_events": [],
+            });
+            db.persist_event(
+                nid,
+                eid,
+                room_nid,
+                type_msg,
+                alice_nid,
+                0,
+                nid,
+                nid,
+                &serde_json::to_vec(&ev).unwrap(),
+                &[],
+                &[],
+                false,
+                false,
+            )
+            .unwrap();
+            db.record_relation(
+                parent_nid, nid, nid, thread_nid, type_msg, room_nid, alice_nid, true, true,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            db.count_relation_for_type(parent_nid, thread_nid).unwrap(),
+            2
+        );
+
+        // reply_a was already redacted on the live path.
+        persist_redactor(&state, room_nid, 305, "$reply_a");
+        db.mark_redacted_by(210, 305).unwrap();
+        db.relation_redacted(parent_nid, thread_nid).unwrap();
+        assert_eq!(
+            db.count_relation_for_type(parent_nid, thread_nid).unwrap(),
+            1
+        );
+
+        // A second, parked redactor for the same target arrives.
+        persist_redactor(&state, room_nid, 306, "$reply_a");
+        db.park_pending_redaction("$reply_a", 306).unwrap();
+        apply_parked_redaction_for_target(&state, room_nid, "$reply_a", 210);
+        assert_eq!(
+            db.get_redacted_by(210).unwrap(),
+            Some(306),
+            "marker updated"
+        );
+        assert_eq!(
+            db.count_relation_for_type(parent_nid, thread_nid).unwrap(),
+            1,
+            "counter moves once per target"
+        );
     }
 }
 
