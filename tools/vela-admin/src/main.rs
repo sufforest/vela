@@ -60,6 +60,12 @@ enum Cmd {
         /// Full `!opaque:server` or v12 `!hash` room id.
         room_id: String,
     },
+    /// Dump one stored event: header fields + full persisted PDU JSON
+    /// (auth_events, prev_events, signatures). Federation triage tool.
+    Event {
+        /// Full `$...` event id.
+        event_id: String,
+    },
     /// List stored media files. Useful for spotting orphaned uploads.
     Media {
         /// Cap results so a server with millions of files doesn't
@@ -91,6 +97,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Rooms => cmd::rooms::run(&db),
         Cmd::RoomsTop { limit } => cmd::rooms::run_top(&db, limit),
         Cmd::Room { room_id } => cmd::rooms::run_one(&db, &room_id),
+        Cmd::Event { event_id } => cmd::event::run(&db, &event_id),
         Cmd::Media { limit } => cmd::media::run(&db, limit),
         Cmd::DiagnoseMembership { room_id, user_id } => {
             cmd::membership::run(&db, &room_id, &user_id)

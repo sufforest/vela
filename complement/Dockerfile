@@ -29,15 +29,17 @@ COPY vela-api/Cargo.toml vela-api/
 COPY vela-server/Cargo.toml vela-server/
 COPY tools/vela-admin/Cargo.toml tools/vela-admin/
 COPY vela-extensions/Cargo.toml vela-extensions/
+COPY tools/testing/interop/Cargo.toml tools/testing/interop/
 
 # Create stub sources so the workspace resolves for the dep-build step.
 # vela-extensions is a workspace member but not a dependency of the vela binary,
 # so it isn't compiled here (no wasmtime in the image build).
-RUN mkdir -p vela-core/src vela-store/src vela-api/src vela-server/src tools/vela-admin/src vela-extensions/src \
+RUN mkdir -p vela-core/src vela-store/src vela-api/src vela-server/src tools/vela-admin/src vela-extensions/src tools/testing/interop/src \
     && echo "" > vela-core/src/lib.rs \
     && echo "" > vela-store/src/lib.rs \
     && echo "" > vela-api/src/lib.rs \
     && echo "" > vela-extensions/src/lib.rs \
+    && echo "" > tools/testing/interop/src/lib.rs \
     && echo "fn main() {}" > vela-server/src/main.rs \
     && echo "fn main() {}" > tools/vela-admin/src/main.rs \
     && cargo build --release --bin vela || true

@@ -93,11 +93,14 @@ impl RoomVersion {
 
     // --- per-version behaviour knobs ---
 
-    /// Pre-v11, `m.room.create` is included in `auth_events` for every
-    /// non-create event. v11 dropped this — the create event is always
-    /// the root of the auth chain implicitly.
+    /// Through v11, `m.room.create` is included in `auth_events` for every
+    /// non-create event — spec-compliant servers (Synapse included) REJECT
+    /// a ≤v11 event whose auth_events omit it ("No create event in auth
+    /// events"). v12 (MSC4291) dropped it: the create event is implied by
+    /// the room id and MUST NOT be listed. (Not to be confused with v11's
+    /// actual change, dropping the create CONTENT's `creator` field.)
     pub fn include_create_in_auth_events(&self) -> bool {
-        !self.at_least(Self::V11)
+        !self.at_least(Self::V12)
     }
 
     /// v12 uses the "state resolution v2.1" variant of the algorithm: the
@@ -207,7 +210,7 @@ mod tests {
     fn version_specific_knobs() {
         // v6 is most permissive in old features
         let v6 = RoomVersion::V6;
-        assert!(v6.include_create_in_auth_events()); // pre-v11
+        assert!(v6.include_create_in_auth_events()); // pre-v12
         assert!(!v6.hash_based_room_ids()); // pre-v12
         assert!(!v6.omit_room_id_from_create()); // pre-v12
         assert!(v6.create_event_has_creator_field()); // pre-v11
@@ -227,9 +230,13 @@ mod tests {
         assert!(RoomVersion::V8.supports_restricted_joins());
         assert!(!RoomVersion::V7.supports_restricted_joins());
 
-        // v11 boundary on creator field
-        assert!(!RoomVersion::V11.include_create_in_auth_events());
+        // create stays in auth_events through v11; only v12 (MSC4291)
+        // drops it. Regression: this boundary was once wrongly set at
+        // v11, making every vela-authored event in a federated v11 room
+        // rejectable ("No create event in auth events") by peers.
+        assert!(RoomVersion::V11.include_create_in_auth_events());
         assert!(RoomVersion::V10.include_create_in_auth_events());
+        assert!(!RoomVersion::V12.include_create_in_auth_events());
     }
 
     /// state-res v2.1 (empty initial state + conflicted subgraph) is a v12+

@@ -28,6 +28,14 @@ ignore = [
     # object_store ships a quick-xml >= 0.41 release.
     { id = "RUSTSEC-2026-0194", reason = "transitive quick-xml DoS; S3-backend-only; no object_store release uses quick-xml >=0.41 yet" },
     { id = "RUSTSEC-2026-0195", reason = "transitive quick-xml DoS; S3-backend-only; no object_store release uses quick-xml >=0.41 yet" },
+    # wasmtime "Stores can mix up type indices between engines": requires a
+    # Store used across MULTIPLE Engines. vela-extensions builds ONE shared
+    # Engine (Plugin::new_engine — "one engine backs every plugin") and every
+    # Store is created from it; a SIGHUP reload's fresh runtime keeps its
+    # stores within its own engine too, so the mix-up is unreachable. The
+    # 45.x line has no patched release — drop this when bumping wasmtime to
+    # >=46.0.2 / >=47.0.3 (a major bump: own PR, API + MSRV review).
+    { id = "RUSTSEC-2026-0222", reason = "requires cross-engine Store use; vela has a single shared Engine; no 45.x patch exists — revisit on the wasmtime major bump" },
 ]
 
 [licenses]

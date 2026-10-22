@@ -1,0 +1,19 @@
+[package]
+name = "vela-interop"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Differential federation interop harness: drives a live vela and a live Synapse and asserts both converge."
+publish = false
+
+# Uses only existing workspace deps, so being a workspace member costs the
+# dev loop nothing (unlike smoketest-rs, which is excluded for its ruma tree).
+# The tests are env-gated and skip without a running rig — see run.sh.
+[dependencies]
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
