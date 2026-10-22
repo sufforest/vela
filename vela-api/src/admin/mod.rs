@@ -419,11 +419,7 @@ async fn create_admin_room(
     //    Spec: m.room.create.content.m.federate; per spec the default is
     //    true, and clients that explicitly set it to false get an
     //    unfederated room.
-    let mut create_content_val = content::create_content(room_version);
-    create_content_val
-        .as_object_mut()
-        .unwrap()
-        .insert("creator".to_string(), Value::String(sender.to_string()));
+    let mut create_content_val = content::create_content(room_version, sender);
     create_content_val
         .as_object_mut()
         .unwrap()

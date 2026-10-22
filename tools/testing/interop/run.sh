@@ -20,6 +20,10 @@
 # vela's cert content doesn't matter. If TLS ever misbehaves, vela's
 # [federation] http_peers map is the plain-HTTP escape hatch.
 #
+# Env knobs: SYNAPSE_IMAGE (default matrixdotorg/synapse:latest),
+# INTEROP_WORKDIR (default <repo>/target/interop), INTEROP_EVIDENCE_DIR
+# (default <repo>/target/interop-evidence).
+#
 # Usage:
 #   ./run.sh            build + boot + test + teardown
 #   ./run.sh --up-only  boot the rig and print the env exports, no teardown
@@ -39,6 +43,12 @@ VELA_NAME="host.docker.internal:$VELA_FED_PORT"
 SYN_NAME="localhost:$SYN_FED_PORT"
 
 down() {
+    # Snapshot Synapse's log before the container goes away — a boot
+    # failure (wait_up timeout) exits through this trap too, and the log
+    # is the only evidence of why.
+    if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+        docker logs "$CONTAINER" > "$WORK/synapse.log" 2>&1 || true
+    fi
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     if [[ -f "$WORK/vela.pid" ]]; then
         kill "$(cat "$WORK/vela.pid")" >/dev/null 2>&1 || true
@@ -124,8 +134,12 @@ echo $! > "$WORK/vela.pid"
 
 # -------------------------------------------------------------- synapse boot
 echo "==> generating Synapse config (signing key) via $SYNAPSE_IMAGE"
+# UID/GID: the image's entrypoint gosu's to them, so the files it writes
+# into the bind mount are ours. Without this (Linux, e.g. CI) `generate`
+# leaves root-owned files and the cp/chmod below fail. No-op on macOS.
 docker run --rm \
     -v "$WORK/synapse:/data" \
+    -e UID="$(id -u)" -e GID="$(id -g)" \
     -e SYNAPSE_SERVER_NAME="$SYN_NAME" \
     -e SYNAPSE_REPORT_STATS=no \
     "$SYNAPSE_IMAGE" generate >/dev/null
@@ -161,6 +175,10 @@ tls_private_key_path: /data/synapse.key
 federation_verify_certificates: false
 # Direct key fetch only — no matrix.org perspectives on a loopback rig.
 trusted_key_servers: []
+# vela is a private address from inside the container (the docker bridge
+# gateway on Linux), which Synapse's SSRF guard refuses by default. Same
+# knob as vela's [federation] private_ip_block=false above.
+ip_range_blacklist: []
 suppress_key_server_warning: true
 
 enable_registration: true
@@ -186,7 +204,11 @@ rc_federation:
   reject_limit: 1000
   concurrent: 100
 EOF
-chmod -R a+rwX "$WORK/synapse"
+# Belt and braces for the container reading what the host wrote. With
+# UID/GID passed above the container already runs as us, and `generate`
+# can leave a root-owned file behind on Linux (the log config), so a
+# failure here is not fatal.
+chmod -R a+rwX "$WORK/synapse" 2>/dev/null || true
 
 echo "==> starting Synapse ($SYN_NAME)"
 # Publish only on loopback: vela (on the host) is the sole consumer of
@@ -195,6 +217,7 @@ echo "==> starting Synapse ($SYN_NAME)"
 # 0.0.0.0 so the container can reach it via host-gateway.)
 docker run -d --name "$CONTAINER" \
     --add-host host.docker.internal:host-gateway \
+    -e UID="$(id -u)" -e GID="$(id -g)" \
     -p "127.0.0.1:$SYN_CS_PORT:$SYN_CS_PORT" -p "127.0.0.1:$SYN_FED_PORT:$SYN_FED_PORT" \
     -v "$WORK/synapse:/data" \
     "$SYNAPSE_IMAGE" >/dev/null
@@ -219,6 +242,8 @@ export INTEROP_VELA_CS="http://127.0.0.1:$VELA_CS_PORT"
 export INTEROP_SYNAPSE_CS="http://127.0.0.1:$SYN_CS_PORT"
 export INTEROP_VELA_NAME="$VELA_NAME"
 export INTEROP_SYNAPSE_NAME="$SYN_NAME"
+# Divergence dumps go here; defaults to <repo>/target/interop-evidence.
+export INTEROP_EVIDENCE_DIR="${INTEROP_EVIDENCE_DIR:-$ROOT/target/interop-evidence}"
 
 if [[ "${1:-}" == "--up-only" ]]; then
     trap - EXIT
@@ -227,6 +252,7 @@ if [[ "${1:-}" == "--up-only" ]]; then
     echo "  export INTEROP_SYNAPSE_CS=$INTEROP_SYNAPSE_CS"
     echo "  export INTEROP_VELA_NAME=$INTEROP_VELA_NAME"
     echo "  export INTEROP_SYNAPSE_NAME=$INTEROP_SYNAPSE_NAME"
+    echo "  export INTEROP_EVIDENCE_DIR=$INTEROP_EVIDENCE_DIR"
     echo "tear down with: $0 --down"
     exit 0
 fi
@@ -236,9 +262,7 @@ echo "==> running interop suite"
 status=0
 cargo test --manifest-path "$ROOT/Cargo.toml" -p vela-interop -- --nocapture || status=$?
 if (( status != 0 )); then
-    # Snapshot Synapse's logs before teardown removes the container.
-    docker logs "$CONTAINER" > "$WORK/synapse.log" 2>&1 || true
     echo "!! suite failed — logs: $WORK/vela.log, $WORK/synapse.log"
-    echo "!! divergence evidence (if any): $ROOT/target/interop-evidence/"
+    echo "!! divergence evidence (if any): $INTEROP_EVIDENCE_DIR/"
 fi
 exit "$status"

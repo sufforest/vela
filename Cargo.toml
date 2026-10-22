@@ -14,7 +14,7 @@ version = "0.3.0"
 license = "Apache-2.0"
 description = "A Matrix homeserver written in Rust."
 readme = "README.md"
-rust-version = "1.93"
+rust-version = "1.96"
 
 # Workspace-level lint config — every member crate inherits via
 # `[lints] workspace = true`. The CI lint job runs with `-D warnings`,
@@ -90,7 +90,7 @@ bytes = "1"
 # that handles auth, multipart, retries, virtual-hosting nuances. It's
 # the standard cloud-storage abstraction in the Rust ecosystem (used by
 # arrow-rs, polars, datafusion).
-object_store = { version = "0.13", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 futures = "0.3"
 
 # Utilities

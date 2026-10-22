@@ -145,10 +145,9 @@ impl ObserveQueue {
     /// Decrement the depth gauge without underflowing (the shed path and the
     /// worker can both decrement for an entry under a race).
     fn dec_depth(&self) {
-        let _ = self
-            .depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
-                Some(d.saturating_sub(1))
+        self.depth
+            .update(Ordering::Relaxed, Ordering::Relaxed, |d| {
+                d.saturating_sub(1)
             });
     }
 

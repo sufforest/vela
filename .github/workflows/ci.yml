@@ -69,23 +69,23 @@ jobs:
   msrv:
     # Verifies the SHIPPED code still compiles under the declared minimum
     # supported Rust version (rust-version in Cargo.toml), which must stay
-    # <= the rust:1.93 base both Dockerfiles build on — otherwise a dep
+    # <= the rust:1.96 base both Dockerfiles build on — otherwise a dep
     # bump that raises the floor breaks the image build. Drift here is
     # silent without this job. Uses `cargo build` (not `check`) so codegen
     # errors surface, not just type errors.
     #
     # Deliberately NOT `--all-targets`: that additionally links the ~40
     # integration-test binaries, which (a) are never shipped, so their
-    # 1.93 compat is irrelevant, and (b) under that link storm rust-lld
+    # 1.96 compat is irrelevant, and (b) under that link storm rust-lld
     # crashes intermittently on the runner. Building lib + binaries is
     # what the Docker image actually does, and is the floor that matters.
-    name: cargo build (MSRV 1.93)
+    name: cargo build (MSRV 1.96)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust 1.93
-        uses: dtolnay/rust-toolchain@1.93
+      - name: Install Rust 1.96
+        uses: dtolnay/rust-toolchain@1.96
 
       - name: Install libclang
         run: sudo apt-get update && sudo apt-get install -y libclang-dev
@@ -269,32 +269,40 @@ jobs:
         with:
           shared-key: workspace-s3
 
-      - name: Start MinIO
+      # MinIO withdrew its public container images (Docker Hub and quay) in
+      # 2025, so the sidecar is versitygw: a small S3 gateway over a posix
+      # directory with the same root-key env contract. Pinned tag, bumped
+      # deliberately. The bucket is created with curl's built-in SigV4
+      # signing, so no second image is needed for a CLI.
+      - name: Start S3 sidecar (versitygw)
         run: |
-          docker run -d --name minio \
-            -p 9000:9000 \
-            -e MINIO_ROOT_USER=vela \
-            -e MINIO_ROOT_PASSWORD=vela-test-secret \
-            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
-          # Wait up to 60s for /minio/health/live.
+          docker run -d --name s3 \
+            -p 9000:7070 \
+            -v s3-data:/data \
+            -e ROOT_ACCESS_KEY=vela \
+            -e ROOT_SECRET_KEY=vela-test-secret \
+            versity/versitygw:v1.0.15 posix /data
+          # Any HTTP answer means the gateway is listening (there is no
+          # unauthenticated health route; / needs a signature).
           for i in $(seq 1 30); do
-            if curl -fs http://127.0.0.1:9000/minio/health/live; then
-              echo "minio healthy after ${i} tries"
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/)" != "000" ]; then
+              echo "s3 sidecar listening after ${i} tries"
               break
             fi
             sleep 2
             if [ "$i" = "30" ]; then
-              echo "minio did not become healthy in time"
-              docker logs minio
+              echo "s3 sidecar did not come up in time"
+              docker logs s3
               exit 1
             fi
           done
 
       - name: Create test bucket
         run: |
-          docker run --rm --network host \
-            -e MC_HOST_local=http://vela:vela-test-secret@127.0.0.1:9000 \
-            minio/mc:RELEASE.2025-04-08T15-39-49Z mb local/vela-test
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+            --aws-sigv4 "aws:amz:us-east-1:s3" --user vela:vela-test-secret \
+            http://127.0.0.1:9000/vela-test)
+          [ "$code" = "200" ] || { echo "create bucket failed: HTTP $code"; exit 1; }
 
       - name: cargo test --features s3-integration
         env:
