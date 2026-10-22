@@ -175,6 +175,10 @@ tls_private_key_path: /data/synapse.key
 federation_verify_certificates: false
 # Direct key fetch only — no matrix.org perspectives on a loopback rig.
 trusted_key_servers: []
+# vela is a private address from inside the container (the docker bridge
+# gateway on Linux), which Synapse's SSRF guard refuses by default. Same
+# knob as vela's [federation] private_ip_block=false above.
+ip_range_blacklist: []
 suppress_key_server_warning: true
 
 enable_registration: true
