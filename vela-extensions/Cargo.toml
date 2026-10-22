@@ -21,7 +21,7 @@ wasmtime-runtime = ["dep:wasmtime"]
 [dependencies]
 # Host runtime. Optional + trimmed default features: we need the Cranelift
 # compiler, the Component Model, and runtime support — not the CLI/debug extras.
-wasmtime = { version = "45", optional = true, default-features = false, features = [
+wasmtime = { version = "49", optional = true, default-features = false, features = [
     "std",
     "runtime",
     "cranelift",
