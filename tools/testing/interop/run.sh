@@ -200,7 +200,11 @@ rc_federation:
   reject_limit: 1000
   concurrent: 100
 EOF
-chmod -R a+rwX "$WORK/synapse"
+# Belt and braces for the container reading what the host wrote. With
+# UID/GID passed above the container already runs as us, and `generate`
+# can leave a root-owned file behind on Linux (the log config), so a
+# failure here is not fatal.
+chmod -R a+rwX "$WORK/synapse" 2>/dev/null || true
 
 echo "==> starting Synapse ($SYN_NAME)"
 # Publish only on loopback: vela (on the host) is the sole consumer of
