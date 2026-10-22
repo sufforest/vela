@@ -24,6 +24,7 @@ use serde_json::Value;
 
 use crate::canonical::canonical_json_object;
 use crate::events::pdu::Pdu;
+use crate::events::room_version::RoomVersion;
 use crate::federation::keys::decode_public_key;
 
 /// State lookup function: (type, state_key) → Some(&Pdu) if present.
@@ -797,8 +798,7 @@ fn check_power_levels(event: &Pdu, state: StateFn<'_>, create: &Pdu) -> AuthResu
         // a creator legitimately appears in `users` to retain authority
         // — TestRestrictedRoomsLocalJoinNoCreatorsUsesPowerLevelsV11
         // sets exactly that.
-        let is_v12 = create.content.get("room_version").and_then(|v| v.as_str()) == Some("12");
-        if is_v12 {
+        if creators_have_infinite_power(create) {
             let creators = room_creators(create);
             for user_id in obj.keys() {
                 if creators.contains(user_id.as_str()) {
@@ -1048,19 +1048,53 @@ pub fn room_creators(create: &Pdu) -> HashSet<String> {
     creators
 }
 
+/// The room version a create event declares, when it is one we implement.
+fn create_room_version(create: &Pdu) -> Option<RoomVersion> {
+    create
+        .content
+        .get("room_version")
+        .and_then(|v| v.as_str())
+        .and_then(RoomVersion::parse)
+}
+
+/// v12+ (MSC4289): creators have implicit infinite power. Through v11 a
+/// creator is an ordinary user whose authority comes only from
+/// `power_levels.users` — the same reading every compliant peer applies,
+/// so getting this wrong on one side means our events are rejected on
+/// the other.
+fn creators_have_infinite_power(create: &Pdu) -> bool {
+    create_room_version(create).is_some_and(|v| v.creators_have_infinite_power())
+}
+
+/// The single creator a pre-v12 room recognises when there is no
+/// `m.room.power_levels` event: the create event's sender (v11+) or its
+/// `content.creator` (v1–v10, where the field was mandatory).
+fn pre_v12_creator(create: &Pdu) -> Option<&str> {
+    match create_room_version(create) {
+        Some(v) if !v.create_event_has_creator_field() => Some(create.sender.as_str()),
+        _ => create.content.get("creator").and_then(|v| v.as_str()),
+    }
+}
+
 /// Compute a user's effective power level. In v12, creators have infinite power.
 /// We represent "infinite" as `i64::MAX`.
 pub fn user_power_level(state: StateFn<'_>, user: &str, create: &Pdu) -> i64 {
     // v12: creators have infinite power
-    if room_creators(create).contains(user) {
+    if creators_have_infinite_power(create) && room_creators(create).contains(user) {
         return i64::MAX;
     }
 
     let pl = match state("m.room.power_levels", "") {
         None => {
-            // No power_levels event: only the create event's sender has power
-            // (note: v12 creators are already handled above).
-            return 0;
+            // No power_levels event: "the room's creator has a power level
+            // of 100, and all other users have a power level of 0"
+            // (m.room.power_levels schema, versions 1–11). v12 creators
+            // are already handled above.
+            return if pre_v12_creator(create) == Some(user) {
+                100
+            } else {
+                0
+            };
         }
         Some(pl) => pl,
     };
@@ -1253,6 +1287,143 @@ mod tests {
         let sf = |t: &str, sk: &str| lookup(&state, t, sk);
         let power = user_power_level(&sf, "@alice:example.com", &create);
         assert_eq!(power, i64::MAX);
+    }
+
+    /// Through v11 the creator is an ordinary user: 100 only while there is
+    /// no power_levels event, and whatever `users` says once there is one.
+    /// vela used to grant creators infinite power in every version — a
+    /// self-consistent bug that made every vela-authored initial state
+    /// event in a ≤v11 room unauthorised on compliant peers.
+    #[test]
+    fn creator_power_is_ordinary_before_v12() {
+        for (version, extra) in [
+            ("11", json!({})),
+            ("10", json!({"creator": "@alice:example.com"})),
+        ] {
+            let mut content = json!({"room_version": version});
+            for (k, v) in extra.as_object().unwrap() {
+                content[k] = v.clone();
+            }
+            let create = pdu(
+                "$create",
+                "m.room.create",
+                Some(""),
+                "@alice:example.com",
+                content,
+                "",
+            );
+
+            // No power_levels event: creator 100, everyone else 0.
+            let state = make_state(vec![(("m.room.create", ""), create.clone())]);
+            let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+            assert_eq!(
+                user_power_level(&sf, "@alice:example.com", &create),
+                100,
+                "v{version}"
+            );
+            assert_eq!(
+                user_power_level(&sf, "@bob:example.com", &create),
+                0,
+                "v{version}"
+            );
+
+            // power_levels present but the creator not listed: users_default.
+            let pl = pdu(
+                "$pl",
+                "m.room.power_levels",
+                Some(""),
+                "@alice:example.com",
+                json!({"users": {}, "users_default": 0}),
+                "",
+            );
+            let state = make_state(vec![
+                (("m.room.create", ""), create.clone()),
+                (("m.room.power_levels", ""), pl),
+            ]);
+            let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+            assert_eq!(
+                user_power_level(&sf, "@alice:example.com", &create),
+                0,
+                "v{version}"
+            );
+
+            // Listed at 100: 100 — and nothing more.
+            let pl = pdu(
+                "$pl",
+                "m.room.power_levels",
+                Some(""),
+                "@alice:example.com",
+                json!({"users": {"@alice:example.com": 100}}),
+                "",
+            );
+            let state = make_state(vec![
+                (("m.room.create", ""), create.clone()),
+                (("m.room.power_levels", ""), pl),
+            ]);
+            let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+            assert_eq!(
+                user_power_level(&sf, "@alice:example.com", &create),
+                100,
+                "v{version}"
+            );
+        }
+    }
+
+    /// A create event with no `room_version` (spec default v1) or one we
+    /// don't implement never gets the v12 rule, and falls back to
+    /// `content.creator` for the no-power-levels case.
+    #[test]
+    fn unknown_or_absent_version_is_pre_v12() {
+        for content in [
+            json!({"creator": "@alice:example.com"}),
+            json!({"room_version": "5", "creator": "@alice:example.com"}),
+        ] {
+            let create = pdu(
+                "$create",
+                "m.room.create",
+                Some(""),
+                "@alice:example.com",
+                content,
+                "",
+            );
+            let state = make_state(vec![(("m.room.create", ""), create.clone())]);
+            let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+            assert_eq!(user_power_level(&sf, "@alice:example.com", &create), 100);
+            assert_eq!(user_power_level(&sf, "@bob:example.com", &create), 0);
+            let pl = pdu(
+                "$pl",
+                "m.room.power_levels",
+                Some(""),
+                "@alice:example.com",
+                json!({"users": {}}),
+                "",
+            );
+            let state = make_state(vec![
+                (("m.room.create", ""), create.clone()),
+                (("m.room.power_levels", ""), pl),
+            ]);
+            let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+            assert_eq!(user_power_level(&sf, "@alice:example.com", &create), 0);
+        }
+    }
+
+    /// v1–v10 name the creator in `content.creator`; the sender is not
+    /// consulted. (Through v10 the two must match at create-event auth,
+    /// so this only matters for the lookup path.)
+    #[test]
+    fn pre_v11_no_power_levels_uses_creator_field() {
+        let create = pdu(
+            "$create",
+            "m.room.create",
+            Some(""),
+            "@alice:example.com",
+            json!({"room_version": "10", "creator": "@carol:example.com"}),
+            "",
+        );
+        let state = make_state(vec![(("m.room.create", ""), create.clone())]);
+        let sf = |t: &str, sk: &str| lookup(&state, t, sk);
+        assert_eq!(user_power_level(&sf, "@carol:example.com", &create), 100);
+        assert_eq!(user_power_level(&sf, "@alice:example.com", &create), 0);
     }
 
     #[test]

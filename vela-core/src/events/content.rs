@@ -4,9 +4,14 @@ use serde_json::{Value, json};
 
 use crate::events::room_version::RoomVersion;
 
-pub fn create_content(room_version: RoomVersion) -> Value {
+/// `m.room.create` content. `creator` is mandatory through v10 (the auth
+/// rules read it when there is no power_levels event yet) and merely
+/// tolerated afterwards; it is always written because clients and tests
+/// still read it, and v11+ authorise off `sender`, never off this field.
+pub fn create_content(room_version: RoomVersion, creator: &str) -> Value {
     json!({
-        "room_version": room_version.as_str()
+        "room_version": room_version.as_str(),
+        "creator": creator,
     })
 }
 
@@ -43,9 +48,16 @@ pub fn member_content_knock(reason: Option<&str>) -> Value {
     content
 }
 
-pub fn power_levels_content(room_version: RoomVersion) -> Value {
+pub fn power_levels_content(room_version: RoomVersion, creator: &str) -> Value {
     // Default power levels per spec.
-    // In v12: creator has infinite power and MUST NOT be in users.
+    // Through v11 the creator has no special status in the auth rules: the
+    // only thing that gives them authority is `users[creator] = 100` in this
+    // event (createRoom spec: "In room versions 1 through 11, the room
+    // creator ... will be given permission to send state events"). Omitting
+    // it leaves the creator at users_default and every subsequent initial
+    // state event (join_rules, history_visibility, name) is rejected by a
+    // compliant peer. In v12 (MSC4289) the creator has infinite power and
+    // MUST NOT be listed in `users`.
     // Tombstone must be >= 150 (higher than state_default).
     // Spec default for `invite` in m.room.power_levels is 0, but the value
     // synapse stamps at room-create time is 50, and Complement's
@@ -75,6 +87,8 @@ pub fn power_levels_content(room_version: RoomVersion) -> Value {
 
     if room_version.creators_have_infinite_power() {
         content["events"]["m.room.tombstone"] = json!(150);
+    } else {
+        content["users"][creator] = json!(100);
     }
 
     content
@@ -111,6 +125,18 @@ pub fn topic_content(topic: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creator_listed_at_100_through_v11_only() {
+        for v in [RoomVersion::V6, RoomVersion::V10, RoomVersion::V11] {
+            let c = power_levels_content(v, "@alice:example.com");
+            assert_eq!(c["users"]["@alice:example.com"], 100, "{v:?}");
+            assert!(c["events"].get("m.room.tombstone").is_none(), "{v:?}");
+        }
+        let c = power_levels_content(RoomVersion::V12, "@alice:example.com");
+        assert!(c["users"].as_object().unwrap().is_empty());
+        assert_eq!(c["events"]["m.room.tombstone"], 150);
+    }
 
     #[test]
     fn topic_content_includes_legacy_and_rich_representation() {

@@ -493,6 +493,11 @@ pub async fn assert_membership(u: &User, room_id: &str, user_id: &str, want: &st
 }
 
 fn evidence_dir() -> PathBuf {
+    // `INTEROP_EVIDENCE_DIR` wins (CI points it next to the server logs so
+    // one artifact upload collects everything); otherwise
     // <workspace>/target/interop-evidence, derived from this crate's location.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../target/interop-evidence")
+    match std::env::var_os("INTEROP_EVIDENCE_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../target/interop-evidence"),
+    }
 }

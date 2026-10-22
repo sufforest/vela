@@ -369,8 +369,8 @@ fn topological_power_sort(events: &HashSet<String>, event_fn: EventFn<'_>) -> Ve
     // Compute sender power at respective auth_events.
     // For the purposes of ordering, we look up the event's auth_events, find any power_levels
     // event there, and compute the sender's power using that state snapshot. If no power_levels
-    // is in auth_events, the sender's power is derived from the create event (creator rules
-    // apply: creator = infinite; else 0).
+    // is in auth_events, the sender's power is derived from the create event (v12 creators
+    // infinite; through v11 the creator is 100 and everyone else 0).
     //
     // Callers that want perfect accuracy (e.g. when the sender's power depends on the create
     // event's additional_creators) must populate event_fn to return those events.

@@ -213,17 +213,10 @@ pub async fn create_room(
     }
 
     // --- 1. m.room.create (no room_id, no auth) ---
-    let mut create_content_val = content::create_content(room_version);
-    // Set `content.creator = caller`. MSC4291 removes the field for v12,
-    // but most clients (and many integration tests) still read it; the
-    // field is harmless on v12 because we authorise off `sender`, not
-    // `content.creator`. Caller-supplied `creation_content.creator` is
-    // explicitly NOT honoured (a client cannot impersonate another user
-    // as the creator).
-    create_content_val
-        .as_object_mut()
-        .unwrap()
-        .insert("creator".to_string(), Value::String(user.user_id.clone()));
+    // `content.creator = caller` (set by create_content). Caller-supplied
+    // `creation_content.creator` is explicitly NOT honoured (a client
+    // cannot impersonate another user as the creator).
+    let mut create_content_val = content::create_content(room_version, &user.user_id);
     if let Some(extra) = &body.creation_content
         && let Some(extra_obj) = extra.as_object()
     {
@@ -234,12 +227,14 @@ pub async fn create_room(
             }
         }
     }
-    // MSC4289: trusted_private_chat used to grant power 100 to invitees by
-    // putting them in power_levels.users. v12 forbids creators-in-users, so
-    // we instead promote invitees to `additional_creators` on the create
-    // event. Existing entries from `creation_content.additional_creators`
-    // are preserved.
+    // trusted_private_chat gives invitees the creator's power. Through v11
+    // that is `power_levels.users[invitee] = 100` (applied below, with the
+    // power_levels event). v12 (MSC4289) forbids creators-in-users and the
+    // creator's power is infinite, so instead invitees are promoted to
+    // `additional_creators` on the create event. Existing entries from
+    // `creation_content.additional_creators` are preserved.
     if preset == "trusted_private_chat"
+        && room_version.creators_have_infinite_power()
         && let Some(invites) = &body.invite
         && !invites.is_empty()
     {
@@ -332,7 +327,16 @@ pub async fn create_room(
     depth += 1;
 
     // --- 3. m.room.power_levels ---
-    let mut pl_content = content::power_levels_content(room_version);
+    let mut pl_content = content::power_levels_content(room_version, &user.user_id);
+    if preset == "trusted_private_chat"
+        && !room_version.creators_have_infinite_power()
+        && let Some(invites) = &body.invite
+        && let Some(users) = pl_content.get_mut("users").and_then(|u| u.as_object_mut())
+    {
+        for invitee in invites {
+            users.insert(invitee.clone(), json!(100));
+        }
+    }
     // Preset-specific PL overrides — match synapse's `_presets_dict`. Both
     // private_chat and trusted_private_chat drop the invite floor to 0 so
     // any joined member can invite; public_chat keeps the default 50. The
@@ -352,6 +356,18 @@ pub async fn create_room(
         if room_version.creators_have_infinite_power() {
             let creators = collect_creators(&user.user_id, body.creation_content.as_ref());
             validate_pl_override_no_creators(ov, &creators)?;
+        } else if let Some(users) = ov.get("users").and_then(|v| v.as_object())
+            && !users.contains_key(&user.user_id)
+        {
+            // Through v11 the override's `users` replaces ours wholesale, and
+            // one without the creator would leave them powerless in their
+            // own room before the first state event lands. Refuse up front.
+            return Err(VelaError::BadJson(format!(
+                "power_level_content_override.users must contain the creator {} in room version {}",
+                user.user_id,
+                room_version.as_str()
+            ))
+            .into());
         }
         if let Some(ov_obj) = ov.as_object() {
             let pl = pl_content.as_object_mut().unwrap();

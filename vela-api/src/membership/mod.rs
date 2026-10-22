@@ -22,6 +22,7 @@ use vela_core::canonical::canonical_json_object;
 use vela_core::error::VelaError;
 use vela_core::events::builder::{build_event, select_auth_events};
 use vela_core::events::content;
+use vela_core::events::room_version::RoomVersion;
 use vela_core::events::view::EventView;
 use vela_core::identifiers::{EventId, Nid, RoomId};
 
@@ -734,22 +735,38 @@ pub(crate) fn notifications_room_level(state: &AppState, room_nid: u64) -> i64 {
 }
 
 pub(crate) fn user_power(state: &AppState, room_nid: u64, user_id: &str) -> Result<i64, ApiError> {
-    // v12: creator has infinite power. We approximate by inspecting the
-    // create event sender + additional_creators.
-    if let Some(create) = read_state_value(state, room_nid, "m.room.create", "")? {
-        if create.sender() == Some(user_id) {
-            return Ok(i64::MAX);
-        }
-        if let Some(arr) = create
+    // Mirrors `vela_core::auth_rules::user_power_level` over stored state:
+    // v12 (MSC4289) creators have infinite power; through v11 the creator
+    // is an ordinary user — 100 only while no power_levels event exists,
+    // then whatever `users` says.
+    let create = read_state_value(state, room_nid, "m.room.create", "")?;
+    let pl = read_state_value(state, room_nid, "m.room.power_levels", "")?;
+    if let Some(create) = &create {
+        let version = create
             .content()
-            .and_then(|c| c.get("additional_creators"))
-            .and_then(|v| v.as_array())
-            && arr.iter().any(|v| v.as_str() == Some(user_id))
-        {
-            return Ok(i64::MAX);
+            .and_then(|c| c.get("room_version"))
+            .and_then(|v| v.as_str())
+            .and_then(RoomVersion::parse);
+        if version.is_some_and(|v| v.creators_have_infinite_power()) {
+            if create.sender() == Some(user_id) {
+                return Ok(i64::MAX);
+            }
+            if let Some(arr) = create
+                .content()
+                .and_then(|c| c.get("additional_creators"))
+                .and_then(|v| v.as_array())
+                && arr.iter().any(|v| v.as_str() == Some(user_id))
+            {
+                return Ok(i64::MAX);
+            }
+        } else if pl.is_none() {
+            let creator = match version {
+                Some(v) if !v.create_event_has_creator_field() => create.sender(),
+                _ => create.content_str("creator"),
+            };
+            return Ok(if creator == Some(user_id) { 100 } else { 0 });
         }
     }
-    let pl = read_state_value(state, room_nid, "m.room.power_levels", "")?;
     let users = pl
         .as_ref()
         .and_then(|p| p.get("content").and_then(|c| c.get("users")));

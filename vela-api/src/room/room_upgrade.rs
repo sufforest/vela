@@ -120,7 +120,7 @@ pub async fn upgrade_room(
     let mut prev: Vec<EventId> = vec![];
 
     // 1. create — with predecessor + optional additional_creators + optional type.
-    let mut create_content = content::create_content(room_version);
+    let mut create_content = content::create_content(room_version, &user.user_id);
     {
         let cc = create_content.as_object_mut().unwrap();
         let mut predecessor = serde_json::Map::new();
@@ -229,15 +229,19 @@ pub async fn upgrade_room(
         let Some(mut content) = transferable.get(*t).cloned() else {
             continue;
         };
-        if *t == "m.room.power_levels"
-            && room_version.creators_have_infinite_power()
-            && let Some(users) = content
-                .as_object_mut()
-                .and_then(|o| o.get_mut("users"))
-                .and_then(|v| v.as_object_mut())
-        {
-            for creator in &new_room_creators {
-                users.remove(creator);
+        if *t == "m.room.power_levels" {
+            if room_version.creators_have_infinite_power() {
+                if let Some(users) = content
+                    .as_object_mut()
+                    .and_then(|o| o.get_mut("users"))
+                    .and_then(|v| v.as_object_mut())
+                {
+                    for creator in &new_room_creators {
+                        users.remove(creator);
+                    }
+                }
+            } else {
+                raise_upgrader_power(&mut content, &user.user_id);
             }
         }
         let auth = select_auth_for(
@@ -551,7 +555,7 @@ fn can_send_tombstone(state: &AppState, room_nid: u64, user_id: &str) -> Result<
     //   power_levels.events[tombstone] ?? power_levels.state_default ?? 50
     // And sender's current level:
     //   power_levels.users[sender] ?? users_default ?? 0
-    // Short-circuit: room creators always pass (v12 infinite power).
+    // Short-circuit: v12 room creators always pass (infinite power).
     // `read_state_json` returns the full event JSON; PL fields live under
     // `content`, not at the top level. The previous version read top-level
     // and silently fell through to `unwrap_or(0)`, so any non-creator
@@ -568,8 +572,12 @@ fn can_send_tombstone(state: &AppState, room_nid: u64, user_id: &str) -> Result<
         })
         .unwrap_or(50);
 
-    let creators = room_creators(state, room_nid)?;
-    if creators.iter().any(|c| c == user_id) {
+    // The implicit-creator short-circuit is v12-only (MSC4289); through
+    // v11 a creator's power is whatever `users` says, like anyone else's.
+    let (old_version, creators) = room_version_and_creators(state, room_nid)?;
+    if old_version.is_some_and(|v| v.creators_have_infinite_power())
+        && creators.iter().any(|c| c == user_id)
+    {
         return Ok(());
     }
     let user_power = pl_content
@@ -591,27 +599,75 @@ fn can_send_tombstone(state: &AppState, room_nid: u64, user_id: &str) -> Result<
     Ok(())
 }
 
-fn room_creators(state: &AppState, room_nid: u64) -> Result<Vec<String>, ApiError> {
+/// Through v11 the upgrader is an ordinary user in the new room, and a
+/// power_levels copied verbatim may give them less than it takes to
+/// administer it (or nothing at all when the old room was v12, where
+/// creators are not listed in `users`). Raise them to the highest level
+/// the event demands for any state change, unless they already have it.
+fn raise_upgrader_power(pl: &mut Value, user_id: &str) {
+    let Some(obj) = pl.as_object_mut() else {
+        return;
+    };
+    let int = |v: Option<&Value>, default: i64| v.and_then(|v| v.as_i64()).unwrap_or(default);
+    let state_default = int(obj.get("state_default"), 50);
+    let ban = int(obj.get("ban"), 50);
+    let events_max = obj
+        .get("events")
+        .and_then(|e| e.as_object())
+        .map(|e| e.values().filter_map(|v| v.as_i64()).max().unwrap_or(0))
+        .unwrap_or(0);
+    let needed = state_default.max(ban).max(events_max);
+    let users_default = int(obj.get("users_default"), 0);
+    if !obj.get("users").is_some_and(|u| u.is_object()) {
+        obj.insert("users".to_string(), json!({}));
+    }
+    let users = obj
+        .get_mut("users")
+        .and_then(|u| u.as_object_mut())
+        .unwrap();
+    let current = int(users.get(user_id), users_default);
+    if current < needed {
+        users.insert(user_id.to_string(), json!(needed));
+    }
+}
+
+/// The room's declared version (when supported) and its creator set,
+/// from one read of the create event.
+fn room_version_and_creators(
+    state: &AppState,
+    room_nid: u64,
+) -> Result<(Option<RoomVersion>, Vec<String>), ApiError> {
+    let Some(ev) = read_state_json(state, room_nid, "m.room.create", "")? else {
+        return Ok((None, Vec::new()));
+    };
+    let version = ev
+        .content()
+        .and_then(|c| c.get("room_version"))
+        .and_then(|v| v.as_str())
+        .and_then(RoomVersion::parse);
+    Ok((version, creators_of(&ev)))
+}
+
+/// Sender of the create event plus `additional_creators`.
+fn creators_of(ev: &Value) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(ev) = read_state_json(state, room_nid, "m.room.create", "")? {
-        if let Some(s) = ev.sender() {
-            out.push(s.to_string());
-        }
-        if let Some(arr) = ev
-            .content()
-            .and_then(|c| c.get("additional_creators"))
-            .and_then(|v| v.as_array())
-        {
-            for v in arr {
-                if let Some(s) = v.as_str()
-                    && !out.iter().any(|x| x == s)
-                {
-                    out.push(s.to_string());
-                }
+    if let Some(s) = ev.sender() {
+        out.push(s.to_string());
+    }
+    if let Some(arr) = ev
+        .content()
+        .and_then(|c| c.get("additional_creators"))
+        .and_then(|v| v.as_array())
+    {
+        for v in arr {
+            if let Some(s) = v.as_str()
+                && !out.iter().any(|x| x == s)
+            {
+                out.push(s.to_string());
             }
         }
     }
-    Ok(out)
+    out
 }
 
 fn read_state_json(

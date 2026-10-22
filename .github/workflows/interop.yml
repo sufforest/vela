@@ -1,0 +1,82 @@
+name: Interop
+
+# Differential federation tests: vela on the runner host, Synapse in a
+# container, federated over loopback TLS, asserting both converge on
+# identical room state across the room-version matrix. Catches the class
+# of bug vela-vs-vela testing (unit suites, Complement) structurally
+# cannot — a self-consistent wrong reading of the spec on both sides.
+# See tools/testing/interop/run.sh.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Nightly against synapse:latest to catch drift in the oracle itself.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  interop:
+    name: Interop (vela ↔ Synapse)
+    runs-on: ubuntu-latest
+    # Cold rust-cache means a release build of vela-server (rocksdb +
+    # bindgen) before the suite even starts; warm runs finish in minutes.
+    timeout-minutes: 60
+    env:
+      # Pinned for PR/push so the gate is deterministic; bump deliberately,
+      # same discipline as the Complement ref. The nightly run tracks
+      # `latest` instead so a Synapse release that changes behaviour
+      # shows up as a scheduled failure, never as a PR flake.
+      SYNAPSE_IMAGE: ${{ github.event_name == 'schedule' && 'matrixdotorg/synapse:latest' || 'matrixdotorg/synapse:v1.163.0' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: interop
+
+      - name: Pull Synapse image
+        run: docker pull "$SYNAPSE_IMAGE"
+
+      # The rig's DB, logs and evidence live under RUNNER_TEMP, not target/,
+      # so rust-cache never snapshots them. (`runner` is a step-level
+      # context: it is not available in job-level `env`.)
+      - name: Run interop suite
+        env:
+          INTEROP_WORKDIR: ${{ runner.temp }}/interop
+          INTEROP_EVIDENCE_DIR: ${{ runner.temp }}/interop/evidence
+        run: bash tools/testing/interop/run.sh
+
+      - name: Upload rig logs + divergence evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-logs
+          path: |
+            ${{ runner.temp }}/interop/vela.log
+            ${{ runner.temp }}/interop/synapse.log
+            ${{ runner.temp }}/interop/evidence
+          if-no-files-found: ignore
+          retention-days: 14
