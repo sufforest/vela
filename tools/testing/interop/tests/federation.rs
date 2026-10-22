@@ -15,64 +15,11 @@
 //! and `cargo test <scenario>::v<N>` reruns exactly that cell.
 
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::json;
 use vela_interop::{
-    InteropEnv, User, assert_membership, assert_state_converged, assert_timeline_contains,
-    eventually, register,
+    InteropEnv, assert_membership, assert_state_converged, assert_timeline_contains, cell,
+    eventually, register, room_body, users, version_matrix,
 };
-
-/// Skip (returning None) unless the rig is up.
-fn rig() -> Option<InteropEnv> {
-    let env = InteropEnv::from_env();
-    if env.is_none() {
-        eprintln!("skipped: interop rig not running (use tools/testing/interop/run.sh)");
-    }
-    env
-}
-
-async fn users(env: &InteropEnv) -> Result<(User, User)> {
-    let v = register("vela", &env.vela_cs, "vuser").await?;
-    let s = register("synapse", &env.synapse_cs, "suser").await?;
-    Ok((v, s))
-}
-
-/// A `/createRoom` body with the matrix cell's `room_version` applied.
-/// `None` leaves it out so the creating server picks its own default.
-fn room_body(version: Option<&str>, mut body: Value) -> Value {
-    if let Some(v) = version {
-        body["room_version"] = json!(v);
-    }
-    body
-}
-
-/// Evidence label suffix naming the matrix cell.
-fn cell(version: Option<&str>) -> String {
-    version.map_or_else(|| "default".to_string(), |v| format!("v{v}"))
-}
-
-/// Stamp one `#[tokio::test]` per matrix cell for a scenario
-/// `async fn name(env: &InteropEnv, version: Option<&str>) -> Result<()>`.
-macro_rules! version_matrix {
-    ($($scenario:ident),* $(,)?) => {
-        $(
-            mod $scenario {
-                use super::*;
-                async fn run(version: Option<&str>) -> Result<()> {
-                    let Some(env) = rig() else { return Ok(()) };
-                    super::$scenario(&env, version).await
-                }
-                #[tokio::test] async fn default() -> Result<()> { run(None).await }
-                #[tokio::test] async fn v6() -> Result<()> { run(Some("6")).await }
-                #[tokio::test] async fn v7() -> Result<()> { run(Some("7")).await }
-                #[tokio::test] async fn v8() -> Result<()> { run(Some("8")).await }
-                #[tokio::test] async fn v9() -> Result<()> { run(Some("9")).await }
-                #[tokio::test] async fn v10() -> Result<()> { run(Some("10")).await }
-                #[tokio::test] async fn v11() -> Result<()> { run(Some("11")).await }
-                #[tokio::test] async fn v12() -> Result<()> { run(Some("12")).await }
-            }
-        )*
-    };
-}
 
 version_matrix!(
     vela_room_synapse_joins,

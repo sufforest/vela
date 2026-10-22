@@ -28,6 +28,9 @@ pub struct Pdu {
     /// Pre-redaction signatures block — kept for signature verification.
     /// Auth rules may need to check signed third-party invites.
     pub signatures: Option<Value>,
+    /// Top-level `redacts` of an `m.room.redaction` event. Through v10 this
+    /// is where the target lives; v11 moved it into `content.redacts`.
+    pub redacts: Option<String>,
 }
 
 impl Pdu {
@@ -80,6 +83,10 @@ impl Pdu {
             .to_string();
 
         let signatures = json.get("signatures").cloned();
+        let redacts = json
+            .get("redacts")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
 
         Some(Pdu {
             event_id,
@@ -93,6 +100,7 @@ impl Pdu {
             prev_events,
             depth,
             signatures,
+            redacts,
         })
     }
 
@@ -138,5 +146,28 @@ impl Pdu {
     /// Example: "@alice:example.com" → "example.com"
     pub fn sender_domain(&self) -> Option<&str> {
         self.sender.split_once(':').map(|(_, domain)| domain)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn top_level_redacts_is_parsed() {
+        let json = json!({
+            "type": "m.room.redaction",
+            "sender": "@a:x",
+            "origin_server_ts": 1,
+            "content": {"reason": "r"},
+            "redacts": "$target",
+            "room_id": "!r:x",
+        });
+        let pdu = Pdu::from_json("$e".into(), json.as_object().unwrap()).unwrap();
+        assert_eq!(pdu.redacts.as_deref(), Some("$target"));
+        let json = json!({"type": "m.room.message", "sender": "@a:x", "origin_server_ts": 1, "content": {}});
+        let pdu = Pdu::from_json("$e".into(), json.as_object().unwrap()).unwrap();
+        assert!(pdu.redacts.is_none());
     }
 }

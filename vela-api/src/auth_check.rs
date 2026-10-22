@@ -172,6 +172,7 @@ mod tests {
             prev_events: vec![],
             depth: 1,
             signatures: None,
+            redacts: None,
         }
     }
 
@@ -308,6 +309,7 @@ mod tests {
             prev_events: vec!["$create".into()],
             depth: 2,
             signatures: None,
+            redacts: None,
         };
 
         let mut in_flight = InFlightState::new();
@@ -496,6 +498,7 @@ mod tests {
             prev_events: vec![],
             depth: 10,
             signatures: None,
+            redacts: None,
         };
 
         let event_json = pdu_to_event_json(&bob_bans);
@@ -1085,6 +1088,7 @@ mod tests {
             prev_events: vec!["$create".into()],
             depth: 5,
             signatures: None,
+            redacts: None,
         };
         let event_json = pdu_to_event_json(&bob_msg);
         let event_id = EventId::from_reference_hash("bob_msg");

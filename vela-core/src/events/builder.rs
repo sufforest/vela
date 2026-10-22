@@ -100,8 +100,45 @@ pub fn build_event_at_ts(
     depth: u64,
     signing_key: &ServerSigningKey,
     server_name: &str,
+    room_version: RoomVersion,
+    origin_server_ts: Option<u64>,
+) -> (Map<String, Value>, EventId) {
+    build_event_with_top_level(
+        event_type,
+        state_key,
+        content,
+        sender,
+        room_id,
+        prev_events,
+        auth_events,
+        depth,
+        signing_key,
+        server_name,
+        room_version,
+        origin_server_ts,
+        &[],
+    )
+}
+
+/// [`build_event_at_ts`] plus extra top-level fields, hashed and signed
+/// with the rest. Needed for the one event type whose protocol data sits
+/// outside `content` in some versions: `m.room.redaction` carries its
+/// target as a top-level `redacts` through v10.
+#[allow(clippy::too_many_arguments)]
+pub fn build_event_with_top_level(
+    event_type: &str,
+    state_key: Option<&str>,
+    content: Value,
+    sender: &str,
+    room_id: Option<&RoomId>,
+    prev_events: &[EventId],
+    auth_events: &[EventId],
+    depth: u64,
+    signing_key: &ServerSigningKey,
+    server_name: &str,
     _room_version: RoomVersion,
     origin_server_ts: Option<u64>,
+    top_level: &[(&str, Value)],
 ) -> (Map<String, Value>, EventId) {
     let is_create = event_type == "m.room.create";
     let now = match origin_server_ts {
@@ -133,6 +170,9 @@ pub fn build_event_at_ts(
     let auth: Vec<Value> = auth_events.iter().map(|e| json!(e.as_str())).collect();
     event.insert("prev_events".to_string(), Value::Array(prev));
     event.insert("auth_events".to_string(), Value::Array(auth));
+    for (k, v) in top_level {
+        event.insert((*k).to_string(), v.clone());
+    }
 
     // Step 1: compute content hash and add to hashes field
     // (content hash is version-independent — it's the full event

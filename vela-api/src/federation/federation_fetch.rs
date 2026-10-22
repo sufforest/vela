@@ -352,20 +352,17 @@ pub async fn get_backfill(
         return Err(StatusCode::FORBIDDEN);
     }
 
+    // Decoded per pair: peers percent-encode the `$` of event ids
+    // (`v=%24abc`) while our own caller sends it raw, and a raw copy of
+    // `%24abc` matches nothing — every page came back empty. The X-Matrix
+    // signature is verified over the URI as sent, so decoding only the
+    // parsed values is safe.
     let mut v_params: Vec<String> = Vec::new();
     let mut limit_param: Option<u32> = None;
     if let Some(qs) = raw_query.as_deref() {
-        for pair in qs.split('&') {
-            let Some((k, val)) = pair.split_once('=') else {
-                continue;
-            };
-            // Spec event IDs use the URL-unreserved char set plus `$`,
-            // and our outbound /backfill caller doesn't percent-encode
-            // — so a byte-for-byte string copy here matches what was
-            // signed. If we later normalise outbound encoding, this
-            // side has to decode in lockstep.
-            match k {
-                "v" => v_params.push(val.to_string()),
+        for (k, val) in form_urlencoded::parse(qs.as_bytes()) {
+            match &*k {
+                "v" => v_params.push(val.into_owned()),
                 "limit" => limit_param = val.parse().ok(),
                 _ => {}
             }
@@ -1121,6 +1118,40 @@ mod residency_tests {
         )
         .await;
         assert!(ok.is_ok(), "resident server must pass the residency gate");
+    }
+
+    /// Peers percent-encode the `$` of event ids. A raw copy of `%24e1`
+    /// matched nothing and every backfill page came back empty, which a
+    /// joiner experiences as "no history before my join".
+    #[tokio::test]
+    async fn backfill_decodes_percent_encoded_event_ids() {
+        let (state, _tmp) = build_test_state();
+        let room_id = room_with_member(&state);
+        let page = |q: &'static str| {
+            let state = state.clone();
+            let room_id = room_id.clone();
+            async move {
+                get_backfill(
+                    State(state),
+                    Path(room_id),
+                    RawQuery(Some(q.to_string())),
+                    xorigin("good.example"),
+                )
+                .await
+                .expect("resident backfill")
+                .0
+            }
+        };
+        let raw = page("v=$e1&limit=10").await;
+        let encoded = page("v=%24e1&limit=10").await;
+        assert_eq!(
+            raw["pdus"], encoded["pdus"],
+            "encoded and raw ids must walk the same page"
+        );
+        assert!(
+            !encoded["pdus"].as_array().unwrap().is_empty(),
+            "the seed event is served, so the page is never empty"
+        );
     }
 }
 
