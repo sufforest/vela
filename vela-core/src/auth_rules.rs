@@ -1213,6 +1213,7 @@ mod tests {
             prev_events: vec![],
             depth: 1,
             signatures: None,
+            redacts: None,
         }
     }
 
@@ -1463,6 +1464,7 @@ mod tests {
             prev_events: vec![],
             depth: 2,
             signatures: None,
+            redacts: None,
         };
         let result = check_auth(&pl_event, &sf);
         assert!(

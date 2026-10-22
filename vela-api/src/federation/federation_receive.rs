@@ -2099,8 +2099,15 @@ async fn try_apply_redaction_marker(
     redactor_nid: u64,
     origin: &str,
 ) {
-    // v11+: redacts lives in content.redacts.
-    let target_id = match pdu.content.get("redacts").and_then(|v| v.as_str()) {
+    // v11+ carries the target in content.redacts; through v10 it is the
+    // top-level `redacts`. Accept either so a peer on the other rule is
+    // understood regardless of what this room's version strictly says.
+    let target_id = match pdu
+        .content
+        .get("redacts")
+        .and_then(|v| v.as_str())
+        .or(pdu.redacts.as_deref())
+    {
         Some(s) => s,
         None => return,
     };
@@ -3197,6 +3204,7 @@ mod tests {
             prev_events: vec![],
             depth: 1,
             signatures: None,
+            redacts: None,
         }
     }
 
@@ -3266,6 +3274,7 @@ mod tests {
             prev_events: vec![],
             depth: 0,
             signatures: None,
+            redacts: None,
         };
         verify_restricted_join_authoriser(
             state,

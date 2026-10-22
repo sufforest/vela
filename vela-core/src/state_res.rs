@@ -783,6 +783,7 @@ mod tests {
             prev_events: vec![],
             depth: 1,
             signatures: None,
+            redacts: None,
         }
     }
 
@@ -1339,6 +1340,7 @@ mod tests {
                 prev_events: vec![],
                 depth: i as u64,
                 signatures: None,
+                redacts: None,
             };
             pdus.insert(id, p);
         }
@@ -1495,6 +1497,7 @@ mod tests {
             prev_events: vec![],
             depth: ts,
             signatures: None,
+            redacts: None,
         };
         let create = mk(
             "$create",

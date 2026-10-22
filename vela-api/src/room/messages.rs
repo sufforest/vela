@@ -677,10 +677,41 @@ fn collect_prev_event_ids(
     Ok(Some(prevs))
 }
 
+/// Serve `m.room.redaction` with the target in BOTH places. Where it is
+/// signed depends on the room version (top level through v10, content
+/// from v11); the spec asks servers to add the other placement over the
+/// Client-Server API so clients on either rule find it. Render-only —
+/// never touches the stored, signed event.
+fn mirror_redacts_for_client(event: &mut serde_json::Map<String, Value>) {
+    if event.get("type").and_then(|t| t.as_str()) != Some("m.room.redaction") {
+        return;
+    }
+    let top = event
+        .get("redacts")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let inner = event
+        .get("content")
+        .and_then(|c| c.get("redacts"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    match (top, inner) {
+        (Some(t), None) => {
+            if let Some(c) = event.get_mut("content").and_then(|c| c.as_object_mut()) {
+                c.insert("redacts".to_string(), json!(t));
+            }
+        }
+        (None, Some(i)) => {
+            event.insert("redacts".to_string(), json!(i));
+        }
+        _ => {}
+    }
+}
+
 /// Load an event from storage and format it for client consumption.
 /// Adds event_id, room_id, and unsigned.age. If the event has been
-/// redacted (per the `event_redactions` table), applies the v11 redact
-/// algorithm and injects `unsigned.redacted_because`.
+/// redacted (per the `event_redactions` table), applies the room
+/// version's redaction algorithm and injects `unsigned.redacted_because`.
 pub fn load_client_event(
     state: &AppState,
     event_nid: u64,
@@ -712,7 +743,17 @@ pub fn load_client_event(
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
 
     if let Some(rnid) = redactor_nid {
-        event = vela_core::events::redact::redact_event(&event);
+        // The keep-list is a room-version rule (v11 changed what create,
+        // power_levels and member retain); render with the room's version,
+        // not the newest one.
+        let version = state
+            .db
+            .get_nid(room_id)
+            .ok()
+            .flatten()
+            .and_then(|room_nid| state.db.get_room_version_typed(room_nid).ok())
+            .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
+        event = vela_core::events::redact::redact_event_for_version(&event, version);
         let redactor = load_redactor_client_event(state, rnid, room_id)?;
         let mut unsigned = serde_json::Map::new();
         if let Some(r) = redactor {
@@ -735,6 +776,7 @@ pub fn load_client_event(
     if !event.contains_key("room_id") {
         event.insert("room_id".to_string(), json!(room_id));
     }
+    mirror_redacts_for_client(&mut event);
 
     event.remove("hashes");
     event.remove("signatures");
@@ -1233,6 +1275,7 @@ fn load_redactor_client_event(
     if !event.contains_key("room_id") {
         event.insert("room_id".to_string(), json!(room_id));
     }
+    mirror_redacts_for_client(&mut event);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

@@ -13,8 +13,9 @@ use serde_json::{Map, Value, json};
 use vela_core::auth_rules::can_apply_redaction;
 use vela_core::canonical::canonical_json_object;
 use vela_core::error::VelaError;
-use vela_core::events::builder::{build_event, select_auth_events};
+use vela_core::events::builder::{build_event_with_top_level, select_auth_events};
 use vela_core::events::pdu::Pdu;
+use vela_core::events::room_version::RoomVersion;
 use vela_core::identifiers::{EventId, Nid, RoomId};
 
 use crate::auth_check::authorise_event;
@@ -116,16 +117,6 @@ pub async fn redact_event(
         );
     }
 
-    // Build the redaction event content. v11+ carries `redacts` in content.
-    let mut content = Map::new();
-    content.insert("redacts".to_string(), json!(target_event_id));
-    if let Some(reason) = body.reason
-        && !reason.is_empty()
-    {
-        content.insert("reason".to_string(), json!(reason));
-    }
-    let content = Value::Object(content);
-
     let signing_key = get_or_create_signing_key(&state)?;
     let server_name = &state.config.server_name;
     let room_version = state
@@ -133,6 +124,27 @@ pub async fn redact_event(
         .get_room_version_typed(room_nid)
         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
     let event_type = "m.room.redaction";
+
+    // Where the target lives is a room-version rule: v11 moved `redacts`
+    // from the top level of the event into `content`. A peer on the
+    // older rule reads only the top level, so a v≤10 redaction carrying
+    // it in content alone never applies there.
+    let redacts_in_content = room_version.at_least(RoomVersion::V11);
+    let mut content = Map::new();
+    if redacts_in_content {
+        content.insert("redacts".to_string(), json!(target_event_id));
+    }
+    if let Some(reason) = body.reason
+        && !reason.is_empty()
+    {
+        content.insert("reason".to_string(), json!(reason));
+    }
+    let content = Value::Object(content);
+    let top_level: Vec<(&str, Value)> = if redacts_in_content {
+        Vec::new()
+    } else {
+        vec![("redacts", json!(target_event_id))]
+    };
 
     let extremity_nids = state
         .db
@@ -177,7 +189,7 @@ pub async fn redact_event(
         )
     };
 
-    let (event, event_id) = build_event(
+    let (event, event_id) = build_event_with_top_level(
         event_type,
         None,
         content,
@@ -189,6 +201,8 @@ pub async fn redact_event(
         &signing_key,
         server_name,
         room_version,
+        None,
+        &top_level,
     );
 
     // Standard PDU auth (rule 8 + rule 11). Separate from the apply check above.
@@ -390,6 +404,12 @@ mod tests {
     /// and one message from alice. Returns (state, room_nid, message_nid,
     /// message_event_id).
     async fn setup_room() -> (AppState, tempfile::TempDir, u64, u64, String) {
+        setup_room_with_version("12").await
+    }
+
+    async fn setup_room_with_version(
+        version: &str,
+    ) -> (AppState, tempfile::TempDir, u64, u64, String) {
         let (state, tmp) = build_test_state();
         let db = &state.db;
 
@@ -409,13 +429,14 @@ mod tests {
         let room_id = "!room12";
         let create_eid = "$room12";
         let room_nid = db.get_or_create_nid(room_id).unwrap();
+        db.create_room_meta(room_nid, room_id, version).unwrap();
 
         let create_json = json!({
             "type": "m.room.create",
             "sender": alice,
             "state_key": "",
             "room_id": room_id,
-            "content": {"room_version": "12"},
+            "content": {"room_version": version, "creator": alice},
             "origin_server_ts": 1,
             "depth": 1,
             "prev_events": [],
@@ -637,6 +658,98 @@ mod tests {
         );
 
         let _ = room_nid;
+    }
+
+    /// Through v10 the target lives in the top-level `redacts`; a peer on
+    /// that rule never looks in content, so a v10 redaction must carry it
+    /// there (and only there — the pre-v11 algorithm strips content).
+    #[tokio::test]
+    async fn pre_v11_redaction_carries_top_level_redacts() {
+        let (state, _tmp, _room_nid, msg_nid, msg_eid) = setup_room_with_version("10").await;
+
+        redact_event(
+            State(state.clone()),
+            alice_user(&state),
+            Path(("!room12".into(), msg_eid.clone(), "txn-v10".into())),
+            Json(RedactBody {
+                reason: Some("old rule".into()),
+            }),
+        )
+        .await
+        .expect("redact succeeds");
+
+        let redactor_nid = state
+            .db
+            .get_redacted_by(msg_nid)
+            .unwrap()
+            .expect("marker written");
+
+        // The signed event (what peers receive): top level only.
+        let (_, stored) = state.db.get_event(redactor_nid).unwrap().unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(
+            stored.get("redacts").and_then(|v| v.as_str()),
+            Some(msg_eid.as_str()),
+            "v10 redaction must carry a top-level redacts"
+        );
+        assert!(
+            stored.pointer("/content/redacts").is_none(),
+            "v10 redaction must not put redacts in content"
+        );
+        assert_eq!(
+            stored.pointer("/content/reason").and_then(|v| v.as_str()),
+            Some("old rule")
+        );
+
+        // The client render: both placements, for old and new clients.
+        let rendered = load_client_event(&state, msg_nid, "!room12")
+            .unwrap()
+            .expect("event renders");
+        let because = rendered
+            .pointer("/unsigned/redacted_because")
+            .expect("unsigned.redacted_because present");
+        assert_eq!(
+            because.get("redacts").and_then(|v| v.as_str()),
+            Some(msg_eid.as_str())
+        );
+        assert_eq!(
+            because.pointer("/content/redacts").and_then(|v| v.as_str()),
+            Some(msg_eid.as_str())
+        );
+    }
+
+    /// v11+ stores the target in content; the client render mirrors it to
+    /// the top level for clients on the old rule.
+    #[tokio::test]
+    async fn v12_render_mirrors_redacts_to_top_level() {
+        let (state, _tmp, _room_nid, msg_nid, msg_eid) = setup_room().await;
+        redact_event(
+            State(state.clone()),
+            alice_user(&state),
+            Path(("!room12".into(), msg_eid.clone(), "txn-v12".into())),
+            Json(RedactBody::default()),
+        )
+        .await
+        .expect("redact succeeds");
+        let redactor_nid = state.db.get_redacted_by(msg_nid).unwrap().unwrap();
+        let (_, stored) = state.db.get_event(redactor_nid).unwrap().unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+        assert!(
+            stored.get("redacts").is_none(),
+            "v12 signed event has no top-level redacts"
+        );
+        let rendered = load_client_event(&state, msg_nid, "!room12")
+            .unwrap()
+            .unwrap();
+        let because = rendered.pointer("/unsigned/redacted_because").unwrap();
+        assert_eq!(
+            because.get("redacts").and_then(|v| v.as_str()),
+            Some(msg_eid.as_str())
+        );
+        assert_eq!(
+            because.pointer("/content/redacts").and_then(|v| v.as_str()),
+            Some(msg_eid.as_str())
+        );
     }
 
     #[tokio::test]

@@ -271,12 +271,61 @@ impl User {
             .ok_or_else(|| anyhow!("/state on {} was not an array", self.hs))
     }
 
-    /// This server's view of `user_id`'s membership in the room, if any.
-    pub async fn membership_of(&self, room_id: &str, user_id: &str) -> Result<Option<String>> {
-        let path = format!(
-            "/rooms/{}/state/m.room.member/{}",
+    /// Redact an event (as this user); returns the redaction's event_id.
+    pub async fn redact(&self, room_id: &str, event_id: &str, reason: &str) -> Result<String> {
+        let txn = format!("txn{}", unique());
+        let v = self
+            .put(
+                &format!(
+                    "/rooms/{}/redact/{}/{txn}",
+                    urlencode(room_id),
+                    urlencode(event_id)
+                ),
+                json!({"reason": reason}),
+            )
+            .await?;
+        Ok(v["event_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("redact on {}: no event_id in {v}", self.hs))?
+            .to_string())
+    }
+
+    /// A single event as this server serves it (`/rooms/{room}/event/{id}`).
+    pub async fn event(&self, room_id: &str, event_id: &str) -> Result<Value> {
+        self.get(&format!(
+            "/rooms/{}/event/{}",
             urlencode(room_id),
-            urlencode(user_id)
+            urlencode(event_id)
+        ))
+        .await
+    }
+
+    /// Upgrade the room; returns the replacement room id.
+    pub async fn upgrade(&self, room_id: &str, new_version: &str) -> Result<String> {
+        let v = self
+            .post(
+                &format!("/rooms/{}/upgrade", urlencode(room_id)),
+                json!({"new_version": new_version}),
+            )
+            .await?;
+        Ok(v["replacement_room"]
+            .as_str()
+            .ok_or_else(|| anyhow!("upgrade on {}: no replacement_room in {v}", self.hs))?
+            .to_string())
+    }
+
+    /// The content of one current state event, or `None` when the server
+    /// has no such state (404).
+    pub async fn state_event(
+        &self,
+        room_id: &str,
+        event_type: &str,
+        state_key: &str,
+    ) -> Result<Option<Value>> {
+        let path = format!(
+            "/rooms/{}/state/{event_type}/{}",
+            urlencode(room_id),
+            urlencode(state_key)
         );
         let resp = self
             .http
@@ -288,8 +337,15 @@ impl User {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let body = check(&self.hs, &path, resp).await?;
-        Ok(body["membership"].as_str().map(str::to_string))
+        Ok(Some(check(&self.hs, &path, resp).await?))
+    }
+
+    /// This server's view of `user_id`'s membership in the room, if any.
+    pub async fn membership_of(&self, room_id: &str, user_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .state_event(room_id, "m.room.member", user_id)
+            .await?
+            .and_then(|c| c["membership"].as_str().map(str::to_string)))
     }
 
     /// Every event_id this server can paginate out of the room's timeline.
@@ -473,6 +529,19 @@ pub async fn assert_state_converged(a: &User, b: &User, room_id: &str, label: &s
     Ok(())
 }
 
+/// Assert this server eventually serves `event_id` as redacted: empty
+/// content and `unsigned.redacted_because` carrying the redaction.
+pub async fn assert_event_redacted(u: &User, room_id: &str, event_id: &str) -> Result<()> {
+    let what = format!("{} to serve {event_id} redacted", u.hs);
+    eventually(&what, || async {
+        let ev = u.event(room_id, event_id).await?;
+        let empty = ev["content"].as_object().is_some_and(|c| c.is_empty());
+        let because = ev["unsigned"]["redacted_because"].is_object();
+        Ok(empty && because)
+    })
+    .await
+}
+
 /// Assert this server's timeline eventually contains every id in `ids`.
 pub async fn assert_timeline_contains(u: &User, room_id: &str, ids: &[String]) -> Result<()> {
     let what = format!("{} timeline to contain {} event(s)", u.hs, ids.len());
@@ -490,6 +559,63 @@ pub async fn assert_membership(u: &User, room_id: &str, user_id: &str, want: &st
         Ok(u.membership_of(room_id, user_id).await?.as_deref() == Some(want))
     })
     .await
+}
+
+/// Skip (returning None) unless the rig is up.
+pub fn rig() -> Option<InteropEnv> {
+    let env = InteropEnv::from_env();
+    if env.is_none() {
+        eprintln!("skipped: interop rig not running (use tools/testing/interop/run.sh)");
+    }
+    env
+}
+
+/// One fresh user on each server.
+pub async fn users(env: &InteropEnv) -> Result<(User, User)> {
+    let v = register("vela", &env.vela_cs, "vuser").await?;
+    let s = register("synapse", &env.synapse_cs, "suser").await?;
+    Ok((v, s))
+}
+
+/// A `/createRoom` body with the matrix cell's `room_version` applied.
+/// `None` leaves it out so the creating server picks its own default.
+pub fn room_body(version: Option<&str>, mut body: Value) -> Value {
+    if let Some(v) = version {
+        body["room_version"] = json!(v);
+    }
+    body
+}
+
+/// Evidence label suffix naming the matrix cell.
+pub fn cell(version: Option<&str>) -> String {
+    version.map_or_else(|| "default".to_string(), |v| format!("v{v}"))
+}
+
+/// Stamp one `#[tokio::test]` per room-version matrix cell for each scenario
+/// `async fn name(env: &InteropEnv, version: Option<&str>) -> Result<()>`.
+/// Each cell is its own test so a failure names the version and
+/// `cargo test <scenario>::v<N>` reruns exactly that cell.
+#[macro_export]
+macro_rules! version_matrix {
+    ($($scenario:ident),* $(,)?) => {
+        $(
+            mod $scenario {
+                use super::*;
+                async fn run(version: Option<&str>) -> anyhow::Result<()> {
+                    let Some(env) = $crate::rig() else { return Ok(()) };
+                    super::$scenario(&env, version).await
+                }
+                #[tokio::test] async fn default() -> anyhow::Result<()> { run(None).await }
+                #[tokio::test] async fn v6() -> anyhow::Result<()> { run(Some("6")).await }
+                #[tokio::test] async fn v7() -> anyhow::Result<()> { run(Some("7")).await }
+                #[tokio::test] async fn v8() -> anyhow::Result<()> { run(Some("8")).await }
+                #[tokio::test] async fn v9() -> anyhow::Result<()> { run(Some("9")).await }
+                #[tokio::test] async fn v10() -> anyhow::Result<()> { run(Some("10")).await }
+                #[tokio::test] async fn v11() -> anyhow::Result<()> { run(Some("11")).await }
+                #[tokio::test] async fn v12() -> anyhow::Result<()> { run(Some("12")).await }
+            }
+        )*
+    };
 }
 
 fn evidence_dir() -> PathBuf {
