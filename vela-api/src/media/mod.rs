@@ -18,6 +18,7 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 use vela_core::error::VelaError;
 
+use crate::federation::federation_client::MediaResponse;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::error::ApiError;
 use crate::router::AppState;
@@ -599,11 +600,7 @@ async fn thumbnail_inner(
     q: ThumbnailQuery,
 ) -> Result<Response, ApiError> {
     if server_name != state.config.server_name {
-        // Remote thumbnails — delegate to the standard remote-download
-        // path which fetches the original from the source server and
-        // serves it back. We don't resize remote bytes (yet) to keep
-        // this loop bounded.
-        return download_remote(&state, &server_name, &media_id).await;
+        return download_remote_thumbnail(&state, &server_name, &media_id, &q).await;
     }
 
     // Reservation-only media (MSC2246 placeholder, no bytes yet):
@@ -1160,7 +1157,52 @@ async fn download_remote(
             tracing::debug!(remote = %server_name, %media_id, error = %e, "federation media fetch failed");
             ApiError(VelaError::NotFound("remote media unavailable".into()))
         })?;
+    media_response(media)
+}
 
+/// Thumbnail of remote media: fetch the original over federation and
+/// resize it with the same thumbnailer as local media, so a client gets
+/// one size policy whichever server holds the file. Non-image content and
+/// undecodable bytes are served as the original, as the local path does.
+/// The fetch is bounded by `max_upload_size`; nothing is cached, so every
+/// request costs one federation fetch (as remote downloads already do).
+async fn download_remote_thumbnail(
+    state: &AppState,
+    server_name: &str,
+    media_id: &str,
+    q: &ThumbnailQuery,
+) -> Result<Response, ApiError> {
+    let media = state
+        .federation_client
+        .fetch_media(server_name, media_id, state.config.max_upload_size as usize)
+        .await
+        .map_err(|e| {
+            tracing::debug!(remote = %server_name, %media_id, error = %e, "federation media fetch failed");
+            ApiError(VelaError::NotFound("remote media unavailable".into()))
+        })?;
+    if !media.content_type.starts_with("image/") {
+        return media_response(media);
+    }
+    let width = q.width.unwrap_or(96);
+    let height = q.height.unwrap_or(96);
+    let method = q.method.as_deref().unwrap_or("scale");
+    match resize_to_png_thumbnail(&media.bytes, width, height, method) {
+        Ok(png) => {
+            let len = png.len();
+            with_media_security_headers(Response::builder().status(StatusCode::OK))
+                .header(header::CONTENT_TYPE, "image/png")
+                .header(header::CONTENT_LENGTH, len.to_string())
+                .body(Body::from(png))
+                .map_err(|e| ApiError(VelaError::Unknown(e.to_string())))
+        }
+        Err(e) => {
+            tracing::debug!(remote = %server_name, %media_id, error = %e, "remote media not thumbnailable; serving the original");
+            media_response(media)
+        }
+    }
+}
+
+fn media_response(media: MediaResponse) -> Result<Response, ApiError> {
     let len = media.bytes.len();
     let mut builder = with_media_security_headers(Response::builder().status(StatusCode::OK))
         .header(header::CONTENT_TYPE, media.content_type)

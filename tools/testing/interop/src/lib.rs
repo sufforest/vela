@@ -62,6 +62,9 @@ pub struct User {
     http: reqwest::Client,
     pub user_id: String,
     token: String,
+    /// The device `/register` created for this session; E2EE scenarios
+    /// address it directly.
+    pub device_id: String,
     /// Short label for error messages ("vela" / "synapse").
     pub hs: String,
 }
@@ -92,6 +95,10 @@ pub async fn register(hs_label: &str, cs: &str, localpart: &str) -> Result<User>
         token: body["access_token"]
             .as_str()
             .ok_or_else(|| anyhow!("register on {hs_label}: no access_token"))?
+            .to_string(),
+        device_id: body["device_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("register on {hs_label}: no device_id"))?
             .to_string(),
         hs: hs_label.to_string(),
     })
@@ -496,6 +503,286 @@ impl User {
 
 /// Status-check a response, returning the parsed JSON body or an error that
 /// includes the body text (Matrix errcode etc.) for diagnosis.
+/// A non-JSON response: status, `Content-Type` and the body bytes.
+#[derive(Debug, Clone)]
+pub struct RawResponse {
+    pub status: u16,
+    pub content_type: String,
+    pub content_disposition: Option<String>,
+    pub body: Vec<u8>,
+}
+
+/// E2EE and media helpers. Keys are fake strings: neither server verifies
+/// device-key signatures on upload, and the scenarios compare what each
+/// server hands out, not whether the keys are usable.
+impl User {
+    /// Incremental sync from `since` (`None` for initial). Returns the whole
+    /// response; `next_batch` is at the top level.
+    pub async fn sync_since(&self, since: Option<&str>) -> Result<Value> {
+        match since {
+            Some(s) => {
+                self.get(&format!("/sync?timeout=0&since={}", urlencode(s)))
+                    .await
+            }
+            None => self.sync_once().await,
+        }
+    }
+
+    /// Upload a device-key set for this user's device, with `otk_count`
+    /// fake `signed_curve25519` one-time keys. Returns the server's
+    /// `one_time_key_counts`.
+    pub async fn upload_device_keys(&self, label: &str, otk_count: u32) -> Result<Value> {
+        let mut otks = serde_json::Map::new();
+        for i in 0..otk_count {
+            otks.insert(
+                format!("signed_curve25519:{label}{i}"),
+                json!({
+                    "key": format!("otk-{label}-{i}"),
+                    "signatures": {self.user_id.clone(): {
+                        format!("ed25519:{}", self.device_id): "sig"}},
+                }),
+            );
+        }
+        let body = json!({
+            "device_keys": {
+                "user_id": self.user_id,
+                "device_id": self.device_id,
+                "algorithms": ["m.olm.v1.curve25519-aes-sha2", "m.megolm.v1.aes-sha2"],
+                "keys": {
+                    format!("curve25519:{}", self.device_id): format!("curve-{label}"),
+                    format!("ed25519:{}", self.device_id): format!("ed-{label}"),
+                },
+                "signatures": {self.user_id.clone(): {
+                    format!("ed25519:{}", self.device_id): "sig"}},
+            },
+            "one_time_keys": otks,
+        });
+        let v = self.post("/keys/upload", body).await?;
+        Ok(v["one_time_key_counts"].clone())
+    }
+
+    /// `POST /keys/query` for the given users (all devices).
+    pub async fn query_keys(&self, users: &[&str]) -> Result<Value> {
+        let mut dk = serde_json::Map::new();
+        for u in users {
+            dk.insert((*u).to_string(), json!([]));
+        }
+        self.post("/keys/query", json!({"device_keys": dk, "timeout": 10000}))
+            .await
+    }
+
+    /// `POST /keys/claim` one key of `algorithm` for `user`/`device`.
+    /// Returns `one_time_keys[user][device]` (an empty object when the
+    /// server had none).
+    pub async fn claim_key(&self, user: &str, device: &str, algorithm: &str) -> Result<Value> {
+        let v = self
+            .post(
+                "/keys/claim",
+                json!({"one_time_keys": {user: {device: algorithm}}, "timeout": 10000}),
+            )
+            .await?;
+        Ok(v["one_time_keys"][user][device].clone())
+    }
+
+    /// `GET /keys/changes?from&to`: users whose device lists changed.
+    pub async fn key_changes(&self, from: &str, to: &str) -> Result<Vec<String>> {
+        let v = self
+            .get(&format!(
+                "/keys/changes?from={}&to={}",
+                urlencode(from),
+                urlencode(to)
+            ))
+            .await?;
+        Ok(v["changed"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// `PUT /sendToDevice/{type}/{txn}` to one device (or `*`) of `user`.
+    pub async fn send_to_device(
+        &self,
+        event_type: &str,
+        user: &str,
+        device: &str,
+        content: Value,
+    ) -> Result<()> {
+        let txn = unique();
+        self.put(
+            &format!("/sendToDevice/{event_type}/{txn}"),
+            json!({"messages": {user: {device: content}}}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// `POST /_matrix/media/v3/upload`; returns the `mxc://` URI.
+    pub async fn upload_media(
+        &self,
+        bytes: Vec<u8>,
+        content_type: &str,
+        filename: &str,
+    ) -> Result<String> {
+        let resp = self
+            .http
+            .post(format!(
+                "{}/_matrix/media/v3/upload?filename={}",
+                self.cs,
+                urlencode(filename)
+            ))
+            .bearer_auth(&self.token)
+            .header("Content-Type", content_type)
+            .body(bytes)
+            .send()
+            .await
+            .with_context(|| format!("media upload on {}", self.hs))?;
+        let v = check(&self.hs, "media upload", resp).await?;
+        v["content_uri"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow!("media upload on {}: no content_uri in {v}", self.hs))
+    }
+
+    /// Authenticated media download (`/_matrix/client/v1/media/download`).
+    /// Non-2xx is returned, not an error, so callers can assert on it.
+    pub async fn download_media(&self, server: &str, media_id: &str) -> Result<RawResponse> {
+        self.raw_get(&format!(
+            "{}/_matrix/client/v1/media/download/{}/{}",
+            self.cs,
+            urlencode(server),
+            urlencode(media_id)
+        ))
+        .await
+    }
+
+    /// Authenticated thumbnail (`/_matrix/client/v1/media/thumbnail`).
+    pub async fn thumbnail_media(
+        &self,
+        server: &str,
+        media_id: &str,
+        width: u32,
+        height: u32,
+        method: &str,
+    ) -> Result<RawResponse> {
+        self.raw_get(&format!(
+            "{}/_matrix/client/v1/media/thumbnail/{}/{}?width={width}&height={height}&method={method}",
+            self.cs,
+            urlencode(server),
+            urlencode(media_id)
+        ))
+        .await
+    }
+
+    async fn raw_get(&self, url: &str) -> Result<RawResponse> {
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .with_context(|| format!("GET {url} on {}", self.hs))?;
+        let status = resp.status().as_u16();
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        };
+        let content_type = header("content-type").unwrap_or_default();
+        let content_disposition = header("content-disposition");
+        let body = resp.bytes().await?.to_vec();
+        Ok(RawResponse {
+            status,
+            content_type,
+            content_disposition,
+            body,
+        })
+    }
+}
+
+/// Split an `mxc://server/id` URI.
+pub fn split_mxc(mxc: &str) -> Result<(String, String)> {
+    let rest = mxc
+        .strip_prefix("mxc://")
+        .ok_or_else(|| anyhow!("not an mxc uri: {mxc}"))?;
+    let (server, id) = rest
+        .split_once('/')
+        .ok_or_else(|| anyhow!("mxc uri without media id: {mxc}"))?;
+    Ok((server.to_string(), id.to_string()))
+}
+
+/// Width and height from a PNG's IHDR chunk (bytes 16..24), without an
+/// image decoder dependency.
+pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let be = |i: usize| u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+    Some((be(16), be(20)))
+}
+
+/// A solid-colour RGB PNG of the given size, built by hand (stored
+/// deflate blocks, no compression) so the rig needs no image crate.
+pub fn solid_png(width: u32, height: u32) -> Vec<u8> {
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    0xEDB8_8320 ^ (crc >> 1)
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc32(&body).to_be_bytes());
+    }
+    // Raw scanlines: filter byte 0 + RGB per pixel.
+    let mut row = vec![0u8];
+    for _ in 0..width {
+        row.extend_from_slice(&[0x33, 0x99, 0xCC]);
+    }
+    let raw: Vec<u8> = row.repeat(height as usize);
+    // zlib stream of stored blocks (max 65535 bytes each).
+    let mut z = vec![0x78, 0x01];
+    let blocks: Vec<&[u8]> = raw.chunks(65535).collect();
+    for (i, b) in blocks.iter().enumerate() {
+        z.push(u8::from(i + 1 == blocks.len()));
+        let len = b.len() as u16;
+        z.extend_from_slice(&len.to_le_bytes());
+        z.extend_from_slice(&(!len).to_le_bytes());
+        z.extend_from_slice(b);
+    }
+    let (mut a, mut bsum) = (1u32, 0u32);
+    for &x in &raw {
+        a = (a + x as u32) % 65521;
+        bsum = (bsum + a) % 65521;
+    }
+    z.extend_from_slice(&((bsum << 16) | a).to_be_bytes());
+
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(&mut out, b"IDAT", &z);
+    chunk(&mut out, b"IEND", &[]);
+    out
+}
+
 async fn check(hs: &str, what: &str, resp: reqwest::Response) -> Result<Value> {
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
@@ -757,6 +1044,18 @@ fn evidence_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::cell_at_least;
+
+    #[test]
+    fn solid_png_roundtrips_dimensions() {
+        use crate::{png_dimensions, solid_png, split_mxc};
+        let png = solid_png(300, 200);
+        assert_eq!(png_dimensions(&png), Some((300, 200)));
+        assert_eq!(png_dimensions(b"not a png"), None);
+        assert_eq!(
+            split_mxc("mxc://example.org/abc").unwrap(),
+            ("example.org".to_string(), "abc".to_string())
+        );
+    }
 
     #[test]
     fn cell_gate_parses_versions() {
