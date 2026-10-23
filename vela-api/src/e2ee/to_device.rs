@@ -59,11 +59,18 @@ pub async fn send_to_device(
             };
             for (device_id, content) in devices {
                 if device_id == "*" {
-                    let all_device_keys = state
+                    // All registered devices, not only those with E2EE
+                    // keys uploaded: a freshly logged-in client has a
+                    // device but no keys yet and must still get its
+                    // to-device traffic (same rule as the inbound path).
+                    let registered = state
                         .db
-                        .get_all_device_keys(target_user_nid)
+                        .list_devices(target_user_nid)
                         .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
-                    for (did, _) in &all_device_keys {
+                    for dev in &registered {
+                        let Some(did) = dev.get("device_id").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
                         state
                             .db
                             .queue_to_device(
@@ -99,13 +106,11 @@ pub async fn send_to_device(
                 .entry(target_user_id.clone())
                 .or_insert_with(|| Value::Object(serde_json::Map::new()));
             if let Some(obj) = user_entry.as_object_mut() {
+                // `*` travels as-is: the EDU schema lets a device id be
+                // `*` for all of the user's devices, and the receiving
+                // server is the one that knows that list (we expand it
+                // the same way on the inbound side).
                 for (device_id, content) in devices {
-                    // Wildcard fan-out doesn't apply for remote — we
-                    // don't know the peer's device list. Caller must
-                    // address specific devices.
-                    if device_id == "*" {
-                        continue;
-                    }
                     obj.insert(device_id.clone(), content.clone());
                 }
             }
@@ -145,4 +150,79 @@ pub async fn send_to_device(
     }
 
     Ok(Json(json!({})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::build_test_state_with_name;
+
+    async fn send(state: &AppState, messages: Value) -> Result<Json<Value>, ApiError> {
+        let user = AuthenticatedUser {
+            user_nid: state.db.get_or_create_nid("@alice:example.com").unwrap(),
+            user_id: "@alice:example.com".into(),
+            device_id: "ALICEDEV".into(),
+            appservice_nid: None,
+        };
+        let body: SendToDeviceRequest =
+            serde_json::from_value(json!({"messages": messages})).unwrap();
+        send_to_device(
+            State(state.clone()),
+            user,
+            Path(("m.room_key_request".to_string(), "txn1".to_string())),
+            Json(body),
+        )
+        .await
+    }
+
+    /// A local wildcard reaches every registered device, including one
+    /// that has not uploaded E2EE keys yet.
+    #[tokio::test]
+    async fn local_wildcard_reaches_devices_without_keys() {
+        let (state, _tmp) = build_test_state_with_name("example.com");
+        let bob_nid = state.db.get_or_create_nid("@bob:example.com").unwrap();
+        state.db.create_device(bob_nid, "FRESH").unwrap();
+        state.db.create_device(bob_nid, "OLD").unwrap();
+        send(
+            &state,
+            json!({"@bob:example.com": {"*": {"action": "request"}}}),
+        )
+        .await
+        .expect("send_to_device");
+        for dev in ["FRESH", "OLD"] {
+            let queued = state.db.get_to_device_messages(bob_nid, dev).unwrap();
+            assert_eq!(queued.len(), 1, "device {dev} got {}", queued.len());
+            assert_eq!(queued[0].1["sender"], "@alice:example.com");
+        }
+    }
+
+    /// A message to all of a remote user's devices is queued for that
+    /// user's server with the `*` device id intact, next to messages
+    /// addressed to a named device.
+    #[tokio::test]
+    async fn wildcard_device_is_forwarded_to_remote_servers() {
+        let (state, _tmp) = build_test_state_with_name("example.com");
+        send(
+            &state,
+            json!({
+                "@bob:remote.example": {
+                    "*": {"action": "request", "n": 1},
+                    "BOBDEV": {"action": "request", "n": 2},
+                }
+            }),
+        )
+        .await
+        .expect("send_to_device");
+
+        let (queued, _) = state
+            .db
+            .scan_to_device_outbound("remote.example", 0, 10)
+            .unwrap();
+        assert_eq!(queued.len(), 1, "one EDU per destination: {queued:?}");
+        let messages = &queued[0].1["messages"]["@bob:remote.example"];
+        assert_eq!(messages["*"]["n"], 1, "wildcard dropped: {messages}");
+        assert_eq!(messages["BOBDEV"]["n"], 2);
+        assert_eq!(queued[0].1["type"], "m.room_key_request");
+        assert_eq!(queued[0].1["sender"], "@alice:example.com");
+    }
 }
