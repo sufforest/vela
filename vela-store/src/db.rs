@@ -1272,6 +1272,11 @@ impl Database {
 
     // --- Room operations ---
 
+    /// Record a room's id and version. The same record also carries the
+    /// MSC3706 partial-state bookkeeping, and an invite or knock can land
+    /// while a join is still filling in, so an existing record is updated
+    /// in place rather than replaced: dropping the partial-state fields
+    /// would leave the room half-filled forever.
     pub fn create_room_meta(
         &self,
         room_nid: u64,
@@ -1279,15 +1284,19 @@ impl Database {
         version: &str,
     ) -> Result<(), rocksdb::Error> {
         let cf = self.db.cf_handle("room_meta").unwrap();
-        let record = serde_json::json!({
-            "room_id": room_id,
-            "version": version,
-        });
-        self.db.put_cf(
-            &cf,
-            keys::encode_u64(room_nid),
-            record.to_string().as_bytes(),
-        )
+        let key = keys::encode_u64(room_nid);
+        let mut record = match self.db.get_cf(&cf, key)? {
+            Some(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| serde_json::json!({})),
+            None => serde_json::json!({}),
+        };
+        if let Some(obj) = record.as_object_mut() {
+            obj.insert("room_id".into(), serde_json::json!(room_id));
+            obj.insert("version".into(), serde_json::json!(version));
+        }
+        self.db.put_cf(&cf, key, record.to_string().as_bytes())
     }
 
     /// Read the persisted room version string. Returns `None` if the
@@ -10252,6 +10261,30 @@ mod partial_state_pending_dlu_tests {
         let mut sorted = sent_to;
         sorted.sort();
         assert_eq!(sorted, vec!["a.example", "b.example"]);
+    }
+}
+
+#[cfg(test)]
+mod room_meta_tests {
+    use super::*;
+
+    #[test]
+    fn rewriting_room_meta_keeps_partial_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        let room_nid = db.get_or_create_nid("!r:x").unwrap();
+        db.create_room_meta(room_nid, "!r:x", "10").unwrap();
+        db.set_partial_state_join(room_nid, &["other.example".to_string()], 7)
+            .unwrap();
+        // An invite or knock for the same room re-records id and version.
+        db.create_room_meta(room_nid, "!r:x", "10").unwrap();
+        let (partial, servers) = db.get_partial_state_info(room_nid).unwrap();
+        assert!(partial, "partial-state flag survives a meta rewrite");
+        assert_eq!(servers, vec!["other.example".to_string()]);
+        assert_eq!(
+            db.get_room_version(room_nid).unwrap().as_deref(),
+            Some("10")
+        );
     }
 }
 

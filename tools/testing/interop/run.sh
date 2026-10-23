@@ -185,6 +185,10 @@ enable_registration: true
 enable_registration_without_verification: true
 
 # The suite drives both servers hard; stock limits would 429 it.
+# Synapse caches a /sync response per (user, since, ...) for two minutes by
+# default; a rig that polls initial /sync to observe federation would only
+# ever see the first answer. Turn the cache off so every poll is live.
+caches: {sync_response_cache_duration: 0}
 rc_message: {per_second: 1000, burst_count: 1000}
 rc_registration: {per_second: 1000, burst_count: 1000}
 rc_login:
@@ -260,7 +264,7 @@ fi
 # --------------------------------------------------------------------- test
 echo "==> running interop suite"
 status=0
-cargo test --manifest-path "$ROOT/Cargo.toml" -p vela-interop -- --nocapture || status=$?
+cargo test --manifest-path "$ROOT/Cargo.toml" -p vela-interop --no-fail-fast -- --nocapture || status=$?
 if (( status != 0 )); then
     echo "!! suite failed — logs: $WORK/vela.log, $WORK/synapse.log"
     echo "!! divergence evidence (if any): $INTEROP_EVIDENCE_DIR/"
