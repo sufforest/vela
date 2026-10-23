@@ -13,7 +13,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::{Map, Value};
+use vela_core::auth_rules::{AuthError, check_auth_events_resolved};
 use vela_core::events::pdu::Pdu;
+use vela_core::events::room_version::RoomVersion;
 use vela_core::state_res::{self, StateMap};
 use vela_store::db::Database;
 
@@ -52,6 +54,45 @@ pub fn load_state_pdu(
         .ok()
         .flatten()?;
     load_pdu_by_nid(db, event_nid)
+}
+
+/// Rule 3 over the auth events a PDU cites, producing the state view that
+/// `check_auth` runs against.
+///
+/// `auth_pdus` are the cited auth events the caller resolved (how an
+/// unknown id is handled — fetch, 403, reject — stays with the caller).
+/// Checks 3.3 against the rejected list, then the structural rules
+/// (`check_auth_events_resolved`: 3.1 duplicates, 3.2 selection, 3.4
+/// create presence through v11, 3.5 same room). From v12 the create is
+/// not cited, so it is injected from room state.
+pub fn auth_state_from_auth_events(
+    db: &Database,
+    room_nid: u64,
+    event: &Pdu,
+    version: RoomVersion,
+    auth_pdus: Vec<Pdu>,
+) -> Result<HashMap<(String, String), Pdu>, String> {
+    for auth in &auth_pdus {
+        if db.is_event_rejected(&auth.event_id).unwrap_or(false) {
+            return Err(format!("auth_event {} is rejected", auth.event_id));
+        }
+    }
+    let refs: Vec<&Pdu> = auth_pdus.iter().collect();
+    if let Err(AuthError::Rejected(reason)) = check_auth_events_resolved(event, version, &refs) {
+        return Err(reason);
+    }
+    let mut auth_state: HashMap<(String, String), Pdu> = auth_pdus
+        .into_iter()
+        .filter_map(|p| {
+            p.state_key
+                .clone()
+                .map(|sk| ((p.event_type.clone(), sk), p))
+        })
+        .collect();
+    if !version.include_create_in_auth_events() {
+        ensure_create_in_state(db, room_nid, &mut auth_state);
+    }
+    Ok(auth_state)
 }
 
 /// Insert `m.room.create` into a state map from persisted state if it's

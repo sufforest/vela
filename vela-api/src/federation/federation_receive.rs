@@ -685,7 +685,7 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
             .insert(room_nid, state.db.current_stream_position());
     }
 
-    let mut auth_state: HashMap<(String, String), Pdu> = HashMap::new();
+    let mut auth_pdus: Vec<Pdu> = Vec::new();
     for aev_id in &effective_pdu.auth_events {
         let pdu_opt = load_pdu_by_event_id(state, aev_id).or({
             // Not found locally — will fetch below.
@@ -755,31 +755,27 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
                 }
             }
         };
-        if let Some(sk) = p.state_key.as_deref() {
-            // Auth rule 2.x / receipt rule 3.5: an auth event must belong to
-            // THIS room. m.room.create is exempt — in v12 it carries no room_id
-            // and check_auth rule 2 already binds it to the room via the
-            // room_id↔create-id relation; pre-v12 create matches anyway. Without
-            // this a peer could cite a foreign-room m.room.power_levels (or
-            // member) as an auth event to fake authority it doesn't hold here.
-            if p.event_type != "m.room.create" && p.room_id != effective_pdu.room_id {
-                return (
-                    effective_pdu.event_id.clone(),
-                    PduOutcome::Rejected(format!(
-                        "auth_event {} belongs to a different room",
-                        p.event_id
-                    )),
-                );
-            }
-            auth_state.insert((p.event_type.clone(), sk.to_string()), p);
-        }
+        auth_pdus.push(p);
     }
-    // v12 (MSC4291): m.room.create is absent from auth_events.
-    crate::federation::federation_state::ensure_create_in_state(
+    // Rule 3 (3.1–3.5) over the cited auth events. A structural fault here
+    // — a foreign-room or unselected auth event, a missing create through
+    // v11 — is the event's own doing, not a gap in our state, so it rejects
+    // even in a partial-state room.
+    let auth_state = match crate::federation::federation_state::auth_state_from_auth_events(
         &state.db,
         room_nid,
-        &mut auth_state,
-    );
+        &effective_pdu,
+        event_room_version,
+        auth_pdus,
+    ) {
+        Ok(m) => m,
+        Err(reason) => {
+            return (
+                effective_pdu.event_id.clone(),
+                PduOutcome::Rejected(format!("auth_events validation failed: {reason}")),
+            );
+        }
+    };
     let auth_fn = |t: &str, sk: &str| auth_state.get(&(t.to_string(), sk.to_string()));
     if let Err(AuthError::Rejected(reason)) = check_auth(&effective_pdu, &auth_fn) {
         if is_partial_state_room {
@@ -2804,7 +2800,7 @@ async fn persist_fetched_event_inner(
     // This is what closes the 3b single-level-fetch gap: a fetched event
     // whose ancestors are also missing triggers further fetches, bounded
     // by the shared budget.
-    let mut auth_state: HashMap<(String, String), Pdu> = HashMap::new();
+    let mut auth_pdus: Vec<Pdu> = Vec::new();
     for aev_id in &target_pdu.auth_events {
         let auth_pdu = match load_pdu_by_event_id(state, aev_id) {
             Some(p) => p,
@@ -2929,16 +2925,25 @@ async fn persist_fetched_event_inner(
                 }
             }
         };
-        if let Some(sk) = auth_pdu.state_key.as_deref() {
-            auth_state.insert((auth_pdu.event_type.clone(), sk.to_string()), auth_pdu);
-        }
+        auth_pdus.push(auth_pdu);
     }
-    // v12 (MSC4291): m.room.create is absent from auth_events.
-    crate::federation::federation_state::ensure_create_in_state(
+    let auth_state = match crate::federation::federation_state::auth_state_from_auth_events(
         &state.db,
         room_nid,
-        &mut auth_state,
-    );
+        &target_pdu,
+        event_room_version,
+        auth_pdus,
+    ) {
+        Ok(m) => m,
+        Err(reason) => {
+            let full = format!(
+                "fetched event {}: auth_events validation failed: {reason}",
+                target_pdu.event_id
+            );
+            let _ = state.db.mark_event_rejected(&target_pdu.event_id, &full);
+            return Err(full);
+        }
+    };
     let auth_fn = |t: &str, sk: &str| auth_state.get(&(t.to_string(), sk.to_string()));
     if let Err(vela_core::auth_rules::AuthError::Rejected(reason)) =
         vela_core::auth_rules::check_auth(&target_pdu, &auth_fn)

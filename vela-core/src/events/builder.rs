@@ -283,8 +283,10 @@ pub fn select_auth_events(
         // Per server-server spec auth_events selection: when a join carries
         // `join_authorised_via_users_server`, that user's current member
         // event MUST be in auth_events so the rule engine can verify the
-        // authoriser is joined and powered to invite.
+        // authoriser is joined and powered to invite. The field only means
+        // something from v8 (restricted joins); before that it is ignored.
         if membership == "join"
+            && room_version.supports_restricted_joins()
             && let Some(authoriser) = content
                 .and_then(|c| c.get("join_authorised_via_users_server"))
                 .and_then(|v| v.as_str())
