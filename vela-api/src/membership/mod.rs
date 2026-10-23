@@ -673,6 +673,37 @@ fn has_local_joined_member(state: &AppState, room_nid: u64) -> Result<bool, ApiE
 /// restricted-room join. The caller's auth rule already checks the
 /// authoriser is joined and has invite power, so this just has to find
 /// SOME qualifying user.
+/// Whether `user_id` can authorise a restricted join right now: joined
+/// to the room with at least the invite power level, judged on current
+/// state. `send_join` uses this before vouching for a join whose
+/// `join_authorised_via_users_server` names one of our users: the auth
+/// rules only judge the authoriser against the auth events the joiner
+/// chose to cite, which may predate a leave or a demotion.
+pub(crate) fn local_user_can_authorise_join(
+    state: &AppState,
+    room_nid: u64,
+    user_id: &str,
+) -> Result<bool, ApiError> {
+    let user_nid = state
+        .db
+        .get_nid(user_id)
+        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    let joined = match user_nid {
+        Some(n) => {
+            state
+                .db
+                .get_membership(room_nid, n)
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+                == Some(1)
+        }
+        None => false,
+    };
+    if !joined {
+        return Ok(false);
+    }
+    Ok(user_power(state, room_nid, user_id)? >= invite_power_level(state, room_nid)?)
+}
+
 fn pick_local_authoriser(state: &AppState, room_nid: u64) -> Result<Option<String>, ApiError> {
     let server = &state.config.server_name;
     let members = state

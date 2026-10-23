@@ -375,15 +375,122 @@ impl User {
         Ok(ids)
     }
 
-    /// Whether this user currently has a pending invite to `room_id`,
-    /// per a one-shot `/sync`. Invited-but-not-joined users can't read
-    /// room state (servers may 403 previews), so invite delivery is
-    /// asserted through the sync invite section — the spec-portable view.
+    /// One-shot initial `/sync`: the spec-portable view of what this
+    /// server tells this user (invites, knocks, ephemeral data, presence).
+    pub async fn sync_once(&self) -> Result<Value> {
+        self.get("/sync?timeout=0").await
+    }
+
+    /// Whether this user currently has a pending invite to `room_id`.
+    /// Invited-but-not-joined users can't read room state (servers may
+    /// 403 previews), so invite delivery is asserted through the sync
+    /// invite section.
     pub async fn is_invited_to(&self, room_id: &str) -> Result<bool> {
-        let v = self.get("/sync?timeout=0").await?;
+        let v = self.sync_once().await?;
         Ok(v["rooms"]["invite"]
             .as_object()
             .is_some_and(|rooms| rooms.contains_key(room_id)))
+    }
+
+    /// The stripped `invite_state` events this user's sync carries for a
+    /// pending invite to `room_id` (empty when there is no such invite).
+    pub async fn invite_state(&self, room_id: &str) -> Result<Vec<Value>> {
+        let v = self.sync_once().await?;
+        Ok(v["rooms"]["invite"][room_id]["invite_state"]["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Whether this user's sync lists `room_id` under `rooms.knock`.
+    pub async fn is_knocking_on(&self, room_id: &str) -> Result<bool> {
+        let v = self.sync_once().await?;
+        Ok(v["rooms"]["knock"]
+            .as_object()
+            .is_some_and(|rooms| rooms.contains_key(room_id)))
+    }
+
+    /// Knock on `room_id`, hinting the resident server.
+    pub async fn knock(&self, room_id: &str, via: &str, reason: &str) -> Result<()> {
+        let path = format!(
+            "/knock/{}?server_name={}&via={}",
+            urlencode(room_id),
+            urlencode(via),
+            urlencode(via)
+        );
+        self.post(&path, json!({"reason": reason}))
+            .await
+            .map(|_| ())
+    }
+
+    /// Start or stop a typing notification in `room_id`.
+    pub async fn typing(&self, room_id: &str, typing: bool) -> Result<()> {
+        // Longer than any poll window, so a "stopped typing" observation
+        // comes from the stop notification, not from the timeout lapsing.
+        let body = if typing {
+            json!({"typing": true, "timeout": 120_000})
+        } else {
+            json!({"typing": false})
+        };
+        self.put(
+            &format!(
+                "/rooms/{}/typing/{}",
+                urlencode(room_id),
+                urlencode(&self.user_id)
+            ),
+            body,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Send an `m.read` receipt for `event_id`.
+    pub async fn read_receipt(&self, room_id: &str, event_id: &str) -> Result<()> {
+        self.post(
+            &format!(
+                "/rooms/{}/receipt/m.read/{}",
+                urlencode(room_id),
+                urlencode(event_id)
+            ),
+            json!({}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Set this user's presence state and status message.
+    pub async fn set_presence(&self, presence: &str, status_msg: &str) -> Result<()> {
+        self.put(
+            &format!("/presence/{}/status", urlencode(&self.user_id)),
+            json!({"presence": presence, "status_msg": status_msg}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// `GET /presence/{user}/status` as this server answers it.
+    pub async fn presence_of(&self, user_id: &str) -> Result<Value> {
+        self.get(&format!("/presence/{}/status", urlencode(user_id)))
+            .await
+    }
+
+    /// The ephemeral events (`m.typing`, `m.receipt`) this user's sync
+    /// carries for a joined room.
+    pub async fn ephemeral(&self, room_id: &str) -> Result<Vec<Value>> {
+        let v = self.sync_once().await?;
+        Ok(v["rooms"]["join"][room_id]["ephemeral"]["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// The `m.presence` events this user's sync carries.
+    pub async fn presence_events(&self) -> Result<Vec<Value>> {
+        let v = self.sync_once().await?;
+        Ok(v["presence"]["events"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default())
     }
 }
 
@@ -591,18 +698,37 @@ pub fn cell(version: Option<&str>) -> String {
     version.map_or_else(|| "default".to_string(), |v| format!("v{v}"))
 }
 
+/// Whether a matrix cell's room version is at least `min`. The default
+/// cell (`None`) is each server's own default, which is newer than any
+/// feature gate the rig cares about, so it always qualifies. A version
+/// that doesn't parse as a number is unsupported.
+pub fn cell_at_least(version: Option<&str>, min: u8) -> bool {
+    match version {
+        None => true,
+        Some(v) => v.parse::<u8>().is_ok_and(|n| n >= min),
+    }
+}
+
 /// Stamp one `#[tokio::test]` per room-version matrix cell for each scenario
 /// `async fn name(env: &InteropEnv, version: Option<&str>) -> Result<()>`.
 /// Each cell is its own test so a failure names the version and
 /// `cargo test <scenario>::v<N>` reruns exactly that cell.
+///
+/// A scenario that needs a feature introduced in room version N is written
+/// `name >= N`; cells below N skip green, like cells without a rig.
 #[macro_export]
 macro_rules! version_matrix {
-    ($($scenario:ident),* $(,)?) => {
+    ($($scenario:ident $(>= $min:literal)?),* $(,)?) => {
         $(
             mod $scenario {
                 use super::*;
                 async fn run(version: Option<&str>) -> anyhow::Result<()> {
                     let Some(env) = $crate::rig() else { return Ok(()) };
+                    let min: Option<u8> = None $(.or(Some($min)))?;
+                    if let Some(min) = min && !$crate::cell_at_least(version, min) {
+                        eprintln!("skipped: {} needs room v{min}+", stringify!($scenario));
+                        return Ok(());
+                    }
                     super::$scenario(&env, version).await
                 }
                 #[tokio::test] async fn default() -> anyhow::Result<()> { run(None).await }
@@ -625,5 +751,19 @@ fn evidence_dir() -> PathBuf {
     match std::env::var_os("INTEROP_EVIDENCE_DIR") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../target/interop-evidence"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cell_at_least;
+
+    #[test]
+    fn cell_gate_parses_versions() {
+        assert!(cell_at_least(None, 8));
+        assert!(cell_at_least(Some("8"), 8));
+        assert!(cell_at_least(Some("12"), 7));
+        assert!(!cell_at_least(Some("6"), 7));
+        assert!(!cell_at_least(Some("org.matrix.msc3757.10"), 7));
     }
 }

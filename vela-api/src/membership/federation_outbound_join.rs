@@ -502,6 +502,21 @@ async fn bootstrap_remote_room(
             crate::federation::partial_state_filler::ensure_running(state);
             crate::federation::partial_state_filler::notify_new_partial_room(state);
         }
+    } else if state
+        .db
+        .get_partial_state_info(room_nid)
+        .map(|(partial, _)| partial)
+        .unwrap_or(false)
+    {
+        // Rejoining with full state a room we last left while its fill
+        // was still pending: the stale flag would keep make_join and
+        // send_join refusing and the filler probing old servers.
+        if let Err(e) = state
+            .db
+            .clear_partial_state(room_nid, state.db.current_stream_position())
+        {
+            warn!(error = %e, room = %room_id.as_str(), "failed to clear stale partial_state flag");
+        }
     }
 
     // Set our own membership.

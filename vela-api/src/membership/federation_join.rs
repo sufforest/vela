@@ -305,19 +305,9 @@ pub async fn make_join(
         json!(auth_events.iter().map(|e| e.as_str()).collect::<Vec<_>>()),
     );
 
-    // For restricted joins, the resident server (us) must sign the template
-    // on behalf of the authoriser's homeserver — vela only picks local
-    // authorisers, so we sign with our own key. The requesting server adds
-    // its own signature on send_join, and the resident verifies both. Per
-    // server-server spec §"Restricted rooms".
-    if authoriser.is_some() {
-        vela_core::events::hash::add_content_hash(&mut template);
-        state.signing_key.sign_event_for_version(
-            &mut template,
-            &state.config.server_name,
-            room_version,
-        );
-    }
+    // The template is unsigned: the joining server builds and signs the
+    // real event from it. For a restricted join our own signature goes on
+    // at send_join, once we have checked the finished event.
 
     Ok(Json(json!({
         "room_version": room_version.as_str(),
@@ -518,14 +508,14 @@ pub async fn send_join_v2(
         ));
     }
 
-    // Restricted-join extra check (MSC3083 / server-server-api §"Restricted
-    // rooms" / auth rule 4.2): when the event carries
-    // `join_authorised_via_users_server`, the spec requires a signature
-    // from the authoriser's homeserver in addition to the sender's. This
-    // is the cryptographic proof that a qualifying user on the authorising
-    // server actually approved the join. PL + joined-membership of the
-    // authoriser are enforced later via `check_auth` (rule 5.3.5) against
-    // the event's claimed auth_events.
+    // Restricted join (server-server-api §"Restricted rooms"): when the
+    // event carries `join_authorised_via_users_server`, the authoriser's
+    // homeserver — us — vouches for the join by adding its signature to
+    // the event. The joiner cannot produce that signature, so nothing is
+    // verified here beyond the authoriser being ours; the signature is
+    // added below once the event has passed the auth rules (5.3.5 checks
+    // the authoriser's membership and power).
+    let mut local_authoriser: Option<String> = None;
     if let Some(authoriser) = event_obj
         .get("content")
         .and_then(|c| c.get("join_authorised_via_users_server"))
@@ -555,31 +545,7 @@ pub async fn send_join_v2(
                 "join_authorised_via_users_server must be a local user",
             ));
         }
-        // Skip the duplicate verify when sender and authoriser share a
-        // domain (the sender check above covered it). When the
-        // authoriser is local but the sender is remote (the normal
-        // case for restricted federation), verify against OUR own
-        // server signing key — fetching our own keys over HTTPS would
-        // either loop back or fail entirely depending on bind config.
-        if authoriser_domain != sender_domain {
-            let our_key_id = state.signing_key.key_id();
-            let our_pub = state.signing_key.verifying_key();
-            if verify_event_signature(
-                event_obj,
-                authoriser_domain,
-                our_key_id,
-                &our_pub,
-                send_join_room_version,
-            )
-            .is_err()
-            {
-                return Err(err_response(
-                    StatusCode::UNAUTHORIZED,
-                    "M_UNAUTHORIZED",
-                    "authoriser signature verification failed",
-                ));
-            }
-        }
+        local_authoriser = Some(authoriser.to_string());
     }
 
     // Look up room.
@@ -609,7 +575,8 @@ pub async fn send_join_v2(
     // when the joiner already has an invite — Synapse parity, and the
     // path TestDeviceListsUpdateOverFederation exercises (alice invites
     // bob across federation; bob's hs2 then send_joins via hs1).
-    let join_rule = read_join_rules_content(&state, room_nid)
+    let join_rules_content = read_join_rules_content(&state, room_nid);
+    let join_rule = join_rules_content
         .as_ref()
         .and_then(|c| c.get("join_rule"))
         .and_then(|r| r.as_str())
@@ -627,6 +594,32 @@ pub async fn send_join_v2(
             "M_FORBIDDEN",
             "room is invite-only or knock-only; send_join not allowed",
         ));
+    }
+
+    // Restricted rooms (server-server-api §"Restricted rooms"): the
+    // resident must check the allow list on send_join as well as on
+    // make_join. Nothing ties a send_join to an earlier make_join, so a
+    // joiner that skipped it would otherwise get our signature below
+    // without ever satisfying a condition. An invited user joins as in a
+    // public room, mirroring make_join.
+    if matches!(join_rule.as_str(), "restricted" | "knock_restricted") && !joiner_invited {
+        let allow = join_rules_content
+            .as_ref()
+            .and_then(|c| c.get("allow"))
+            .and_then(|a| a.as_array())
+            .cloned()
+            .unwrap_or_default();
+        match crate::membership::user_qualifies_via_allow_list_pub(&state, joiner_nid, &allow) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(err_response(
+                    StatusCode::FORBIDDEN,
+                    "M_FORBIDDEN",
+                    "user is not a member of any allow-list room",
+                ));
+            }
+            Err(e) => return Err(db_err(e.0)),
+        }
     }
 
     // Verify event_id in URL matches the computed reference hash. An origin
@@ -654,7 +647,7 @@ pub async fn send_join_v2(
         Some(d) => d != computed_hash,
         None => true,
     };
-    let effective_event_obj: Map<String, Value> = if use_redacted {
+    let mut effective_event_obj: Map<String, Value> = if use_redacted {
         tracing::warn!(%event_id, "send_join: content hash mismatch, using redacted form");
         vela_core::events::redact::redact_event_for_version(event_obj, send_join_room_version)
     } else {
@@ -750,6 +743,46 @@ pub async fn send_join_v2(
             "M_FORBIDDEN",
             &format!("auth check failed: {reason}"),
         ));
+    }
+
+    // The join is good: vouch for it. Signatures sit outside the hashed
+    // and signed content, so the event id and the joiner's own signature
+    // are untouched; what we persist, echo back and federate carries both.
+    let is_restricted_join = effective_event_obj
+        .get("content")
+        .and_then(|c| c.get("join_authorised_via_users_server"))
+        .is_some();
+    if let Some(authoriser) = local_authoriser.as_deref().filter(|_| is_restricted_join) {
+        // The auth rules judged the authoriser against the auth events the
+        // joiner cited, which may predate a leave or a demotion. Our
+        // signature says the authoriser can vouch now, so judge that on
+        // current state. M_UNABLE_TO_GRANT_JOIN tells the joiner to try
+        // another resident rather than treating the join as forbidden.
+        match crate::membership::local_user_can_authorise_join(&state, room_nid, authoriser) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(err_response(
+                    StatusCode::BAD_REQUEST,
+                    "M_UNABLE_TO_GRANT_JOIN",
+                    "join_authorised_via_users_server can no longer authorise joins",
+                ));
+            }
+            Err(e) => return Err(db_err(e.0)),
+        }
+        // Only our real signature may sit under our name: a pre-seeded
+        // entry would be federated alongside it and trip peers' key
+        // lookups.
+        if let Some(sigs) = effective_event_obj
+            .get_mut("signatures")
+            .and_then(|s| s.as_object_mut())
+        {
+            sigs.remove(state.config.server_name.as_str());
+        }
+        state.signing_key.sign_event_for_version(
+            &mut effective_event_obj,
+            &state.config.server_name,
+            send_join_room_version,
+        );
     }
 
     // Build the state + auth_chain response BEFORE persisting (so the
@@ -875,16 +908,10 @@ pub async fn send_join_v2(
     resp.insert("auth_chain".into(), json!(auth_chain_pdus));
     resp.insert("state".into(), json!(response_state));
     // Restricted Rooms only (joins-v2.yaml): "The full event with the
-    // additional signatures of the resident server applied to it."
-    // For restricted joins we signed the make_join template on behalf
-    // of the local authoriser, so the event the joiner sent us already
-    // carries both signatures — echo it back so the joiner can confirm
-    // which exact bytes we persisted. For non-restricted joins the
-    // field stays null (the spec only requires it for restricted).
-    let is_restricted_join = effective_event_obj
-        .get("content")
-        .and_then(|c| c.get("join_authorised_via_users_server"))
-        .is_some();
+    // additional signatures of the resident server applied to it." We
+    // added our signature above; echo the event so the joiner can
+    // federate the vouched-for bytes. For non-restricted joins the field
+    // stays null (the spec only requires it for restricted).
     if is_restricted_join {
         resp.insert("event".into(), Value::Object(effective_event_obj.clone()));
     } else {
@@ -1247,25 +1274,10 @@ mod tests {
             .expect("authoriser present");
         assert_eq!(authoriser, "@alice:example.com");
 
-        // The resident server (us) must have signed the template on
-        // behalf of the authoriser's homeserver. The requesting server
-        // adds its own signature on send_join. Without our signature,
-        // the spec's two-server proof for restricted joins breaks.
-        let sigs = resp
-            .0
-            .pointer("/event/signatures")
-            .and_then(|v| v.as_object())
-            .expect("template carries signatures");
-        assert!(
-            sigs.contains_key(&state.config.server_name),
-            "template must be signed by the authoriser's server (us): {sigs:?}"
-        );
-        let hashes = resp
-            .0
-            .pointer("/event/hashes")
-            .and_then(|v| v.as_object())
-            .expect("template carries content hash");
-        assert!(hashes.contains_key("sha256"));
+        // The template is unsigned and unhashed: the joiner builds the
+        // real event from it, and our signature goes on at send_join.
+        assert!(resp.0.pointer("/event/signatures").is_none());
+        assert!(resp.0.pointer("/event/hashes").is_none());
     }
 
     #[tokio::test]
@@ -1617,29 +1629,27 @@ mod tests {
         );
     }
 
-    /// Inbound send_join with a properly dual-signed restricted-room
-    /// join: remote sender signs, vela signs on behalf of the local
-    /// authoriser. Confirms the !=sender_domain branch of the
-    /// authoriser-signature check (federation_join.rs:505-523) passes
-    /// when the signature is genuinely vela's, not when the rest of
-    /// send_join falls through to a non-signature-related failure
-    /// (e.g. an auth-events check), the signature path itself didn't
-    /// cause the failure. The companion rejection test
-    /// `send_join_rejects_non_local_authoriser` covers the negative
-    /// case; this one closes the happy-path gap.
-    #[tokio::test]
-    async fn send_join_accepts_dual_signed_restricted_join() {
+    /// A v10 restricted room on `example.com` (creator alice, allow list
+    /// pointing at `!gate:example.com`) plus a joiner-signed restricted
+    /// join for `@bob:remote.example` naming alice as authoriser. Returns
+    /// the ready-to-send event and its id; the caller decides whether bob
+    /// is a member of the gate room.
+    async fn restricted_join_fixture() -> (
+        AppState,
+        tempfile::TempDir,
+        serde_json::Map<String, Value>,
+        String,
+    ) {
         use crate::federation::federation_client::RemoteKeys;
-        use crate::middleware::federation_auth::VerifiedBody;
         use std::collections::HashMap;
         use vela_core::events::sign::ServerSigningKey;
 
-        let (state, _tmp) = crate::test_helpers::build_test_state_with_name("example.com");
+        let (state, tmp) = crate::test_helpers::build_test_state_with_name("example.com");
         let db = &state.db;
 
         let restricted = "!restricted:example.com";
         let restricted_nid = db.get_or_create_nid(restricted).unwrap();
-        db.create_room_meta(restricted_nid, restricted, "12")
+        db.create_room_meta(restricted_nid, restricted, "10")
             .unwrap();
         let alice = "@alice:example.com";
         let alice_nid = db.get_or_create_nid(alice).unwrap();
@@ -1658,7 +1668,7 @@ mod tests {
             1,
             &serde_json::to_vec(&json!({
                 "type": "m.room.create", "sender": alice, "state_key": "",
-                "room_id": restricted, "content": {"room_version": "12"},
+                "room_id": restricted, "content": {"room_version": "10", "creator": alice},
                 "origin_server_ts": 1, "depth": 1,
                 "prev_events": [], "auth_events": [],
             }))
@@ -1737,10 +1747,8 @@ mod tests {
             },
         );
 
-        // Bob (remote) joins; authoriser is alice (local). Sender
-        // signs, then vela signs on behalf of alice's domain — that's
-        // what `make_join` would have produced if vela had handed the
-        // template to bob's server.
+        // Bob (remote) joins; authoriser is alice (local). Only the
+        // joiner signs: the resident's signature is send_join's job.
         let bob = format!("@bob:{remote_sn}");
         let mut event = serde_json::Map::new();
         event.insert("type".into(), json!("m.room.member"));
@@ -1758,49 +1766,163 @@ mod tests {
         event.insert("origin_server_ts".into(), json!(100u64));
         event.insert("depth".into(), json!(4u64));
         event.insert("prev_events".into(), json!(["$jr"]));
-        event.insert("auth_events".into(), json!(["$c", "$jr"]));
+        // A restricted join cites the authoriser's membership too.
+        event.insert("auth_events".into(), json!(["$c", "$jr", "$aj"]));
         vela_core::events::hash::add_content_hash(&mut event);
-        // Vela signs first (on behalf of alice's domain).
-        state.signing_key.sign_event_for_version(
-            &mut event,
-            "example.com",
-            vela_core::events::room_version::RoomVersion::V12,
-        );
-        // Then the remote signs (as bob's homeserver).
         remote_key.sign_event_for_version(
             &mut event,
             remote_sn,
-            vela_core::events::room_version::RoomVersion::V12,
+            vela_core::events::room_version::RoomVersion::V10,
         );
         let event_id = vela_core::events::hash::compute_event_id_for_version(
             &event,
-            vela_core::events::room_version::RoomVersion::V12,
-        );
+            vela_core::events::room_version::RoomVersion::V10,
+        )
+        .as_str()
+        .to_string();
+        (state, tmp, event, event_id)
+    }
 
-        let origin = axum::Extension(XMatrixOrigin(remote_sn.into()));
+    /// Make `user` a joined member of the gate room on this server. The
+    /// allow-list check only trusts gate rooms with a local joined member,
+    /// so alice joins too.
+    fn join_gate_room(state: &AppState, user: &str) {
+        let db = &state.db;
+        let gate_nid = db.get_or_create_nid("!gate:example.com").unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        let user_nid = db.get_or_create_nid(user).unwrap();
+        db.set_membership(gate_nid, alice_nid, 1).unwrap();
+        db.set_membership(gate_nid, user_nid, 1).unwrap();
+    }
+
+    async fn send_restricted_join(
+        state: &AppState,
+        event: serde_json::Map<String, Value>,
+        event_id: &str,
+    ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+        use crate::middleware::federation_auth::VerifiedBody;
+        let origin = axum::Extension(XMatrixOrigin("remote.example".into()));
         let body = axum::Extension(VerifiedBody(Some(Value::Object(event))));
-        let result = send_join_v2(
+        send_join_v2(
             axum::extract::State(state.clone()),
-            Path((restricted.to_string(), event_id.as_str().to_string())),
+            Path(("!restricted:example.com".to_string(), event_id.to_string())),
             axum::extract::RawQuery(None),
             origin,
             body,
         )
-        .await;
+        .await
+    }
 
-        // The signature-verify path must NOT be the failure point.
-        // Later state-resolution / auth_events checks may legitimately
-        // reject this minimal scaffolding, but a "must be a local
-        // user" or "signature verification failed" message would
-        // indicate the wrong branch fired.
-        if let Err(err) = &result {
-            let msg = err.1.0.get("error").and_then(|v| v.as_str()).unwrap_or("");
-            assert!(
-                !msg.contains("must be a local user")
-                    && !msg.contains("signature verification failed"),
-                "signature path rejected what should have been accepted: {msg}",
-            );
-        }
+    /// A restricted join signed only by the joiner is accepted and comes
+    /// back with our signature added; the persisted bytes carry it too.
+    /// `send_join_rejects_non_local_authoriser` covers the negative
+    /// case; this one closes the happy-path gap.
+    #[tokio::test]
+    async fn send_join_adds_our_signature_to_a_restricted_join() {
+        let (state, _tmp, event, event_id) = restricted_join_fixture().await;
+        join_gate_room(&state, "@bob:remote.example");
+
+        let resp = match send_restricted_join(&state, event, &event_id).await {
+            Ok(r) => r.0,
+            Err(err) => panic!(
+                "send_join refused a joiner-signed restricted join: {:?}",
+                err.1.0
+            ),
+        };
+        let sigs = resp
+            .pointer("/event/signatures")
+            .and_then(|v| v.as_object())
+            .expect("echoed event carries signatures");
+        assert!(
+            sigs.contains_key("example.com"),
+            "resident signature missing: {sigs:?}"
+        );
+        assert!(
+            sigs.contains_key("remote.example"),
+            "joiner signature dropped: {sigs:?}"
+        );
+        // What we persisted (and will federate) is the vouched-for event.
+        let db = &state.db;
+        let nid = db.get_event_nid_by_id(&event_id).unwrap().unwrap();
+        let (_, bytes) = db.get_event(nid).unwrap().unwrap();
+        let stored: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(stored["signatures"]["example.com"].is_object());
+    }
+
+    /// send_join must apply the allow list itself: nothing ties it to an
+    /// earlier make_join, so a joiner that skipped make_join would
+    /// otherwise be vouched for without ever satisfying a condition.
+    #[tokio::test]
+    async fn send_join_refuses_restricted_join_outside_the_allow_list() {
+        let (state, _tmp, event, event_id) = restricted_join_fixture().await;
+        // Alice is in the gate room, bob is not.
+        join_gate_room(&state, "@alice:example.com");
+
+        let err = send_restricted_join(&state, event, &event_id)
+            .await
+            .expect_err("joiner outside every allowed room must be refused");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        let msg = err.1.0.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            msg.contains("allow-list"),
+            "unexpected refusal: {:?}",
+            err.1.0
+        );
+        assert!(
+            state.db.get_event_nid_by_id(&event_id).unwrap().is_none(),
+            "refused join must not be persisted"
+        );
+    }
+
+    /// The authoriser is judged on current state, not on the auth events
+    /// the joiner cited: once alice has left, her old join and power
+    /// still satisfy the auth rules but we must not vouch for her.
+    #[tokio::test]
+    async fn send_join_refuses_restricted_join_from_a_departed_authoriser() {
+        let (state, _tmp, event, event_id) = restricted_join_fixture().await;
+        join_gate_room(&state, "@bob:remote.example");
+        let db = &state.db;
+        let room_nid = db.get_or_create_nid("!restricted:example.com").unwrap();
+        let alice_nid = db.get_or_create_nid("@alice:example.com").unwrap();
+        db.set_membership(room_nid, alice_nid, 0).unwrap();
+
+        let err = send_restricted_join(&state, event, &event_id)
+            .await
+            .expect_err("a departed authoriser must not be vouched for");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            err.1.0.get("errcode").and_then(|v| v.as_str()),
+            Some("M_UNABLE_TO_GRANT_JOIN"),
+            "{:?}",
+            err.1.0
+        );
+        assert!(db.get_event_nid_by_id(&event_id).unwrap().is_none());
+    }
+
+    /// A joiner cannot smuggle an entry under our server name: whatever
+    /// sits there is replaced by our real signature alone.
+    #[tokio::test]
+    async fn send_join_replaces_forged_signatures_under_our_name() {
+        let (state, _tmp, mut event, event_id) = restricted_join_fixture().await;
+        join_gate_room(&state, "@bob:remote.example");
+        // Signatures are outside the hashed content, so the event id is
+        // unchanged by this tampering.
+        event["signatures"]["example.com"] = json!({"ed25519:bogus": "AAAA"});
+
+        let resp = send_restricted_join(&state, event, &event_id)
+            .await
+            .expect("tampered signatures block must not block the join")
+            .0;
+        let ours = resp
+            .pointer("/event/signatures/example.com")
+            .and_then(|v| v.as_object())
+            .expect("our signature present");
+        assert!(
+            !ours.contains_key("ed25519:bogus"),
+            "forged entry kept: {ours:?}"
+        );
+        assert_eq!(ours.len(), 1, "exactly our key: {ours:?}");
+        assert!(ours.contains_key(state.signing_key.key_id()));
     }
 
     /// Synthesise a state-events list with `count` joined members named
