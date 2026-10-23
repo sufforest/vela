@@ -2831,6 +2831,11 @@ mod auth_events_selection_tests {
                 ),
                 (
                     "m.room.member",
+                    Some("@t:hs2"),
+                    json!({"membership": "invite", "third_party_invite": {"signed": {"token": "tok"}}}),
+                ),
+                (
+                    "m.room.member",
                     Some("@s:hs1"),
                     json!({"membership": "join", "join_authorised_via_users_server": "@auth:hs1"}),
                 ),
