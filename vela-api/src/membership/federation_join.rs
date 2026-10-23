@@ -702,8 +702,7 @@ pub async fn send_join_v2(
     }
 
     // Check auth against the event's claimed auth_events.
-    let mut auth_state: std::collections::HashMap<(String, String), Pdu> =
-        std::collections::HashMap::new();
+    let mut auth_pdus: Vec<Pdu> = Vec::new();
     for aev in &pdu.auth_events {
         let Some(auth_pdu) = load_pdu_by_event_id(&state.db, aev) else {
             return Err(err_response(
@@ -712,16 +711,23 @@ pub async fn send_join_v2(
                 "unknown auth event",
             ));
         };
-        if let Some(sk) = auth_pdu.state_key.as_deref() {
-            auth_state.insert((auth_pdu.event_type.clone(), sk.to_string()), auth_pdu);
-        }
+        auth_pdus.push(auth_pdu);
     }
-    // v12 (MSC4291): m.room.create is absent from auth_events.
-    crate::federation::federation_state::ensure_create_in_state(
+    let auth_state = crate::federation::federation_state::auth_state_from_auth_events(
         &state.db,
         room_nid,
-        &mut auth_state,
-    );
+        &pdu,
+        send_join_room_version,
+        auth_pdus,
+    )
+    .map_err(|reason| {
+        warn!(%event_id, %reason, %room_id, "send_join rejected");
+        err_response(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            &format!("auth check failed: {reason}"),
+        )
+    })?;
     let auth_fn = |t: &str, sk: &str| auth_state.get(&(t.to_string(), sk.to_string()));
     if let Err(AuthError::Rejected(reason)) = check_auth(&pdu, &auth_fn) {
         let state_keys: Vec<String> = auth_state

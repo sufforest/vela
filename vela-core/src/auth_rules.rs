@@ -282,13 +282,10 @@ fn check_auth_events(event: &Pdu, _state: StateFn<'_>) -> AuthResult {
         }
     }
 
-    // 3.2: auth_events must match the types selected by the auth events
-    // selection algorithm. This is a cross-cutting check best performed
-    // by the caller who has access to auth event PDUs. We defer to callers
-    // (state resolution / PDU receipt path) to validate the type set.
-
-    // 3.3: rejected auth_events → reject. Same: caller responsibility.
-    // 3.5: all auth events must have matching room_id — caller responsibility.
+    // 3.1 (by slot), 3.2, 3.4 and 3.5 need the auth events resolved to
+    // PDUs: see `check_auth_events_resolved`, which the inbound paths run
+    // before this function. 3.3 (rejected entries) needs the store and is
+    // done there too.
 
     Ok(())
 }
@@ -1184,6 +1181,125 @@ fn required_power_level(state: StateFn<'_>, event_type: &str, is_state: bool) ->
 /// Parse a JSON value as i64, accepting both i64 and u64 representations.
 fn as_i64_loose(v: &Value) -> Option<i64> {
     v.as_i64().or_else(|| v.as_u64().map(|u| u as i64))
+}
+
+// ========================================================================
+// Rule 3 over resolved auth events (3.1, 3.2, 3.4, 3.5)
+// ========================================================================
+
+/// The `(type, state_key)` pairs the auth events selection algorithm may
+/// pick for `event` under `version`. Rule 3.2 rejects any cited auth event
+/// outside this set. For `m.room.create` the set is empty.
+///
+/// This is the allowed SUPERSET, not the exact selection: whether a pair is
+/// actually present depends on room state the sender saw (no power_levels
+/// yet, no join_rules, a third-party invite since consumed), so absence is
+/// never a 3.2 violation. Presence of `m.room.create` is a separate rule
+/// (3.4, [`check_auth_events_resolved`]).
+pub fn allowed_auth_types(event: &Pdu, version: RoomVersion) -> HashSet<(String, String)> {
+    let mut allowed = HashSet::new();
+    if event.event_type == "m.room.create" {
+        return allowed;
+    }
+    // Through v11 the create is selected; from v12 the room_id names it
+    // and the spec says not to select it. A cited create is still
+    // harmless in v12 (it is the same event the room_id identifies),
+    // and servers in the wild keep citing it, so the ALLOWED set keeps
+    // it in every version. Vela's own selector drops it from v12.
+    allowed.insert(("m.room.create".to_string(), String::new()));
+    allowed.insert(("m.room.power_levels".to_string(), String::new()));
+    allowed.insert(("m.room.member".to_string(), event.sender.clone()));
+
+    if event.event_type == "m.room.member" {
+        if let Some(target) = event.state_key.as_deref() {
+            allowed.insert(("m.room.member".to_string(), target.to_string()));
+        }
+        let membership = event
+            .content
+            .get("membership")
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        if matches!(membership, "join" | "invite" | "knock") {
+            allowed.insert(("m.room.join_rules".to_string(), String::new()));
+        }
+        if membership == "invite"
+            && let Some(token) = event
+                .content
+                .pointer("/third_party_invite/signed/token")
+                .and_then(|t| t.as_str())
+        {
+            allowed.insert(("m.room.third_party_invite".to_string(), token.to_string()));
+        }
+        if membership == "join"
+            && version.supports_restricted_joins()
+            && let Some(authoriser) = event
+                .content
+                .get("join_authorised_via_users_server")
+                .and_then(|a| a.as_str())
+        {
+            allowed.insert(("m.room.member".to_string(), authoriser.to_string()));
+        }
+    }
+    allowed
+}
+
+/// Rule 3 for an event whose `auth_events` have been resolved to PDUs:
+///
+/// - 3.1 — two auth events with the same `(type, state_key)` → reject.
+/// - 3.2 — an auth event outside [`allowed_auth_types`] (including any
+///   non-state event) → reject.
+/// - 3.4 — through v11 a non-create event must cite `m.room.create`.
+///   From v12 citing it is tolerated (see [`allowed_auth_types`]).
+/// - 3.5 — an auth event from another room → reject. A create without a
+///   `room_id` (the v12 shape) is exempt: rule 2 binds it to the room
+///   through the create-id relation.
+///
+/// Rule 3.3 (an auth event we previously rejected) needs the store and is
+/// the caller's job. `auth_pdus` need not be in `auth_events` order.
+pub fn check_auth_events_resolved(
+    event: &Pdu,
+    version: RoomVersion,
+    auth_pdus: &[&Pdu],
+) -> AuthResult {
+    let allowed = allowed_auth_types(event, version);
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for auth in auth_pdus {
+        // A v12 create carries no room_id (it IS the room id); anything
+        // else, create included, must name this room.
+        let v12_shape_create = auth.event_type == "m.room.create" && auth.room_id.is_empty();
+        if !v12_shape_create && auth.room_id != event.room_id {
+            return Err(AuthError::reject(format!(
+                "auth_event {} belongs to a different room",
+                auth.event_id
+            )));
+        }
+        let Some(sk) = auth.state_key.as_deref() else {
+            return Err(AuthError::reject(format!(
+                "auth_event {} is not a state event",
+                auth.event_id
+            )));
+        };
+        let key = (auth.event_type.clone(), sk.to_string());
+        if !allowed.contains(&key) {
+            return Err(AuthError::reject(format!(
+                "auth_event {} ({}, {sk:?}) is not selected by the auth events selection algorithm",
+                auth.event_id, auth.event_type
+            )));
+        }
+        if !seen.insert(key) {
+            return Err(AuthError::reject(format!(
+                "duplicate ({}, {sk:?}) in auth_events",
+                auth.event_type
+            )));
+        }
+    }
+    if event.event_type != "m.room.create"
+        && version.include_create_in_auth_events()
+        && !seen.contains(&("m.room.create".to_string(), String::new()))
+    {
+        return Err(AuthError::reject("no m.room.create in auth_events"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2313,5 +2429,427 @@ mod tests {
         );
         let result = check_auth(&member, &sf);
         assert!(matches!(result, Err(AuthError::Rejected(_))));
+    }
+}
+
+#[cfg(test)]
+mod auth_events_selection_tests {
+    use super::*;
+    use serde_json::json;
+
+    const ROOM: &str = "!r:hs1";
+
+    fn ev(event_type: &str, state_key: Option<&str>, sender: &str, content: Value) -> Pdu {
+        Pdu {
+            event_id: format!("${event_type}:{}", state_key.unwrap_or("-")),
+            room_id: ROOM.to_string(),
+            event_type: event_type.to_string(),
+            state_key: state_key.map(String::from),
+            sender: sender.to_string(),
+            origin_server_ts: 1,
+            content,
+            auth_events: vec![],
+            prev_events: vec![],
+            depth: 1,
+            signatures: None,
+            redacts: None,
+        }
+    }
+
+    fn create() -> Pdu {
+        let mut c = ev("m.room.create", Some(""), "@a:hs1", json!({}));
+        c.room_id = String::new();
+        c
+    }
+    fn pl() -> Pdu {
+        ev("m.room.power_levels", Some(""), "@a:hs1", json!({}))
+    }
+    fn member(user: &str) -> Pdu {
+        ev(
+            "m.room.member",
+            Some(user),
+            user,
+            json!({"membership": "join"}),
+        )
+    }
+    fn join_rules() -> Pdu {
+        ev(
+            "m.room.join_rules",
+            Some(""),
+            "@a:hs1",
+            json!({"join_rule": "public"}),
+        )
+    }
+    fn msg(sender: &str) -> Pdu {
+        ev("m.room.message", None, sender, json!({"body": "hi"}))
+    }
+    fn membership(sender: &str, target: &str, m: &str, extra: Value) -> Pdu {
+        let mut content = json!({"membership": m});
+        if let Some(obj) = extra.as_object() {
+            for (k, v) in obj {
+                content[k] = v.clone();
+            }
+        }
+        ev("m.room.member", Some(target), sender, content)
+    }
+
+    fn check(event: &Pdu, version: RoomVersion, auth: &[&Pdu]) -> AuthResult {
+        check_auth_events_resolved(event, version, auth)
+    }
+    fn reason(r: AuthResult) -> String {
+        match r {
+            Err(AuthError::Rejected(s)) => s,
+            Ok(()) => panic!("expected rejection"),
+        }
+    }
+
+    // --- accepted shapes ---
+
+    #[test]
+    fn message_with_full_selection_passes_in_every_version() {
+        let m = msg("@a:hs1");
+        let (c, p, s) = (create(), pl(), member("@a:hs1"));
+        for v in RoomVersion::all_supported() {
+            let auth: Vec<&Pdu> = if v.include_create_in_auth_events() {
+                vec![&c, &p, &s]
+            } else {
+                vec![&p, &s]
+            };
+            assert_eq!(check(&m, *v, &auth), Ok(()), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn missing_entries_are_not_a_violation() {
+        // A room with no power_levels yet, or a sender citing only create.
+        let c = create();
+        assert_eq!(check(&msg("@a:hs1"), RoomVersion::V11, &[&c]), Ok(()));
+        // v12 with nothing at all cited (no PL event yet, member omitted).
+        assert_eq!(check(&msg("@a:hs1"), RoomVersion::V12, &[]), Ok(()));
+    }
+
+    #[test]
+    fn create_event_with_no_auth_events_passes() {
+        let c = create();
+        for v in RoomVersion::all_supported() {
+            assert_eq!(check(&c, *v, &[]), Ok(()), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn member_event_may_cite_target_join_rules_and_authoriser() {
+        let (c, p, s, t, jr, auth_m) = (
+            create(),
+            pl(),
+            member("@s:hs1"),
+            member("@t:hs2"),
+            join_rules(),
+            member("@auth:hs1"),
+        );
+        let join = membership(
+            "@t:hs2",
+            "@t:hs2",
+            "join",
+            json!({"join_authorised_via_users_server": "@auth:hs1"}),
+        );
+        assert_eq!(
+            check(&join, RoomVersion::V8, &[&c, &p, &t, &jr, &auth_m]),
+            Ok(())
+        );
+        assert_eq!(
+            check(&join, RoomVersion::V12, &[&p, &t, &jr, &auth_m]),
+            Ok(())
+        );
+        let invite = membership("@s:hs1", "@t:hs2", "invite", json!({}));
+        assert_eq!(
+            check(&invite, RoomVersion::V10, &[&c, &p, &s, &t, &jr]),
+            Ok(())
+        );
+        let knock = membership("@t:hs2", "@t:hs2", "knock", json!({}));
+        assert_eq!(check(&knock, RoomVersion::V7, &[&c, &p, &t, &jr]), Ok(()));
+    }
+
+    #[test]
+    fn join_to_join_with_authoriser_still_allowed() {
+        // The selector only adds the authoriser when it differs from
+        // sender/target, but a cited one is never wrong.
+        let (p, t) = (pl(), member("@t:hs2"));
+        let join = membership(
+            "@t:hs2",
+            "@t:hs2",
+            "join",
+            json!({"join_authorised_via_users_server": "@t:hs2"}),
+        );
+        assert_eq!(check(&join, RoomVersion::V12, &[&p, &t]), Ok(()));
+    }
+
+    #[test]
+    fn invite_may_cite_third_party_invite_token() {
+        let (c, p, s) = (create(), pl(), member("@s:hs1"));
+        let tpi = ev(
+            "m.room.third_party_invite",
+            Some("tok"),
+            "@s:hs1",
+            json!({}),
+        );
+        let invite = membership(
+            "@s:hs1",
+            "@t:hs2",
+            "invite",
+            json!({"third_party_invite": {"signed": {"token": "tok"}}}),
+        );
+        assert_eq!(
+            check(&invite, RoomVersion::V11, &[&c, &p, &s, &tpi]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn sender_equals_target_is_one_slot() {
+        let (c, p, s) = (create(), pl(), member("@s:hs1"));
+        let leave = membership("@s:hs1", "@s:hs1", "leave", json!({}));
+        assert_eq!(check(&leave, RoomVersion::V10, &[&c, &p, &s]), Ok(()));
+    }
+
+    // --- rejected shapes ---
+
+    #[test]
+    fn create_in_auth_events_is_tolerated_from_v12() {
+        // Not selected by the spec from v12, but cited by peers in the
+        // wild; a receiver gains nothing by rejecting it.
+        let (c, p, s) = (create(), pl(), member("@a:hs1"));
+        assert_eq!(
+            check(&msg("@a:hs1"), RoomVersion::V12, &[&c, &p, &s]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn missing_create_is_rejected_through_v11() {
+        let (p, s) = (pl(), member("@a:hs1"));
+        for v in [RoomVersion::V6, RoomVersion::V10, RoomVersion::V11] {
+            let r = reason(check(&msg("@a:hs1"), v, &[&p, &s]));
+            assert!(r.contains("no m.room.create"), "{v:?}: {r}");
+        }
+    }
+
+    #[test]
+    fn create_event_citing_anything_is_rejected() {
+        let p = pl();
+        let mut c = create();
+        c.room_id = ROOM.to_string();
+        let r = reason(check(&c, RoomVersion::V12, &[&p]));
+        assert!(r.contains("not selected"), "{r}");
+    }
+
+    #[test]
+    fn unrelated_state_event_is_rejected() {
+        let (p, s) = (pl(), member("@a:hs1"));
+        let name = ev("m.room.name", Some(""), "@a:hs1", json!({"name": "x"}));
+        let r = reason(check(&msg("@a:hs1"), RoomVersion::V12, &[&p, &s, &name]));
+        assert!(r.contains("m.room.name"), "{r}");
+    }
+
+    #[test]
+    fn another_users_member_event_is_rejected_on_a_message() {
+        let (p, s, other) = (pl(), member("@a:hs1"), member("@b:hs1"));
+        let r = reason(check(&msg("@a:hs1"), RoomVersion::V12, &[&p, &s, &other]));
+        assert!(r.contains("@b:hs1"), "{r}");
+    }
+
+    #[test]
+    fn non_state_auth_event_is_rejected() {
+        let (p, s, m) = (pl(), member("@a:hs1"), msg("@a:hs1"));
+        let r = reason(check(&msg("@a:hs1"), RoomVersion::V12, &[&p, &s, &m]));
+        assert!(r.contains("not a state event"), "{r}");
+    }
+
+    #[test]
+    fn duplicate_slot_is_rejected() {
+        let (p, s) = (pl(), member("@a:hs1"));
+        let mut p2 = pl();
+        p2.event_id = "$pl2".into();
+        let r = reason(check(&msg("@a:hs1"), RoomVersion::V12, &[&p, &p2, &s]));
+        assert!(r.contains("duplicate"), "{r}");
+    }
+
+    #[test]
+    fn v12_shape_create_without_room_id_is_not_cross_room() {
+        // What a persisted v12 create looks like: no room_id at all.
+        let (c, p, s) = (create(), pl(), member("@a:hs1"));
+        assert_eq!(c.room_id, "");
+        assert_eq!(
+            check(&msg("@a:hs1"), RoomVersion::V12, &[&c, &p, &s]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn create_from_another_room_is_rejected() {
+        // A pre-v12 create names its room; citing another room's create
+        // would make its sender look like our creator.
+        let mut c = create();
+        c.room_id = "!other:hs1".into();
+        let (p, s) = (pl(), member("@a:hs1"));
+        let r = reason(check(&msg("@a:hs1"), RoomVersion::V10, &[&c, &p, &s]));
+        assert!(r.contains("different room"), "{r}");
+    }
+
+    #[test]
+    fn selector_adds_authoriser_only_from_v8() {
+        use crate::events::builder::select_auth_events;
+        let state_ids =
+            |t: &str, sk: &str| crate::identifiers::EventId::parse(&format!("${t}:{sk}")).ok();
+        let content =
+            json!({"membership": "join", "join_authorised_via_users_server": "@auth:hs1"});
+        let picks = |v: RoomVersion| -> Vec<String> {
+            select_auth_events(
+                "m.room.member",
+                "@s:hs1",
+                Some("@s:hs1"),
+                Some(&content),
+                v,
+                &state_ids,
+            )
+            .into_iter()
+            .map(|e| e.as_str().to_string())
+            .collect()
+        };
+        assert!(
+            !picks(RoomVersion::V7)
+                .iter()
+                .any(|e| e.contains("@auth:hs1"))
+        );
+        assert!(
+            picks(RoomVersion::V8)
+                .iter()
+                .any(|e| e.contains("@auth:hs1"))
+        );
+    }
+
+    #[test]
+    fn foreign_room_auth_event_is_rejected() {
+        let mut p = pl();
+        p.room_id = "!other:hs1".into();
+        let s = member("@a:hs1");
+        let r = reason(check(&msg("@a:hs1"), RoomVersion::V12, &[&p, &s]));
+        assert!(r.contains("different room"), "{r}");
+    }
+
+    #[test]
+    fn join_rules_on_a_leave_is_rejected() {
+        let (c, p, s, jr) = (create(), pl(), member("@s:hs1"), join_rules());
+        let leave = membership("@s:hs1", "@s:hs1", "leave", json!({}));
+        let r = reason(check(&leave, RoomVersion::V10, &[&c, &p, &s, &jr]));
+        assert!(r.contains("m.room.join_rules"), "{r}");
+    }
+
+    #[test]
+    fn third_party_token_on_a_join_is_rejected() {
+        let (p, s) = (pl(), member("@s:hs1"));
+        let tpi = ev(
+            "m.room.third_party_invite",
+            Some("tok"),
+            "@s:hs1",
+            json!({}),
+        );
+        let join = membership(
+            "@s:hs1",
+            "@s:hs1",
+            "join",
+            json!({"third_party_invite": {"signed": {"token": "tok"}}}),
+        );
+        let r = reason(check(&join, RoomVersion::V12, &[&p, &s, &tpi]));
+        assert!(r.contains("m.room.third_party_invite"), "{r}");
+    }
+
+    #[test]
+    fn malformed_token_or_authoriser_selects_nothing() {
+        let (p, s, tpi) = (
+            pl(),
+            member("@s:hs1"),
+            ev(
+                "m.room.third_party_invite",
+                Some("tok"),
+                "@s:hs1",
+                json!({}),
+            ),
+        );
+        let invite = membership(
+            "@s:hs1",
+            "@t:hs2",
+            "invite",
+            json!({"third_party_invite": {"signed": {"token": 7}}}),
+        );
+        assert!(check(&invite, RoomVersion::V12, &[&p, &s, &tpi]).is_err());
+        let auth_m = member("@auth:hs1");
+        let join = membership(
+            "@t:hs2",
+            "@t:hs2",
+            "join",
+            json!({"join_authorised_via_users_server": ["@auth:hs1"]}),
+        );
+        assert!(check(&join, RoomVersion::V12, &[&p, &auth_m]).is_err());
+    }
+
+    #[test]
+    fn authoriser_is_rejected_before_v8_and_on_non_joins() {
+        let (c, p, t, auth_m) = (create(), pl(), member("@t:hs2"), member("@auth:hs1"));
+        let join = membership(
+            "@t:hs2",
+            "@t:hs2",
+            "join",
+            json!({"join_authorised_via_users_server": "@auth:hs1"}),
+        );
+        let r = reason(check(&join, RoomVersion::V7, &[&c, &p, &t, &auth_m]));
+        assert!(r.contains("@auth:hs1"), "{r}");
+        let invite = membership(
+            "@a:hs1",
+            "@t:hs2",
+            "invite",
+            json!({"join_authorised_via_users_server": "@auth:hs1"}),
+        );
+        let a = member("@a:hs1");
+        let r = reason(check(&invite, RoomVersion::V12, &[&p, &a, &t, &auth_m]));
+        assert!(r.contains("@auth:hs1"), "{r}");
+    }
+
+    #[test]
+    fn selector_output_is_within_allowed_set() {
+        // Whatever vela's own selector picks must pass 3.2: pin the two
+        // pieces together so they can't drift apart.
+        use crate::events::builder::select_auth_events;
+        let state_ids =
+            |t: &str, sk: &str| crate::identifiers::EventId::parse(&format!("${t}:{sk}")).ok();
+        for v in RoomVersion::all_supported() {
+            for (ty, sk, content) in [
+                ("m.room.message", None, json!({})),
+                (
+                    "m.room.member",
+                    Some("@t:hs2"),
+                    json!({"membership": "invite"}),
+                ),
+                (
+                    "m.room.member",
+                    Some("@t:hs2"),
+                    json!({"membership": "invite", "third_party_invite": {"signed": {"token": "tok"}}}),
+                ),
+                (
+                    "m.room.member",
+                    Some("@s:hs1"),
+                    json!({"membership": "join", "join_authorised_via_users_server": "@auth:hs1"}),
+                ),
+            ] {
+                let event = ev(ty, sk, "@s:hs1", content.clone());
+                let allowed = allowed_auth_types(&event, *v);
+                for id in select_auth_events(ty, "@s:hs1", sk, Some(&content), *v, &state_ids) {
+                    let (t, k) = id.as_str()[1..].split_once(':').unwrap();
+                    assert!(
+                        allowed.contains(&(t.to_string(), k.to_string())),
+                        "{v:?} {ty}: selector picked ({t},{k}) outside the allowed set"
+                    );
+                }
+            }
+        }
     }
 }

@@ -223,9 +223,12 @@ pub fn sign_unsigned_template(
 /// Sprint 1: populate from DB's current room_state.
 /// Sprint 2 (federation): populate from incoming PDU's auth_events.
 ///
-/// Per spec (server-server-api.md:528-554):
+/// Per spec (server-server-api.md, "Auth events selection"):
 /// - m.room.create: auth_events = []
-/// - All others (v12): power_levels + sender's member + (for m.room.member: target's member, join_rules)
+/// - all others: create (through v11), power_levels, sender's member
+/// - m.room.member adds: target's member; join_rules on join/invite/knock;
+///   the third-party-invite token event on an invite carrying one; the
+///   authoriser's member on a restricted join (v8+)
 /// - v12: m.room.create MUST NOT be included
 pub fn select_auth_events(
     event_type: &str,
@@ -280,11 +283,25 @@ pub fn select_auth_events(
             auth.push(eid);
         }
 
+        // An invite redeemed from a third-party invite cites the
+        // m.room.third_party_invite event whose token it carries; the
+        // membership rules verify the signature against that event.
+        if membership == "invite"
+            && let Some(token) = content
+                .and_then(|c| c.pointer("/third_party_invite/signed/token"))
+                .and_then(|t| t.as_str())
+            && let Some(eid) = current_state("m.room.third_party_invite", token)
+        {
+            auth.push(eid);
+        }
+
         // Per server-server spec auth_events selection: when a join carries
         // `join_authorised_via_users_server`, that user's current member
         // event MUST be in auth_events so the rule engine can verify the
-        // authoriser is joined and powered to invite.
+        // authoriser is joined and powered to invite. The field only means
+        // something from v8 (restricted joins); before that it is ignored.
         if membership == "join"
+            && room_version.supports_restricted_joins()
             && let Some(authoriser) = content
                 .and_then(|c| c.get("join_authorised_via_users_server"))
                 .and_then(|v| v.as_str())
@@ -327,6 +344,33 @@ mod tests {
     /// auth events"); a v12 message MUST NOT (MSC4291: implied by the
     /// room id). Regression test for the interop finding where the
     /// boundary sat at v11 and federated v11 messages were rejected.
+    #[test]
+    fn invite_with_third_party_token_cites_the_tpi_event() {
+        let mut state = HashMap::<(String, String), EventId>::new();
+        let tpi_eid = EventId::from_reference_hash("tpi");
+        state.insert(
+            ("m.room.third_party_invite".into(), "tok".into()),
+            tpi_eid.clone(),
+        );
+        let lookup = |t: &str, sk: &str| state.get(&(t.to_string(), sk.to_string())).cloned();
+        let select = |content: serde_json::Value| {
+            select_auth_events(
+                "m.room.member",
+                "@alice:example.com",
+                Some("@bob:other.example"),
+                Some(&content),
+                RoomVersion::V12,
+                &lookup,
+            )
+        };
+        let with_token = |m: &str| serde_json::json!({"membership": m, "third_party_invite": {"signed": {"token": "tok"}}});
+        assert!(select(with_token("invite")).contains(&tpi_eid));
+        assert!(!select(serde_json::json!({"membership": "invite"})).contains(&tpi_eid));
+        assert!(!select(with_token("join")).contains(&tpi_eid));
+        let bad = serde_json::json!({"membership": "invite", "third_party_invite": {"signed": {"token": 7}}});
+        assert!(!select(bad).contains(&tpi_eid));
+    }
+
     #[test]
     fn message_auth_includes_create_through_v11_not_v12() {
         let mut state = HashMap::<(String, String), EventId>::new();

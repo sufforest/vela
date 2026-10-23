@@ -25,7 +25,7 @@ use vela_core::federation::keys::{decode_public_key, verify_event_signature};
 use vela_core::identifiers::EventId;
 use vela_core::identifiers::Nid;
 
-use crate::federation::federation_state::{ensure_create_in_state, load_pdu_by_event_id};
+use crate::federation::federation_state::load_pdu_by_event_id;
 use crate::middleware::federation_auth::{VerifiedBody, XMatrixOrigin};
 use crate::router::AppState;
 
@@ -329,15 +329,35 @@ pub async fn send_leave_v2(
 
     // Run standard auth via the rule engine. Build a state view from the
     // event's auth_events + (v12) injected create.
-    let mut auth_state = std::collections::HashMap::new();
+    let mut auth_pdus: Vec<Pdu> = Vec::new();
     for aev in &pdu.auth_events {
-        if let Some(p) = load_pdu_by_event_id(&state.db, aev)
-            && let Some(sk) = p.state_key.as_deref()
-        {
-            auth_state.insert((p.event_type.clone(), sk.to_string()), p);
-        }
+        // We handed out these auth events in make_leave; one we
+        // can't find is not something we can vouch for.
+        let Some(p) = load_pdu_by_event_id(&state.db, aev) else {
+            warn!(%event_id, auth_event = %aev, "send_leave rejected: unknown auth event");
+            return Err(err(
+                StatusCode::FORBIDDEN,
+                "M_FORBIDDEN",
+                "unknown auth event",
+            ));
+        };
+        auth_pdus.push(p);
     }
-    ensure_create_in_state(&state.db, room_nid, &mut auth_state);
+    let auth_state = crate::federation::federation_state::auth_state_from_auth_events(
+        &state.db,
+        room_nid,
+        &pdu,
+        send_leave_room_version,
+        auth_pdus,
+    )
+    .map_err(|reason| {
+        warn!(%event_id, %reason, "send_leave rejected");
+        err(
+            StatusCode::FORBIDDEN,
+            "M_FORBIDDEN",
+            &format!("auth check failed: {reason}"),
+        )
+    })?;
     let auth_fn = |t: &str, sk: &str| auth_state.get(&(t.to_string(), sk.to_string()));
     if let Err(AuthError::Rejected(reason)) = check_auth(&pdu, &auth_fn) {
         warn!(%event_id, %reason, "send_leave rejected");
