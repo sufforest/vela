@@ -75,6 +75,10 @@ pub struct ServerConfig {
     /// Maximum upload size in bytes. Enforced both at the global body
     /// limit layer and inside the media upload handler. Default 50 MiB.
     pub max_upload_size: u64,
+    /// Disk budget for media cached from other servers, in bytes;
+    /// least recently read files go first when it is exceeded. `0`
+    /// disables the budget.
+    pub remote_media_cache_max_bytes: u64,
     /// Cap on one account-data value's serialized size (also applied,
     /// growth-only, to the merged `m.push_rules` blob). `0` disables.
     /// Default 1 MiB — a guard-rail against runaway blobs, not a quota:
@@ -334,6 +338,11 @@ pub struct AppState {
     /// session writes are inherently race-free; this lock protects
     /// the (read, modify, write) cycles on version metadata + stats.
     pub key_backup_user_locks: Arc<DashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
+    /// Single-flight guard for remote media fetches, keyed by
+    /// `{origin}\0{media_id}`. N clients asking for the same uncached
+    /// remote file at once produce one federation fetch; the entry is
+    /// dropped once no request holds it.
+    pub remote_media_locks: Arc<DashMap<String, Arc<media::RemoteFetchSlot>>>,
     pub room_senders: Arc<DashMap<Nid, tokio::sync::broadcast::Sender<u64>>>,
     /// In-memory typing state: room_nid → [(user_nid, expires_at_ms)]
     pub typing_state: Arc<DashMap<u64, Vec<(u64, u64)>>>,

@@ -68,6 +68,13 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // into a later /sync window for the observer.
     "device_list_edu_seen",
     "media_metadata",
+    // Remote media fetched over federation and kept locally. Key:
+    // `{origin}\0{media_id}`; value JSON `{ blob_id, content_type,
+    // filename, size, cached_at, last_access_at }`. The blob sits in
+    // the media store under `blob_id`, with NO `media_metadata` row,
+    // so it is never servable under our own server name. Swept by
+    // the retention task on `last_access_at`.
+    "remote_media_cache",
     "receipts",
     // Generic small-value position tracking. Keys are
     // `<purpose-prefix>:<scope-bytes>`, values are u64 BE-encoded

@@ -772,7 +772,7 @@ pub async fn query_profile(
 /// the value is already a UTF-8 string; the spec-critical bit is the
 /// **port**: it MUST be 1-5 decimal digits when present, and a
 /// non-numeric port (e.g. `localhost:http`) MUST be rejected with 400.
-fn is_valid_server_name(s: &str) -> bool {
+pub(crate) fn is_valid_server_name(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }

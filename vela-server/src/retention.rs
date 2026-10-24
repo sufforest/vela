@@ -1,7 +1,7 @@
 //! Periodic data retention sweeps.
 //!
-//! Today this covers media only — local user uploads and (forward-
-//! looking) cached remote media expire on independent timelines. Event
+//! Today this covers media only — local user uploads and cached remote
+//! media expire on independent timelines. Event
 //! retention via MSC1763 / server-default purge is Pass 5 work; the
 //! retention story for events is more delicate (auth chain, state
 //! resolution) and gets its own design pass.
@@ -117,9 +117,10 @@ pub struct SweepReport {
     pub skipped: usize,
 }
 
-/// Run a single media-retention pass. For each metadata row: classify
-/// as local-or-remote by uploader's server, compare `created_at`
-/// against the matching lifetime, delete blob + metadata if expired.
+/// Run a single media-retention pass. Local uploads: classify each
+/// metadata row by uploader's server, compare `created_at` against the
+/// matching lifetime, delete blob + metadata if expired. Cached remote
+/// media: expire by `last_access_at` against the remote lifetime.
 pub async fn run_one_media_pass(
     db: &Database,
     media_store: &dyn MediaStore,
@@ -163,6 +164,51 @@ pub async fn run_one_media_pass(
             continue;
         }
         report.deleted += 1;
+    }
+
+    // Remote media fetched over federation lives in its own table and
+    // ages by last use, not by upload time: a file nobody has opened for
+    // `remote_media_lifetime` goes, a file opened yesterday stays.
+    if let Some(lifetime) = config.remote_media_lifetime {
+        let rows = db
+            .list_remote_media()
+            .map_err(|e| anyhow::anyhow!("list remote media: {e}"))?;
+        for (origin, media_id, row) in rows {
+            report.examined += 1;
+            let last_access = row
+                .get("last_access_at")
+                .or_else(|| row.get("cached_at"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if now_ms.saturating_sub(last_access) < lifetime.as_millis() as u64 {
+                report.skipped += 1;
+                continue;
+            }
+            debug!(%origin, %media_id, "retention: expiring cached remote media");
+            let blob_id = row.get("blob_id").and_then(|v| v.as_str());
+            if let Some(blob_id) = blob_id
+                && let Err(e) = media_store.delete(blob_id).await
+            {
+                warn!(%origin, %media_id, error = %e, "retention: remote blob delete failed; row kept");
+                continue;
+            }
+            // A read that raced us may have refetched the file under a new
+            // blob; leave that fresh row alone.
+            let current = db.get_remote_media(&origin, &media_id).ok().flatten();
+            let current_blob = current
+                .as_ref()
+                .and_then(|r| r.get("blob_id"))
+                .and_then(|v| v.as_str());
+            if current_blob != blob_id {
+                report.skipped += 1;
+                continue;
+            }
+            if let Err(e) = db.delete_remote_media(&origin, &media_id) {
+                warn!(%origin, %media_id, error = %e, "retention: remote row delete failed; will retry next sweep");
+                continue;
+            }
+            report.deleted += 1;
+        }
     }
     Ok(report)
 }
@@ -284,6 +330,91 @@ mod tests {
         assert!(media_store.get("local0001").await.unwrap().is_none());
         assert!(db.get_media_metadata("remote0001").unwrap().is_some());
         assert!(media_store.get("remote0001").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn remote_cache_rows_age_by_last_access() {
+        let (db, _tmp) = build_db();
+        let media_dir = tempfile::tempdir().unwrap();
+        let media_store: Arc<dyn MediaStore> =
+            Arc::new(FilesystemMediaStore::new(media_dir.path()).unwrap());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let day = 24 * 3600 * 1000;
+
+        // Cached 40 days ago but opened yesterday: stays. Cached and last
+        // opened 40 days ago: goes. Row with no access field falls back
+        // to cached_at.
+        media_store.put("blobhot0", b"hot").await.unwrap();
+        media_store.put("blobcold", b"cold").await.unwrap();
+        media_store.put("blobnoac", b"noac").await.unwrap();
+        db.set_remote_media(
+            "remote.example",
+            "hot",
+            &json!({"blob_id": "blobhot0", "cached_at": now_ms - 40 * day, "last_access_at": now_ms - day}),
+        )
+        .unwrap();
+        db.set_remote_media(
+            "remote.example",
+            "cold",
+            &json!({"blob_id": "blobcold", "cached_at": now_ms - 40 * day, "last_access_at": now_ms - 40 * day}),
+        )
+        .unwrap();
+        db.set_remote_media(
+            "other.example",
+            "noaccess",
+            &json!({"blob_id": "blobnoac", "cached_at": now_ms - 40 * day}),
+        )
+        .unwrap();
+
+        let cfg = RetentionConfig {
+            enabled: true,
+            interval: Duration::from_secs(86400),
+            local_media_lifetime: None,
+            remote_media_lifetime: Some(Duration::from_secs(30 * 86400)),
+            server_name: "vela.example".into(),
+        };
+        let report = run_one_media_pass(db.as_ref(), media_store.as_ref(), &cfg)
+            .await
+            .unwrap();
+        assert_eq!(report.examined, 3);
+        assert_eq!(report.deleted, 2);
+        assert_eq!(report.skipped, 1);
+        assert!(
+            db.get_remote_media("remote.example", "hot")
+                .unwrap()
+                .is_some()
+        );
+        assert!(media_store.get("blobhot0").await.unwrap().is_some());
+        assert!(
+            db.get_remote_media("remote.example", "cold")
+                .unwrap()
+                .is_none()
+        );
+        assert!(media_store.get("blobcold").await.unwrap().is_none());
+        assert!(
+            db.get_remote_media("other.example", "noaccess")
+                .unwrap()
+                .is_none()
+        );
+        assert!(media_store.get("blobnoac").await.unwrap().is_none());
+
+        // Lifetime "forever" leaves the remote table alone entirely.
+        let forever = RetentionConfig {
+            remote_media_lifetime: None,
+            ..cfg
+        };
+        let report = run_one_media_pass(db.as_ref(), media_store.as_ref(), &forever)
+            .await
+            .unwrap();
+        assert_eq!(report.examined, 0);
+        assert!(
+            db.get_remote_media("remote.example", "hot")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
