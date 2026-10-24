@@ -95,6 +95,72 @@ pub fn auth_state_from_auth_events(
     Ok(auth_state)
 }
 
+/// Result of a log-only structural check of an event's `auth_events`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuthShape {
+    /// Every cited auth event resolved and the citation passes the
+    /// selection rules.
+    Ok,
+    /// Some cited auth events are not persisted, so the shape cannot be
+    /// judged. Carries how many.
+    Skipped(usize),
+    /// Cited events resolved but violate the selection rules (3.1, 3.2,
+    /// 3.4, 3.5). Carries the reason.
+    Violation(String),
+}
+
+/// Structural `auth_events` check without enforcement, for ingestion
+/// paths that do not run full auth (backfill, the state and auth chain of
+/// an outbound join). The live receive path rejects on the same rules;
+/// here a violation is only reported so we learn whether these paths see
+/// malformed citations before deciding to reject there too.
+pub fn audit_auth_events_shape(
+    event: &Pdu,
+    version: RoomVersion,
+    load: impl Fn(&str) -> Option<Pdu>,
+) -> AuthShape {
+    let mut auth_pdus = Vec::with_capacity(event.auth_events.len());
+    let mut missing = 0usize;
+    for id in &event.auth_events {
+        match load(id) {
+            Some(p) => auth_pdus.push(p),
+            None => missing += 1,
+        }
+    }
+    if missing > 0 {
+        return AuthShape::Skipped(missing);
+    }
+    let refs: Vec<&Pdu> = auth_pdus.iter().collect();
+    match check_auth_events_resolved(event, version, &refs) {
+        Ok(()) => AuthShape::Ok,
+        Err(AuthError::Rejected(reason)) => AuthShape::Violation(reason),
+    }
+}
+
+/// `audit_auth_events_shape` against persisted events, logged under
+/// `site`. A violation is a warning, a skip is debug noise. Callers skip
+/// redacted events: redaction strips the content the selection rules
+/// read for third-party invites and restricted joins in older room
+/// versions, so a legitimately redacted member event would look malformed.
+pub fn log_auth_events_shape(db: &Database, event: &Pdu, version: RoomVersion, site: &str) {
+    match audit_auth_events_shape(event, version, |id| load_pdu_by_event_id(db, id)) {
+        AuthShape::Ok => {}
+        AuthShape::Skipped(missing) => tracing::debug!(
+            site,
+            event_id = %event.event_id,
+            missing,
+            "auth_events shape not checked: cited events not persisted"
+        ),
+        AuthShape::Violation(reason) => tracing::warn!(
+            site,
+            event_id = %event.event_id,
+            event_type = %event.event_type,
+            %reason,
+            "auth_events shape violation (log-only on this path)"
+        ),
+    }
+}
+
 /// Insert `m.room.create` into a state map from persisted state if it's
 /// not already present (v12/MSC4291: create is excluded from auth_events).
 ///
@@ -474,4 +540,97 @@ pub fn auth_chain_union_pdu_json(db: &Database, roots: &[&str]) -> Result<Vec<Va
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod auth_shape_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn pdu(id: &str, body: Value) -> Pdu {
+        let mut obj = body.as_object().unwrap().clone();
+        obj.entry("room_id").or_insert(json!("!r:a.example"));
+        obj.entry("sender").or_insert(json!("@a:a.example"));
+        obj.entry("content").or_insert(json!({}));
+        obj.entry("origin_server_ts").or_insert(json!(1));
+        obj.entry("depth").or_insert(json!(1));
+        obj.entry("prev_events").or_insert(json!([]));
+        obj.entry("auth_events").or_insert(json!([]));
+        Pdu::from_json(id.to_string(), &obj).expect("pdu")
+    }
+
+    fn fixtures() -> std::collections::HashMap<String, Pdu> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "$create".into(),
+            pdu("$create", json!({"type": "m.room.create", "state_key": "", "content": {"room_version": "10"}})),
+        );
+        m.insert(
+            "$pl".into(),
+            pdu(
+                "$pl",
+                json!({"type": "m.room.power_levels", "state_key": ""}),
+            ),
+        );
+        m.insert(
+            "$join".into(),
+            pdu("$join", json!({"type": "m.room.member", "state_key": "@a:a.example", "content": {"membership": "join"}})),
+        );
+        m.insert(
+            "$topic".into(),
+            pdu("$topic", json!({"type": "m.room.topic", "state_key": ""})),
+        );
+        m
+    }
+
+    fn audit(auth_events: Vec<&str>) -> AuthShape {
+        let fx = fixtures();
+        let ev = pdu(
+            "$msg",
+            json!({"type": "m.room.message", "auth_events": auth_events}),
+        );
+        audit_auth_events_shape(&ev, RoomVersion::V10, |id| fx.get(id).cloned())
+    }
+
+    #[test]
+    fn well_formed_citation_is_ok() {
+        assert_eq!(audit(vec!["$create", "$pl", "$join"]), AuthShape::Ok);
+    }
+
+    #[test]
+    fn unselected_state_event_is_a_violation() {
+        match audit(vec!["$create", "$pl", "$join", "$topic"]) {
+            AuthShape::Violation(reason) => assert!(reason.contains("m.room.topic"), "{reason}"),
+            other => panic!("expected violation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_create_is_a_violation_below_v12() {
+        assert!(matches!(
+            audit(vec!["$pl", "$join"]),
+            AuthShape::Violation(_)
+        ));
+    }
+
+    #[test]
+    fn unresolved_citation_is_skipped_not_judged() {
+        assert_eq!(
+            audit(vec!["$create", "$pl", "$join", "$ghost"]),
+            AuthShape::Skipped(1)
+        );
+    }
+
+    #[test]
+    fn v12_without_create_citation_is_ok() {
+        let fx = fixtures();
+        let ev = pdu(
+            "$msg",
+            json!({"type": "m.room.message", "auth_events": ["$pl", "$join"]}),
+        );
+        assert_eq!(
+            audit_auth_events_shape(&ev, RoomVersion::V12, |id| fx.get(id).cloned()),
+            AuthShape::Ok
+        );
+    }
 }

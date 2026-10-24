@@ -661,6 +661,7 @@ pub(crate) async fn persist_remote_event(
         .and_then(|h| h.get("sha256"))
         .and_then(|v| v.as_str());
     let computed = compute_content_hash(obj);
+    let redacted = !matches!(declared, Some(d) if d == computed);
     let to_persist: Map<String, Value> = match declared {
         Some(d) if d == computed => obj.clone(),
         _ => vela_core::events::redact::redact_event_for_version(obj, event_room_version),
@@ -707,6 +708,17 @@ pub(crate) async fn persist_remote_event(
                 debug!(event_id = %event_id, auth_event = %aid, error = %e, "outbound_join state: auth_event lookup error")
             }
         }
+    }
+
+    // Log-only shape audit; only judged when every cited event is known
+    // and the event was not redacted on the way in.
+    if !redacted && auth_nids.len() == pdu.auth_events.len() {
+        crate::federation::federation_state::log_auth_events_shape(
+            &state.db,
+            &pdu,
+            event_room_version,
+            "persist_remote_event",
+        );
     }
 
     let event_nid = state.db.next_nid()?;

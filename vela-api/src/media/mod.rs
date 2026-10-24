@@ -1230,12 +1230,7 @@ fn check_remote_media_ref(origin: &str, media_id: &str) -> Result<(), ApiError> 
         && media_id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-    // Server names are printable ASCII; the grammar check below does not
-    // look at the character set, and a control byte would otherwise reach
-    // the signed request headers.
-    let origin_ok = origin.len() <= 255
-        && origin.bytes().all(|b| b.is_ascii_graphic())
-        && crate::federation::federation_fetch::is_valid_server_name(origin);
+    let origin_ok = crate::federation::federation_client::check_destination(origin).is_ok();
     if !id_ok || !origin_ok {
         return Err(ApiError(VelaError::NotFound("media not found".into())));
     }

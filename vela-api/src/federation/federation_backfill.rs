@@ -219,6 +219,7 @@ async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Res
         .and_then(|h| h.get("sha256"))
         .and_then(|v| v.as_str());
     let computed = compute_content_hash(obj);
+    let redacted = !matches!(declared, Some(d) if d == computed);
     let to_persist = match declared {
         Some(d) if d == computed => obj.clone(),
         _ => vela_core::events::redact::redact_event_for_version(obj, event_room_version),
@@ -266,6 +267,17 @@ async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Res
                 debug!(%event_id, auth_event = %aid, error = %e, "backfill: auth_event lookup error")
             }
         }
+    }
+
+    // Log-only shape audit; only judged when every cited event is known
+    // and the event was not redacted on the way in.
+    if !redacted && auth_nids.len() == pdu.auth_events.len() {
+        crate::federation::federation_state::log_auth_events_shape(
+            &state.db,
+            &pdu,
+            event_room_version,
+            "backfill",
+        );
     }
 
     let event_nid = state.db.next_nid()?;
