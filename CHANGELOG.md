@@ -29,6 +29,12 @@ minor versions.
 
 ### Security
 
+- **Federation client destination check.** A server name taken from client
+  input (an mxc origin, the server part of a user id, a `server_name` hint)
+  is validated before it is resolved or a signed request is built; a control
+  character in it used to hit a panic while building the Authorization
+  header, and other garbage cost DNS and well-known lookups.
+
 - **Password-path hardening.** All argon2 hashing/verification now runs in
   one module, off the async runtime and capped at core-count concurrency
   (bounds worst-case hashing memory under a login flood). Login and UIA

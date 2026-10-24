@@ -486,6 +486,7 @@ impl FederationClient {
         if !self.enabled {
             return Err(FederationClientError::FederationDisabled);
         }
+        check_destination(destination)?;
         // Test override short-circuits the resolve + HTTPS path: when set,
         // we use plain HTTP via the default client to the given base URL.
         let (url, host_header, client) =
@@ -512,7 +513,7 @@ impl FederationClient {
             path_and_query,
             destination,
             body.as_ref(),
-        );
+        )?;
 
         let mut req = client
             .request(method, &url)
@@ -1052,6 +1053,7 @@ impl FederationClient {
         if !self.enabled {
             return Err(FederationClientError::FederationDisabled);
         }
+        check_destination(destination)?;
         let path = format!("/_matrix/federation/v1/media/download/{media_id}");
 
         let (url, host_header, client) =
@@ -1074,7 +1076,7 @@ impl FederationClient {
                 )
             };
         let auth_header =
-            self.sign_federation_request(reqwest::Method::GET.as_str(), &path, destination, None);
+            self.sign_federation_request(reqwest::Method::GET.as_str(), &path, destination, None)?;
 
         let mut req = client
             .request(reqwest::Method::GET, &url)
@@ -1527,13 +1529,18 @@ impl FederationClient {
     ///  "content": <body-if-any>}
     /// ```
     /// `content` is omitted entirely for requests without a body (e.g. GET).
+    ///
+    /// `destination` is checked again here (the request paths check it
+    /// before resolving) so a caller that only builds a header cannot
+    /// hand it a name the header grammar cannot carry.
     pub fn sign_federation_request(
         &self,
         method: &str,
         uri: &str,
         destination: &str,
         body: Option<&Value>,
-    ) -> HeaderValue {
+    ) -> Result<HeaderValue, FederationClientError> {
+        check_destination(destination)?;
         let header_str = build_x_matrix_header(
             &self.signing_key,
             &self.our_server_name,
@@ -1542,8 +1549,32 @@ impl FederationClient {
             destination,
             body,
         );
-        HeaderValue::from_str(&header_str).expect("signed header is ASCII")
+        HeaderValue::from_str(&header_str)
+            .map_err(|e| FederationClientError::Http(format!("authorization header: {e}")))
     }
+}
+
+/// Reject a destination server name before it reaches the resolver or the
+/// signed request. Destinations often come straight from a client (the
+/// server part of a user id, an mxc origin, a `?server_name` hint), so
+/// they are checked rather than trusted: server-name grammar, the
+/// characters that grammar allows, and a 255-byte hostname plus port.
+/// Anything else would otherwise cost DNS and .well-known lookups and,
+/// before this check existed, could break the Authorization header.
+pub(crate) fn check_destination(destination: &str) -> Result<(), FederationClientError> {
+    let charset_ok = destination
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':' | b'[' | b']'));
+    if destination.is_empty()
+        || destination.len() > 255 + ":65535".len()
+        || !charset_ok
+        || !crate::federation::federation_fetch::is_valid_server_name(destination)
+    {
+        return Err(FederationClientError::Http(format!(
+            "invalid destination server name {destination:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// Build the X-Matrix Authorization header value. Extracted as a free function
@@ -2136,6 +2167,58 @@ mod tests {
     }
 
     // --- X-Matrix signing tests ---
+
+    #[test]
+    fn bad_destination_is_an_error_not_a_panic() {
+        use crate::federation::federation_resolver::FederationResolver;
+        use std::sync::Arc;
+        let key = Arc::new(ServerSigningKey::generate());
+        let resolver = Arc::new(FederationResolver::new().unwrap());
+        let client = FederationClient::new(key, "us.example".into(), resolver, Vec::new());
+        for bad in [
+            "",
+            "bad\0name",
+            "two words",
+            "tab\there",
+            "ünïcode.example",
+            "a\",sig=\"x",
+            "hs1:http",
+            "[1234::abcd",
+        ] {
+            assert!(
+                client
+                    .sign_federation_request("GET", "/x", bad, None)
+                    .is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(
+            client
+                .sign_federation_request("GET", "/x", "ok.example:8448", None)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_media_rejects_bad_destination_before_resolving() {
+        use crate::federation::federation_resolver::FederationResolver;
+        use std::sync::Arc;
+        let key = Arc::new(ServerSigningKey::generate());
+        let resolver = Arc::new(FederationResolver::new().unwrap());
+        let client = FederationClient::new(key, "us.example".into(), resolver, Vec::new());
+        // No base-url override: the check has to fire before the resolver
+        // would otherwise try DNS for this name.
+        let err = client
+            .fetch_media("bad\0name", "abc", 1024)
+            .await
+            .unwrap_err();
+        match err {
+            FederationClientError::Http(msg) => {
+                assert!(msg.contains("invalid destination"), "{msg}")
+            }
+            other => panic!("expected destination error, got {other}"),
+        }
+    }
 
     #[test]
     fn client_cache_keys_by_sni_and_port() {
