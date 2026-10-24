@@ -10,6 +10,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
+use dashmap::DashMap;
 use futures::TryStreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -481,7 +482,13 @@ async fn download_inner(
     Path((server_name, media_id, filename_override)): Path<(String, String, Option<String>)>,
 ) -> Result<Response, ApiError> {
     if server_name != state.config.server_name {
-        return download_remote(&state, &server_name, &media_id).await;
+        return download_remote(
+            &state,
+            &server_name,
+            &media_id,
+            filename_override.as_deref(),
+        )
+        .await;
     }
 
     let metadata = state
@@ -1148,40 +1155,52 @@ async fn download_remote(
     state: &AppState,
     server_name: &str,
     media_id: &str,
+    filename_override: Option<&str>,
 ) -> Result<Response, ApiError> {
-    let media = state
-        .federation_client
-        .fetch_media(server_name, media_id, state.config.max_upload_size as usize)
-        .await
-        .map_err(|e| {
-            tracing::debug!(remote = %server_name, %media_id, error = %e, "federation media fetch failed");
-            ApiError(VelaError::NotFound("remote media unavailable".into()))
-        })?;
-    media_response(media)
+    check_remote_media_ref(server_name, media_id)?;
+    // Cache hit: stream the blob, as the local path does; only a miss
+    // (and the thumbnailer) needs the whole file in memory.
+    if let Some((row, reader)) = lookup_remote_cache(state, server_name, media_id).await? {
+        let size = row.get("size").and_then(|v| v.as_u64());
+        let content_type = row_content_type(&row);
+        let filename = filename_override
+            .map(str::to_string)
+            .or_else(|| row_filename(&row));
+        let mut builder = with_media_security_headers(Response::builder().status(StatusCode::OK))
+            .header(header::CONTENT_TYPE, content_type);
+        if let Some(size) = size {
+            builder = builder.header(header::CONTENT_LENGTH, size.to_string());
+        }
+        if let Some(filename) = filename.filter(|f| !f.is_empty()) {
+            builder = builder.header(
+                header::CONTENT_DISPOSITION,
+                format_content_disposition(&filename),
+            );
+        }
+        return builder
+            .body(Body::from_stream(ReaderStream::new(reader)))
+            .map_err(|e| ApiError(VelaError::Unknown(e.to_string())));
+    }
+    let media = fetch_remote_original(state, server_name, media_id).await?;
+    media_response(media, filename_override)
 }
 
-/// Thumbnail of remote media: fetch the original over federation and
-/// resize it with the same thumbnailer as local media, so a client gets
-/// one size policy whichever server holds the file. Non-image content and
-/// undecodable bytes are served as the original, as the local path does.
-/// The fetch is bounded by `max_upload_size`; nothing is cached, so every
-/// request costs one federation fetch (as remote downloads already do).
+/// Thumbnail of remote media: take the original from the cache (fetching
+/// it over federation on a miss) and resize it with the same thumbnailer
+/// as local media, so a client gets one size policy whichever server
+/// holds the file. Non-image content and undecodable bytes are served as
+/// the original, as the local path does. Thumbnails themselves are not
+/// cached, matching the local path.
 async fn download_remote_thumbnail(
     state: &AppState,
     server_name: &str,
     media_id: &str,
     q: &ThumbnailQuery,
 ) -> Result<Response, ApiError> {
-    let media = state
-        .federation_client
-        .fetch_media(server_name, media_id, state.config.max_upload_size as usize)
-        .await
-        .map_err(|e| {
-            tracing::debug!(remote = %server_name, %media_id, error = %e, "federation media fetch failed");
-            ApiError(VelaError::NotFound("remote media unavailable".into()))
-        })?;
+    check_remote_media_ref(server_name, media_id)?;
+    let media = fetch_remote_original(state, server_name, media_id).await?;
     if !media.content_type.starts_with("image/") {
-        return media_response(media);
+        return media_response(media, None);
     }
     let width = q.width.unwrap_or(96);
     let height = q.height.unwrap_or(96);
@@ -1197,21 +1216,403 @@ async fn download_remote_thumbnail(
         }
         Err(e) => {
             tracing::debug!(remote = %server_name, %media_id, error = %e, "remote media not thumbnailable; serving the original");
-            media_response(media)
+            media_response(media, None)
         }
     }
 }
 
-fn media_response(media: MediaResponse) -> Result<Response, ApiError> {
+/// Reject references we would never have handed out ourselves before
+/// they reach federation or the cache: the spec recommends restricting
+/// media ids to `[A-Za-z0-9_-]`, and the origin must parse as a server
+/// name. Anything else cannot exist, so it is a plain 404.
+fn check_remote_media_ref(origin: &str, media_id: &str) -> Result<(), ApiError> {
+    let id_ok = !media_id.is_empty()
+        && media_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    // Server names are printable ASCII; the grammar check below does not
+    // look at the character set, and a control byte would otherwise reach
+    // the signed request headers.
+    let origin_ok = origin.len() <= 255
+        && origin.bytes().all(|b| b.is_ascii_graphic())
+        && crate::federation::federation_fetch::is_valid_server_name(origin);
+    if !id_ok || !origin_ok {
+        return Err(ApiError(VelaError::NotFound("media not found".into())));
+    }
+    Ok(())
+}
+
+/// `last_access_at` on a cached remote row is rewritten at most this
+/// often, so a hot file does not cost a store write per read. The
+/// retention sweeper evicts on this field, so the cache ages by last use
+/// at hour granularity.
+const REMOTE_ACCESS_TOUCH_MS: u64 = 60 * 60 * 1000;
+
+fn remote_media_lock_key(origin: &str, media_id: &str) -> String {
+    format!("{origin}\0{media_id}")
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn store_err(e: impl std::fmt::Display) -> ApiError {
+    ApiError(VelaError::Store(e.to_string()))
+}
+
+fn row_content_type(row: &Value) -> String {
+    row.get("content_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("application/octet-stream")
+        .to_string()
+}
+
+fn row_filename(row: &Value) -> Option<String> {
+    row.get("filename")
+        .and_then(|v| v.as_str())
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+}
+
+/// Why a federation fetch of a remote file failed, in client terms.
+/// `Copy` so one fetch's failure can be handed to every request that
+/// queued behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteFetchFailure {
+    /// Peer said 404 with a real not-found code.
+    NotFound,
+    /// Peer said 504: an MSC2246 reservation without bytes yet.
+    NotYetUploaded,
+    /// Peer said 413, or the body crossed our cap.
+    TooLarge,
+    /// Peer answered 404 M_UNRECOGNIZED: it predates authenticated media
+    /// and we have no legacy fallback, so the file may well exist.
+    LegacyPeer,
+    /// Transport failure, 5xx, unparsable body.
+    Unavailable,
+}
+
+impl RemoteFetchFailure {
+    fn into_error(self) -> ApiError {
+        match self {
+            Self::NotFound => ApiError(VelaError::NotFound("remote media not found".into())),
+            Self::NotYetUploaded => custom_media_err(
+                504,
+                "M_NOT_YET_UPLOADED",
+                "remote media is reserved but not yet uploaded",
+            ),
+            Self::TooLarge => {
+                custom_media_err(502, "M_TOO_LARGE", "remote media exceeds the size limit")
+            }
+            Self::LegacyPeer => custom_media_err(
+                502,
+                "M_UNKNOWN",
+                "remote server does not serve authenticated media",
+            ),
+            Self::Unavailable => custom_media_err(502, "M_UNKNOWN", "remote media unavailable"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RemoteFetchOutcome {
+    /// The bytes themselves, so waiters are answered even when the file
+    /// could not be cached (over budget, storage failure).
+    Fetched(MediaResponse),
+    Failed(RemoteFetchFailure),
+}
+
+/// Single-flight slot for one `(origin, media_id)`. The first request
+/// through the mutex fetches and records the outcome; requests that were
+/// already queued behind it get that outcome instead of fetching again,
+/// so a dead peer costs one timeout, not one per waiting client. The
+/// slot leaves the map when the last request holding it finishes.
+pub struct RemoteFetchSlot(tokio::sync::Mutex<Option<RemoteFetchOutcome>>);
+
+/// Holds a slot for the duration of one request and removes it from the
+/// map on drop, including when the request is cancelled or errors out
+/// early. The map entry is only removed once no other request holds it:
+/// a newcomer clones under the shard lock before our check runs.
+struct SlotGuard {
+    map: std::sync::Arc<DashMap<String, std::sync::Arc<RemoteFetchSlot>>>,
+    key: String,
+    slot: Option<std::sync::Arc<RemoteFetchSlot>>,
+}
+
+impl SlotGuard {
+    fn acquire(state: &AppState, origin: &str, media_id: &str) -> Self {
+        let key = remote_media_lock_key(origin, media_id);
+        let slot = state
+            .remote_media_locks
+            .entry(key.clone())
+            .or_insert_with(|| std::sync::Arc::new(RemoteFetchSlot(tokio::sync::Mutex::new(None))))
+            .clone();
+        Self {
+            map: state.remote_media_locks.clone(),
+            key,
+            slot: Some(slot),
+        }
+    }
+
+    fn slot(&self) -> &RemoteFetchSlot {
+        self.slot.as_ref().expect("slot held until drop")
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        // Release our reference first, then drop the entry if it was the
+        // last one: the map's own count is the one that remains.
+        self.slot.take();
+        self.map
+            .remove_if(&self.key, |_, s| std::sync::Arc::strong_count(s) <= 1);
+    }
+}
+
+/// The original bytes of a remote file, from the local cache when we have
+/// them and over federation otherwise. Failures are never cached beyond
+/// the requests already waiting on the same fetch: a 404 today may be an
+/// MSC2246 upload that completes tomorrow.
+pub(crate) async fn fetch_remote_original(
+    state: &AppState,
+    origin: &str,
+    media_id: &str,
+) -> Result<MediaResponse, ApiError> {
+    if let Some(media) = read_remote_cache(state, origin, media_id).await? {
+        return Ok(media);
+    }
+    let guard = SlotGuard::acquire(state, origin, media_id);
+    let mut outcome = guard.slot().0.lock().await;
+    match &*outcome {
+        Some(RemoteFetchOutcome::Fetched(media)) => return Ok(media.clone()),
+        Some(RemoteFetchOutcome::Failed(failure)) => return Err(failure.into_error()),
+        None => {}
+    }
+    match fetch_and_store_remote(state, origin, media_id).await {
+        Ok(media) => {
+            *outcome = Some(RemoteFetchOutcome::Fetched(media.clone()));
+            Ok(media)
+        }
+        Err(failure) => {
+            *outcome = Some(RemoteFetchOutcome::Failed(failure));
+            Err(failure.into_error())
+        }
+    }
+}
+
+/// Cache row plus an open reader on its blob, with `last_access_at`
+/// touched. `None` on a miss, including a row whose blob has gone.
+async fn lookup_remote_cache(
+    state: &AppState,
+    origin: &str,
+    media_id: &str,
+) -> Result<Option<(Value, vela_store::media::MediaReader)>, ApiError> {
+    let Some(row) = state
+        .db
+        .get_remote_media(origin, media_id)
+        .map_err(store_err)?
+    else {
+        return Ok(None);
+    };
+    let Some(blob_id) = row.get("blob_id").and_then(|v| v.as_str()) else {
+        let _ = state.db.delete_remote_media(origin, media_id);
+        return Ok(None);
+    };
+    let Some(reader) = state.media_store.get(blob_id).await.map_err(store_err)? else {
+        // Blob removed behind our back (manual cleanup, storage lifecycle
+        // rule). Forget the row and fetch again.
+        tracing::warn!(%origin, %media_id, %blob_id, "cached remote media blob missing; refetching");
+        let _ = state.db.delete_remote_media(origin, media_id);
+        return Ok(None);
+    };
+    touch_last_access(state, origin, media_id, &row);
+    Ok(Some((row, reader)))
+}
+
+/// Rewrite `last_access_at` when it is older than the touch interval.
+/// Re-reads the row first so a refetch that raced us (new `blob_id`) is
+/// not overwritten with the stale one.
+fn touch_last_access(state: &AppState, origin: &str, media_id: &str, row: &Value) {
+    let now = now_ms();
+    let last = row
+        .get("last_access_at")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if now.saturating_sub(last) < REMOTE_ACCESS_TOUCH_MS {
+        return;
+    }
+    let current = match state.db.get_remote_media(origin, media_id) {
+        Ok(Some(current)) => current,
+        _ => return,
+    };
+    if current.get("blob_id") != row.get("blob_id") {
+        return;
+    }
+    let mut touched = current;
+    touched["last_access_at"] = json!(now);
+    if let Err(e) = state.db.set_remote_media(origin, media_id, &touched) {
+        tracing::debug!(%origin, %media_id, error = %e, "remote media access touch failed");
+    }
+}
+
+async fn read_remote_cache(
+    state: &AppState,
+    origin: &str,
+    media_id: &str,
+) -> Result<Option<MediaResponse>, ApiError> {
+    let Some((row, mut reader)) = lookup_remote_cache(state, origin, media_id).await? else {
+        return Ok(None);
+    };
+    let size = row.get("size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let mut bytes = Vec::with_capacity(size);
+    use tokio::io::AsyncReadExt;
+    reader.read_to_end(&mut bytes).await.map_err(store_err)?;
+    Ok(Some(MediaResponse {
+        content_type: row_content_type(&row),
+        filename: row_filename(&row),
+        bytes: Bytes::from(bytes),
+    }))
+}
+
+/// Fetch over federation and cache. Only the peer's verdict is an error
+/// here; our own storage failing is logged and the bytes are still served.
+async fn fetch_and_store_remote(
+    state: &AppState,
+    origin: &str,
+    media_id: &str,
+) -> Result<MediaResponse, RemoteFetchFailure> {
+    let media = state
+        .federation_client
+        .fetch_media(origin, media_id, state.config.max_upload_size as usize)
+        .await
+        .map_err(|e| classify_fetch_error(origin, media_id, e))?;
+
+    // From here on the bytes are in hand; a storage problem is logged and
+    // the response still succeeds, it just is not cached.
+    let size = media.bytes.len() as u64;
+    if !make_room_in_remote_cache(state, size).await {
+        return Ok(media);
+    }
+    let blob_id = Uuid::new_v4().simple().to_string();
+    if let Err(e) = state.media_store.put(&blob_id, &media.bytes).await {
+        tracing::warn!(%origin, %media_id, error = %e, "remote media blob write failed; serving uncached");
+        return Ok(media);
+    }
+    let now = now_ms();
+    let row = json!({
+        "blob_id": blob_id,
+        "content_type": media.content_type,
+        "filename": media.filename.as_deref().unwrap_or(""),
+        "size": size,
+        "cached_at": now,
+        "last_access_at": now,
+    });
+    if let Err(e) = state.db.set_remote_media(origin, media_id, &row) {
+        tracing::warn!(%origin, %media_id, error = %e, "remote media row write failed; dropping blob");
+        let _ = state.media_store.delete(&blob_id).await;
+    }
+    Ok(media)
+}
+
+/// Enforce `remote_media_cache_max_bytes` before storing `incoming`
+/// bytes: evict least recently read files until the new one fits.
+/// Returns false when the file cannot be cached at all (larger than the
+/// whole budget). A budget of 0 means unbounded.
+async fn make_room_in_remote_cache(state: &AppState, incoming: u64) -> bool {
+    let budget = state.config.remote_media_cache_max_bytes;
+    if budget == 0 {
+        return true;
+    }
+    if incoming > budget {
+        return false;
+    }
+    let rows = match state.db.list_remote_media() {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "remote media cache listing failed; storing without eviction");
+            return true;
+        }
+    };
+    let mut total: u64 = rows
+        .iter()
+        .map(|(_, _, r)| r.get("size").and_then(|v| v.as_u64()).unwrap_or(0))
+        .sum();
+    if total + incoming <= budget {
+        return true;
+    }
+    let mut by_age: Vec<_> = rows
+        .into_iter()
+        .map(|(origin, media_id, row)| {
+            let last = row
+                .get("last_access_at")
+                .or_else(|| row.get("cached_at"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            (last, origin, media_id, row)
+        })
+        .collect();
+    by_age.sort_by_key(|(last, ..)| *last);
+    for (_, origin, media_id, row) in by_age {
+        if total + incoming <= budget {
+            break;
+        }
+        let size = row.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+        if let Some(blob_id) = row.get("blob_id").and_then(|v| v.as_str())
+            && let Err(e) = state.media_store.delete(blob_id).await
+        {
+            tracing::warn!(%origin, %media_id, error = %e, "remote media eviction: blob delete failed");
+            continue;
+        }
+        if let Err(e) = state.db.delete_remote_media(&origin, &media_id) {
+            tracing::warn!(%origin, %media_id, error = %e, "remote media eviction: row delete failed");
+            continue;
+        }
+        tracing::debug!(%origin, %media_id, size, "remote media cache: evicted for space");
+        total = total.saturating_sub(size);
+    }
+    true
+}
+
+/// Map a federation media fetch failure onto the client-facing class.
+/// Only a genuine peer 404 becomes a 404; everything else says so
+/// honestly, since the media may well exist.
+fn classify_fetch_error(
+    origin: &str,
+    media_id: &str,
+    e: crate::federation::federation_client::FederationClientError,
+) -> RemoteFetchFailure {
+    use crate::federation::federation_client::FederationClientError as E;
+    tracing::debug!(remote = %origin, %media_id, error = %e, "federation media fetch failed");
+    match e {
+        E::Status { code: 404, errcode } => {
+            if errcode.as_deref() == Some("M_UNRECOGNIZED") {
+                RemoteFetchFailure::LegacyPeer
+            } else {
+                RemoteFetchFailure::NotFound
+            }
+        }
+        E::Status { code: 504, .. } => RemoteFetchFailure::NotYetUploaded,
+        E::Status { code: 413, .. } | E::TooLarge { .. } => RemoteFetchFailure::TooLarge,
+        _ => RemoteFetchFailure::Unavailable,
+    }
+}
+
+fn media_response(
+    media: MediaResponse,
+    filename_override: Option<&str>,
+) -> Result<Response, ApiError> {
     let len = media.bytes.len();
     let mut builder = with_media_security_headers(Response::builder().status(StatusCode::OK))
         .header(header::CONTENT_TYPE, media.content_type)
         .header(header::CONTENT_LENGTH, len.to_string());
-    // Propagate the original filename from the peer so clients see the
-    // Unicode-safe filename whether the file came from us or via
-    // federation. Stripping it here would silently lose Unicode names
-    // when bob on hs2 downloads alice@hs1's file via hs2.
-    if let Some(filename) = media.filename.as_deref()
+    // Spec: a `{filename}` URL segment overrides the stored name. Otherwise
+    // propagate the peer's filename so clients see the Unicode-safe name
+    // whether the file came from us or via federation.
+    let filename = filename_override.or(media.filename.as_deref());
+    if let Some(filename) = filename
         && !filename.is_empty()
     {
         builder = builder.header(
@@ -1222,6 +1623,544 @@ fn media_response(media: MediaResponse) -> Result<Response, ApiError> {
     builder
         .body(Body::from(media.bytes))
         .map_err(|e| ApiError(VelaError::Unknown(e.to_string())))
+}
+
+#[cfg(test)]
+mod remote_media_cache_tests {
+    use super::*;
+    use crate::test_helpers::build_test_state;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ORIGIN: &str = "remote.example";
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(width, height, image::Rgba([10, 200, 30, 255]));
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    fn png_dims(bytes: &[u8]) -> (u32, u32) {
+        let img = image::load_from_memory(bytes).unwrap();
+        (img.width(), img.height())
+    }
+
+    /// A peer serving `bytes` for `media_id` on the federation download
+    /// endpoint, on the legacy non-multipart path, expecting exactly
+    /// `expect` fetches.
+    async fn peer(state: &AppState, media_id: &str, bytes: Vec<u8>, expect: u64) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/_matrix/federation/v1/media/download/{media_id}"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .insert_header("content-disposition", "inline; filename=\"cat.png\"")
+                    .set_body_bytes(bytes),
+            )
+            .expect(expect)
+            .mount(&server)
+            .await;
+        state
+            .federation_client
+            .set_base_url_override(ORIGIN, &server.uri());
+        server
+    }
+
+    async fn download(
+        state: &AppState,
+        media_id: &str,
+        name: Option<&str>,
+    ) -> Result<Response, ApiError> {
+        download_inner(
+            State(state.clone()),
+            Path((
+                ORIGIN.to_string(),
+                media_id.to_string(),
+                name.map(str::to_string),
+            )),
+        )
+        .await
+    }
+
+    async fn thumbnail(
+        state: &AppState,
+        media_id: &str,
+        w: u32,
+        h: u32,
+    ) -> Result<Response, ApiError> {
+        thumbnail_inner(
+            State(state.clone()),
+            ORIGIN.to_string(),
+            media_id.to_string(),
+            ThumbnailQuery {
+                width: Some(w),
+                height: Some(h),
+                method: Some("scale".into()),
+                animated: None,
+                allow_remote: None,
+                allow_redirect: None,
+                timeout_ms: None,
+            },
+        )
+        .await
+    }
+
+    fn header(resp: &Response, name: header::HeaderName) -> Option<String> {
+        resp.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    async fn body(resp: Response) -> Vec<u8> {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn second_download_is_served_from_cache() {
+        let (state, _tmp) = build_test_state();
+        let bytes = png(40, 30);
+        let server = peer(&state, "m1", bytes.clone(), 1).await;
+
+        for _ in 0..2 {
+            let resp = download(&state, "m1", None).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                header(&resp, header::CONTENT_TYPE).as_deref(),
+                Some("image/png")
+            );
+            assert!(
+                header(&resp, header::CONTENT_DISPOSITION)
+                    .unwrap()
+                    .contains("cat.png")
+            );
+            assert_eq!(body(resp).await, bytes);
+        }
+        let row = state.db.get_remote_media(ORIGIN, "m1").unwrap().unwrap();
+        assert_eq!(row["size"], bytes.len());
+        assert_eq!(row["content_type"], "image/png");
+        assert_eq!(row["filename"], "cat.png");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn thumbnail_after_download_does_not_refetch() {
+        let (state, _tmp) = build_test_state();
+        let bytes = png(400, 300);
+        let server = peer(&state, "m2", bytes.clone(), 1).await;
+
+        download(&state, "m2", None).await.unwrap();
+        let resp = thumbnail(&state, "m2", 96, 96).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            header(&resp, header::CONTENT_TYPE).as_deref(),
+            Some("image/png")
+        );
+        let thumb = body(resp).await;
+        let local = resize_to_png_thumbnail(&bytes, 96, 96, "scale").unwrap();
+        assert_eq!(png_dims(&thumb), png_dims(&local));
+        assert!(png_dims(&thumb).0 < 400);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_requests_share_one_fetch() {
+        let (state, _tmp) = build_test_state();
+        let bytes = png(40, 30);
+        let server = peer(&state, "m3", bytes.clone(), 1).await;
+
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let st = state.clone();
+            tasks.push(tokio::spawn(async move {
+                body(download(&st, "m3", None).await.unwrap()).await
+            }));
+        }
+        for t in tasks {
+            assert_eq!(t.await.unwrap(), bytes);
+        }
+        assert!(
+            state.remote_media_locks.is_empty(),
+            "single-flight entries must not outlive the requests"
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn peer_404_is_not_cached() {
+        let (state, _tmp) = build_test_state();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(2)
+            .mount(&server)
+            .await;
+        state
+            .federation_client
+            .set_base_url_override(ORIGIN, &server.uri());
+
+        for _ in 0..2 {
+            let err = download(&state, "gone", None).await.unwrap_err();
+            assert_eq!(err.0.status_code(), 404);
+        }
+        assert!(state.db.get_remote_media(ORIGIN, "gone").unwrap().is_none());
+        server.verify().await;
+    }
+
+    /// Requests queued behind one failing fetch share its verdict instead
+    /// of each timing out in turn; requests after the slot is gone retry.
+    #[tokio::test]
+    async fn concurrent_misses_share_one_failure() {
+        let (state, _tmp) = build_test_state();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(404).set_delay(std::time::Duration::from_millis(300)),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        state
+            .federation_client
+            .set_base_url_override(ORIGIN, &server.uri());
+
+        let started = std::time::Instant::now();
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let st = state.clone();
+            tasks.push(tokio::spawn(async move {
+                download(&st, "gone", None)
+                    .await
+                    .unwrap_err()
+                    .0
+                    .status_code()
+            }));
+        }
+        for t in tasks {
+            assert_eq!(t.await.unwrap(), 404);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "waiters must not serialise 32 fetches"
+        );
+        assert!(state.remote_media_locks.is_empty());
+        // Fresh request after the slot is gone fetches again.
+        assert_eq!(
+            download(&state, "gone", None)
+                .await
+                .unwrap_err()
+                .0
+                .status_code(),
+            404
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_leaves_no_slot_behind() {
+        let (state, _tmp) = build_test_state();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(png(10, 10))
+                    .set_delay(std::time::Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        state
+            .federation_client
+            .set_base_url_override(ORIGIN, &server.uri());
+
+        let st = state.clone();
+        let task = tokio::spawn(async move { download(&st, "slow", None).await.map(|_| ()) });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(state.remote_media_locks.len(), 1);
+        task.abort();
+        let _ = task.await;
+        assert!(state.remote_media_locks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_references_never_reach_federation() {
+        let (state, _tmp) = build_test_state();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        state
+            .federation_client
+            .set_base_url_override(ORIGIN, &server.uri());
+        for (origin, id) in [
+            (ORIGIN, "../../_matrix/key/v2/server"),
+            (ORIGIN, "a/b"),
+            (ORIGIN, "a\0b"),
+            (ORIGIN, ""),
+            ("bad\0name", "abc"),
+            ("remote.example:http", "abc"),
+        ] {
+            let err = download_inner(
+                State(state.clone()),
+                Path((origin.to_string(), id.to_string(), None)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0.status_code(), 404, "{origin}/{id}");
+            let err = thumbnail_inner(
+                State(state.clone()),
+                origin.to_string(),
+                id.to_string(),
+                ThumbnailQuery {
+                    width: None,
+                    height: None,
+                    method: None,
+                    animated: None,
+                    allow_remote: None,
+                    allow_redirect: None,
+                    timeout_ms: None,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0.status_code(), 404, "{origin}/{id}");
+        }
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_peer_404_is_not_reported_as_not_found() {
+        let (state, _tmp) = build_test_state();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "errcode": "M_UNRECOGNIZED",
+                "error": "Unrecognized request"
+            })))
+            .mount(&server)
+            .await;
+        state
+            .federation_client
+            .set_base_url_override(ORIGIN, &server.uri());
+        let err = download(&state, "old", None).await.unwrap_err();
+        assert_eq!(err.0.status_code(), 502);
+    }
+
+    fn with_budget(state: &AppState, budget: u64) -> AppState {
+        let mut st = state.clone();
+        let mut cfg = (*st.config).clone();
+        cfg.remote_media_cache_max_bytes = budget;
+        st.config = std::sync::Arc::new(cfg);
+        st
+    }
+
+    #[tokio::test]
+    async fn budget_evicts_least_recently_read_first() {
+        let (base, _tmp) = build_test_state();
+        let a = png(20, 20);
+        let size = a.len() as u64;
+        // Room for two files, not three.
+        let state = with_budget(&base, size * 2 + size / 2);
+        let server = MockServer::start().await;
+        for id in ["a", "b", "c"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/_matrix/federation/v1/media/download/{id}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "image/png")
+                        .set_body_bytes(a.clone()),
+                )
+                .mount(&server)
+                .await;
+        }
+        state
+            .federation_client
+            .set_base_url_override(ORIGIN, &server.uri());
+
+        download(&state, "a", None).await.unwrap();
+        download(&state, "b", None).await.unwrap();
+        // Make "a" the stale one and "b" freshly read.
+        let mut row = state.db.get_remote_media(ORIGIN, "a").unwrap().unwrap();
+        row["last_access_at"] = json!(now_ms() - 10 * REMOTE_ACCESS_TOUCH_MS);
+        state.db.set_remote_media(ORIGIN, "a", &row).unwrap();
+        let a_blob = row["blob_id"].as_str().unwrap().to_string();
+
+        download(&state, "c", None).await.unwrap();
+        assert!(state.db.get_remote_media(ORIGIN, "a").unwrap().is_none());
+        assert!(state.media_store.get(&a_blob).await.unwrap().is_none());
+        assert!(state.db.get_remote_media(ORIGIN, "b").unwrap().is_some());
+        assert!(state.db.get_remote_media(ORIGIN, "c").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn file_larger_than_budget_is_served_but_not_cached() {
+        let (base, _tmp) = build_test_state();
+        let bytes = png(20, 20);
+        let state = with_budget(&base, bytes.len() as u64 - 1);
+        let server = peer(&state, "big", bytes.clone(), 2).await;
+        for _ in 0..2 {
+            let resp = download(&state, "big", None).await.unwrap();
+            assert_eq!(body(resp).await, bytes);
+        }
+        assert!(state.db.get_remote_media(ORIGIN, "big").unwrap().is_none());
+        server.verify().await;
+    }
+
+    /// Waiters behind a successful fetch get its bytes even when the file
+    /// never made it into the cache.
+    #[tokio::test]
+    async fn concurrent_requests_for_uncacheable_file_share_one_fetch() {
+        let (base, _tmp) = build_test_state();
+        let bytes = png(20, 20);
+        let state = with_budget(&base, bytes.len() as u64 - 1);
+        let server = peer(&state, "big2", bytes.clone(), 1).await;
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let st = state.clone();
+            tasks.push(tokio::spawn(async move {
+                body(download(&st, "big2", None).await.unwrap()).await
+            }));
+        }
+        for t in tasks {
+            assert_eq!(t.await.unwrap(), bytes);
+        }
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn peer_errors_map_to_honest_statuses() {
+        let (state, _tmp) = build_test_state();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/federation/v1/media/download/pending"))
+            .respond_with(ResponseTemplate::new(504))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/federation/v1/media/download/big"))
+            .respond_with(ResponseTemplate::new(413))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/federation/v1/media/download/down"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        state
+            .federation_client
+            .set_base_url_override(ORIGIN, &server.uri());
+
+        let err = download(&state, "pending", None).await.unwrap_err();
+        assert_eq!(err.0.status_code(), 504);
+        assert_eq!(err.0.errcode(), "M_NOT_YET_UPLOADED");
+        let err = download(&state, "big", None).await.unwrap_err();
+        assert_eq!(err.0.status_code(), 502);
+        assert_eq!(err.0.errcode(), "M_TOO_LARGE");
+        let err = download(&state, "down", None).await.unwrap_err();
+        assert_eq!(err.0.status_code(), 502);
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_too_large_and_not_cached() {
+        let (state, _tmp) = build_test_state();
+        let too_big = vec![0u8; state.config.max_upload_size as usize + 1];
+        let server = peer(&state, "huge", too_big, 1).await;
+        let err = download(&state, "huge", None).await.unwrap_err();
+        assert_eq!(err.0.status_code(), 502);
+        assert_eq!(err.0.errcode(), "M_TOO_LARGE");
+        assert!(state.db.get_remote_media(ORIGIN, "huge").unwrap().is_none());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn missing_blob_triggers_refetch_and_row_repair() {
+        let (state, _tmp) = build_test_state();
+        let bytes = png(40, 30);
+        let server = peer(&state, "m5", bytes.clone(), 2).await;
+
+        download(&state, "m5", None).await.unwrap();
+        let row = state.db.get_remote_media(ORIGIN, "m5").unwrap().unwrap();
+        let old_blob = row["blob_id"].as_str().unwrap().to_string();
+        state.media_store.delete(&old_blob).await.unwrap();
+
+        let resp = download(&state, "m5", None).await.unwrap();
+        assert_eq!(body(resp).await, bytes);
+        let row = state.db.get_remote_media(ORIGIN, "m5").unwrap().unwrap();
+        let new_blob = row["blob_id"].as_str().unwrap();
+        assert_ne!(new_blob, old_blob);
+        assert!(state.media_store.get(new_blob).await.unwrap().is_some());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn cached_blob_is_not_servable_as_local_media() {
+        let (state, _tmp) = build_test_state();
+        let _server = peer(&state, "m6", png(40, 30), 1).await;
+        download(&state, "m6", None).await.unwrap();
+        let row = state.db.get_remote_media(ORIGIN, "m6").unwrap().unwrap();
+        let blob_id = row["blob_id"].as_str().unwrap().to_string();
+
+        let err = download_inner(
+            State(state.clone()),
+            Path((state.config.server_name.clone(), blob_id.clone(), None)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0.status_code(), 404);
+
+        let status = federation_media::federation_download(
+            State(state.clone()),
+            Path(blob_id),
+            Query(federation_media::MediaDownloadQuery::default()),
+            axum::extract::Extension(crate::middleware::federation_auth::XMatrixOrigin(
+                "other.example".into(),
+            )),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn url_filename_segment_overrides_peer_filename() {
+        let (state, _tmp) = build_test_state();
+        let _server = peer(&state, "m7", png(40, 30), 1).await;
+        let resp = download(&state, "m7", Some("mine.png")).await.unwrap();
+        let cd = header(&resp, header::CONTENT_DISPOSITION).unwrap();
+        assert!(cd.contains("mine.png"), "{cd}");
+        assert!(!cd.contains("cat.png"), "{cd}");
+    }
+
+    #[tokio::test]
+    async fn last_access_is_touched_hourly_not_per_read() {
+        let (state, _tmp) = build_test_state();
+        let _server = peer(&state, "m8", png(40, 30), 1).await;
+        download(&state, "m8", None).await.unwrap();
+        let fresh = state.db.get_remote_media(ORIGIN, "m8").unwrap().unwrap();
+        download(&state, "m8", None).await.unwrap();
+        let again = state.db.get_remote_media(ORIGIN, "m8").unwrap().unwrap();
+        assert_eq!(fresh["last_access_at"], again["last_access_at"]);
+
+        let mut stale = again.clone();
+        stale["last_access_at"] = json!(now_ms() - REMOTE_ACCESS_TOUCH_MS - 1);
+        state.db.set_remote_media(ORIGIN, "m8", &stale).unwrap();
+        download(&state, "m8", None).await.unwrap();
+        let touched = state.db.get_remote_media(ORIGIN, "m8").unwrap().unwrap();
+        assert!(
+            touched["last_access_at"].as_u64().unwrap() > stale["last_access_at"].as_u64().unwrap()
+        );
+    }
 }
 
 #[cfg(all(test, feature = "extensions"))]

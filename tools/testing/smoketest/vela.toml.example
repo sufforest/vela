@@ -54,6 +54,9 @@ enabled = true
 # files often. Accepts "K", "M", "G" suffixes.
 max_upload_size = "100MB"
 
+# Disk budget for media cached from other servers ("0" = no budget).
+remote_cache_max_size = "10GB"
+
 # Default is filesystem (rooted at <database.path>/media). For
 # multi-instance / off-host durability, switch to S3-compatible
 # (MinIO, Cloudflare R2, Backblaze B2, AWS S3 itself).

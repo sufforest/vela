@@ -5353,6 +5353,72 @@ impl Database {
         self.db.delete_cf(&cf, media_id.as_bytes())
     }
 
+    // --- Remote media cache ---
+
+    /// Row key for a cached remote file. Server names and media ids are
+    /// ASCII without NUL, so `\0` is an unambiguous separator.
+    fn remote_media_key(origin: &str, media_id: &str) -> Vec<u8> {
+        let mut k = Vec::with_capacity(origin.len() + 1 + media_id.len());
+        k.extend_from_slice(origin.as_bytes());
+        k.push(0);
+        k.extend_from_slice(media_id.as_bytes());
+        k
+    }
+
+    pub fn set_remote_media(
+        &self,
+        origin: &str,
+        media_id: &str,
+        row: &Value,
+    ) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("remote_media_cache").unwrap();
+        self.db.put_cf(
+            &cf,
+            Self::remote_media_key(origin, media_id),
+            row.to_string().as_bytes(),
+        )
+    }
+
+    pub fn get_remote_media(
+        &self,
+        origin: &str,
+        media_id: &str,
+    ) -> Result<Option<Value>, rocksdb::Error> {
+        let cf = self.db.cf_handle("remote_media_cache").unwrap();
+        match self
+            .db
+            .get_cf(&cf, Self::remote_media_key(origin, media_id))?
+        {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes).unwrap_or(Value::Null))),
+            None => Ok(None),
+        }
+    }
+
+    pub fn delete_remote_media(&self, origin: &str, media_id: &str) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("remote_media_cache").unwrap();
+        self.db
+            .delete_cf(&cf, Self::remote_media_key(origin, media_id))
+    }
+
+    /// Every cached remote media row as `(origin, media_id, row)`. Used by
+    /// the retention sweeper; same unbounded-but-daily rationale as
+    /// `list_media_metadata`.
+    pub fn list_remote_media(&self) -> Result<Vec<(String, String, Value)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("remote_media_cache").unwrap();
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (k, v) = item?;
+            let Some(sep) = k.iter().position(|b| *b == 0) else {
+                continue;
+            };
+            let origin = String::from_utf8_lossy(&k[..sep]).to_string();
+            let media_id = String::from_utf8_lossy(&k[sep + 1..]).to_string();
+            let row: Value = serde_json::from_slice(&v).unwrap_or(Value::Null);
+            out.push((origin, media_id, row));
+        }
+        Ok(out)
+    }
+
     // --- Receipts ---
 
     pub fn set_receipt(

@@ -117,6 +117,13 @@ pub enum FederationClientError {
     Signature(#[from] SignatureError),
     #[error("federation is disabled in this server's config")]
     FederationDisabled,
+    /// The peer answered with a non-2xx status. Kept apart from `Http` so
+    /// media handlers can relay 404 / 504 and turn 413 into M_TOO_LARGE.
+    #[error("remote returned HTTP {code}")]
+    Status { code: u16, errcode: Option<String> },
+    /// The body crossed our size cap before we finished reading it.
+    #[error("remote body exceeds {cap}-byte cap")]
+    TooLarge { cap: usize },
 }
 
 /// Outbound federation HTTP client.
@@ -258,9 +265,7 @@ async fn read_capped_bytes(
     if let Some(len) = resp.content_length()
         && len > max as u64
     {
-        return Err(FederationClientError::Http(format!(
-            "media too large: {len} bytes (cap {max})"
-        )));
+        return Err(FederationClientError::TooLarge { cap: max });
     }
     let mut buf = Vec::new();
     while let Some(chunk) = resp
@@ -269,9 +274,7 @@ async fn read_capped_bytes(
         .map_err(|e| FederationClientError::Http(e.to_string()))?
     {
         if buf.len() + chunk.len() > max {
-            return Err(FederationClientError::Http(format!(
-                "media exceeds {max}-byte cap"
-            )));
+            return Err(FederationClientError::TooLarge { cap: max });
         }
         buf.extend_from_slice(&chunk);
     }
@@ -1086,9 +1089,21 @@ impl FederationClient {
 
         let status = resp.status();
         if !status.is_success() {
-            return Err(FederationClientError::Http(format!(
-                "media: status {status}"
-            )));
+            // The errcode tells a real 404 apart from a pre-1.11 peer that
+            // does not serve the authenticated endpoint at all.
+            let errcode = read_capped_bytes(resp, 4096)
+                .await
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|v| {
+                    v.get("errcode")
+                        .and_then(|e| e.as_str())
+                        .map(str::to_string)
+                });
+            return Err(FederationClientError::Status {
+                code: status.as_u16(),
+                errcode,
+            });
         }
 
         let response_ct = resp
@@ -1123,7 +1138,7 @@ impl FederationClient {
             Ok(MediaResponse {
                 content_type: response_ct,
                 filename: top_level_filename,
-                bytes: body,
+                bytes: axum::body::Bytes::from(body),
             })
         }
     }
@@ -1135,11 +1150,12 @@ impl FederationClient {
 /// top-level Content-Disposition); otherwise `None`. Callers propagate
 /// it back to the local-download response so clients see the original
 /// filename even when the file came from a remote homeserver.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MediaResponse {
     pub content_type: String,
     pub filename: Option<String>,
-    pub bytes: Vec<u8>,
+    /// Cheap to clone, so one fetch can answer every request waiting on it.
+    pub bytes: axum::body::Bytes,
 }
 
 /// Pull `boundary=...` out of a `Content-Type: multipart/mixed; boundary=...`
@@ -1224,7 +1240,7 @@ fn parse_multipart_media(body: &[u8], boundary: &str) -> Result<MediaResponse, S
     Ok(MediaResponse {
         content_type,
         filename,
-        bytes: body[content_start..content_end].to_vec(),
+        bytes: axum::body::Bytes::copy_from_slice(&body[content_start..content_end]),
     })
 }
 

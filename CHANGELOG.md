@@ -10,6 +10,16 @@ minor versions.
 
 ### Added
 
+- **Remote media cache.** Media fetched from other homeservers is now kept
+  locally, so a file viewed by a room full of users costs one federation
+  fetch instead of one per view. Concurrent first requests share a single
+  fetch (including its failure), cached downloads stream from disk, and
+  thumbnails of remote media are rendered from the cached original. A new
+  `[media] remote_cache_max_size` budget (default 10GB) evicts least recently
+  read files first; `[retention.media] remote_lifetime` expires by last read.
+  Remote fetch failures now report honestly: peer 404 → 404, peer 504 → 504
+  `M_NOT_YET_UPLOADED`, too large → 502 `M_TOO_LARGE`, anything else → 502.
+
 - **Local-user moderation commands.** `!kick <@user> [<room>]` force-removes a
   local user from one room or all their rooms, and `!redact-user <@user>
   [<room>] [limit]` redacts a local user's recent messages. Both act as the

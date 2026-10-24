@@ -427,10 +427,10 @@ struct RetentionMediaSection {
     /// Local-uploaded media — retain forever by default. Operators
     /// who want cost-driven expiry set this to e.g. `"365d"`.
     local_lifetime: String,
-    /// Cached remote media — short-by-default once we start fetching
-    /// remote blobs (today vela 404s on remote downloads, so the
-    /// field is forward-looking but harmless). 30 days is a sane
-    /// default for a fetch-and-cache layer.
+    /// Cached remote media, aged by last access. 30 days by default;
+    /// the sweep only runs when `[retention] enabled = true`, so an
+    /// operator who leaves retention off keeps every remote file ever
+    /// fetched until they turn it on.
     remote_lifetime: String,
 }
 
@@ -551,6 +551,12 @@ struct MediaSection {
     /// Human-readable size: "50MB", "1GB", "500K", or a bare byte
     /// count ("1024"). Default 50MB.
     max_upload_size: String,
+    /// Total disk budget for media fetched from other servers. When a
+    /// new file would push the cache over it, the least recently read
+    /// files are evicted first; a file larger than the whole budget is
+    /// served but not kept. `"0"` means no budget (lifetime-only, see
+    /// `[retention.media] remote_lifetime`). Default 10GB.
+    remote_cache_max_size: String,
     /// `"fs"` (default) or `"s3"`. Determines which MediaStore impl
     /// is wired into AppState.
     backend: String,
@@ -566,6 +572,7 @@ impl Default for MediaSection {
     fn default() -> Self {
         Self {
             max_upload_size: "50MB".to_string(),
+            remote_cache_max_size: "10GB".to_string(),
             backend: "fs".to_string(),
             s3: None,
             url_preview_allow_private_ips: false,
@@ -1594,6 +1601,7 @@ fn main() -> anyhow::Result<()> {
                 registration_enabled: config.registration.enabled,
                 registration_token: config.registration.token.clone(),
                 max_upload_size: parse_size(&config.media.max_upload_size)?,
+                remote_media_cache_max_bytes: parse_size(&config.media.remote_cache_max_size)?,
                 max_account_data_bytes: config.limits.max_account_data_bytes,
                 url_preview_allow_private_ips: config.media.url_preview_allow_private_ips,
                 encrypt_by_default: parse_encrypt_policy(&config.room_defaults.encrypt_by_default)?,
@@ -1670,6 +1678,7 @@ fn main() -> anyhow::Result<()> {
             room_locks: Arc::new(DashMap::new()),
             user_locks: Arc::new(DashMap::new()),
             key_backup_user_locks: Arc::new(DashMap::new()),
+            remote_media_locks: Arc::new(DashMap::new()),
             room_senders: Arc::new(DashMap::new()),
             typing_state: Arc::new(DashMap::new()),
             typing_change_pos: Arc::new(DashMap::new()),
@@ -2119,6 +2128,8 @@ fn load_config(path: &std::path::Path) -> Config {
 fn validate_runtime_parsable(config: &Config) -> anyhow::Result<()> {
     parse_size(&config.media.max_upload_size)
         .map_err(|e| anyhow::anyhow!("[media] max_upload_size: {e}"))?;
+    parse_size(&config.media.remote_cache_max_size)
+        .map_err(|e| anyhow::anyhow!("[media] remote_cache_max_size: {e}"))?;
     if config.backup.enabled {
         parse_duration(&config.backup.interval)
             .map_err(|e| anyhow::anyhow!("[backup] interval: {e}"))?;
@@ -2170,6 +2181,11 @@ fn print_config_summary(path: &std::path::Path, config: &Config) {
         "  media.max_upload_size   = {} ({} bytes)",
         config.media.max_upload_size,
         parse_size(&config.media.max_upload_size).unwrap_or(0)
+    );
+    println!(
+        "  media.remote_cache_max_size = {} ({} bytes)",
+        config.media.remote_cache_max_size,
+        parse_size(&config.media.remote_cache_max_size).unwrap_or(0)
     );
     println!("  backup.enabled          = {}", config.backup.enabled);
     println!("  retention.enabled       = {}", config.retention.enabled);
@@ -2295,6 +2311,19 @@ mod validate_config_tests {
             err.to_string().contains("max_upload_size"),
             "error should name the offending field: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_malformed_remote_cache_max_size() {
+        let mut cfg = Config::default();
+        cfg.media.remote_cache_max_size = "lots".to_string();
+        let err = validate_runtime_parsable(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("remote_cache_max_size"),
+            "error should name the offending field: {err}"
+        );
+        cfg.media.remote_cache_max_size = "0".to_string();
+        validate_runtime_parsable(&cfg).expect("0 disables the budget");
     }
 
     /// Retention parsers are skipped when `retention.enabled = false`

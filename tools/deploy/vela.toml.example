@@ -59,6 +59,11 @@ enabled = true
 # Size cap for uploads. Default 50MB; raise for big-file workflows.
 max_upload_size = "50MB"
 
+# Disk budget for media fetched from other servers. Least recently read
+# files are evicted first when it fills; "0" disables the budget and
+# leaves expiry to [retention.media] remote_lifetime. Default 10GB.
+remote_cache_max_size = "10GB"
+
 # Default backend: filesystem (under <database.path>/media). Switch to
 # s3 for off-host durability or shared storage across restarts.
 backend = "fs"
