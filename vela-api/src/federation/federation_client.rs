@@ -126,6 +126,23 @@ pub enum FederationClientError {
     TooLarge { cap: usize },
 }
 
+impl FederationClientError {
+    /// The HTTP status a peer answered with, when the error is a non-2xx
+    /// response (`Status`, or the textual `Http("status NNN: ...")` the
+    /// transaction path produces); `None` for transport, JSON and
+    /// key-document errors.
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            FederationClientError::Status { code, .. } => Some(*code),
+            FederationClientError::Http(msg) => msg
+                .strip_prefix("status ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|code| code.trim_end_matches(':').parse().ok()),
+            _ => None,
+        }
+    }
+}
+
 /// Outbound federation HTTP client.
 ///
 /// Caches one `reqwest::Client` per destination. Each client has its DNS

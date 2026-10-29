@@ -69,6 +69,20 @@ pub struct User {
     pub hs: String,
 }
 
+/// A recognisable stand-in for a base64 key or signature: `seed` (letters
+/// and digits only) padded with `A` to `len` characters, ending in `A` so the
+/// trailing bits are zero. The rig checks what a server hands out, not
+/// whether keys are usable, but servers that parse uploaded keys as base64
+/// drop anything that is not well-formed, so the shape has to be right.
+fn fake_b64(seed: &str, len: usize) -> String {
+    let mut s: String = seed.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    s.truncate(len - 1);
+    while s.len() < len {
+        s.push('A');
+    }
+    s
+}
+
 /// Register a fresh user. The localpart is suffixed with nanos so reruns
 /// against a persistent rig never collide.
 pub async fn register(hs_label: &str, cs: &str, localpart: &str) -> Result<User> {
@@ -537,9 +551,9 @@ impl User {
             otks.insert(
                 format!("signed_curve25519:{label}{i}"),
                 json!({
-                    "key": format!("otk-{label}-{i}"),
+                    "key": fake_b64(&format!("otk{label}{i}"), 43),
                     "signatures": {self.user_id.clone(): {
-                        format!("ed25519:{}", self.device_id): "sig"}},
+                        format!("ed25519:{}", self.device_id): fake_b64("sig", 86)}},
                 }),
             );
         }
@@ -549,11 +563,11 @@ impl User {
                 "device_id": self.device_id,
                 "algorithms": ["m.olm.v1.curve25519-aes-sha2", "m.megolm.v1.aes-sha2"],
                 "keys": {
-                    format!("curve25519:{}", self.device_id): format!("curve-{label}"),
-                    format!("ed25519:{}", self.device_id): format!("ed-{label}"),
+                    format!("curve25519:{}", self.device_id): fake_b64(&format!("curve{label}"), 43),
+                    format!("ed25519:{}", self.device_id): fake_b64(&format!("ed{label}"), 43),
                 },
                 "signatures": {self.user_id.clone(): {
-                    format!("ed25519:{}", self.device_id): "sig"}},
+                    format!("ed25519:{}", self.device_id): fake_b64("sig", 86)}},
             },
             "one_time_keys": otks,
         });

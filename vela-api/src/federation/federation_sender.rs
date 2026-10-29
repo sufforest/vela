@@ -1,19 +1,22 @@
 //! Outbound federation transaction sender.
 //!
-//! One async task per destination, dispatching per-(destination, room)
-//! transactions concurrently. The persistent outbox in RocksDB
-//! (`federation_outbox` CF) is keyed `<dest> 0xff <room_nid:8> <pos:8>`
-//! so each room's pending entries can be drained without scanning the
-//! whole destination, and rooms inside the same destination no longer
-//! block each other on a slow send.
+//! One async task per destination, sending one transaction at a time to
+//! it: the spec requires the sender to wait for a 200 before sending a
+//! transaction with a different id to the same server, and peers enforce
+//! that (a second in-flight transaction from the same origin is refused).
+//! The persistent outbox in RocksDB (`federation_outbox` CF) is keyed
+//! `<dest> 0xff <room_nid:8> <pos:8>` so each room's pending entries can
+//! be drained without scanning the whole destination, and a transaction
+//! carries one room's PDUs.
 //!
 //! Per cycle the destination task:
 //!   1. Enumerates rooms with pending entries (`list_outbound_rooms_for_destination`).
-//!   2. Spawns one `send_room_txn` per room, plus one `send_edu_txn`
-//!      for the EDU streams (EDUs aren't room-keyed and share a single
-//!      per-destination channel).
-//!   3. Awaits all spawned sends via `FuturesUnordered`. Any success
-//!      resets backoff; any failure with no success applies it.
+//!   2. Sends one `send_room_txn` per room in turn, then one
+//!      `send_edu_txn` for the EDU streams (EDUs aren't room-keyed and
+//!      share a single per-destination channel). An unreachable, busy
+//!      (429) or erroring (5xx) peer ends the cycle until the retry; a
+//!      transaction the peer refused (other 4xx) does not hold up the rest.
+//!   3. Any success resets backoff; a failure with no success applies it.
 //!   4. Waits for the next wake (`broadcast()` notify, or the idle
 //!      poll tick).
 //!
@@ -21,7 +24,7 @@
 //! its own backoff state, so one slow / dead peer does not stall
 //! delivery to anyone else. Per-room ordering inside a destination is
 //! preserved by the outbox key shape — one room's TXNs are sent in
-//! `(room_nid, pos)` order; nothing serialises against other rooms.
+//! `(room_nid, pos)` order.
 //!
 //! Restart recovery: on startup `FederationSender::new` enumerates
 //! every destination with at least one pending entry and spawns its
@@ -48,7 +51,7 @@ use uuid::Uuid;
 use vela_store::db::Database;
 
 use crate::federation::edu::EduStreams;
-use crate::federation::federation_client::{FederationClient, now_ms};
+use crate::federation::federation_client::{FederationClient, FederationClientError, now_ms};
 
 /// Max PDUs per transaction per spec.
 const MAX_PDUS_PER_TXN: usize = 50;
@@ -420,11 +423,8 @@ async fn run_destination(
     let mut last_success = Instant::now();
 
     loop {
-        // Each cycle: send per-room PDU TXNs concurrently (one TXN per
-        // room with pending events) and a single EDU-only TXN. Rooms no
-        // longer block each other inside a destination — a slow room
-        // doesn't stall others, and a destination's PDU throughput
-        // scales with how many rooms have pending entries.
+        // Each cycle: one PDU TXN per room with pending entries, sent one
+        // after another, then a single EDU-only TXN.
         let rooms = match db.list_outbound_rooms_for_destination(&server_name) {
             Ok(r) => r,
             Err(e) => {
@@ -444,43 +444,43 @@ async fn run_destination(
             continue;
         }
 
-        // Per-room PDU TXNs run concurrently. An EDU-only TXN runs
-        // alongside if there are EDUs to send.
-        let mut futures: futures::stream::FuturesUnordered<_> =
-            futures::stream::FuturesUnordered::new();
-        for room_nid in rooms {
-            let server = server_name.clone();
-            let origin = our_server_name.clone();
-            let db = db.clone();
-            let client = client.clone();
-            futures.push(tokio::spawn(async move {
-                send_room_txn(&server, room_nid, &origin, &db, &client).await
-            }));
-        }
-        if !edus.is_empty() {
-            let server = server_name.clone();
-            let origin = our_server_name.clone();
-            let db = db.clone();
-            let client = client.clone();
-            let edus_clone = edus.clone();
-            let advances = cursor_advances.clone();
-            futures.push(tokio::spawn(async move {
-                send_edu_txn(&server, &origin, edus_clone, advances, &db, &client).await
-            }));
-        }
-
-        use futures::StreamExt;
+        // One transaction in flight per destination: room TXNs in turn,
+        // then the EDU TXN. A peer that is unreachable, busy (429) or
+        // erroring (5xx) ends the cycle, so it never sees a second
+        // transaction while it may still be processing the first; the
+        // cycle's backoff retries. A peer that answered another 4xx has
+        // dealt with that transaction, so the remaining rooms and the
+        // EDUs still go out — one room the peer refuses must not starve
+        // the destination.
         let mut any_success = false;
         let mut any_failure = false;
-        while let Some(joined) = futures.next().await {
-            match joined {
-                Ok(SendOutcome::Success) => any_success = true,
-                Ok(SendOutcome::Empty) => {} // room queue raced empty — neither outcome
-                Ok(SendOutcome::Failure) => any_failure = true,
-                Err(e) => {
-                    warn!(%server_name, error = %e, "spawned send task panicked");
+        let mut peer_unavailable = false;
+        for room_nid in rooms {
+            match send_room_txn(&server_name, room_nid, &our_server_name, &db, &client).await {
+                SendOutcome::Success => any_success = true,
+                SendOutcome::Empty => {} // room queue raced empty — neither outcome
+                SendOutcome::Rejected => any_failure = true,
+                SendOutcome::Failure => {
                     any_failure = true;
+                    peer_unavailable = true;
+                    break;
                 }
+            }
+        }
+        if !peer_unavailable && !edus.is_empty() {
+            match send_edu_txn(
+                &server_name,
+                &our_server_name,
+                edus,
+                cursor_advances,
+                &db,
+                &client,
+            )
+            .await
+            {
+                SendOutcome::Success => any_success = true,
+                SendOutcome::Empty => {}
+                SendOutcome::Rejected | SendOutcome::Failure => any_failure = true,
             }
         }
 
@@ -506,13 +506,24 @@ async fn run_destination(
 enum SendOutcome {
     Success,
     Empty,
+    /// The peer answered with a 4xx other than 429: it processed (and
+    /// refused) this transaction, so the next one may be sent.
+    Rejected,
+    /// No usable answer: transport error, 429, or 5xx.
     Failure,
+}
+
+/// Classify a failed `send_transaction` for the destination loop.
+fn classify_send_error(e: &FederationClientError) -> SendOutcome {
+    match e.http_status() {
+        Some(status) if (400..500).contains(&status) && status != 429 => SendOutcome::Rejected,
+        _ => SendOutcome::Failure,
+    }
 }
 
 /// Drain one room's pending entries for `destination` and send them as
 /// a single TXN. Per-room ordering is preserved by the outbox key
-/// shape; concurrent calls for different rooms can run alongside this
-/// one against the same destination.
+/// shape; the destination task calls this for one room at a time.
 async fn send_room_txn(
     server_name: &str,
     room_nid: u64,
@@ -559,7 +570,7 @@ async fn send_room_txn(
         }
         Err(e) => {
             warn!(%server_name, room_nid, error = %e, "room PDU txn send failed");
-            SendOutcome::Failure
+            classify_send_error(&e)
         }
     }
 }
@@ -894,5 +905,38 @@ mod tests {
         let (partial, servers) = db.get_partial_state_info(room_nid).unwrap();
         assert!(partial);
         assert!(servers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod send_error_tests {
+    use super::*;
+
+    #[test]
+    fn classify_send_error_separates_peer_refusals_from_unavailability() {
+        let refused = FederationClientError::Http("status 403 Forbidden: {}".into());
+        assert!(matches!(
+            classify_send_error(&refused),
+            SendOutcome::Rejected
+        ));
+        let busy = FederationClientError::Http("status 429 Too Many Requests: {}".into());
+        assert!(matches!(classify_send_error(&busy), SendOutcome::Failure));
+        let broken = FederationClientError::Http("status 502 Bad Gateway: {}".into());
+        assert!(matches!(classify_send_error(&broken), SendOutcome::Failure));
+        let transport = FederationClientError::Http("error sending request".into());
+        assert!(matches!(
+            classify_send_error(&transport),
+            SendOutcome::Failure
+        ));
+        assert_eq!(refused.http_status(), Some(403));
+        assert_eq!(transport.http_status(), None);
+        let structured = FederationClientError::Status {
+            code: 413,
+            errcode: None,
+        };
+        assert!(matches!(
+            classify_send_error(&structured),
+            SendOutcome::Rejected
+        ));
     }
 }

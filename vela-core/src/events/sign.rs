@@ -27,11 +27,35 @@ impl ServerSigningKey {
         let secret: [u8; 32] = rand::random();
         let signing_key = SigningKey::from_bytes(&secret);
         let public = signing_key.verifying_key();
-        let pub_b64 = STANDARD_NO_PAD.encode(public.as_bytes());
-        let version = &pub_b64[..6];
+        // The key version is derived from the public key for recognisability,
+        // but the spec restricts it to `[a-zA-Z0-9_]`; base64 can also produce
+        // `+` and `/`, which strict peers reject as an invalid key id (and
+        // with it every request we sign). Keep only the allowed characters.
+        let version: String = STANDARD_NO_PAD
+            .encode(public.as_bytes())
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(6)
+            .collect();
         Self {
             key_id: format!("ed25519:{version}"),
             signing_key,
+        }
+    }
+
+    /// Whether `key_id` is `ed25519:<version>` with a non-empty version made
+    /// only of `[a-zA-Z0-9_]`, as the server keys API requires. A key loaded
+    /// from storage with another shape still signs, but peers that enforce
+    /// the grammar refuse everything signed under it.
+    pub fn key_id_is_well_formed(key_id: &str) -> bool {
+        match key_id.strip_prefix("ed25519:") {
+            Some(version) => {
+                !version.is_empty()
+                    && version
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            }
+            None => false,
         }
     }
 
@@ -137,6 +161,31 @@ impl ServerSigningKey {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn generated_key_ids_match_the_spec_grammar() {
+        // Standard base64 of a random public key contains `+` or `/` in
+        // its first six characters often enough that 200 draws would hit
+        // one if the filter were missing.
+        for _ in 0..200 {
+            let key = ServerSigningKey::generate();
+            assert!(
+                ServerSigningKey::key_id_is_well_formed(key.key_id()),
+                "bad key id {}",
+                key.key_id()
+            );
+            assert_eq!(key.key_id().len(), "ed25519:".len() + 6);
+        }
+    }
+
+    #[test]
+    fn key_id_grammar() {
+        assert!(ServerSigningKey::key_id_is_well_formed("ed25519:abc_123"));
+        assert!(!ServerSigningKey::key_id_is_well_formed("ed25519:Ic0+aR"));
+        assert!(!ServerSigningKey::key_id_is_well_formed("ed25519:a/b"));
+        assert!(!ServerSigningKey::key_id_is_well_formed("ed25519:"));
+        assert!(!ServerSigningKey::key_id_is_well_formed("rsa:abc"));
+    }
 
     #[test]
     fn generate_and_sign() {
