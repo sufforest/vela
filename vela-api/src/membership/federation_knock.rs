@@ -514,31 +514,11 @@ pub async fn send_knock_v1(
 }
 
 fn build_knock_room_state(state: &AppState, room_nid: u64) -> Result<Vec<Value>, rocksdb::Error> {
-    // knock_room_state uses the same recommended stripped-state set as invites
-    // (`vela_core::events::INVITE_STRIPPED_STATE_TYPES`): the knocking server
-    // renders room chrome (name, avatar, topic, encrypted badge) while waiting
-    // to be admitted, plus the knocker's own member event.
-    let nids = state.db.get_all_state_event_nids(room_nid)?;
-    let mut out = Vec::new();
-    for nid in nids {
-        let Some((_h, bytes)) = state.db.get_event(nid)? else {
-            continue;
-        };
-        let Ok(v): Result<Value, _> = serde_json::from_slice(&bytes) else {
-            continue;
-        };
-        let etype = v.event_type().unwrap_or("");
-        if !vela_core::events::INVITE_STRIPPED_STATE_TYPES.contains(&etype) {
-            continue;
-        }
-        out.push(json!({
-            "type": v.get("type"),
-            "state_key": v.get("state_key"),
-            "sender": v.get("sender"),
-            "content": v.get("content"),
-        }));
-    }
-    Ok(out)
+    // Same bundle as invite_room_state: full PDUs of the recommended
+    // stripped-state types (no memberships — the knocker has none yet and
+    // needs none), so the knocking server can render room chrome and
+    // verify the create event while waiting to be admitted.
+    super::room_state_pdus_for_peer(state, room_nid, &[])
 }
 
 fn read_join_rules_content(state: &AppState, room_nid: u64) -> Option<Value> {
@@ -764,9 +744,30 @@ mod tests {
             "join_rules must be in stripped state"
         );
         assert!(
-            types.contains("m.room.member"),
-            "member must be in stripped state"
+            !types.contains("m.room.member"),
+            "memberships are not part of knock_room_state"
         );
+        // Every entry is the PDU exactly as persisted: the knocking server
+        // verifies these, so nothing may be computed in or stripped out.
+        let mut stored: Vec<Value> = Vec::new();
+        for nid in state.db.get_all_state_event_nids(room_nid).unwrap() {
+            let (_h, bytes) = state.db.get_event(nid).unwrap().unwrap();
+            let ev: Value = serde_json::from_slice(&bytes).unwrap();
+            let etype = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if vela_core::events::INVITE_STRIPPED_STATE_TYPES.contains(&etype)
+                && etype != "m.room.member"
+            {
+                stored.push(ev);
+            }
+        }
+        for ev in &stripped {
+            assert!(ev.get("event_id").is_none(), "entry carries event_id: {ev}");
+            assert!(
+                stored.contains(ev),
+                "entry is not a stored PDU verbatim: {ev}"
+            );
+        }
+        assert_eq!(stripped.len(), stored.len());
         // Unrelated types not in our test setup; but be sure no invalid leakage.
         for t in &types {
             assert!(

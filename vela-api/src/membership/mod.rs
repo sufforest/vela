@@ -17,7 +17,7 @@ use crate::middleware::json::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use vela_core::canonical::canonical_json_object;
 use vela_core::error::VelaError;
 use vela_core::events::builder::{build_event, select_auth_events};
@@ -2232,7 +2232,9 @@ async fn emit_membership_event_for_target(
         && !is_local_user(target_user_id, server_name)
         && let Some(target_server) = target_user_id.split_once(':').map(|(_, d)| d.to_string())
     {
-        let invite_room_state = build_invite_stripped_state(state, room_nid, room_id.as_str())?;
+        let invite_room_state =
+            room_state_pdus_for_peer(state, room_nid, &[sender.user_id.as_str(), target_user_id])
+                .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
         let body = json!({
             "event": Value::Object(event.clone()),
             "room_version": room_version.as_str(),
@@ -2347,30 +2349,27 @@ fn is_local_user(user_id: &str, server: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Build the `invite_room_state` array for the recipient — stripped state
-/// events giving them just enough context to render the room invite. Spec:
-/// `client-server-api/#invite_state` (mirrors what we send in CS-API sync's
-/// `rooms.invite.{id}.invite_state`).
+/// The `invite_room_state` / `knock_room_state` bundle sent to another
+/// server: the room's current state events of the recommended stripped
+/// types, each as the full PDU exactly as persisted. Since Matrix 1.16 every
+/// entry must be formatted per the room version (the create event must be
+/// present so a v12 recipient can check the hash-derived room id), so the
+/// receiver verifies signatures on them: nothing may be added (no computed
+/// `event_id`, no `room_id` on a v12 create) or stripped. The receiver does
+/// the stripping for its clients.
 ///
-/// MSC4311 (room version 12): the `m.room.create` event MUST appear in
-/// full — recipients need it to verify the room_id, which v12 derives
-/// from a hash of the create event.
-fn build_invite_stripped_state(
+/// Member events are limited to `members` (the inviter and invitee; none
+/// for a knock): a full membership PDU per room member would make the body
+/// grow with the room and trip peers' request-size caps.
+pub(crate) fn room_state_pdus_for_peer(
     state: &AppState,
     room_nid: u64,
-    room_id: &str,
-) -> Result<Vec<Value>, ApiError> {
-    let state_nids = state
-        .db
-        .get_all_state_event_nids(room_nid)
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    members: &[&str],
+) -> Result<Vec<Value>, rocksdb::Error> {
+    let state_nids = state.db.get_all_state_event_nids(room_nid)?;
     let mut out = Vec::new();
     for nid in state_nids {
-        let Some((_h, bytes)) = state
-            .db
-            .get_event(nid)
-            .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
-        else {
+        let Some((_h, bytes)) = state.db.get_event(nid)? else {
             continue;
         };
         let Ok(ev) = serde_json::from_slice::<Value>(&bytes) else {
@@ -2380,36 +2379,10 @@ fn build_invite_stripped_state(
         if !vela_core::events::INVITE_STRIPPED_STATE_TYPES.contains(&etype) {
             continue;
         }
-        if etype == "m.room.create" {
-            // MSC4311: emit the full create event. Re-derive event_id
-            // (v3+ events on the wire don't carry event_id) and ensure
-            // room_id is present so receivers can verify the version-
-            // appropriate hash matches.
-            let stripped_state_room_version = state
-                .db
-                .get_room_version_typed(room_nid)
-                .unwrap_or(vela_core::events::room_version::RoomVersion::V12);
-            let event_id = vela_core::events::hash::compute_event_id_for_version(
-                ev.as_object().unwrap_or(&Map::new()),
-                stripped_state_room_version,
-            );
-            let mut full = ev;
-            if let Some(obj) = full.as_object_mut() {
-                obj.insert("event_id".to_string(), json!(event_id.as_str()));
-                if !obj.contains_key("room_id") {
-                    obj.insert("room_id".to_string(), json!(room_id));
-                }
-            }
-            out.push(full);
-        } else {
-            out.push(json!({
-                "type": ev.get("type"),
-                "state_key": ev.get("state_key"),
-                "sender": ev.get("sender"),
-                "content": ev.get("content"),
-                "room_id": room_id,
-            }));
+        if etype == "m.room.member" && !members.contains(&ev.state_key().unwrap_or("")) {
+            continue;
         }
+        out.push(ev);
     }
     Ok(out)
 }

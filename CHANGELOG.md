@@ -53,6 +53,38 @@ minor versions.
   cap) and 64 live versions per user; user-directory search bounds its
   candidate walk at 10k rows and reports `limited: true` when truncated.
 
+### Fixed
+
+- **Signing key version charset.** Newly generated server signing keys get
+  a version made only of `[a-zA-Z0-9_]`, as the server keys API requires.
+  The old generator took the first six characters of the public key's
+  base64, which can contain `+` or `/`; peers that enforce the grammar
+  reject every request signed under such a key id. An existing key with an
+  invalid version still loads, with a startup warning that names it and
+  suggests `!rotate-signing-key`.
+- **`send_join` auth chain.** The full (non-`omit_members`) response now
+  carries the whole auth chain, including events also present in `state`.
+  The spec only lets a server leave those out when the joiner opted into
+  `omit_members`, and joiners that look up their create event in
+  `auth_chain` alone failed to join rooms hosted here.
+- **Invite and knock room state over federation.** `invite_room_state` and
+  `knock_room_state` now carry the room's state events as the full PDUs
+  they are stored as. They used to be stripped to four fields with a
+  computed `event_id` (and a `room_id`) added to the create event, which
+  Matrix 1.16 no longer allows: every entry must be formatted per the room
+  version, and a receiver that verifies the create event's signature saw
+  the added fields as tampering and refused the invite or knock.
+- **One transaction at a time per destination.** The federation sender used
+  to put several room transactions on the wire to the same server at once;
+  the spec requires waiting for the response before sending the next, and a
+  peer that enforces that refuses the overlapping ones, delaying delivery. A
+  peer that refuses one room's transaction no longer holds up the other rooms
+  or the EDUs bound for it.
+- **Own events relayed back.** An event signed by this server that a peer
+  hands back (a relay, a backfill, an echoed join) is verified against the
+  local signing keys instead of fetching this server's own key document over
+  the network, which failed on some deployments and rejected the event.
+
 ## [0.3.0] — 2026-06-27
 
 A sandboxed WebAssembly extension platform, plus a round of federation,

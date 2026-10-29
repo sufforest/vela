@@ -833,14 +833,15 @@ pub async fn send_join_v2(
         }
     }
     let auth_chain_ids = auth_chain_including_seeds(&state.db, &chain_seeds).unwrap_or_default();
-    // State events already returned in `state` MUST NOT be repeated in
-    // `auth_chain` — Complement's test harness treats the returned
-    // state as the union of the two lists, so duplicates show up as
-    // unexpected extras during state checks. Auth chain is the
-    // transitive auth closure *not* present in the state we returned.
+    // The spec lets a send_join response omit from `auth_chain` events
+    // that are already in `state` only when the caller asked for
+    // `omit_members`; a full response carries the whole chain. Joiners
+    // are entitled to look for the create event (and the rest of their
+    // own join's auth events) in `auth_chain` without also scanning
+    // `state`, so dedupe only on the opt-in shape.
     let mut auth_chain_pdus: Vec<Value> = Vec::with_capacity(auth_chain_ids.len());
     for id in &auth_chain_ids {
-        if state_event_ids.contains(id) {
+        if omit_members && state_event_ids.contains(id) {
             continue;
         }
         if let Some(j) = load_event_json_by_event_id(&state.db, id) {

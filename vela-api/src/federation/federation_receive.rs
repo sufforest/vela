@@ -25,6 +25,7 @@ use vela_core::federation::keys::{decode_public_key, verify_event_signature};
 use vela_core::identifiers::Nid;
 use vela_core::state_res::{self, StateMap};
 
+use crate::federation::federation_client::RemoteKeys;
 use crate::router::AppState;
 
 /// Constants from spec §Transactions.
@@ -139,6 +140,28 @@ async fn verify_event_signed_by_domain(
         }
     }
     false
+}
+
+/// Our own signing keys in the shape the remote-key cache hands back, so
+/// an event signed by this server verifies on the same path as any peer's.
+fn own_keys_document(state: &AppState) -> RemoteKeys {
+    let mut verify_keys = HashMap::new();
+    verify_keys.insert(
+        state.signing_key.key_id().to_string(),
+        state.signing_key.public_key_base64(),
+    );
+    let mut old_verify_keys = HashMap::new();
+    for (key_id, public_key, _expired_ts) in
+        state.db.load_rotated_signing_keys().unwrap_or_default()
+    {
+        old_verify_keys.insert(key_id, public_key);
+    }
+    RemoteKeys {
+        verify_keys,
+        old_verify_keys,
+        valid_until_ts: u64::MAX,
+        fetched_at: 0,
+    }
 }
 
 /// Restricted-room joins (MSC3083, auth rule 5.2.1): a GENUINE join via the
@@ -463,18 +486,26 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
         .and_then(|v| v.as_object())
         .map(|m| m.keys().map(String::as_str).collect())
         .unwrap_or_default();
-    let sender_keys = match state
-        .remote_keys
-        .get_or_fetch_signed(&sender_domain, &wanted)
-        .await
-    {
-        Ok(k) => k,
-        Err(e) => {
-            warn!(domain = %sender_domain, error = %e, "failed to fetch sender keys");
-            return (
-                pdu.event_id,
-                PduOutcome::Rejected("cannot fetch sender keys".into()),
-            );
+    // A peer may legitimately hand us one of our own events (a relay, a
+    // backfill, a resident echoing a join it accepted). Our keys are not
+    // "remote": verify against the live signing key and the rotated-out
+    // ones instead of fetching our own key document over the network.
+    let sender_keys = if sender_domain == state.config.server_name {
+        std::sync::Arc::new(own_keys_document(state))
+    } else {
+        match state
+            .remote_keys
+            .get_or_fetch_signed(&sender_domain, &wanted)
+            .await
+        {
+            Ok(k) => k,
+            Err(e) => {
+                warn!(domain = %sender_domain, error = %e, "failed to fetch sender keys");
+                return (
+                    pdu.event_id,
+                    PduOutcome::Rejected("cannot fetch sender keys".into()),
+                );
+            }
         }
     };
 
@@ -668,9 +699,12 @@ pub async fn process_pdu(state: &AppState, pdu_json: &Value, origin: &str) -> (S
     }
     if missing_prev {
         let earliest_ids = get_room_extremity_ids(state, room_nid).unwrap_or_default();
+        // Ask the server that handed us the event, not the event's sender:
+        // a peer may relay another server's event (or one of ours), and the
+        // sender's server need not be reachable or even be a different host.
         if let Err(e) = fetch_missing_events(
             state,
-            &sender_domain,
+            origin,
             &effective_pdu.room_id,
             &effective_pdu.event_id,
             &earliest_ids,
@@ -2704,11 +2738,15 @@ async fn persist_fetched_event_inner(
         .and_then(|v| v.as_object())
         .map(|m| m.keys().map(String::as_str).collect())
         .unwrap_or_default();
-    let keys = state
-        .remote_keys
-        .get_or_fetch_signed(&sender_domain, &wanted)
-        .await
-        .map_err(|e| format!("cannot fetch keys for {sender_domain}: {e}"))?;
+    let keys = if sender_domain == state.config.server_name {
+        std::sync::Arc::new(own_keys_document(state))
+    } else {
+        state
+            .remote_keys
+            .get_or_fetch_signed(&sender_domain, &wanted)
+            .await
+            .map_err(|e| format!("cannot fetch keys for {sender_domain}: {e}"))?
+    };
     let sigs = obj
         .get("signatures")
         .and_then(|v| v.as_object())

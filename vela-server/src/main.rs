@@ -1405,6 +1405,13 @@ fn main() -> anyhow::Result<()> {
         {
             Some((key_id, secret)) => {
                 info!(key_id = %key_id, "loaded existing signing key");
+                if !ServerSigningKey::key_id_is_well_formed(&key_id) {
+                    warn!(
+                        key_id = %key_id,
+                        "signing key version contains characters outside [a-zA-Z0-9_]; \
+                         strict peers reject requests signed with it (!rotate-signing-key)"
+                    );
+                }
                 ServerSigningKey::from_bytes(key_id, &secret)
             }
             None => {
