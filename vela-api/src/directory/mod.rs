@@ -523,6 +523,18 @@ pub async fn list_public_rooms(
     })))
 }
 
+/// The `server` query parameter names a homeserver the client picked, so
+/// it is checked before it reaches the federation client: a name outside
+/// the server-name grammar is the client's mistake (400 `M_INVALID_PARAM`),
+/// not a failure of ours.
+fn check_directory_server(server: &str) -> Result<(), ApiError> {
+    crate::federation::federation_client::check_destination(server).map_err(|_| {
+        ApiError(VelaError::InvalidParam(format!(
+            "invalid server name {server:?}"
+        )))
+    })
+}
+
 async fn fetch_remote_public_rooms(
     state: &AppState,
     server: &str,
@@ -530,6 +542,7 @@ async fn fetch_remote_public_rooms(
     since: Option<&str>,
     search_term: Option<&str>,
 ) -> Result<Json<Value>, ApiError> {
+    check_directory_server(server)?;
     state
         .federation_client
         .fetch_public_rooms(server, limit, since, search_term)
@@ -685,6 +698,23 @@ fn read_simple_state(
         .get(content_key)?
         .as_str()
         .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod remote_server_param_tests {
+    use super::check_directory_server;
+    use vela_core::error::VelaError;
+
+    #[test]
+    fn malformed_server_param_is_the_clients_error() {
+        for bad in ["", "not a host", "evil.example/../x", "a\u{0}b", "[::1"] {
+            let err = check_directory_server(bad).expect_err(bad).0;
+            assert!(matches!(err, VelaError::InvalidParam(_)), "{bad}: {err:?}");
+        }
+        for good in ["example.org", "example.org:8448", "[::1]:8448", "10.0.0.1"] {
+            check_directory_server(good).unwrap_or_else(|e| panic!("{good}: {e:?}"));
+        }
+    }
 }
 
 #[cfg(test)]

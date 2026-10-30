@@ -84,6 +84,31 @@ minor versions.
   hands back (a relay, a backfill, an echoed join) is verified against the
   local signing keys instead of fetching this server's own key document over
   the network, which failed on some deployments and rejected the event.
+- **Rule 3 on ingested history and join bundles.** Events taken in without
+  the state-dependent auth rules — backfill pages, the state and auth chain
+  of a send_join response, partial-state fills, outliers fetched for
+  relations — now have their `auth_events` citation judged by the same
+  rules as the live receive path (duplicate, unselected or cross-room
+  entries, a missing create below v12, a cited event this server
+  rejected), on the redacted copy when the content hash did not match. A
+  violating event is marked rejected and left out; its siblings and the
+  join itself are unaffected. Citations these paths do not hold are not
+  fetched and leave the event unjudged. Two consequences for operators:
+  history that older builds wrote without citing the create event in
+  v6–v11 rooms is rejected when fetched back, as every compliant peer
+  already did; and a redacted restricted join in a v8 room or a redacted
+  third-party invite below v11 loses the content that justified its
+  citation and is rejected with everything that cites it, as on the live
+  path.
+- **Rejection markers.** Only a verdict on the event itself (the auth rules,
+  the format limits) is remembered for rule 3.3; a key fetch that timed out,
+  a stripped signature, a room not yet bootstrapped, a storage error, a
+  server ACL or policy-list hit no longer leave a permanent marker that
+  later rejected every event citing that one.
+- **Public rooms `server` parameter.** A `server` value outside the
+  server-name grammar on `GET`/`POST /publicRooms` is answered with 400
+  `M_INVALID_PARAM` instead of surfacing the failed federation request as a
+  500.
 
 ## [0.3.0] — 2026-06-27
 
