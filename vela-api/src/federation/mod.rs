@@ -343,30 +343,48 @@ fn record_outcome(
             // Persist the rejection so descendant events that
             // reference this one in `auth_events` can cascade-
             // reject without needing to re-derive WHY the
-            // ancestor was rejected.
-            //
-            // EXCEPT for transient state-incompleteness rejections:
-            // a PDU broadcast that races our own outbound-join
-            // bootstrap on the same room gets rejected with
-            // "unknown room" (we haven't created the room nid
-            // yet) or with "no m.room.create in state" (we
-            // haven't promoted state yet). Marking those would
-            // poison any later PDU whose auth chain references
-            // them — even after our state is fully populated and
-            // the re-delivered PDU would otherwise be accepted
-            // (TestUnbanViaInvite: ban PDU cascade-rejected off
-            // alice's own join, which got marked rejected while
-            // her outbound_join was still in flight).
-            let is_transient =
-                reason == "unknown room" || reason.contains("no m.room.create in state");
+            // ancestor was rejected — but only for a verdict on
+            // the event itself (see `rejection_is_durable`).
             if !event_id.is_empty()
-                && !is_transient
+                && rejection_is_durable(reason)
                 && let Err(e) = state.db.mark_event_rejected(event_id, reason)
             {
                 warn!(%txn_id, %event_id, error = %e, "mark_event_rejected failed");
             }
         }
     }
+}
+
+/// Whether a `PduOutcome::Rejected` reason is a verdict on the event
+/// itself, so recording it lets later events that cite this one fail rule
+/// 3.3 (on the live path and on backfill, join bundles and partial-state
+/// fills alike) without re-deriving why.
+///
+/// Only the auth rules and the event-format limits qualify: they judge the
+/// event's own content, so the verdict holds however and whenever the
+/// same event id is seen again. Everything else is about this delivery or
+/// this server's state at the time, not the event — a key fetch that timed
+/// out, a signature a relaying peer stripped (the id is the reference hash
+/// and does not cover signatures, so another copy may verify), a room we
+/// had not bootstrapped yet, a storage error, a server ACL or policy list
+/// that can change — and must not be remembered: a marker is never
+/// removed, and one stale marker on the creator's join would reject every
+/// power-levels, join-rules and member event citing it in every later join
+/// of that room.
+fn rejection_is_durable(reason: &str) -> bool {
+    const DURABLE: &[&str] = &[
+        "auth_event ",                     // rule 3.3 cascade of a durable marker
+        "auth_events validation failed",   // rule 3.1/3.2/3.4/3.5
+        "auth_events check failed",        // the auth rules against auth_events
+        "state-at-event check failed",     // the auth rules against state
+        "event malformed after redaction", // not an event under this room version
+        "PDU exceeds size limits",
+        "too many auth_events",
+        "too many prev_events",
+        "no prev_events", // only a create has none, never over /send
+        "only the original inviter can rescind an invite",
+    ];
+    DURABLE.iter().any(|prefix| reason.starts_with(prefix))
 }
 
 /// PUT /_matrix/federation/v1/send/{txnId}
@@ -550,6 +568,39 @@ pub async fn receive_transaction(
 mod tests {
     use super::*;
     use vela_core::federation::keys::verify_json_signature;
+
+    #[test]
+    fn only_verdicts_on_the_event_itself_are_remembered() {
+        for durable in [
+            "auth_event $x is rejected",
+            "auth_events validation failed: unselected m.room.topic",
+            "auth_events check failed: sender not in room",
+            "state-at-event check failed: power",
+            "event malformed after redaction",
+            "PDU exceeds size limits: 70000 bytes",
+            "too many auth_events",
+            "no prev_events",
+        ] {
+            assert!(rejection_is_durable(durable), "{durable}");
+        }
+        for transient in [
+            "unknown room",
+            "no m.room.create in state",
+            "internal error",
+            "cannot fetch sender keys",
+            "no signature from remote.example",
+            "signature verification failed",
+            "restricted join missing a valid authoriser-server signature",
+            "server_acl: origin banned",
+            "moderation policy: sender banned",
+            "state-at-event resolution failed",
+            "persist failed: io",
+            "nid alloc: io",
+            "",
+        ] {
+            assert!(!rejection_is_durable(transient), "{transient}");
+        }
+    }
 
     #[test]
     fn server_key_response_is_self_signed() {

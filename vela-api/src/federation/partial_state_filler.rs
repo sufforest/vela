@@ -403,16 +403,21 @@ async fn merge_state_response(
         .into_iter()
         .collect();
 
-    let auth_chain = resp
-        .get("auth_chain")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let state_events = resp
-        .get("pdus")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    // Depth order, as the join bootstrap does: rule 3 on each entry is
+    // judged against what is already persisted, so an ancestor must land
+    // before the events that cite it or its verdict cannot cascade.
+    let auth_chain = crate::membership::federation_outbound_join::sort_by_depth(
+        resp.get("auth_chain")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+    );
+    let state_events = crate::membership::federation_outbound_join::sort_by_depth(
+        resp.get("pdus")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+    );
     if state_events.is_empty() {
         return Err("peer returned no state PDUs".into());
     }

@@ -542,8 +542,10 @@ async fn bootstrap_remote_room(
     Ok(())
 }
 
-/// Persist a single event received in a send_join response. Validates
-/// signature + hash; skips higher-level auth checks (the resident server
+/// Persist a single event received in a send_join response (also used by
+/// the partial-state filler, `/state_ids` outlier fetches and relation
+/// fetches). Validates signature + hash and rule 3 on the `auth_events`
+/// citation; skips the state-dependent auth checks (the resident server
 /// vouches for the chain). Returns the event_nid on success, or None if
 /// the event is already known (idempotent).
 pub(crate) async fn persist_remote_event(
@@ -661,7 +663,6 @@ pub(crate) async fn persist_remote_event(
         .and_then(|h| h.get("sha256"))
         .and_then(|v| v.as_str());
     let computed = compute_content_hash(obj);
-    let redacted = !matches!(declared, Some(d) if d == computed);
     let to_persist: Map<String, Value> = match declared {
         Some(d) if d == computed => obj.clone(),
         _ => vela_core::events::redact::redact_event_for_version(obj, event_room_version),
@@ -710,16 +711,15 @@ pub(crate) async fn persist_remote_event(
         }
     }
 
-    // Log-only shape audit; only judged when every cited event is known
-    // and the event was not redacted on the way in.
-    if !redacted && auth_nids.len() == pdu.auth_events.len() {
-        crate::federation::federation_state::log_auth_events_shape(
-            &state.db,
-            &pdu,
-            event_room_version,
-            "persist_remote_event",
-        );
-    }
+    // Rule 3 on the citation itself, enforced as on the live path (see
+    // `enforce_auth_events_shape`). A rejected entry is skipped by every
+    // caller; the join itself is never routed through here.
+    crate::federation::federation_state::enforce_auth_events_shape(
+        &state.db,
+        &pdu,
+        event_room_version,
+        "persist_remote_event",
+    )?;
 
     let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&to_persist);
@@ -817,7 +817,7 @@ pub(crate) fn build_partial_state_servers(
 
 /// Sort a batch of events by `depth` ascending so ancestors come first.
 /// Events without a parsable depth sort to the front.
-fn sort_by_depth(mut events: Vec<Value>) -> Vec<Value> {
+pub(crate) fn sort_by_depth(mut events: Vec<Value>) -> Vec<Value> {
     events.sort_by_key(|ev| {
         ev.as_object()
             .and_then(|o| o.get("depth"))

@@ -99,8 +99,10 @@ pub async fn attempt_backfill(
     0
 }
 
-/// Persist backfilled events. Signature + hash checked; auth rules skipped
-/// (they're historical context, same rationale as fetched auth events).
+/// Persist backfilled events. Signature + hash checked, and rule 3 on the
+/// `auth_events` citation enforced; the state-dependent auth rules are
+/// skipped (they're historical context, same rationale as fetched auth
+/// events).
 /// Sorts the batch by `depth` ascending so ancestors are persisted before
 /// descendants — without this, `auth_nids`/`prev_nids` resolution in
 /// `persist_event` silently drops edges when referenced events aren't yet in
@@ -219,7 +221,6 @@ async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Res
         .and_then(|h| h.get("sha256"))
         .and_then(|v| v.as_str());
     let computed = compute_content_hash(obj);
-    let redacted = !matches!(declared, Some(d) if d == computed);
     let to_persist = match declared {
         Some(d) if d == computed => obj.clone(),
         _ => vela_core::events::redact::redact_event_for_version(obj, event_room_version),
@@ -269,16 +270,17 @@ async fn persist_one(state: &AppState, room_nid: u64, event_json: &Value) -> Res
         }
     }
 
-    // Log-only shape audit; only judged when every cited event is known
-    // and the event was not redacted on the way in.
-    if !redacted && auth_nids.len() == pdu.auth_events.len() {
-        crate::federation::federation_state::log_auth_events_shape(
-            &state.db,
-            &pdu,
-            event_room_version,
-            "backfill",
-        );
-    }
+    // Rule 3 on the citation itself (a rejected ancestor, an unselected
+    // or cross-room entry, a missing create below v12): the same check the
+    // live path runs, on the same possibly-redacted copy. Unknown
+    // citations leave the event unjudged; a violation marks it rejected
+    // and drops it from the page while the rest of the page goes on.
+    crate::federation::federation_state::enforce_auth_events_shape(
+        &state.db,
+        &pdu,
+        event_room_version,
+        "backfill",
+    )?;
 
     let event_nid = state.db.next_nid()?;
     let json_bytes = canonical_json_object(&to_persist);

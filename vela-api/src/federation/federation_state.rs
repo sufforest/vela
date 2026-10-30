@@ -95,33 +95,51 @@ pub fn auth_state_from_auth_events(
     Ok(auth_state)
 }
 
-/// Result of a log-only structural check of an event's `auth_events`.
+/// Result of the structural check of an event's `auth_events` on the
+/// ingestion paths that do not run full auth.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthShape {
     /// Every cited auth event resolved and the citation passes the
     /// selection rules.
     Ok,
-    /// Some cited auth events are not persisted, so the shape cannot be
-    /// judged. Carries how many.
+    /// Some cited auth events are neither persisted nor rejected, so the
+    /// shape cannot be judged yet. Carries how many.
     Skipped(usize),
-    /// Cited events resolved but violate the selection rules (3.1, 3.2,
+    /// The citation violates rule 3: a cited event was rejected (3.3), or
+    /// the cited events resolved but fail the selection rules (3.1, 3.2,
     /// 3.4, 3.5). Carries the reason.
     Violation(String),
 }
 
-/// Structural `auth_events` check without enforcement, for ingestion
-/// paths that do not run full auth (backfill, the state and auth chain of
-/// an outbound join). The live receive path rejects on the same rules;
-/// here a violation is only reported so we learn whether these paths see
-/// malformed citations before deciding to reject there too.
+/// Structural `auth_events` check for ingestion paths that do not run full
+/// auth against room state: backfill pages, the state and auth chain of an
+/// outbound join, the partial-state filler, outliers fetched for
+/// relations. The same rule-3 checks the live receive path applies, on the
+/// same (possibly redacted) copy of the event.
+///
+/// A citation of an event this server has rejected is a violation in its
+/// own right (rule 3.3) and is judged before the missing count, so a
+/// rejected ancestor cascades instead of hiding behind "not persisted".
+/// Citations that are simply unknown leave the event unjudged: deciding on
+/// an incomplete chain would reject legitimate events whose ancestors are
+/// still on their way (the create event often arrives after the auth
+/// chain entries that cite it). Unlike the live path, these paths do not
+/// fetch the missing citation, so this is a consistency check against
+/// peers that mean well, not a boundary against one that pads
+/// `auth_events` with an unknown id on purpose — the state-dependent
+/// auth rules are not run on these paths either.
 pub fn audit_auth_events_shape(
     event: &Pdu,
     version: RoomVersion,
     load: impl Fn(&str) -> Option<Pdu>,
+    is_rejected: impl Fn(&str) -> bool,
 ) -> AuthShape {
     let mut auth_pdus = Vec::with_capacity(event.auth_events.len());
     let mut missing = 0usize;
     for id in &event.auth_events {
+        if is_rejected(id) {
+            return AuthShape::Violation(format!("auth event {id} was rejected"));
+        }
         match load(id) {
             Some(p) => auth_pdus.push(p),
             None => missing += 1,
@@ -137,27 +155,46 @@ pub fn audit_auth_events_shape(
     }
 }
 
-/// `audit_auth_events_shape` against persisted events, logged under
-/// `site`. A violation is a warning, a skip is debug noise. Callers skip
-/// redacted events: redaction strips the content the selection rules
-/// read for third-party invites and restricted joins in older room
-/// versions, so a legitimately redacted member event would look malformed.
-pub fn log_auth_events_shape(db: &Database, event: &Pdu, version: RoomVersion, site: &str) {
-    match audit_auth_events_shape(event, version, |id| load_pdu_by_event_id(db, id)) {
-        AuthShape::Ok => {}
-        AuthShape::Skipped(missing) => tracing::debug!(
-            site,
-            event_id = %event.event_id,
-            missing,
-            "auth_events shape not checked: cited events not persisted"
-        ),
-        AuthShape::Violation(reason) => tracing::warn!(
-            site,
-            event_id = %event.event_id,
-            event_type = %event.event_type,
-            %reason,
-            "auth_events shape violation (log-only on this path)"
-        ),
+/// `audit_auth_events_shape` against persisted events, enforced: a
+/// violation marks the event rejected (so later events citing it fail
+/// rule 3.3 the same way) and returns the reason as the error, a skip is
+/// debug noise and lets the event through. `site` labels the log line.
+pub fn enforce_auth_events_shape(
+    db: &Database,
+    event: &Pdu,
+    version: RoomVersion,
+    site: &str,
+) -> Result<(), String> {
+    let shape = audit_auth_events_shape(
+        event,
+        version,
+        |id| load_pdu_by_event_id(db, id),
+        |id| db.is_event_rejected(id).unwrap_or(false),
+    );
+    match shape {
+        AuthShape::Ok => Ok(()),
+        AuthShape::Skipped(missing) => {
+            tracing::debug!(
+                site,
+                event_id = %event.event_id,
+                missing,
+                "auth_events shape not checked: cited events not persisted"
+            );
+            Ok(())
+        }
+        AuthShape::Violation(reason) => {
+            tracing::warn!(
+                site,
+                event_id = %event.event_id,
+                event_type = %event.event_type,
+                %reason,
+                "rejecting event: auth_events violate rule 3"
+            );
+            if let Err(e) = db.mark_event_rejected(&event.event_id, &reason) {
+                tracing::warn!(event_id = %event.event_id, error = %e, "mark_event_rejected failed");
+            }
+            Err(format!("auth_events violate rule 3: {reason}"))
+        }
     }
 }
 
@@ -584,12 +621,21 @@ mod auth_shape_tests {
     }
 
     fn audit(auth_events: Vec<&str>) -> AuthShape {
+        audit_with(RoomVersion::V10, auth_events, &[])
+    }
+
+    fn audit_with(version: RoomVersion, auth_events: Vec<&str>, rejected: &[&str]) -> AuthShape {
         let fx = fixtures();
         let ev = pdu(
             "$msg",
             json!({"type": "m.room.message", "auth_events": auth_events}),
         );
-        audit_auth_events_shape(&ev, RoomVersion::V10, |id| fx.get(id).cloned())
+        audit_auth_events_shape(
+            &ev,
+            version,
+            |id| fx.get(id).cloned(),
+            |id| rejected.contains(&id),
+        )
     }
 
     #[test]
@@ -629,7 +675,130 @@ mod auth_shape_tests {
             json!({"type": "m.room.message", "auth_events": ["$pl", "$join"]}),
         );
         assert_eq!(
-            audit_auth_events_shape(&ev, RoomVersion::V12, |id| fx.get(id).cloned()),
+            audit_auth_events_shape(&ev, RoomVersion::V12, |id| fx.get(id).cloned(), |_| false),
+            AuthShape::Ok
+        );
+    }
+
+    #[test]
+    fn rejected_citation_is_a_violation_even_when_unresolved() {
+        // A rejected event is never persisted, so without the explicit
+        // check it would count as "missing" and the event would slip
+        // through unjudged. Rule 3.3 must win over the skip.
+        match audit_with(
+            RoomVersion::V10,
+            vec!["$create", "$pl", "$ghost"],
+            &["$ghost"],
+        ) {
+            AuthShape::Violation(reason) => assert!(reason.contains("$ghost"), "{reason}"),
+            other => panic!("expected violation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_citation_is_a_violation() {
+        assert!(matches!(
+            audit(vec!["$create", "$pl", "$join", "$join"]),
+            AuthShape::Violation(_)
+        ));
+    }
+
+    #[test]
+    fn cross_room_citation_is_a_violation() {
+        let mut fx = fixtures();
+        fx.insert(
+            "$other_pl".into(),
+            pdu(
+                "$other_pl",
+                json!({"type": "m.room.power_levels", "state_key": "", "room_id": "!elsewhere:a.example"}),
+            ),
+        );
+        let ev = pdu(
+            "$msg",
+            json!({"type": "m.room.message", "auth_events": ["$create", "$other_pl", "$join"]}),
+        );
+        assert!(matches!(
+            audit_auth_events_shape(&ev, RoomVersion::V10, |id| fx.get(id).cloned(), |_| false),
+            AuthShape::Violation(_)
+        ));
+    }
+
+    #[test]
+    fn join_to_join_with_authoriser_is_ok_from_v8() {
+        // A restricted join cites the authoriser's membership; the
+        // selector only adds it from v8 and the allowed set follows.
+        let mut fx = fixtures();
+        fx.insert(
+            "$bob".into(),
+            pdu("$bob", json!({"type": "m.room.member", "state_key": "@b:a.example", "content": {"membership": "join"}})),
+        );
+        fx.insert(
+            "$jr".into(),
+            pdu("$jr", json!({"type": "m.room.join_rules", "state_key": "", "content": {"join_rule": "restricted"}})),
+        );
+        let ev = pdu(
+            "$rejoin",
+            json!({
+                "type": "m.room.member", "state_key": "@a:a.example",
+                "content": {"membership": "join", "join_authorised_via_users_server": "@b:a.example"},
+                "auth_events": ["$create", "$pl", "$join", "$jr", "$bob"],
+            }),
+        );
+        assert_eq!(
+            audit_auth_events_shape(&ev, RoomVersion::V8, |id| fx.get(id).cloned(), |_| false),
+            AuthShape::Ok
+        );
+        assert!(matches!(
+            audit_auth_events_shape(&ev, RoomVersion::V7, |id| fx.get(id).cloned(), |_| false),
+            AuthShape::Violation(_)
+        ));
+    }
+
+    #[test]
+    fn redacted_restricted_join_below_v9_loses_its_authoriser_citation() {
+        // Redaction keeps `join_authorised_via_users_server` only from v9.
+        // A v8 restricted join redacted on ingest therefore cites a
+        // membership the pruned content no longer selects: rejected on
+        // the live path and, since the same check runs here, on ingest.
+        let mut fx = fixtures();
+        fx.insert(
+            "$bob".into(),
+            pdu("$bob", json!({"type": "m.room.member", "state_key": "@b:a.example", "content": {"membership": "join"}})),
+        );
+        fx.insert(
+            "$jr".into(),
+            pdu("$jr", json!({"type": "m.room.join_rules", "state_key": ""})),
+        );
+        let ev = pdu(
+            "$rejoin",
+            json!({
+                "type": "m.room.member", "state_key": "@a:a.example",
+                "content": {"membership": "join"},
+                "auth_events": ["$create", "$pl", "$join", "$jr", "$bob"],
+            }),
+        );
+        assert!(matches!(
+            audit_auth_events_shape(&ev, RoomVersion::V8, |id| fx.get(id).cloned(), |_| false),
+            AuthShape::Violation(_)
+        ));
+    }
+
+    #[test]
+    fn invite_citing_no_third_party_invite_is_ok() {
+        // An invite whose tpi token entry has vanished (or was never
+        // cited) is not a shape violation: missing selectable entries are
+        // the auth check's concern, not rule 3.2's.
+        let fx = fixtures();
+        let ev = pdu(
+            "$inv",
+            json!({
+                "type": "m.room.member", "state_key": "@c:a.example",
+                "content": {"membership": "invite", "third_party_invite": {"signed": {"token": "tok"}}},
+                "auth_events": ["$create", "$pl", "$join"],
+            }),
+        );
+        assert_eq!(
+            audit_auth_events_shape(&ev, RoomVersion::V10, |id| fx.get(id).cloned(), |_| false),
             AuthShape::Ok
         );
     }
