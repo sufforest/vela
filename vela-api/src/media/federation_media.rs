@@ -146,27 +146,65 @@ pub async fn federation_thumbnail(
         .await;
     }
 
-    let reader = state
-        .media_store
-        .get(&media_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let mut buf = Vec::new();
-    let mut stream = ReaderStream::new(reader);
-    use futures::StreamExt;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        buf.extend_from_slice(&chunk);
-    }
-
-    let png_bytes = crate::media::resize_to_png_thumbnail(
-        &buf,
-        query.width.unwrap_or(96),
-        query.height.unwrap_or(96),
-        query.method.as_deref().unwrap_or("scale"),
-    )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Same cache and size policy as the client endpoint, so both surfaces
+    // emit identical bytes for the same request.
+    let png_bytes: Vec<u8> = match crate::media::normalise_thumbnail_request(
+        query.width,
+        query.height,
+        query.method.as_deref(),
+    ) {
+        Some(spec) => {
+            let origin = state.config.server_name.clone();
+            match crate::media::thumbnail_bytes(&state, &origin, &media_id, spec)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            {
+                crate::media::ThumbnailOutcome::Png(png) => png.to_vec(),
+                crate::media::ThumbnailOutcome::Original
+                | crate::media::ThumbnailOutcome::Failed(_) => {
+                    return federation_download(
+                        State(state),
+                        Path(media_id),
+                        Query(MediaDownloadQuery::default()),
+                        axum::extract::Extension(_origin),
+                    )
+                    .await;
+                }
+            }
+        }
+        None => {
+            let reader = state
+                .media_store
+                .get(&media_id)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .ok_or(StatusCode::NOT_FOUND)?;
+            let mut buf = Vec::new();
+            let mut stream = ReaderStream::new(reader);
+            use futures::StreamExt;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                buf.extend_from_slice(&chunk);
+            }
+            match crate::media::resize_to_png_thumbnail(
+                &buf,
+                query.width.unwrap_or(96),
+                query.height.unwrap_or(96),
+                query.method.as_deref().unwrap_or("scale"),
+            ) {
+                Ok(Some(png)) => png,
+                Ok(None) | Err(_) => {
+                    return federation_download(
+                        State(state),
+                        Path(media_id),
+                        Query(MediaDownloadQuery::default()),
+                        axum::extract::Extension(_origin),
+                    )
+                    .await;
+                }
+            }
+        }
+    };
 
     let boundary = format!("vela-{}", uuid::Uuid::new_v4().simple());
     let multipart_ct = format!("multipart/mixed; boundary={boundary}");

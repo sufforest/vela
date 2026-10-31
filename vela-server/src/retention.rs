@@ -163,6 +163,9 @@ pub async fn run_one_media_pass(
             warn!(%media_id, error = %e, "retention: metadata delete failed; row will reappear next sweep");
             continue;
         }
+        // Content the operator believes gone must not stay servable
+        // through /thumbnail.
+        vela_api::media::purge_thumbnails(db, media_store, &config.server_name, &media_id).await;
         report.deleted += 1;
     }
 
@@ -207,8 +210,66 @@ pub async fn run_one_media_pass(
                 warn!(%origin, %media_id, error = %e, "retention: remote row delete failed; will retry next sweep");
                 continue;
             }
+            vela_api::media::purge_thumbnails(db, media_store, &origin, &media_id).await;
             report.deleted += 1;
         }
+    }
+
+    // Thumbnails: a local-origin row whose original is gone is an orphan
+    // (deleted outside this sweep); a remote-origin row ages by last use
+    // like the originals it was made from.
+    let rows = db
+        .list_thumbnails()
+        .map_err(|e| anyhow::anyhow!("list thumbnails: {e}"))?;
+    for (key, row) in rows {
+        report.examined += 1;
+        let expired = if key.origin == config.server_name {
+            match db.get_media_metadata(&key.media_id) {
+                Ok(meta) => meta.is_none(),
+                Err(e) => {
+                    warn!(media_id = %key.media_id, error = %e, "retention: media metadata read failed; thumbnail kept");
+                    report.skipped += 1;
+                    continue;
+                }
+            }
+        } else if let Some(lifetime) = config.remote_media_lifetime {
+            let last_access = row
+                .get("last_access_at")
+                .or_else(|| row.get("created_at"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            now_ms.saturating_sub(last_access) >= lifetime.as_millis() as u64
+        } else {
+            false
+        };
+        if !expired {
+            report.skipped += 1;
+            continue;
+        }
+        debug!(origin = %key.origin, media_id = %key.media_id, "retention: dropping cached thumbnail");
+        let blob_id = row.get("blob_id").and_then(|v| v.as_str());
+        if let Some(blob_id) = blob_id
+            && let Err(e) = media_store.delete(blob_id).await
+        {
+            warn!(origin = %key.origin, media_id = %key.media_id, error = %e, "retention: thumbnail blob delete failed; row kept");
+            continue;
+        }
+        // A request that raced us may have re-rendered under a new blob;
+        // leave that fresh row alone.
+        let current = db.get_thumbnail(&key).ok().flatten();
+        let current_blob = current
+            .as_ref()
+            .and_then(|r| r.get("blob_id"))
+            .and_then(|v| v.as_str());
+        if current_blob != blob_id {
+            report.skipped += 1;
+            continue;
+        }
+        if let Err(e) = db.delete_thumbnail(&key) {
+            warn!(origin = %key.origin, media_id = %key.media_id, error = %e, "retention: thumbnail row delete failed; will retry next sweep");
+            continue;
+        }
+        report.deleted += 1;
     }
     Ok(report)
 }
@@ -330,6 +391,205 @@ mod tests {
         assert!(media_store.get("local0001").await.unwrap().is_none());
         assert!(db.get_media_metadata("remote0001").unwrap().is_some());
         assert!(media_store.get("remote0001").await.unwrap().is_some());
+    }
+
+    fn thumb_key(origin: &str, media_id: &str) -> vela_store::db::ThumbnailKey {
+        vela_store::db::ThumbnailKey {
+            origin: origin.into(),
+            media_id: media_id.into(),
+            width: 320,
+            height: 240,
+            method: "scale".into(),
+        }
+    }
+
+    async fn seed_thumbnail(
+        db: &Database,
+        media_store: &dyn MediaStore,
+        origin: &str,
+        media_id: &str,
+        blob_id: &str,
+        last_access_at: u64,
+    ) {
+        media_store.put(blob_id, b"png").await.unwrap();
+        db.set_thumbnail(
+            &thumb_key(origin, media_id),
+            &json!({
+                "blob_id": blob_id,
+                "content_type": "image/png",
+                "size": 3,
+                "width": 320,
+                "height": 240,
+                "created_at": last_access_at,
+                "last_access_at": last_access_at,
+            }),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn expiring_an_original_purges_its_thumbnails() {
+        let (db, _tmp) = build_db();
+        let media_dir = tempfile::tempdir().unwrap();
+        let media_store: Arc<dyn MediaStore> =
+            Arc::new(FilesystemMediaStore::new(media_dir.path()).unwrap());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let old = now - 10 * 24 * 3600 * 1000;
+
+        // A local upload past its lifetime, with a thumbnail.
+        media_store.put("local1", b"body").await.unwrap();
+        db.set_media_metadata(
+            "local1",
+            &json!({"uploader": "@a:vela.example", "created_at": old, "size": 4}),
+        )
+        .unwrap();
+        seed_thumbnail(
+            &db,
+            media_store.as_ref(),
+            "vela.example",
+            "local1",
+            "t-local",
+            now,
+        )
+        .await;
+        // A cached remote file nobody has read for ages, with a thumbnail
+        // that was read today (its original's expiry still takes it).
+        media_store.put("r-blob", b"body").await.unwrap();
+        db.set_remote_media(
+            "remote.example",
+            "r1",
+            &json!({"blob_id": "r-blob", "size": 4, "cached_at": old, "last_access_at": old}),
+        )
+        .unwrap();
+        seed_thumbnail(
+            &db,
+            media_store.as_ref(),
+            "remote.example",
+            "r1",
+            "t-remote",
+            now,
+        )
+        .await;
+
+        let cfg = RetentionConfig {
+            enabled: true,
+            interval: Duration::from_secs(86400),
+            local_media_lifetime: Some(Duration::from_secs(0)),
+            remote_media_lifetime: Some(Duration::from_secs(86400)),
+            server_name: "vela.example".into(),
+        };
+        run_one_media_pass(db.as_ref(), media_store.as_ref(), &cfg)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_thumbnail(&thumb_key("vela.example", "local1"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(media_store.get("t-local").await.unwrap().is_none());
+        assert!(
+            db.get_thumbnail(&thumb_key("remote.example", "r1"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(media_store.get("t-remote").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn orphan_and_stale_thumbnails_are_swept_fresh_ones_kept() {
+        let (db, _tmp) = build_db();
+        let media_dir = tempfile::tempdir().unwrap();
+        let media_store: Arc<dyn MediaStore> =
+            Arc::new(FilesystemMediaStore::new(media_dir.path()).unwrap());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let old = now - 10 * 24 * 3600 * 1000;
+
+        // Local-origin thumbnail whose original is gone: orphan.
+        seed_thumbnail(
+            &db,
+            media_store.as_ref(),
+            "vela.example",
+            "gone",
+            "t-orphan",
+            now,
+        )
+        .await;
+        // Local-origin thumbnail whose original exists: kept whatever its age.
+        db.set_media_metadata(
+            "kept",
+            &json!({"uploader": "@a:vela.example", "created_at": now, "size": 1}),
+        )
+        .unwrap();
+        seed_thumbnail(
+            &db,
+            media_store.as_ref(),
+            "vela.example",
+            "kept",
+            "t-kept",
+            old,
+        )
+        .await;
+        // Remote-origin thumbnails age by their own last use.
+        seed_thumbnail(
+            &db,
+            media_store.as_ref(),
+            "remote.example",
+            "stale",
+            "t-stale",
+            old,
+        )
+        .await;
+        seed_thumbnail(
+            &db,
+            media_store.as_ref(),
+            "remote.example",
+            "fresh",
+            "t-fresh",
+            now,
+        )
+        .await;
+
+        let cfg = RetentionConfig {
+            enabled: true,
+            interval: Duration::from_secs(86400),
+            local_media_lifetime: None,
+            remote_media_lifetime: Some(Duration::from_secs(86400)),
+            server_name: "vela.example".into(),
+        };
+        let report = run_one_media_pass(db.as_ref(), media_store.as_ref(), &cfg)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted, 2);
+
+        assert!(
+            db.get_thumbnail(&thumb_key("vela.example", "gone"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(media_store.get("t-orphan").await.unwrap().is_none());
+        assert!(
+            db.get_thumbnail(&thumb_key("vela.example", "kept"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.get_thumbnail(&thumb_key("remote.example", "stale"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(media_store.get("t-stale").await.unwrap().is_none());
+        assert!(
+            db.get_thumbnail(&thumb_key("remote.example", "fresh"))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

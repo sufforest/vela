@@ -18,6 +18,7 @@ use tokio::io::AsyncRead;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 use vela_core::error::VelaError;
+use vela_store::db::ThumbnailKey;
 
 use crate::federation::federation_client::MediaResponse;
 use crate::middleware::auth::AuthenticatedUser;
@@ -642,75 +643,114 @@ async fn thumbnail_inner(
         return download_inner(State(state), Path((server_name, media_id, None))).await;
     }
 
-    // Spec clamp: server SHOULD pick the smallest cached thumbnail
-    // size at-or-above the requested dimensions. We don't pre-bucket;
-    // we just clamp the requested size to a sane ceiling so a
-    // malicious request can't ask us to render 100k×100k.
-    let req_w = q.width.unwrap_or(96).clamp(1, 1600);
-    let req_h = q.height.unwrap_or(96).clamp(1, 1600);
-    let method = q.method.as_deref().unwrap_or("scale");
+    // A request inside the recommended size table is served from the
+    // thumbnail cache (rendered once per size); anything else is rendered
+    // at its own size, uncached, with a ceiling so a request cannot ask
+    // for 100k×100k.
+    let png = match normalise_thumbnail_request(q.width, q.height, q.method.as_deref()) {
+        Some(spec) => match thumbnail_bytes(&state, &server_name, &media_id, spec)
+            .await?
+            .into_result()?
+        {
+            ThumbnailOutcome::Png(png) => png,
+            ThumbnailOutcome::Original | ThumbnailOutcome::Failed(_) => {
+                return download_inner(State(state), Path((server_name, media_id, None))).await;
+            }
+        },
+        None => {
+            if metadata.get("thumbnailable").and_then(|v| v.as_bool()) == Some(false) {
+                return download_inner(State(state), Path((server_name, media_id, None))).await;
+            }
+            let buf = read_local_blob(&state, &media_id).await?;
+            let req_w = q.width.unwrap_or(96);
+            let req_h = q.height.unwrap_or(96);
+            let method = q.method.as_deref().unwrap_or("scale");
+            match resize_to_png_thumbnail(&buf, req_w, req_h, method) {
+                Ok(Some(png)) => Bytes::from(png),
+                Ok(None) => {
+                    return download_inner(State(state), Path((server_name, media_id, None))).await;
+                }
+                Err(e) => {
+                    // The spec lets a server fall through to the original
+                    // when it cannot render a thumbnail.
+                    tracing::debug!(%media_id, error = %e, "media not thumbnailable; serving the original");
+                    return download_inner(State(state), Path((server_name, media_id, None))).await;
+                }
+            }
+        }
+    };
+    png_response(png)
+}
 
-    // Load original bytes via the same path as /download.
+/// The whole of a local blob in memory (thumbnailing needs it all).
+async fn read_local_blob(state: &AppState, media_id: &str) -> Result<Vec<u8>, ApiError> {
     let mut reader = state
         .media_store
-        .get(&media_id)
+        .get(media_id)
         .await
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?
+        .map_err(store_err)?
         .ok_or_else(|| ApiError(VelaError::NotFound("media file not found".into())))?;
     let mut buf = Vec::new();
     use tokio::io::AsyncReadExt;
-    reader
-        .read_to_end(&mut buf)
-        .await
-        .map_err(|e| ApiError(VelaError::Store(e.to_string())))?;
+    reader.read_to_end(&mut buf).await.map_err(store_err)?;
+    Ok(buf)
+}
 
-    // Decode → resize → encode. We always emit PNG because:
-    //   - lossless (no second round of JPEG quality loss),
-    //   - alpha channel preserved (some chat clients render PNGs for
-    //     stickers and emoji),
-    //   - decoders are universally available.
-    let img = decode_image_limited(&buf)
-        .map_err(|e| ApiError(VelaError::Unknown(format!("decode image: {e}"))))?;
-    let resized = match method {
-        "crop" => crop_to(&img, req_w, req_h),
-        _ => img.thumbnail(req_w, req_h),
-    };
-    let mut out_bytes = Vec::new();
-    resized
-        .write_to(
-            &mut std::io::Cursor::new(&mut out_bytes),
-            image::ImageFormat::Png,
-        )
-        .map_err(|e| ApiError(VelaError::Unknown(format!("encode thumbnail: {e}"))))?;
-
-    let body = Body::from(out_bytes.clone());
+fn png_response(png: Bytes) -> Result<Response, ApiError> {
+    let len = png.len();
     with_media_security_headers(Response::builder().status(StatusCode::OK))
         .header(header::CONTENT_TYPE, "image/png")
-        .header(header::CONTENT_LENGTH, out_bytes.len().to_string())
-        .body(body)
+        .header(header::CONTENT_LENGTH, len.to_string())
+        .body(Body::from(png))
         .map_err(|e| ApiError(VelaError::Unknown(e.to_string())))
 }
 
-/// Resize the given image bytes to a PNG thumbnail. Used by the
-/// /thumbnail handler AND by the federation thumbnail endpoint so
-/// both surfaces emit identical bytes for the same input — the
-/// federation test compares the two byte-for-byte.
+/// Resize the given image bytes to a PNG thumbnail at the requested size
+/// with today's uncached ceiling. `Ok(None)` when the image already fits
+/// inside the requested size: a thumbnail must not upscale, and the spec
+/// says to return the original then.
 pub(crate) fn resize_to_png_thumbnail(
     bytes: &[u8],
     width: u32,
     height: u32,
     method: &str,
-) -> Result<Vec<u8>, image::ImageError> {
-    let w = width.clamp(1, 1600);
-    let h = height.clamp(1, 1600);
+) -> Result<Option<Vec<u8>>, image::ImageError> {
+    render_thumbnail(
+        bytes,
+        width.clamp(1, 1600),
+        height.clamp(1, 1600),
+        ThumbnailMethod::parse(Some(method)),
+    )
+}
+
+/// Decode, resize per `method`, encode as PNG. One function for every
+/// surface (client, federation, cache) so the same request gives the same
+/// bytes. PNG because it is lossless, keeps alpha (stickers, emoji) and
+/// decodes everywhere. `Ok(None)` when the original already fits.
+fn render_thumbnail(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    method: ThumbnailMethod,
+) -> Result<Option<Vec<u8>>, image::ImageError> {
     let img = decode_image_limited(bytes)?;
+    if img.width() <= width && img.height() <= height {
+        return Ok(None);
+    }
     let resized = match method {
-        "crop" => crop_to(&img, w, h),
-        _ => img.thumbnail(w, h),
+        ThumbnailMethod::Crop => crop_to(&img, width, height),
+        ThumbnailMethod::Scale => img.thumbnail(width, height),
     };
     let mut out = Vec::new();
     resized.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)?;
-    Ok(out)
+    Ok(Some(out))
+}
+
+// How many decodes ran on this thread; tests (each on its own
+// current-thread runtime) pin that a cached thumbnail costs none.
+#[cfg(test)]
+thread_local! {
+    static DECODE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Decode an image with explicit resource limits. A "decompression bomb" is
@@ -718,6 +758,8 @@ pub(crate) fn resize_to_png_thumbnail(
 /// default caps allocation at 512 MiB and places NO ceiling on dimensions,
 /// so we tighten both. Bounds the worst-case memory per thumbnail request.
 fn decode_image_limited(bytes: &[u8]) -> Result<image::DynamicImage, image::ImageError> {
+    #[cfg(test)]
+    DECODE_COUNT.with(|c| c.set(c.get() + 1));
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(16_384);
     limits.max_image_height = Some(16_384);
@@ -729,26 +771,531 @@ fn decode_image_limited(bytes: &[u8]) -> Result<image::DynamicImage, image::Imag
     reader.decode()
 }
 
-/// `method=crop` returns an image of exactly the requested
-/// dimensions (or the smallest valid crop above them). We scale the
-/// shorter side to fit and crop the longer side from the centre.
+/// `method=crop`: scale so the image covers the requested box, then crop
+/// the longer side from the centre. Never upscales: an original shorter
+/// than the box on one side is scaled by at most 1 and cropped to what is
+/// there, so the result can be smaller than requested (the spec forbids
+/// upscaling; an original that fits entirely is served as is by the
+/// caller).
 fn crop_to(img: &image::DynamicImage, w: u32, h: u32) -> image::DynamicImage {
     let (iw, ih) = (img.width(), img.height());
     if iw == 0 || ih == 0 {
         return img.clone();
     }
-    let scale = (w as f32 / iw as f32).max(h as f32 / ih as f32);
+    let scale = (w as f32 / iw as f32).max(h as f32 / ih as f32).min(1.0);
     let new_w = ((iw as f32) * scale).ceil() as u32;
     let new_h = ((ih as f32) * scale).ceil() as u32;
-    let scaled = img.resize_exact(
-        new_w.max(w),
-        new_h.max(h),
-        image::imageops::FilterType::Triangle,
-    );
+    let scaled = if scale < 1.0 {
+        img.resize_exact(new_w, new_h, image::imageops::FilterType::Triangle)
+    } else {
+        img.clone()
+    };
     let (sw, sh) = (scaled.width(), scaled.height());
-    let x = sw.saturating_sub(w) / 2;
-    let y = sh.saturating_sub(h) / 2;
-    scaled.crop_imm(x, y, w.min(sw), h.min(sh))
+    let cw = w.min(sw);
+    let ch = h.min(sh);
+    let x = (sw - cw) / 2;
+    let y = (sh - ch) / 2;
+    scaled.crop_imm(x, y, cw, ch)
+}
+
+// ------------------------------------------------------------ thumbnail cache
+
+/// `method` of a thumbnail request. Anything other than `crop` is scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThumbnailMethod {
+    Scale,
+    Crop,
+}
+
+impl ThumbnailMethod {
+    fn parse(method: Option<&str>) -> Self {
+        if method == Some("crop") {
+            Self::Crop
+        } else {
+            Self::Scale
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scale => "scale",
+            Self::Crop => "crop",
+        }
+    }
+}
+
+/// A thumbnail size vela renders and caches: one of the spec's
+/// recommended sizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThumbnailSpec {
+    pub width: u32,
+    pub height: u32,
+    pub method: ThumbnailMethod,
+}
+
+/// The recommended thumbnail sizes, smallest first.
+const SCALE_SIZES: [(u32, u32); 3] = [(320, 240), (640, 480), (800, 600)];
+const CROP_SIZES: [(u32, u32); 2] = [(32, 32), (96, 96)];
+
+/// Snap a request to the recommended size table: the smallest entry at
+/// or above the requested dimensions, scale boxes for `scale` and square
+/// crops for a square `crop`. `None` when nothing in the table covers it
+/// (larger than 800x600, a non-square crop): such a request is rendered
+/// at its own size and not cached. That bounds the cache at a handful of
+/// rows per original however a caller (unauthenticated, on the legacy
+/// endpoint) varies the numbers.
+pub fn normalise_thumbnail_request(
+    width: Option<u32>,
+    height: Option<u32>,
+    method: Option<&str>,
+) -> Option<ThumbnailSpec> {
+    let w = width.unwrap_or(96);
+    let h = height.unwrap_or(96);
+    let method = ThumbnailMethod::parse(method);
+    let table: &[(u32, u32)] = match method {
+        ThumbnailMethod::Scale => &SCALE_SIZES,
+        ThumbnailMethod::Crop => {
+            if w != h {
+                return None;
+            }
+            &CROP_SIZES
+        }
+    };
+    table
+        .iter()
+        .find(|(tw, th)| *tw >= w && *th >= h)
+        .map(|&(width, height)| ThumbnailSpec {
+            width,
+            height,
+            method,
+        })
+}
+
+/// What a thumbnail request resolves to once rendered (or found cached).
+#[derive(Debug, Clone)]
+pub enum ThumbnailOutcome {
+    /// The PNG bytes.
+    Png(Bytes),
+    /// The original is what the spec asks for here: it is not an image,
+    /// does not decode, or already fits inside the requested size (a
+    /// thumbnail must not upscale). The caller serves it.
+    Original,
+    /// The remote original could not be fetched; the peer's verdict,
+    /// shared with every request queued on the same thumbnail.
+    Failed(RemoteFetchFailure),
+}
+
+impl ThumbnailOutcome {
+    /// Turn a `Failed` verdict into the client-facing error.
+    pub(crate) fn into_result(self) -> Result<Self, ApiError> {
+        match self {
+            Self::Failed(failure) => Err(failure.into_error()),
+            other => Ok(other),
+        }
+    }
+}
+
+pub type ThumbnailSlot = FetchSlot<ThumbnailOutcome>;
+
+fn thumbnail_cache_key(origin: &str, media_id: &str, spec: ThumbnailSpec) -> ThumbnailKey {
+    ThumbnailKey {
+        origin: origin.to_string(),
+        media_id: media_id.to_string(),
+        width: spec.width,
+        height: spec.height,
+        method: spec.method.as_str().to_string(),
+    }
+}
+
+fn thumbnail_lock_key(key: &ThumbnailKey) -> String {
+    format!(
+        "{}\0{}\0{}x{}\0{}",
+        key.origin, key.media_id, key.width, key.height, key.method
+    )
+}
+
+/// The thumbnail of `(origin, media_id)` at `spec`, from the cache when
+/// present and rendered (and cached, budget permitting) otherwise. One
+/// render per key at a time: requests queued behind the first get its
+/// outcome, a peer's refusal included, so a dead peer costs one timeout
+/// for everyone waiting on the same thumbnail. `origin` is our own server
+/// name for local media. Only our own storage errors are not recorded.
+pub(crate) async fn thumbnail_bytes(
+    state: &AppState,
+    origin: &str,
+    media_id: &str,
+    spec: ThumbnailSpec,
+) -> Result<ThumbnailOutcome, ApiError> {
+    let key = thumbnail_cache_key(origin, media_id, spec);
+    if let Some(hit) = read_thumbnail_cache(state, &key).await? {
+        return Ok(hit);
+    }
+    let guard = SlotGuard::acquire(&state.thumbnail_locks, thumbnail_lock_key(&key));
+    let mut outcome = guard.slot().0.lock().await;
+    if let Some(o) = &*outcome {
+        return Ok(o.clone());
+    }
+    // The holder before us may have just stored it.
+    if let Some(hit) = read_thumbnail_cache(state, &key).await? {
+        *outcome = Some(hit.clone());
+        return Ok(hit);
+    }
+    let o = render_and_cache_thumbnail(state, &key, spec).await?;
+    *outcome = Some(o.clone());
+    Ok(o)
+}
+
+async fn render_and_cache_thumbnail(
+    state: &AppState,
+    key: &ThumbnailKey,
+    spec: ThumbnailSpec,
+) -> Result<ThumbnailOutcome, ApiError> {
+    let local = key.origin == state.config.server_name;
+    let (bytes, content_type, blob_before) = if local {
+        let meta = state
+            .db
+            .get_media_metadata(&key.media_id)
+            .map_err(store_err)?
+            .ok_or_else(|| ApiError(VelaError::NotFound("media not found".into())))?;
+        if meta.get("thumbnailable").and_then(|v| v.as_bool()) == Some(false) {
+            return Ok(ThumbnailOutcome::Original);
+        }
+        let ct = meta
+            .get("content_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        (
+            Bytes::from(read_local_blob(state, &key.media_id).await?),
+            ct,
+            None,
+        )
+    } else {
+        let row = state
+            .db
+            .get_remote_media(&key.origin, &key.media_id)
+            .ok()
+            .flatten();
+        if let Some(row) = &row
+            && row.get("thumbnailable").and_then(|v| v.as_bool()) == Some(false)
+        {
+            return Ok(ThumbnailOutcome::Original);
+        }
+        let blob_before = row
+            .as_ref()
+            .and_then(|r| r.get("blob_id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        match fetch_remote_original_verdict(state, &key.origin, &key.media_id).await? {
+            Ok(media) => (media.bytes, media.content_type, blob_before),
+            Err(failure) => return Ok(ThumbnailOutcome::Failed(failure)),
+        }
+    };
+    if !content_type.starts_with("image/") {
+        // Flagged too, so a non-image fetched through /thumbnail is not
+        // read from the cache twice on every request.
+        mark_not_thumbnailable(state, key, local, blob_before.as_deref());
+        return Ok(ThumbnailOutcome::Original);
+    }
+    let png = match render_thumbnail(&bytes, spec.width, spec.height, spec.method) {
+        Ok(Some(png)) => Bytes::from(png),
+        Ok(None) => {
+            // Already fits: the original is the answer, and that verdict
+            // is cached so the next request does not decode to learn it.
+            cache_thumbnail_verdict(state, key).await;
+            return Ok(ThumbnailOutcome::Original);
+        }
+        Err(e) => {
+            tracing::debug!(origin = %key.origin, media_id = %key.media_id, error = %e, "media not thumbnailable; serving the original");
+            mark_not_thumbnailable(state, key, local, blob_before.as_deref());
+            return Ok(ThumbnailOutcome::Original);
+        }
+    };
+    cache_thumbnail(state, key, &png).await;
+    Ok(ThumbnailOutcome::Png(png))
+}
+
+/// Remember on the ORIGINAL's row that it cannot be thumbnailed, so the
+/// next request serves the original without reading or decoding it. No
+/// separate negative cache: one flag per original, gone with the
+/// original. For remote media the row is written back only if it still
+/// names the blob the verdict was made on (`blob_before`, or whatever the
+/// fetch just cached when there was none): a refetch or a sweep that
+/// raced us keeps its own row.
+fn mark_not_thumbnailable(
+    state: &AppState,
+    key: &ThumbnailKey,
+    local: bool,
+    blob_before: Option<&str>,
+) {
+    if local {
+        if let Ok(Some(mut meta)) = state.db.get_media_metadata(&key.media_id) {
+            meta["thumbnailable"] = json!(false);
+            if let Err(e) = state.db.set_media_metadata(&key.media_id, &meta) {
+                tracing::debug!(media_id = %key.media_id, error = %e, "thumbnailable flag write failed");
+            }
+        }
+    } else if let Ok(Some(mut row)) = state.db.get_remote_media(&key.origin, &key.media_id) {
+        let blob_now = row.get("blob_id").and_then(|v| v.as_str());
+        if let Some(before) = blob_before
+            && blob_now != Some(before)
+        {
+            return;
+        }
+        row["thumbnailable"] = json!(false);
+        if let Err(e) = state.db.set_remote_media(&key.origin, &key.media_id, &row) {
+            tracing::debug!(origin = %key.origin, media_id = %key.media_id, error = %e, "thumbnailable flag write failed");
+        }
+    }
+}
+
+/// The cached outcome for `key`, with `last_access_at` touched: the PNG
+/// bytes, or the recorded verdict that the original is the answer. `None`
+/// on a miss, including a row whose blob has gone. A hit on remote media
+/// also touches the original's row, so an image only ever viewed as a
+/// thumbnail does not expire underneath its thumbnails.
+async fn read_thumbnail_cache(
+    state: &AppState,
+    key: &ThumbnailKey,
+) -> Result<Option<ThumbnailOutcome>, ApiError> {
+    if !state.config.thumbnail_cache_enabled {
+        return Ok(None);
+    }
+    let Some(row) = state.db.get_thumbnail(key).map_err(store_err)? else {
+        return Ok(None);
+    };
+    if row.get("serve_original").and_then(|v| v.as_bool()) == Some(true) {
+        touch_thumbnail_access(state, key, &row);
+        touch_remote_original_access(state, key);
+        return Ok(Some(ThumbnailOutcome::Original));
+    }
+    let Some(blob_id) = row.get("blob_id").and_then(|v| v.as_str()) else {
+        let _ = state.db.delete_thumbnail(key);
+        return Ok(None);
+    };
+    let Some(mut reader) = state.media_store.get(blob_id).await.map_err(store_err)? else {
+        tracing::warn!(origin = %key.origin, media_id = %key.media_id, %blob_id, "cached thumbnail blob missing; re-rendering");
+        let _ = state.db.delete_thumbnail(key);
+        return Ok(None);
+    };
+    let size = row.get("size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let mut bytes = Vec::with_capacity(size);
+    use tokio::io::AsyncReadExt;
+    reader.read_to_end(&mut bytes).await.map_err(store_err)?;
+    touch_thumbnail_access(state, key, &row);
+    touch_remote_original_access(state, key);
+    Ok(Some(ThumbnailOutcome::Png(Bytes::from(bytes))))
+}
+
+fn touch_remote_original_access(state: &AppState, key: &ThumbnailKey) {
+    if key.origin == state.config.server_name {
+        return;
+    }
+    if let Ok(Some(row)) = state.db.get_remote_media(&key.origin, &key.media_id) {
+        touch_last_access(state, &key.origin, &key.media_id, &row);
+    }
+}
+
+/// Same hourly touch discipline as the remote cache; re-reads the row so
+/// a concurrent re-render (new `blob_id`) is not overwritten.
+fn touch_thumbnail_access(state: &AppState, key: &ThumbnailKey, row: &Value) {
+    let now = now_ms();
+    let last = row
+        .get("last_access_at")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if now.saturating_sub(last) < REMOTE_ACCESS_TOUCH_MS {
+        return;
+    }
+    let current = match state.db.get_thumbnail(key) {
+        Ok(Some(current)) => current,
+        _ => return,
+    };
+    if current.get("blob_id") != row.get("blob_id") {
+        return;
+    }
+    let mut touched = current;
+    touched["last_access_at"] = json!(now);
+    if let Err(e) = state.db.set_thumbnail(key, &touched) {
+        tracing::debug!(origin = %key.origin, media_id = %key.media_id, error = %e, "thumbnail access touch failed");
+    }
+}
+
+/// Store a rendered thumbnail, budget permitting. Storage trouble is
+/// logged; the bytes are served either way.
+async fn cache_thumbnail(state: &AppState, key: &ThumbnailKey, png: &Bytes) {
+    if !state.config.thumbnail_cache_enabled {
+        return;
+    }
+    let size = png.len() as u64;
+    if !make_room_in_thumbnail_cache(state, size).await {
+        return;
+    }
+    let blob_id = Uuid::new_v4().simple().to_string();
+    if let Err(e) = state.media_store.put(&blob_id, png).await {
+        tracing::warn!(origin = %key.origin, media_id = %key.media_id, error = %e, "thumbnail blob write failed; serving uncached");
+        return;
+    }
+    let now = now_ms();
+    let row = json!({
+        "blob_id": blob_id,
+        "content_type": "image/png",
+        "size": size,
+        "width": key.width,
+        "height": key.height,
+        "created_at": now,
+        "last_access_at": now,
+    });
+    if let Err(e) = state.db.set_thumbnail(key, &row) {
+        tracing::warn!(origin = %key.origin, media_id = %key.media_id, error = %e, "thumbnail row write failed; dropping blob");
+        let _ = state.media_store.delete(&blob_id).await;
+    }
+}
+
+/// Record that `key` resolves to the original (it already fits inside the
+/// requested size). No blob; the row costs nothing against the budget and
+/// ages out like any other.
+async fn cache_thumbnail_verdict(state: &AppState, key: &ThumbnailKey) {
+    if !state.config.thumbnail_cache_enabled {
+        return;
+    }
+    let now = now_ms();
+    let row = json!({
+        "serve_original": true,
+        "size": 0,
+        "width": key.width,
+        "height": key.height,
+        "created_at": now,
+        "last_access_at": now,
+    });
+    if let Err(e) = state.db.set_thumbnail(key, &row) {
+        tracing::debug!(origin = %key.origin, media_id = %key.media_id, error = %e, "thumbnail verdict row write failed");
+    }
+}
+
+/// Which entries to evict, least recently used first, so that `incoming`
+/// more bytes fit inside `budget`. `None` when the newcomer is larger than
+/// the whole budget (serve it, do not cache it); an empty plan when it
+/// already fits. Shared by the remote media and thumbnail caches.
+fn eviction_plan<K>(rows: Vec<(u64, u64, K)>, incoming: u64, budget: u64) -> Option<Vec<(u64, K)>> {
+    if incoming > budget {
+        return None;
+    }
+    let mut total: u64 = rows.iter().map(|(_, size, _)| *size).sum();
+    if total + incoming <= budget {
+        return Some(Vec::new());
+    }
+    let mut by_age = rows;
+    by_age.sort_by_key(|(last, ..)| *last);
+    let mut plan = Vec::new();
+    for (_, size, key) in by_age {
+        if total + incoming <= budget {
+            break;
+        }
+        total = total.saturating_sub(size);
+        plan.push((size, key));
+    }
+    Some(plan)
+}
+
+/// Enforce `thumbnail_cache_max_bytes` before storing `incoming` bytes.
+/// Returns false when the thumbnail cannot be cached at all. A budget of 0
+/// means unbounded.
+async fn make_room_in_thumbnail_cache(state: &AppState, incoming: u64) -> bool {
+    let budget = state.config.thumbnail_cache_max_bytes;
+    if budget == 0 {
+        return true;
+    }
+    let rows = match state.db.list_thumbnails() {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "thumbnail cache listing failed; storing without eviction");
+            return true;
+        }
+    };
+    let rows: Vec<(u64, u64, (ThumbnailKey, Value))> = rows
+        .into_iter()
+        .map(|(key, row)| {
+            let last = row
+                .get("last_access_at")
+                .or_else(|| row.get("created_at"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let size = row.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            (last, size, (key, row))
+        })
+        .collect();
+    let Some(plan) = eviction_plan(rows, incoming, budget) else {
+        return false;
+    };
+    for (size, (key, row)) in plan {
+        if let Some(blob_id) = row.get("blob_id").and_then(|v| v.as_str())
+            && let Err(e) = state.media_store.delete(blob_id).await
+        {
+            tracing::warn!(origin = %key.origin, media_id = %key.media_id, error = %e, "thumbnail eviction: blob delete failed");
+            continue;
+        }
+        if let Err(e) = state.db.delete_thumbnail(&key) {
+            tracing::warn!(origin = %key.origin, media_id = %key.media_id, error = %e, "thumbnail eviction: row delete failed");
+            continue;
+        }
+        tracing::debug!(origin = %key.origin, media_id = %key.media_id, size, "thumbnail cache: evicted for space");
+    }
+    true
+}
+
+/// Drop every cached thumbnail of one original (blob first, then row, so
+/// a failed blob delete leaves the row to retry). Returns how many went.
+pub async fn purge_thumbnails(
+    db: &vela_store::db::Database,
+    store: &dyn vela_store::media::MediaStore,
+    origin: &str,
+    media_id: &str,
+) -> usize {
+    match db.list_thumbnails_for(origin, media_id) {
+        Ok(rows) => purge_thumbnail_rows(db, store, rows).await,
+        Err(e) => {
+            tracing::warn!(%origin, %media_id, error = %e, "thumbnail purge: listing failed");
+            0
+        }
+    }
+}
+
+/// Drop every cached thumbnail of media from `origin`.
+pub async fn purge_thumbnails_for_origin(
+    db: &vela_store::db::Database,
+    store: &dyn vela_store::media::MediaStore,
+    origin: &str,
+) -> usize {
+    match db.list_thumbnails_for_origin(origin) {
+        Ok(rows) => purge_thumbnail_rows(db, store, rows).await,
+        Err(e) => {
+            tracing::warn!(%origin, error = %e, "thumbnail purge: listing failed");
+            0
+        }
+    }
+}
+
+async fn purge_thumbnail_rows(
+    db: &vela_store::db::Database,
+    store: &dyn vela_store::media::MediaStore,
+    rows: Vec<(ThumbnailKey, Value)>,
+) -> usize {
+    let mut purged = 0;
+    for (key, row) in rows {
+        if let Some(blob_id) = row.get("blob_id").and_then(|v| v.as_str())
+            && let Err(e) = store.delete(blob_id).await
+        {
+            tracing::warn!(origin = %key.origin, media_id = %key.media_id, error = %e, "thumbnail purge: blob delete failed; row kept");
+            continue;
+        }
+        if let Err(e) = db.delete_thumbnail(&key) {
+            tracing::warn!(origin = %key.origin, media_id = %key.media_id, error = %e, "thumbnail purge: row delete failed");
+            continue;
+        }
+        purged += 1;
+    }
+    purged
 }
 
 /// GET /_matrix/media/v3/config
@@ -1185,12 +1732,12 @@ async fn download_remote(
     media_response(media, filename_override)
 }
 
-/// Thumbnail of remote media: take the original from the cache (fetching
-/// it over federation on a miss) and resize it with the same thumbnailer
-/// as local media, so a client gets one size policy whichever server
-/// holds the file. Non-image content and undecodable bytes are served as
-/// the original, as the local path does. Thumbnails themselves are not
-/// cached, matching the local path.
+/// Thumbnail of remote media, through the same cache and size policy as
+/// local media, so a client gets one answer whichever server holds the
+/// file. A cache hit never touches the original (nor federation); a miss
+/// takes the original from the remote cache, fetching it over federation
+/// if needed. Non-image content and undecodable bytes are served as the
+/// original, as the local path does.
 async fn download_remote_thumbnail(
     state: &AppState,
     server_name: &str,
@@ -1198,27 +1745,36 @@ async fn download_remote_thumbnail(
     q: &ThumbnailQuery,
 ) -> Result<Response, ApiError> {
     check_remote_media_ref(server_name, media_id)?;
-    let media = fetch_remote_original(state, server_name, media_id).await?;
-    if !media.content_type.starts_with("image/") {
-        return media_response(media, None);
-    }
-    let width = q.width.unwrap_or(96);
-    let height = q.height.unwrap_or(96);
-    let method = q.method.as_deref().unwrap_or("scale");
-    match resize_to_png_thumbnail(&media.bytes, width, height, method) {
-        Ok(png) => {
-            let len = png.len();
-            with_media_security_headers(Response::builder().status(StatusCode::OK))
-                .header(header::CONTENT_TYPE, "image/png")
-                .header(header::CONTENT_LENGTH, len.to_string())
-                .body(Body::from(png))
-                .map_err(|e| ApiError(VelaError::Unknown(e.to_string())))
+    let png = match normalise_thumbnail_request(q.width, q.height, q.method.as_deref()) {
+        Some(spec) => match thumbnail_bytes(state, server_name, media_id, spec)
+            .await?
+            .into_result()?
+        {
+            ThumbnailOutcome::Png(png) => png,
+            ThumbnailOutcome::Original | ThumbnailOutcome::Failed(_) => {
+                let media = fetch_remote_original(state, server_name, media_id).await?;
+                return media_response(media, None);
+            }
+        },
+        None => {
+            let media = fetch_remote_original(state, server_name, media_id).await?;
+            if !media.content_type.starts_with("image/") {
+                return media_response(media, None);
+            }
+            let width = q.width.unwrap_or(96);
+            let height = q.height.unwrap_or(96);
+            let method = q.method.as_deref().unwrap_or("scale");
+            match resize_to_png_thumbnail(&media.bytes, width, height, method) {
+                Ok(Some(png)) => Bytes::from(png),
+                Ok(None) => return media_response(media, None),
+                Err(e) => {
+                    tracing::debug!(remote = %server_name, %media_id, error = %e, "remote media not thumbnailable; serving the original");
+                    return media_response(media, None);
+                }
+            }
         }
-        Err(e) => {
-            tracing::debug!(remote = %server_name, %media_id, error = %e, "remote media not thumbnailable; serving the original");
-            media_response(media, None)
-        }
-    }
+    };
+    png_response(png)
 }
 
 /// Reject references we would never have handed out ourselves before
@@ -1276,7 +1832,7 @@ fn row_filename(row: &Value) -> Option<String> {
 /// `Copy` so one fetch's failure can be handed to every request that
 /// queued behind it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RemoteFetchFailure {
+pub enum RemoteFetchFailure {
     /// Peer said 404 with a real not-found code.
     NotFound,
     /// Peer said 504: an MSC2246 reservation without bytes yet.
@@ -1313,51 +1869,55 @@ impl RemoteFetchFailure {
 }
 
 #[derive(Debug, Clone)]
-enum RemoteFetchOutcome {
+pub enum RemoteFetchOutcome {
     /// The bytes themselves, so waiters are answered even when the file
     /// could not be cached (over budget, storage failure).
     Fetched(MediaResponse),
     Failed(RemoteFetchFailure),
 }
 
-/// Single-flight slot for one `(origin, media_id)`. The first request
-/// through the mutex fetches and records the outcome; requests that were
-/// already queued behind it get that outcome instead of fetching again,
-/// so a dead peer costs one timeout, not one per waiting client. The
-/// slot leaves the map when the last request holding it finishes.
-pub struct RemoteFetchSlot(tokio::sync::Mutex<Option<RemoteFetchOutcome>>);
+/// Single-flight slot for one key. The first request through the mutex
+/// does the work and records the outcome; requests that were already
+/// queued behind it get that outcome instead of repeating it, so a dead
+/// peer costs one timeout, not one per waiting client. The slot leaves
+/// the map when the last request holding it finishes.
+pub struct FetchSlot<O>(tokio::sync::Mutex<Option<O>>);
+
+/// Slot for one `(origin, media_id)` remote fetch.
+pub type RemoteFetchSlot = FetchSlot<RemoteFetchOutcome>;
 
 /// Holds a slot for the duration of one request and removes it from the
 /// map on drop, including when the request is cancelled or errors out
 /// early. The map entry is only removed once no other request holds it:
 /// a newcomer clones under the shard lock before our check runs.
-struct SlotGuard {
-    map: std::sync::Arc<DashMap<String, std::sync::Arc<RemoteFetchSlot>>>,
+struct SlotGuard<O> {
+    map: std::sync::Arc<DashMap<String, std::sync::Arc<FetchSlot<O>>>>,
     key: String,
-    slot: Option<std::sync::Arc<RemoteFetchSlot>>,
+    slot: Option<std::sync::Arc<FetchSlot<O>>>,
 }
 
-impl SlotGuard {
-    fn acquire(state: &AppState, origin: &str, media_id: &str) -> Self {
-        let key = remote_media_lock_key(origin, media_id);
-        let slot = state
-            .remote_media_locks
+impl<O> SlotGuard<O> {
+    fn acquire(
+        map: &std::sync::Arc<DashMap<String, std::sync::Arc<FetchSlot<O>>>>,
+        key: String,
+    ) -> Self {
+        let slot = map
             .entry(key.clone())
-            .or_insert_with(|| std::sync::Arc::new(RemoteFetchSlot(tokio::sync::Mutex::new(None))))
+            .or_insert_with(|| std::sync::Arc::new(FetchSlot(tokio::sync::Mutex::new(None))))
             .clone();
         Self {
-            map: state.remote_media_locks.clone(),
+            map: map.clone(),
             key,
             slot: Some(slot),
         }
     }
 
-    fn slot(&self) -> &RemoteFetchSlot {
+    fn slot(&self) -> &FetchSlot<O> {
         self.slot.as_ref().expect("slot held until drop")
     }
 }
 
-impl Drop for SlotGuard {
+impl<O> Drop for SlotGuard<O> {
     fn drop(&mut self) {
         // Release our reference first, then drop the entry if it was the
         // last one: the map's own count is the one that remains.
@@ -1376,24 +1936,39 @@ pub(crate) async fn fetch_remote_original(
     origin: &str,
     media_id: &str,
 ) -> Result<MediaResponse, ApiError> {
+    fetch_remote_original_verdict(state, origin, media_id)
+        .await?
+        .map_err(|failure| failure.into_error())
+}
+
+/// `fetch_remote_original` with the peer's verdict kept apart from our
+/// own storage errors, for callers that record it in a slot of their own.
+async fn fetch_remote_original_verdict(
+    state: &AppState,
+    origin: &str,
+    media_id: &str,
+) -> Result<Result<MediaResponse, RemoteFetchFailure>, ApiError> {
     if let Some(media) = read_remote_cache(state, origin, media_id).await? {
-        return Ok(media);
+        return Ok(Ok(media));
     }
-    let guard = SlotGuard::acquire(state, origin, media_id);
+    let guard = SlotGuard::acquire(
+        &state.remote_media_locks,
+        remote_media_lock_key(origin, media_id),
+    );
     let mut outcome = guard.slot().0.lock().await;
     match &*outcome {
-        Some(RemoteFetchOutcome::Fetched(media)) => return Ok(media.clone()),
-        Some(RemoteFetchOutcome::Failed(failure)) => return Err(failure.into_error()),
+        Some(RemoteFetchOutcome::Fetched(media)) => return Ok(Ok(media.clone())),
+        Some(RemoteFetchOutcome::Failed(failure)) => return Ok(Err(*failure)),
         None => {}
     }
     match fetch_and_store_remote(state, origin, media_id).await {
         Ok(media) => {
             *outcome = Some(RemoteFetchOutcome::Fetched(media.clone()));
-            Ok(media)
+            Ok(Ok(media))
         }
         Err(failure) => {
             *outcome = Some(RemoteFetchOutcome::Failed(failure));
-            Err(failure.into_error())
+            Ok(Err(failure))
         }
     }
 }
@@ -1487,6 +2062,9 @@ async fn fetch_and_store_remote(
 
     // From here on the bytes are in hand; a storage problem is logged and
     // the response still succeeds, it just is not cached.
+    if !state.config.remote_media_cache_enabled {
+        return Ok(media);
+    }
     let size = media.bytes.len() as u64;
     if !make_room_in_remote_cache(state, size).await {
         return Ok(media);
@@ -1521,9 +2099,6 @@ async fn make_room_in_remote_cache(state: &AppState, incoming: u64) -> bool {
     if budget == 0 {
         return true;
     }
-    if incoming > budget {
-        return false;
-    }
     let rows = match state.db.list_remote_media() {
         Ok(rows) => rows,
         Err(e) => {
@@ -1531,14 +2106,7 @@ async fn make_room_in_remote_cache(state: &AppState, incoming: u64) -> bool {
             return true;
         }
     };
-    let mut total: u64 = rows
-        .iter()
-        .map(|(_, _, r)| r.get("size").and_then(|v| v.as_u64()).unwrap_or(0))
-        .sum();
-    if total + incoming <= budget {
-        return true;
-    }
-    let mut by_age: Vec<_> = rows
+    let rows: Vec<(u64, u64, (String, String, Value))> = rows
         .into_iter()
         .map(|(origin, media_id, row)| {
             let last = row
@@ -1546,15 +2114,14 @@ async fn make_room_in_remote_cache(state: &AppState, incoming: u64) -> bool {
                 .or_else(|| row.get("cached_at"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            (last, origin, media_id, row)
+            let size = row.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            (last, size, (origin, media_id, row))
         })
         .collect();
-    by_age.sort_by_key(|(last, ..)| *last);
-    for (_, origin, media_id, row) in by_age {
-        if total + incoming <= budget {
-            break;
-        }
-        let size = row.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    let Some(plan) = eviction_plan(rows, incoming, budget) else {
+        return false;
+    };
+    for (size, (origin, media_id, row)) in plan {
         if let Some(blob_id) = row.get("blob_id").and_then(|v| v.as_str())
             && let Err(e) = state.media_store.delete(blob_id).await
         {
@@ -1566,7 +2133,6 @@ async fn make_room_in_remote_cache(state: &AppState, incoming: u64) -> bool {
             continue;
         }
         tracing::debug!(%origin, %media_id, size, "remote media cache: evicted for space");
-        total = total.saturating_sub(size);
     }
     true
 }
@@ -1760,7 +2326,12 @@ mod remote_media_cache_tests {
             Some("image/png")
         );
         let thumb = body(resp).await;
-        let local = resize_to_png_thumbnail(&bytes, 96, 96, "scale").unwrap();
+        // Same size policy as local media: the request snaps to the
+        // recommended table before rendering.
+        let spec = normalise_thumbnail_request(Some(96), Some(96), Some("scale")).unwrap();
+        let local = resize_to_png_thumbnail(&bytes, spec.width, spec.height, spec.method.as_str())
+            .unwrap()
+            .expect("400x300 is larger than the box");
         assert_eq!(png_dims(&thumb), png_dims(&local));
         assert!(png_dims(&thumb).0 < 400);
         server.verify().await;
@@ -2341,5 +2912,622 @@ mod preview_ssrf_tests {
             .expect("redirect followed");
         assert!(final_url.ends_with("/b"));
         assert_eq!(&body[..], b"final");
+    }
+}
+
+#[cfg(test)]
+mod thumbnail_cache_tests {
+    use super::*;
+    use crate::test_helpers::build_test_state;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ORIGIN: &str = "remote.example";
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(width, height, image::Rgba([200, 10, 30, 255]));
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    fn png_dims(bytes: &[u8]) -> (u32, u32) {
+        let img = image::load_from_memory(bytes).unwrap();
+        (img.width(), img.height())
+    }
+
+    fn decodes() -> usize {
+        DECODE_COUNT.with(|c| c.get())
+    }
+
+    async fn seed_local(state: &AppState, media_id: &str, bytes: &[u8], content_type: &str) {
+        state.media_store.put(media_id, bytes).await.unwrap();
+        state
+            .db
+            .set_media_metadata(
+                media_id,
+                &json!({
+                    "content_type": content_type,
+                    "filename": "x",
+                    "size": bytes.len(),
+                    "uploader": format!("@u:{}", state.config.server_name),
+                    "created_at": now_ms(),
+                }),
+            )
+            .unwrap();
+    }
+
+    fn query(w: u32, h: u32, method: &str) -> ThumbnailQuery {
+        ThumbnailQuery {
+            width: Some(w),
+            height: Some(h),
+            method: Some(method.into()),
+            animated: None,
+            allow_remote: None,
+            allow_redirect: None,
+            timeout_ms: None,
+        }
+    }
+
+    async fn local_thumbnail(
+        state: &AppState,
+        media_id: &str,
+        w: u32,
+        h: u32,
+        method: &str,
+    ) -> Result<Response, ApiError> {
+        thumbnail_inner(
+            State(state.clone()),
+            state.config.server_name.clone(),
+            media_id.to_string(),
+            query(w, h, method),
+        )
+        .await
+    }
+
+    async fn remote_thumbnail(
+        state: &AppState,
+        media_id: &str,
+        w: u32,
+        h: u32,
+    ) -> Result<Response, ApiError> {
+        thumbnail_inner(
+            State(state.clone()),
+            ORIGIN.to_string(),
+            media_id.to_string(),
+            query(w, h, "scale"),
+        )
+        .await
+    }
+
+    async fn body(resp: Response) -> Vec<u8> {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    fn rows_for(state: &AppState, origin: &str, media_id: &str) -> Vec<(ThumbnailKey, Value)> {
+        state.db.list_thumbnails_for(origin, media_id).unwrap()
+    }
+
+    fn with_thumbnail_budget(state: &AppState, budget: u64) -> AppState {
+        let mut st = state.clone();
+        let mut cfg = (*st.config).clone();
+        cfg.thumbnail_cache_max_bytes = budget;
+        st.config = std::sync::Arc::new(cfg);
+        st
+    }
+
+    #[test]
+    fn requests_snap_to_the_recommended_table() {
+        let n = |w, h, m| normalise_thumbnail_request(Some(w), Some(h), Some(m));
+        assert_eq!(
+            n(50, 50, "scale").map(|s| (s.width, s.height)),
+            Some((320, 240))
+        );
+        assert_eq!(
+            n(320, 240, "scale").map(|s| (s.width, s.height)),
+            Some((320, 240))
+        );
+        assert_eq!(
+            n(321, 240, "scale").map(|s| (s.width, s.height)),
+            Some((640, 480))
+        );
+        assert_eq!(
+            n(800, 600, "scale").map(|s| (s.width, s.height)),
+            Some((800, 600))
+        );
+        assert_eq!(n(801, 600, "scale"), None);
+        assert_eq!(
+            n(32, 32, "crop").map(|s| (s.width, s.height)),
+            Some((32, 32))
+        );
+        assert_eq!(
+            n(50, 50, "crop").map(|s| (s.width, s.height)),
+            Some((96, 96))
+        );
+        assert_eq!(n(97, 97, "crop"), None);
+        assert_eq!(
+            n(100, 50, "crop"),
+            None,
+            "non-square crops are not in the table"
+        );
+        // Defaults: 96x96, scale.
+        let d = normalise_thumbnail_request(None, None, None).unwrap();
+        assert_eq!(
+            (d.width, d.height, d.method),
+            (320, 240, ThumbnailMethod::Scale)
+        );
+        // Unknown methods are scale, as before.
+        assert_eq!(n(10, 10, "stretch").unwrap().method, ThumbnailMethod::Scale);
+    }
+
+    #[test]
+    fn eviction_plan_is_lru_and_refuses_oversize_newcomers() {
+        assert!(eviction_plan(Vec::<(u64, u64, &str)>::new(), 11, 10).is_none());
+        assert_eq!(eviction_plan(vec![(5, 4, "a")], 4, 10).unwrap(), vec![]);
+        // 3 rows of 4 bytes in a budget of 10, newcomer 4: evict the two
+        // least recently used, oldest first.
+        let plan = eviction_plan(
+            vec![(30, 4, "new"), (10, 4, "oldest"), (20, 4, "mid")],
+            4,
+            10,
+        )
+        .unwrap();
+        assert_eq!(plan, vec![(4, "oldest"), (4, "mid")]);
+    }
+
+    #[tokio::test]
+    async fn second_request_is_served_from_cache() {
+        let (state, _tmp) = build_test_state();
+        seed_local(&state, "m", &png(400, 300), "image/png").await;
+        let origin = state.config.server_name.clone();
+
+        let first = body(local_thumbnail(&state, "m", 96, 96, "scale").await.unwrap()).await;
+        assert_eq!(png_dims(&first), (320, 240));
+        let rows = rows_for(&state, &origin, "m");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].0.width, rows[0].0.height, rows[0].0.method.as_str()),
+            (320, 240, "scale")
+        );
+
+        // Swap the cached blob for a sentinel: a second request that
+        // decodes the original again would not return it.
+        let blob_id = rows[0].1["blob_id"].as_str().unwrap().to_string();
+        state.media_store.put(&blob_id, &png(5, 5)).await.unwrap();
+        let second = body(local_thumbnail(&state, "m", 96, 96, "scale").await.unwrap()).await;
+        assert_eq!(png_dims(&second), (5, 5));
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_key_requests_decode_once() {
+        let (state, _tmp) = build_test_state();
+        seed_local(&state, "m", &png(400, 300), "image/png").await;
+        let before = decodes();
+        let reqs = (0..32).map(|_| local_thumbnail(&state, "m", 96, 96, "scale"));
+        for r in futures::future::join_all(reqs).await {
+            assert_eq!(r.unwrap().status(), StatusCode::OK);
+        }
+        assert_eq!(
+            decodes() - before,
+            1,
+            "one decode for 32 concurrent requests"
+        );
+        assert_eq!(rows_for(&state, &state.config.server_name, "m").len(), 1);
+        assert!(state.thumbnail_locks.is_empty(), "slots are released");
+    }
+
+    #[tokio::test]
+    async fn requested_size_is_normalised_to_table() {
+        let (state, _tmp) = build_test_state();
+        seed_local(&state, "m", &png(400, 300), "image/png").await;
+        let scaled = body(local_thumbnail(&state, "m", 50, 50, "scale").await.unwrap()).await;
+        assert_eq!(png_dims(&scaled), (320, 240));
+        let cropped = body(local_thumbnail(&state, "m", 50, 50, "crop").await.unwrap()).await;
+        assert_eq!(png_dims(&cropped), (96, 96));
+        let mut keys: Vec<String> = rows_for(&state, &state.config.server_name, "m")
+            .into_iter()
+            .map(|(k, _)| format!("{}x{} {}", k.width, k.height, k.method))
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec!["320x240 scale", "96x96 crop"]);
+    }
+
+    #[tokio::test]
+    async fn non_square_crop_and_oversize_requests_are_served_uncached() {
+        let (state, _tmp) = build_test_state();
+        seed_local(&state, "m", &png(1200, 900), "image/png").await;
+        let crop = body(local_thumbnail(&state, "m", 100, 50, "crop").await.unwrap()).await;
+        assert_eq!(png_dims(&crop), (100, 50));
+        let big = body(
+            local_thumbnail(&state, "m", 1000, 1000, "scale")
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(png_dims(&big), (1000, 750));
+        assert!(rows_for(&state, &state.config.server_name, "m").is_empty());
+    }
+
+    #[tokio::test]
+    async fn budget_evicts_least_recently_used_thumbnail_first() {
+        let (base, _tmp) = build_test_state();
+        for id in ["a", "b", "c"] {
+            seed_local(&base, id, &png(400, 300), "image/png").await;
+        }
+        let origin = base.config.server_name.clone();
+        // Learn one thumbnail's size, then allow room for two of them.
+        let probe = with_thumbnail_budget(&base, 0);
+        local_thumbnail(&probe, "a", 96, 96, "scale").await.unwrap();
+        let size = rows_for(&probe, &origin, "a")[0].1["size"]
+            .as_u64()
+            .unwrap();
+        let state = with_thumbnail_budget(&base, size * 2 + size / 2);
+
+        local_thumbnail(&state, "b", 96, 96, "scale").await.unwrap();
+        let (a_key, mut a_row) = rows_for(&state, &origin, "a").remove(0);
+        a_row["last_access_at"] = json!(now_ms() - 10 * REMOTE_ACCESS_TOUCH_MS);
+        state.db.set_thumbnail(&a_key, &a_row).unwrap();
+        let a_blob = a_row["blob_id"].as_str().unwrap().to_string();
+
+        local_thumbnail(&state, "c", 96, 96, "scale").await.unwrap();
+        assert!(
+            rows_for(&state, &origin, "a").is_empty(),
+            "stale thumbnail evicted"
+        );
+        assert!(state.media_store.get(&a_blob).await.unwrap().is_none());
+        assert_eq!(rows_for(&state, &origin, "b").len(), 1);
+        assert_eq!(rows_for(&state, &origin, "c").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn thumbnail_larger_than_budget_is_served_but_not_cached() {
+        let (base, _tmp) = build_test_state();
+        seed_local(&base, "m", &png(400, 300), "image/png").await;
+        let state = with_thumbnail_budget(&base, 10);
+        let resp = local_thumbnail(&state, "m", 96, 96, "scale").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(rows_for(&state, &state.config.server_name, "m").is_empty());
+    }
+
+    #[tokio::test]
+    async fn remote_thumbnail_hit_does_not_touch_federation() {
+        let (state, _tmp) = build_test_state();
+        let bytes = png(400, 300);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/federation/v1/media/download/r"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(bytes),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        state
+            .federation_client
+            .set_base_url_override(ORIGIN, &server.uri());
+
+        let first = body(remote_thumbnail(&state, "r", 96, 96).await.unwrap()).await;
+        assert_eq!(png_dims(&first), (320, 240));
+        // Lose the cached original entirely: the thumbnail must still be
+        // served from its own cache without a second fetch.
+        let row = state.db.get_remote_media(ORIGIN, "r").unwrap().unwrap();
+        state
+            .media_store
+            .delete(row["blob_id"].as_str().unwrap())
+            .await
+            .unwrap();
+        state.db.delete_remote_media(ORIGIN, "r").unwrap();
+        let second = body(remote_thumbnail(&state, "r", 96, 96).await.unwrap()).await;
+        assert_eq!(second, first);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn undecodable_image_sets_flag_and_is_not_redecoded() {
+        let (state, _tmp) = build_test_state();
+        let garbage = b"not really a png".to_vec();
+        seed_local(&state, "m", &garbage, "image/png").await;
+        let before = decodes();
+        let resp = local_thumbnail(&state, "m", 96, 96, "scale").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body(resp).await, garbage, "the original is served");
+        assert_eq!(decodes() - before, 1);
+        let meta = state.db.get_media_metadata("m").unwrap().unwrap();
+        assert_eq!(meta["thumbnailable"], json!(false));
+
+        let resp = local_thumbnail(&state, "m", 96, 96, "scale").await.unwrap();
+        assert_eq!(body(resp).await, garbage);
+        assert_eq!(decodes() - before, 1, "flag short-circuits the decode");
+        assert!(rows_for(&state, &state.config.server_name, "m").is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleted_original_is_not_served_from_cache() {
+        let (state, _tmp) = build_test_state();
+        seed_local(&state, "m", &png(400, 300), "image/png").await;
+        local_thumbnail(&state, "m", 96, 96, "scale").await.unwrap();
+        state.db.delete_media_metadata("m").unwrap();
+        let err = local_thumbnail(&state, "m", 96, 96, "scale")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.status_code(), 404);
+    }
+
+    #[tokio::test]
+    async fn federation_thumbnail_bytes_equal_client_thumbnail() {
+        use crate::media::federation_media::{FederationThumbnailQuery, federation_thumbnail};
+        use crate::middleware::federation_auth::XMatrixOrigin;
+        let (state, _tmp) = build_test_state();
+        seed_local(&state, "m", &png(400, 300), "image/png").await;
+        let client = body(local_thumbnail(&state, "m", 32, 32, "scale").await.unwrap()).await;
+
+        let resp = federation_thumbnail(
+            State(state.clone()),
+            Path("m".to_string()),
+            Query(FederationThumbnailQuery {
+                width: Some(32),
+                height: Some(32),
+                method: Some("scale".into()),
+                animated: None,
+                timeout_ms: None,
+            }),
+            axum::extract::Extension(XMatrixOrigin("peer.example".into())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let multipart = body(resp).await;
+        // The image part follows its own header block; the trailing
+        // CRLF and closing boundary are not part of the bytes.
+        let marker = b"Content-Type: image/png\r\n\r\n";
+        let start = multipart
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .expect("image part")
+            + marker.len();
+        let rest = &multipart[start..];
+        let end = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|i| {
+                // The PNG itself may contain CRLF; find the boundary line.
+                let tail = &rest[i..];
+                let bpos = tail
+                    .windows(4)
+                    .position(|w| w == b"\r\n--")
+                    .unwrap_or(tail.len());
+                i + bpos
+            })
+            .unwrap_or(rest.len());
+        let federation = &rest[..end.min(rest.len())];
+        assert_eq!(
+            federation,
+            &client[..],
+            "both surfaces serve one cached render"
+        );
+        assert_eq!(
+            rows_for(&state, &state.config.server_name, "m").len(),
+            1,
+            "one cache row serves both"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_thumbnail_is_not_servable_as_local_media() {
+        let (state, _tmp) = build_test_state();
+        seed_local(&state, "m", &png(400, 300), "image/png").await;
+        local_thumbnail(&state, "m", 96, 96, "scale").await.unwrap();
+        let origin = state.config.server_name.clone();
+        let blob_id = rows_for(&state, &origin, "m")[0].1["blob_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let err = download_inner(State(state.clone()), Path((origin, blob_id, None)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0.status_code(), 404);
+    }
+
+    #[tokio::test]
+    async fn small_original_is_not_upscaled_by_crop() {
+        let (state, _tmp) = build_test_state();
+        seed_local(&state, "m", &png(20, 20), "image/png").await;
+        let out = body(local_thumbnail(&state, "m", 96, 96, "crop").await.unwrap()).await;
+        assert_eq!(png_dims(&out), (20, 20));
+    }
+
+    #[tokio::test]
+    async fn purge_drops_every_thumbnail_of_one_original_and_of_one_origin() {
+        let (state, _tmp) = build_test_state();
+        seed_local(&state, "m", &png(400, 300), "image/png").await;
+        seed_local(&state, "n", &png(400, 300), "image/png").await;
+        local_thumbnail(&state, "m", 96, 96, "scale").await.unwrap();
+        local_thumbnail(&state, "m", 96, 96, "crop").await.unwrap();
+        local_thumbnail(&state, "n", 96, 96, "scale").await.unwrap();
+        let origin = state.config.server_name.clone();
+        let blobs: Vec<String> = rows_for(&state, &origin, "m")
+            .iter()
+            .map(|(_, r)| r["blob_id"].as_str().unwrap().to_string())
+            .collect();
+
+        let n = purge_thumbnails(&state.db, state.media_store.as_ref(), &origin, "m").await;
+        assert_eq!(n, 2);
+        assert!(rows_for(&state, &origin, "m").is_empty());
+        for b in &blobs {
+            assert!(state.media_store.get(b).await.unwrap().is_none());
+        }
+        assert_eq!(rows_for(&state, &origin, "n").len(), 1);
+
+        let n = purge_thumbnails_for_origin(&state.db, state.media_store.as_ref(), &origin).await;
+        assert_eq!(n, 1);
+        assert!(state.db.list_thumbnails().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn small_original_is_not_upscaled_by_scale_and_the_verdict_is_cached() {
+        let (state, _tmp) = build_test_state();
+        let original = png(100, 80);
+        seed_local(&state, "m", &original, "image/png").await;
+        let before = decodes();
+        let out = body(local_thumbnail(&state, "m", 96, 96, "scale").await.unwrap()).await;
+        assert_eq!(out, original, "fits inside 320x240: the original is served");
+        assert_eq!(decodes() - before, 1);
+        let rows = rows_for(&state, &state.config.server_name, "m");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1["serve_original"], json!(true));
+        assert!(rows[0].1.get("blob_id").is_none());
+
+        let out = body(local_thumbnail(&state, "m", 96, 96, "scale").await.unwrap()).await;
+        assert_eq!(out, original);
+        assert_eq!(
+            decodes() - before,
+            1,
+            "the verdict is served without decoding"
+        );
+    }
+
+    #[tokio::test]
+    async fn crop_never_upscales_a_short_side() {
+        let (state, _tmp) = build_test_state();
+        seed_local(&state, "m", &png(400, 20), "image/png").await;
+        let out = body(local_thumbnail(&state, "m", 96, 96, "crop").await.unwrap()).await;
+        assert_eq!(png_dims(&out), (96, 20));
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_share_a_dead_peer_verdict() {
+        let (state, _tmp) = build_test_state();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/federation/v1/media/download/gone"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_json(json!({"errcode": "M_NOT_FOUND"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        state
+            .federation_client
+            .set_base_url_override(ORIGIN, &server.uri());
+        let reqs = (0..8).map(|_| remote_thumbnail(&state, "gone", 96, 96));
+        for r in futures::future::join_all(reqs).await {
+            assert_eq!(r.unwrap_err().0.status_code(), 404);
+        }
+        server.verify().await;
+        assert!(state.thumbnail_locks.is_empty());
+        assert!(state.remote_media_locks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn thumbnail_hit_keeps_the_remote_original_fresh() {
+        let (state, _tmp) = build_test_state();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/federation/v1/media/download/r"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(png(400, 300)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        state
+            .federation_client
+            .set_base_url_override(ORIGIN, &server.uri());
+        remote_thumbnail(&state, "r", 96, 96).await.unwrap();
+        let mut row = state.db.get_remote_media(ORIGIN, "r").unwrap().unwrap();
+        let stale = now_ms() - 10 * REMOTE_ACCESS_TOUCH_MS;
+        row["last_access_at"] = json!(stale);
+        state.db.set_remote_media(ORIGIN, "r", &row).unwrap();
+
+        remote_thumbnail(&state, "r", 96, 96).await.unwrap();
+        let row = state.db.get_remote_media(ORIGIN, "r").unwrap().unwrap();
+        assert!(
+            row["last_access_at"].as_u64().unwrap() > stale,
+            "a thumbnail hit counts as a read of the original"
+        );
+        server.verify().await;
+    }
+
+    fn with_caches(state: &AppState, remote: bool, thumbnails: bool) -> AppState {
+        let mut st = state.clone();
+        let mut cfg = (*st.config).clone();
+        cfg.remote_media_cache_enabled = remote;
+        cfg.thumbnail_cache_enabled = thumbnails;
+        st.config = std::sync::Arc::new(cfg);
+        st
+    }
+
+    #[tokio::test]
+    async fn disabled_caches_store_nothing_and_still_serve() {
+        let (base, _tmp) = build_test_state();
+        let state = with_caches(&base, false, false);
+        seed_local(&state, "m", &png(400, 300), "image/png").await;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/federation/v1/media/download/r"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(png(400, 300)),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        state
+            .federation_client
+            .set_base_url_override(ORIGIN, &server.uri());
+
+        for _ in 0..2 {
+            let local = body(local_thumbnail(&state, "m", 96, 96, "scale").await.unwrap()).await;
+            assert_eq!(png_dims(&local), (320, 240));
+            let remote = body(remote_thumbnail(&state, "r", 96, 96).await.unwrap()).await;
+            assert_eq!(png_dims(&remote), (320, 240));
+        }
+        assert!(
+            state.db.list_thumbnails().unwrap().is_empty(),
+            "no thumbnail rows"
+        );
+        assert!(
+            state.db.list_remote_media().unwrap().is_empty(),
+            "no remote rows"
+        );
+        // Nothing but the local original sits in the store.
+        assert!(state.media_store.get("m").await.unwrap().is_some());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn remote_non_image_is_flagged_and_served_as_original() {
+        let (state, _tmp) = build_test_state();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/_matrix/federation/v1/media/download/doc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/pdf")
+                    .set_body_bytes(b"%PDF".to_vec()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        state
+            .federation_client
+            .set_base_url_override(ORIGIN, &server.uri());
+        for _ in 0..2 {
+            let resp = remote_thumbnail(&state, "doc", 96, 96).await.unwrap();
+            assert_eq!(body(resp).await, b"%PDF");
+        }
+        let row = state.db.get_remote_media(ORIGIN, "doc").unwrap().unwrap();
+        assert_eq!(row["thumbnailable"], json!(false));
+        server.verify().await;
     }
 }

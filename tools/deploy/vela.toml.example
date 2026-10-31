@@ -64,6 +64,18 @@ max_upload_size = "50MB"
 # leaves expiry to [retention.media] remote_lifetime. Default 10GB.
 remote_cache_max_size = "10GB"
 
+# Disk budget for rendered thumbnails of local and remote media (the
+# recommended sizes only; others are rendered on demand). Least recently
+# read go first; "0" disables the budget. Default 1GB.
+thumbnail_cache_max_size = "1GB"
+
+# Keep copies at all. Set either to false on a deployment that must not
+# hold other servers' media (remote_cache_enabled) or derived copies of
+# any media (thumbnail_cache_enabled); requests are then served by
+# fetching or rendering every time. Default true.
+remote_cache_enabled = true
+thumbnail_cache_enabled = true
+
 # Default backend: filesystem (under <database.path>/media). Switch to
 # s3 for off-host durability or shared storage across restarts.
 backend = "fs"

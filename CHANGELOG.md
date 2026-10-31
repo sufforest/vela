@@ -10,6 +10,25 @@ minor versions.
 
 ### Added
 
+- **Thumbnail cache.** Thumbnails of local and remote media are rendered
+  once per recommended size and kept, so a room full of clients opening
+  the same image costs one decode instead of one per view, and a thumbnail
+  of remote media whose original has since been evicted is still served
+  without another federation fetch. Requests snap to the spec's size table
+  (32x32 and 96x96 crop; 320x240, 640x480 and 800x600 scale), which also
+  keeps the cache at a handful of entries per original; sizes outside the
+  table are rendered on demand and not kept. Concurrent first requests for
+  one size share a single render. Bounded by `[media]
+  thumbnail_cache_max_size` (default 1GB, least recently read first);
+  thumbnails go with their original when retention deletes it, and
+  orphans are swept. An image that does not decode is remembered as such
+  on its original and served as-is from then on, for local media too
+  (previously a 500). Crops no longer upscale an original that already
+  fits. New column family: a database opened by this build cannot be
+  opened by an older one. Both caches can be switched off for
+  deployments that must not hold copies: `[media] remote_cache_enabled`
+  and `thumbnail_cache_enabled` (default true); off means fetch or render
+  on every request and write nothing.
 - **Remote media cache.** Media fetched from other homeservers is now kept
   locally, so a file viewed by a room full of users costs one federation
   fetch instead of one per view. Concurrent first requests share a single
