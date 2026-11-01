@@ -169,6 +169,18 @@ impl PersistKind {
     }
 }
 
+/// Identity of one cached thumbnail; see the `thumbnail_cache` CF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThumbnailKey {
+    /// Server the original belongs to (our own name for local media).
+    pub origin: String,
+    pub media_id: String,
+    pub width: u32,
+    pub height: u32,
+    /// `scale` or `crop`.
+    pub method: String,
+}
+
 pub struct Database {
     pub(crate) db: DB,
     pub(crate) event_nid_counter: PersistedCounter,
@@ -5415,6 +5427,153 @@ impl Database {
             let media_id = String::from_utf8_lossy(&k[sep + 1..]).to_string();
             let row: Value = serde_json::from_slice(&v).unwrap_or(Value::Null);
             out.push((origin, media_id, row));
+        }
+        Ok(out)
+    }
+
+    // --- Thumbnail cache ---
+
+    /// Row key for a cached thumbnail; see the CF comment in `cf.rs`.
+    fn thumbnail_key(
+        origin: &str,
+        media_id: &str,
+        width: u32,
+        height: u32,
+        method: &str,
+    ) -> Vec<u8> {
+        let mut k = Self::thumbnail_prefix(origin, media_id);
+        k.extend_from_slice(format!("{width}x{height}").as_bytes());
+        k.push(0);
+        k.extend_from_slice(method.as_bytes());
+        k
+    }
+
+    /// `{origin}\0{media_id}\0` — every thumbnail of one original.
+    fn thumbnail_prefix(origin: &str, media_id: &str) -> Vec<u8> {
+        let mut k = Vec::with_capacity(origin.len() + 2 + media_id.len() + 16);
+        k.extend_from_slice(origin.as_bytes());
+        k.push(0);
+        k.extend_from_slice(media_id.as_bytes());
+        k.push(0);
+        k
+    }
+
+    fn parse_thumbnail_key(k: &[u8]) -> Option<ThumbnailKey> {
+        let mut parts = k.split(|b| *b == 0);
+        let origin = std::str::from_utf8(parts.next()?).ok()?.to_string();
+        let media_id = std::str::from_utf8(parts.next()?).ok()?.to_string();
+        let size = std::str::from_utf8(parts.next()?).ok()?;
+        let method = std::str::from_utf8(parts.next()?).ok()?.to_string();
+        let (w, h) = size.split_once('x')?;
+        Some(ThumbnailKey {
+            origin,
+            media_id,
+            width: w.parse().ok()?,
+            height: h.parse().ok()?,
+            method,
+        })
+    }
+
+    pub fn set_thumbnail(&self, key: &ThumbnailKey, row: &Value) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("thumbnail_cache").unwrap();
+        self.db.put_cf(
+            &cf,
+            Self::thumbnail_key(
+                &key.origin,
+                &key.media_id,
+                key.width,
+                key.height,
+                &key.method,
+            ),
+            row.to_string().as_bytes(),
+        )
+    }
+
+    pub fn get_thumbnail(&self, key: &ThumbnailKey) -> Result<Option<Value>, rocksdb::Error> {
+        let cf = self.db.cf_handle("thumbnail_cache").unwrap();
+        match self.db.get_cf(
+            &cf,
+            Self::thumbnail_key(
+                &key.origin,
+                &key.media_id,
+                key.width,
+                key.height,
+                &key.method,
+            ),
+        )? {
+            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes).unwrap_or(Value::Null))),
+            None => Ok(None),
+        }
+    }
+
+    pub fn delete_thumbnail(&self, key: &ThumbnailKey) -> Result<(), rocksdb::Error> {
+        let cf = self.db.cf_handle("thumbnail_cache").unwrap();
+        self.db.delete_cf(
+            &cf,
+            Self::thumbnail_key(
+                &key.origin,
+                &key.media_id,
+                key.width,
+                key.height,
+                &key.method,
+            ),
+        )
+    }
+
+    /// Every cached thumbnail row. Same unbounded-but-rare rationale as
+    /// `list_remote_media` (budget eviction, retention sweep).
+    pub fn list_thumbnails(&self) -> Result<Vec<(ThumbnailKey, Value)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("thumbnail_cache").unwrap();
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(&cf, IteratorMode::Start) {
+            let (k, v) = item?;
+            let Some(key) = Self::parse_thumbnail_key(&k) else {
+                continue;
+            };
+            let row: Value = serde_json::from_slice(&v).unwrap_or(Value::Null);
+            out.push((key, row));
+        }
+        Ok(out)
+    }
+
+    /// The thumbnails of one original (prefix scan).
+    pub fn list_thumbnails_for(
+        &self,
+        origin: &str,
+        media_id: &str,
+    ) -> Result<Vec<(ThumbnailKey, Value)>, rocksdb::Error> {
+        self.list_thumbnails_with_prefix(&Self::thumbnail_prefix(origin, media_id))
+    }
+
+    /// Every thumbnail of media from `origin` (prefix scan).
+    pub fn list_thumbnails_for_origin(
+        &self,
+        origin: &str,
+    ) -> Result<Vec<(ThumbnailKey, Value)>, rocksdb::Error> {
+        let mut prefix = origin.as_bytes().to_vec();
+        prefix.push(0);
+        self.list_thumbnails_with_prefix(&prefix)
+    }
+
+    fn list_thumbnails_with_prefix(
+        &self,
+        prefix: &[u8],
+    ) -> Result<Vec<(ThumbnailKey, Value)>, rocksdb::Error> {
+        let cf = self.db.cf_handle("thumbnail_cache").unwrap();
+        let mut out = Vec::new();
+        for item in self
+            .db
+            .iterator_cf(&cf, IteratorMode::From(prefix, rocksdb::Direction::Forward))
+        {
+            let (k, v) = item?;
+            if !k.starts_with(prefix) {
+                break;
+            }
+            let Some(key) = Self::parse_thumbnail_key(&k) else {
+                continue;
+            };
+            let row: Value = serde_json::from_slice(&v).unwrap_or(Value::Null);
+            out.push((key, row));
         }
         Ok(out)
     }

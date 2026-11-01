@@ -557,6 +557,18 @@ struct MediaSection {
     /// served but not kept. `"0"` means no budget (lifetime-only, see
     /// `[retention.media] remote_lifetime`). Default 10GB.
     remote_cache_max_size: String,
+    /// Disk budget for rendered thumbnails (local and remote media, the
+    /// recommended sizes only). Least recently read go first; `"0"` means
+    /// no budget. Default 1GB.
+    thumbnail_cache_max_size: String,
+    /// Keep media fetched from other servers locally at all. Default
+    /// true. Off: every request fetches over federation and nothing is
+    /// written to disk — for deployments that must not hold copies of
+    /// other servers' content.
+    remote_cache_enabled: bool,
+    /// Keep rendered thumbnails at all. Default true. Off: every request
+    /// renders from the original and nothing is written to disk.
+    thumbnail_cache_enabled: bool,
     /// `"fs"` (default) or `"s3"`. Determines which MediaStore impl
     /// is wired into AppState.
     backend: String,
@@ -573,6 +585,9 @@ impl Default for MediaSection {
         Self {
             max_upload_size: "50MB".to_string(),
             remote_cache_max_size: "10GB".to_string(),
+            thumbnail_cache_max_size: "1GB".to_string(),
+            remote_cache_enabled: true,
+            thumbnail_cache_enabled: true,
             backend: "fs".to_string(),
             s3: None,
             url_preview_allow_private_ips: false,
@@ -1609,6 +1624,9 @@ fn main() -> anyhow::Result<()> {
                 registration_token: config.registration.token.clone(),
                 max_upload_size: parse_size(&config.media.max_upload_size)?,
                 remote_media_cache_max_bytes: parse_size(&config.media.remote_cache_max_size)?,
+                thumbnail_cache_max_bytes: parse_size(&config.media.thumbnail_cache_max_size)?,
+                remote_media_cache_enabled: config.media.remote_cache_enabled,
+                thumbnail_cache_enabled: config.media.thumbnail_cache_enabled,
                 max_account_data_bytes: config.limits.max_account_data_bytes,
                 url_preview_allow_private_ips: config.media.url_preview_allow_private_ips,
                 encrypt_by_default: parse_encrypt_policy(&config.room_defaults.encrypt_by_default)?,
@@ -1686,6 +1704,7 @@ fn main() -> anyhow::Result<()> {
             user_locks: Arc::new(DashMap::new()),
             key_backup_user_locks: Arc::new(DashMap::new()),
             remote_media_locks: Arc::new(DashMap::new()),
+            thumbnail_locks: Arc::new(DashMap::new()),
             room_senders: Arc::new(DashMap::new()),
             typing_state: Arc::new(DashMap::new()),
             typing_change_pos: Arc::new(DashMap::new()),
@@ -2137,6 +2156,8 @@ fn validate_runtime_parsable(config: &Config) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("[media] max_upload_size: {e}"))?;
     parse_size(&config.media.remote_cache_max_size)
         .map_err(|e| anyhow::anyhow!("[media] remote_cache_max_size: {e}"))?;
+    parse_size(&config.media.thumbnail_cache_max_size)
+        .map_err(|e| anyhow::anyhow!("[media] thumbnail_cache_max_size: {e}"))?;
     if config.backup.enabled {
         parse_duration(&config.backup.interval)
             .map_err(|e| anyhow::anyhow!("[backup] interval: {e}"))?;
@@ -2193,6 +2214,19 @@ fn print_config_summary(path: &std::path::Path, config: &Config) {
         "  media.remote_cache_max_size = {} ({} bytes)",
         config.media.remote_cache_max_size,
         parse_size(&config.media.remote_cache_max_size).unwrap_or(0)
+    );
+    println!(
+        "  media.thumbnail_cache_max_size = {} ({} bytes)",
+        config.media.thumbnail_cache_max_size,
+        parse_size(&config.media.thumbnail_cache_max_size).unwrap_or(0)
+    );
+    println!(
+        "  media.remote_cache_enabled = {}",
+        config.media.remote_cache_enabled
+    );
+    println!(
+        "  media.thumbnail_cache_enabled = {}",
+        config.media.thumbnail_cache_enabled
     );
     println!("  backup.enabled          = {}", config.backup.enabled);
     println!("  retention.enabled       = {}", config.retention.enabled);
@@ -2316,6 +2350,17 @@ mod validate_config_tests {
         let err = validate_runtime_parsable(&cfg).unwrap_err();
         assert!(
             err.to_string().contains("max_upload_size"),
+            "error should name the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_thumbnail_cache_max_size() {
+        let mut cfg = Config::default();
+        cfg.media.thumbnail_cache_max_size = "a few".to_string();
+        let err = validate_runtime_parsable(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("thumbnail_cache_max_size"),
             "error should name the offending field: {err}"
         );
     }

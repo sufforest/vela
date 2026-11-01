@@ -79,6 +79,16 @@ pub struct ServerConfig {
     /// least recently read files go first when it is exceeded. `0`
     /// disables the budget.
     pub remote_media_cache_max_bytes: u64,
+    /// Keep media fetched from other servers at all. Off: every request
+    /// fetches over federation and nothing is written locally.
+    pub remote_media_cache_enabled: bool,
+    /// Keep rendered thumbnails at all. Off: every request renders and
+    /// nothing is written locally (one render per size at a time still).
+    pub thumbnail_cache_enabled: bool,
+    /// Disk budget for rendered thumbnails of local and remote media, in
+    /// bytes; least recently read thumbnails go first. `0` disables the
+    /// budget.
+    pub thumbnail_cache_max_bytes: u64,
     /// Cap on one account-data value's serialized size (also applied,
     /// growth-only, to the merged `m.push_rules` blob). `0` disables.
     /// Default 1 MiB — a guard-rail against runaway blobs, not a quota:
@@ -343,6 +353,10 @@ pub struct AppState {
     /// remote file at once produce one federation fetch; the entry is
     /// dropped once no request holds it.
     pub remote_media_locks: Arc<DashMap<String, Arc<media::RemoteFetchSlot>>>,
+    /// Single-flight guard for thumbnail renders, keyed by the thumbnail
+    /// cache key: N clients asking for the same uncached size at once
+    /// produce one decode.
+    pub thumbnail_locks: Arc<DashMap<String, Arc<media::ThumbnailSlot>>>,
     pub room_senders: Arc<DashMap<Nid, tokio::sync::broadcast::Sender<u64>>>,
     /// In-memory typing state: room_nid → [(user_nid, expires_at_ms)]
     pub typing_state: Arc<DashMap<u64, Vec<(u64, u64)>>>,

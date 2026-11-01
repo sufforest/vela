@@ -75,6 +75,16 @@ pub const COLUMN_FAMILIES: &[&str] = &[
     // so it is never servable under our own server name. Swept by
     // the retention task on `last_access_at`.
     "remote_media_cache",
+    // Rendered thumbnails of local and remote media. Key:
+    // `{origin}\0{media_id}\0{w}x{h}\0{method}` (origin = our own server
+    // name for local media; the trailing separator after media_id makes
+    // `{origin}\0{media_id}\0` an exact per-original prefix). Value JSON
+    // `{ blob_id, content_type, size, width, height, created_at,
+    // last_access_at }`. Blob in the media store under `blob_id`, no
+    // `media_metadata` row, so never servable as our own media. Bounded
+    // by `[media] thumbnail_cache_max_size` (LRU on last_access_at) and
+    // purged with its original.
+    "thumbnail_cache",
     "receipts",
     // Generic small-value position tracking. Keys are
     // `<purpose-prefix>:<scope-bytes>`, values are u64 BE-encoded
